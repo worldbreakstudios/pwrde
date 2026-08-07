@@ -158,12 +158,17 @@ pub struct Workspace {
     pub name: String,
     pub root: Node,
     pub focused_tile: u64,
+    /// Directory every shell opened in this group starts in. `None` inherits
+    /// the directory pwrde itself was launched from.
+    pub cwd: Option<std::path::PathBuf>,
 }
 
 impl Workspace {
-    pub fn new(name: String, tile: Tile) -> Self {
+    /// Create a group holding a single tile, rooted at `cwd` (`None` = inherit
+    /// the process launch directory).
+    pub fn new(name: String, tile: Tile, cwd: Option<std::path::PathBuf>) -> Self {
         let focused_tile = tile.id;
-        Self { name, root: Node::Leaf(tile), focused_tile }
+        Self { name, root: Node::Leaf(tile), focused_tile, cwd }
     }
 
     pub fn focused(&self) -> Option<&Tile> {
@@ -212,6 +217,8 @@ pub const SIDEBAR_MAX_W: f32 = 360.0;
 /// is the window drag handle.
 pub const TITLEBAR_H: f32 = 44.0;
 const TAB_H: f32 = 40.0;
+/// Height of the "+" new-group button between the titlebar and the group tabs.
+const NEW_GROUP_H: f32 = 28.0;
 /// Height of the horizontal tab strip atop each tile.
 const TILE_TAB_H: f32 = 28.0;
 /// Gap between tiles; doubles as the divider drag handle.
@@ -228,18 +235,21 @@ pub fn titlebar(scale: f32, sidebar_w: f32) -> LayoutRect {
     LayoutRect { x: 0.0, y: 0.0, w: (sidebar_w * scale).round(), h: (TITLEBAR_H * scale).round() }
 }
 
-/// Custom traffic light `i` (0 close, 1 minimize, 2 zoom), macOS-standard
-/// positions within the titlebar strip.
-pub fn traffic_light(i: usize, scale: f32) -> LayoutRect {
-    let d = (12.0 * scale).round();
-    let cx = (20.0 + i as f32 * 20.0) * scale;
-    let cy = (TITLEBAR_H / 2.0) * scale;
-    LayoutRect { x: (cx - d / 2.0).round(), y: (cy - d / 2.0).round(), w: d, h: d }
+/// The "+" new-group button, directly below the titlebar strip and above the
+/// group tabs. Clicking it opens the cwd picker.
+pub fn new_group_button(scale: f32, sidebar_w: f32) -> LayoutRect {
+    LayoutRect {
+        x: 0.0,
+        y: (TITLEBAR_H * scale).round(),
+        w: (sidebar_w * scale).round(),
+        h: (NEW_GROUP_H * scale).round(),
+    }
 }
 
+/// Group tab `index` in the sidebar, stacked below the new-group button.
 pub fn tab_rect(index: usize, scale: f32, sidebar_w: f32) -> LayoutRect {
     let h = (TAB_H * scale).round();
-    let top = (TITLEBAR_H * scale).round();
+    let top = ((TITLEBAR_H + NEW_GROUP_H) * scale).round();
     LayoutRect { x: 0.0, y: top + index as f32 * h, w: (sidebar_w * scale).round(), h }
 }
 

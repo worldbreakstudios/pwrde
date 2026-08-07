@@ -1,139 +1,196 @@
-//! pwrde — a GPU-accelerated terminal workspace for macOS.
+//! pwrde — a terminal workspace for macOS, rendered with gpui.
 //!
-//! Window layout: borderless window (native traffic lights float over the
-//! sidebar's top strip, which doubles as the window drag handle), a resizable
-//! vertical-tab sidebar (one tab per *group*), and a binary split tree of
-//! tiles — each tile has a horizontal tab strip (cmux-style).
+//! Window layout: a gpui window with a resizable vertical-tab sidebar (one
+//! tab per *group*) and a binary split tree of tiles — each tile has a
+//! horizontal tab strip (cmux-style). Rendering is done by a single custom
+//! gpui `Element` whose `paint()` consumes the stateless `renderer::Frame`.
 //!
 //! Shortcuts:
 //!   ⌘D split side-by-side   ⇧⌘D split stacked    ⌘T new tab in tile
 //!   ⇧⌘T new group           ⌘W close tab         ⌘1–⌘9 switch group
 //!   ⌘]/⌘[ cycle tile focus  ⇧⌘]/⇧⌘[ next/prev tab   ⌘Q quit
+//!   ⌘V paste                ⌘-click open link
 //!
-//! Mouse: drag dividers to resize splits; drag the sidebar edge to resize it;
-//! drag a tile tab to reorder, move to another tile, drop on a tile edge to
-//! split it out, or drop on a sidebar group to send it there.
+//! Port note: this file was ported from winit+wgpu to gpui. The old
+//! `EventLoop`/`ApplicationHandler`/`Window` are replaced by a gpui
+//! `Application`, a window, and a terminal `Element`. Terminal wakeups arrive
+//! over an `mpsc` channel drained on gpui's foreground executor.
 
+mod git;
 mod links;
+mod picker;
 mod rect;
 mod renderer;
 mod term;
 mod workspace;
 
-use std::borrow::Cow;
-use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::time::Duration;
 
-use winit::application::ApplicationHandler;
-use winit::dpi::LogicalSize;
-use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::keyboard::{Key, ModifiersState, NamedKey};
-use winit::window::{CursorIcon, Window, WindowId};
+use gpui::{
+    canvas, div, px, App as GpuiApp, AppContext, Application, Bounds, Context, CursorStyle,
+    FocusHandle,
+    InteractiveElement, IntoElement, KeyDownEvent, Modifiers, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render, ShapedLine,
+    Size, Styled, TextAlign, TextRun, Window, WindowBounds, WindowOptions,
+};
 
 use renderer::Renderer;
 use term::{Session, TermEvent};
-use workspace::{Dir, LayoutRect, Node, Tab, Tile, Workspace};
+use workspace::{Dir, Node, Tab, Tile, Workspace};
 
-/// How far a pressed tab must move before it becomes a drag (physical px).
+// ── Layout / interaction constants (logical px) ──────────────────────────
+
+/// Grab tolerance (logical px) for divider / sidebar-edge hits.
+const GRAB: f32 = 4.0;
+/// Pointer travel (logical px) before a tab press becomes a drag.
 const DRAG_THRESHOLD: f64 = 6.0;
-/// Hit slop around dividers/edges (logical px).
-const GRAB: f32 = 3.0;
 
-enum Drag {
-    None,
-    /// Resizing a split; `path` addresses the Split node in the tree.
-    Divider { path: Vec<u8> },
-    /// Resizing the sidebar.
-    Sidebar,
-    /// Mouse down on a tile tab; becomes `Tab` after the threshold.
-    TabPress { tile: u64, tab: usize, start: (f64, f64) },
-    /// Dragging a tile tab.
-    Tab { tile: u64, tab: usize },
-}
-
+/// A drop landing zone resolved from the pointer during a tab drag.
 #[derive(Clone, Copy, Debug)]
 enum DropTarget {
-    /// Insert into a tile's tab strip at `index`.
+    /// Insert into a tile's tab bar at `index`.
     TabBar { tile: u64, index: usize },
-    /// Split `tile` in `dir`; `first` puts the dropped tab on the left/top.
-    Edge { tile: u64, dir: Dir, first: bool },
-    /// Append to a tile's tabs.
+    /// Drop onto a tile's body → append as a tab.
     Center { tile: u64 },
-    /// Move to another group (its focused tile).
+    /// Drop onto a tile edge → split.
+    Edge { tile: u64, dir: Dir, first: bool },
+    /// Drop onto a group's sidebar tab.
     Group { ws: usize },
 }
 
+/// The in-flight pointer drag gesture.
+#[derive(Clone, Debug)]
+enum Drag {
+    None,
+    /// Resizing the sidebar.
+    Sidebar,
+    /// Resizing a split divider at `path`.
+    Divider { path: Vec<u8> },
+    /// A tab was pressed; may become a drag past the threshold.
+    TabPress { tile: u64, tab: usize, start: (f64, f64) },
+    /// A tab is being dragged.
+    Tab { tile: u64, tab: usize },
+    /// A text selection is being dragged inside a tile's content area.
+    Select { tile: u64 },
+}
+
+/// The whole application state. Under gpui this is the `Entity` that owns the
+/// terminal `Element` and all workspaces.
 struct App {
-    proxy: EventLoopProxy<TermEvent>,
-    window: Option<Arc<Window>>,
-    renderer: Option<Renderer>,
+    /// Wakeups from PTY reader threads are drained from here per frame.
+    events_rx: Receiver<TermEvent>,
+    /// Cloned into each spawned `Session` so its reader thread can wake us.
+    events_tx: Sender<TermEvent>,
+    /// Stateless metrics/color/layout helper. Created once we know the scale.
+    renderer: Renderer,
     workspaces: Vec<Workspace>,
     active: usize,
     next_session_id: u64,
     next_tile_id: u64,
     /// Sidebar width, logical px (user-resizable).
     sidebar_w: f32,
-    modifiers: ModifiersState,
+    modifiers: Modifiers,
     title: String,
     cursor: (f64, f64),
     drag: Drag,
+    /// The open step-1 cwd picker popover, or `None` when closed.
+    picker: Option<picker::Picker>,
+    /// The open step-2 fork-source picker (git repos only), or `None`.
+    fork: Option<picker::ForkPicker>,
+    /// A centered one-line message. `bool` is `dismissable`: false while `drop`
+    /// provisions (input swallowed), true for a failure note the user can close.
+    message: Option<(String, bool)>,
+    /// The single focus handle for the terminal element. Minted once in the
+    /// constructor and focused when the window opens; keyboard events only
+    /// reach us while it holds focus.
+    focus_handle: FocusHandle,
+    /// Whether a redraw is currently needed (set by wakeups, mouse, keys).
+    dirty: bool,
+    /// Sub-notch wheel travel carried between scroll events so tiny deltas
+    /// accumulate into whole scroll steps instead of being lost.
+    scroll_accum: f64,
 }
 
 impl App {
     fn scale(&self) -> f32 {
-        self.window.as_ref().map_or(1.0, |w| w.scale_factor() as f32)
+        self.renderer.scale
     }
 
     fn dpi(&self) -> u32 {
         (96.0 * self.scale()) as u32
     }
 
+    /// Cell size in physical px, rounded for the PTY resize (u16).
+    fn cell_px(&self) -> (u16, u16) {
+        (self.renderer.cell_width as u16, self.renderer.cell_height as u16)
+    }
+
     fn spawn_session(&mut self) -> Session {
-        let (cell_w, cell_h) = self
-            .renderer
-            .as_ref()
-            .map_or((9, 19), |r| (r.cell_width as u16, r.cell_height as u16));
+        let cwd = self.workspaces.get(self.active).and_then(|ws| ws.cwd.clone());
+        self.spawn_session_in(cwd.as_deref())
+    }
+
+    /// Spawn a session whose shell starts in `cwd` (`None` inherits our own).
+    fn spawn_session_in(&mut self, cwd: Option<&std::path::Path>) -> Session {
         let id = self.next_session_id;
         self.next_session_id += 1;
-        if std::env::var_os("PWRDE_DEBUG").is_some() {
-            eprintln!("spawn_session id={id}\n{}", std::backtrace::Backtrace::force_capture());
-        }
-        // Spawned at a nominal size; sync_layout() immediately corrects it.
-        Session::new(id, 80, 24, cell_w, cell_h, self.dpi(), self.proxy.clone())
+        let (cw, ch) = self.cell_px();
+        // Start with a nominal grid; the first sync_layout resizes it.
+        Session::new(
+            id,
+            80,
+            24,
+            cw,
+            ch,
+            self.dpi(),
+            cwd,
+            self.events_tx.clone(),
+        )
     }
 
     fn new_tile(&mut self) -> Tile {
-        let session = self.spawn_session();
         let id = self.next_tile_id;
         self.next_tile_id += 1;
+        let session = self.spawn_session();
         Tile::new(id, session)
     }
 
-    fn area(&self) -> LayoutRect {
-        let renderer = self.renderer.as_ref().expect("renderer");
-        let (w, h) = renderer.surface_size();
-        workspace::terminal_area(w, h, renderer.scale, self.sidebar_w)
+    /// Physical-pixel terminal area (excludes the sidebar).
+    fn area(&self) -> workspace::LayoutRect {
+        let (w, h) = self.renderer.surface_size();
+        workspace::terminal_area(w, h, self.scale(), self.sidebar_w)
     }
 
-    /// Recompute the active workspace's tile layout and push size changes to
-    /// each visible PTY. Cheap when nothing changed (sizes cached per tab).
+    /// The screen-space rect of a tile in the active workspace, if present.
+    fn tile_rect(&self, id: u64) -> Option<workspace::LayoutRect> {
+        let scale = self.scale();
+        let ws = &self.workspaces[self.active];
+        let (tiles, _) = workspace::layout_tiles(&ws.root, self.area(), scale);
+        tiles.into_iter().find(|(tid, _)| *tid == id).map(|(_, rect)| rect)
+    }
+
+    /// Re-measure every visible tile and push grid sizes to the PTYs.
     fn sync_layout(&mut self) {
-        let Some(renderer) = &self.renderer else { return };
+        let scale = self.scale();
+        let (cw, ch) = self.cell_px();
+        let dpi = self.dpi();
         let area = self.area();
-        let scale = renderer.scale;
-        let (cell_w, cell_h) = (renderer.cell_width as u16, renderer.cell_height as u16);
-        let dpi = (96.0 * scale) as u32;
         let ws = &mut self.workspaces[self.active];
         let (tiles, _) = workspace::layout_tiles(&ws.root, area, scale);
         for (id, rect) in &tiles {
             let content = workspace::tile_content(rect, scale);
-            let (cols, rows) = renderer.grid_size_for(&content);
-            if let Some(tab) = ws.root.find_tile_mut(*id).and_then(|t| t.active_tab_mut())
-                && (cols, rows) != (tab.cols, tab.rows)
-            {
-                tab.cols = cols;
-                tab.rows = rows;
-                tab.session.resize(cols, rows, cell_w, cell_h, dpi);
+            // `grid_size_for` subtracts 2*PANE_PAD, matching the renderer's
+            // content_origin inset — so the PTY size tracks the padded render area.
+            let (cols, rows) = self.renderer.grid_size_for(&content);
+            if let Some(tile) = ws.root.find_tile_mut(*id) {
+                if let Some(tab) = tile.active_tab_mut() {
+                    if (cols, rows) != (tab.cols, tab.rows) {
+                        tab.cols = cols;
+                        tab.rows = rows;
+                        tab.session.resize(cols, rows, cw, ch, dpi);
+                    }
+                }
             }
         }
     }
@@ -153,7 +210,8 @@ impl App {
     fn new_tab(&mut self) {
         let session = self.spawn_session();
         let ws = &mut self.workspaces[self.active];
-        if let Some(tile) = ws.focused_mut() {
+        let focused = ws.focused_tile;
+        if let Some(tile) = ws.root.find_tile_mut(focused) {
             tile.tabs.push(Tab::new(session));
             tile.active = tile.tabs.len() - 1;
         }
@@ -161,86 +219,9 @@ impl App {
         self.request_redraw();
     }
 
-    fn add_workspace(&mut self) {
-        let tile = self.new_tile();
-        let n = self.workspaces.len() + 1;
-        self.workspaces.push(Workspace::new(format!("group {n}"), tile));
-        self.active = self.workspaces.len() - 1;
-        self.sync_layout();
-        self.request_redraw();
-    }
-
-    /// Remove tab `tab` from tile `tile` in workspace `wi`, cascading empty
-    /// tiles/groups. Returns the removed Tab (unless the app exited).
-    fn take_tab(
-        &mut self,
-        wi: usize,
-        tile_id: u64,
-        tab_idx: usize,
-        event_loop: &ActiveEventLoop,
-    ) -> Option<Tab> {
-        let ws = self.workspaces.get_mut(wi)?;
-        let tile = ws.root.find_tile_mut(tile_id)?;
-        if tab_idx >= tile.tabs.len() {
-            return None;
-        }
-        let tab = tile.tabs.remove(tab_idx);
-        if tile.active >= tile.tabs.len() {
-            tile.active = tile.tabs.len().saturating_sub(1);
-        }
-        if tile.tabs.is_empty() {
-            if !ws.root.remove_tile(tile_id) {
-                // Root leaf emptied: the group is empty.
-                if self.workspaces.len() > 1 {
-                    self.workspaces.remove(wi);
-                    if self.active >= wi {
-                        self.active = self.active.saturating_sub(1);
-                    }
-                } else {
-                    event_loop.exit();
-                    return Some(tab);
-                }
-            } else {
-                ws.fix_focus();
-            }
-        }
-        if let Some(ws) = self.workspaces.get_mut(wi) {
-            ws.fix_focus();
-        }
-        self.sync_layout();
-        self.request_redraw();
-        Some(tab)
-    }
-
-    fn close_active_tab(&mut self, event_loop: &ActiveEventLoop) {
-        let ws = &self.workspaces[self.active];
-        let tile_id = ws.focused_tile;
-        let Some(tab_idx) = ws.focused().map(|t| t.active) else { return };
-        // Dropping the Tab closes the PTY; the shell exits on hangup and the
-        // later `Exit` event finds nothing.
-        let _ = self.take_tab(self.active, tile_id, tab_idx, event_loop);
-    }
-
-    /// A shell exited on its own: remove its tab wherever it lives.
-    fn remove_session(&mut self, id: u64, event_loop: &ActiveEventLoop) {
-        for wi in 0..self.workspaces.len() {
-            let found = self.workspaces[wi].root.tiles().iter().find_map(|tile| {
-                tile.tabs
-                    .iter()
-                    .position(|t| t.session.id == id)
-                    .map(|ti| (tile.id, ti))
-            });
-            if let Some((tile_id, tab_idx)) = found {
-                let _ = self.take_tab(wi, tile_id, tab_idx, event_loop);
-                return;
-            }
-        }
-    }
-
-    fn switch_workspace(&mut self, index: usize) {
-        if index < self.workspaces.len() && index != self.active {
-            self.active = index;
-            // The window may have resized while this group was inactive.
+    fn switch_workspace(&mut self, wi: usize) {
+        if wi < self.workspaces.len() {
+            self.active = wi;
             self.sync_layout();
             self.request_redraw();
         }
@@ -249,43 +230,142 @@ impl App {
     fn cycle_tile(&mut self, delta: isize) {
         let ws = &mut self.workspaces[self.active];
         let ids: Vec<u64> = ws.root.tiles().iter().map(|t| t.id).collect();
-        if ids.len() > 1 {
-            let cur = ids.iter().position(|&i| i == ws.focused_tile).unwrap_or(0);
-            let next = (cur as isize + delta).rem_euclid(ids.len() as isize) as usize;
-            ws.focused_tile = ids[next];
-            self.request_redraw();
+        if ids.is_empty() {
+            return;
         }
+        let cur = ids.iter().position(|&id| id == ws.focused_tile).unwrap_or(0);
+        let n = ids.len() as isize;
+        let next = (((cur as isize + delta) % n + n) % n) as usize;
+        ws.focused_tile = ids[next];
+        self.request_redraw();
     }
 
     fn cycle_tab(&mut self, delta: isize) {
         let ws = &mut self.workspaces[self.active];
-        if let Some(tile) = ws.focused_mut()
-            && tile.tabs.len() > 1
-        {
-            tile.active =
-                (tile.active as isize + delta).rem_euclid(tile.tabs.len() as isize) as usize;
+        let focused = ws.focused_tile;
+        if let Some(tile) = ws.root.find_tile_mut(focused) {
+            let n = tile.tabs.len();
+            if n == 0 {
+                return;
+            }
+            let cur = tile.active as isize;
+            let n = n as isize;
+            tile.active = (((cur + delta) % n + n) % n) as usize;
         }
         self.sync_layout();
         self.request_redraw();
     }
 
-    fn request_redraw(&self) {
-        if let Some(window) = &self.window {
-            window.request_redraw();
+    fn close_active_tab(&mut self) {
+        let ws = &mut self.workspaces[self.active];
+        let focused = ws.focused_tile;
+        let Some(tile) = ws.root.find_tile_mut(focused) else { return };
+        if tile.tabs.is_empty() {
+            return;
         }
+        let tab_idx = tile.active;
+        let tab = tile.tabs.remove(tab_idx);
+        if tile.active >= tile.tabs.len() {
+            tile.active = tile.tabs.len().saturating_sub(1);
+        }
+        if tile.tabs.is_empty() {
+            if !ws.root.remove_tile(focused) {
+                // Was the last tile of the group: close the group.
+                if self.workspaces.len() > 1 {
+                    self.workspaces.remove(self.active);
+                    if self.active >= self.workspaces.len() {
+                        self.active = self.workspaces.len() - 1;
+                    }
+                }
+            }
+        }
+        drop(tab);
+        // A tile removal may leave `focused_tile` dangling.
+        self.workspaces[self.active].fix_focus();
+        self.sync_layout();
+        self.request_redraw();
+    }
+
+    /// Mouse wheel / trackpad → scroll the pane under the cursor. On the
+    /// primary screen this scrolls our own scrollback (positive = back into
+    /// history, matching macOS natural scrolling). But a full-screen TUI or a
+    /// mouse-tracking app owns the wheel — there we forward it to the app
+    /// (which scrolls its own content), since the alternate screen has no
+    /// scrollback of ours to move.
+    fn on_scroll(&mut self, delta: gpui::ScrollDelta, cell_height: f32) {
+        if self.message.is_some() || self.fork.is_some() || self.picker.is_some() {
+            return;
+        }
+        let scale = self.scale();
+        let cell_h = cell_height as f64;
+        let (px, py) = (self.cursor.0 as f32, self.cursor.1 as f32);
+        // Accumulate into whole wheel "steps": one per wheel notch, or one per
+        // ~3 cell-heights of trackpad travel, so sub-step deltas aren't lost.
+        let notches = match delta {
+            gpui::ScrollDelta::Lines(p) => p.y as f64,
+            gpui::ScrollDelta::Pixels(p) => f32::from(p.y) as f64 / (cell_h * 3.0),
+        };
+        let steps = scroll_steps(&mut self.scroll_accum, notches);
+        if steps == 0 {
+            return;
+        }
+
+        let ws = &self.workspaces[self.active];
+        let (tiles, _) = workspace::layout_tiles(&ws.root, self.area(), scale);
+        let Some((id, rect)) =
+            tiles.iter().find(|(_, r)| workspace::tile_content(r, scale).contains(px, py))
+        else {
+            return;
+        };
+        let Some(tab) = ws.root.find_tile(*id).and_then(|t| t.active_tab()) else {
+            return;
+        };
+        let session = &tab.session;
+        let up = steps > 0;
+
+        if session.app_consumes_wheel() {
+            // Hand the wheel to the app (mouse report, or alternate-scroll arrow
+            // keys on the alternate screen) — once per accumulated step.
+            let content = workspace::tile_content(rect, scale);
+            let (col, row) = self.renderer.cell_at(&content, px, py).unwrap_or((0, 0));
+            for _ in 0..steps.unsigned_abs() {
+                session.forward_wheel(up, col, row);
+            }
+        } else {
+            // Primary screen: scroll our own scrollback, ~3 lines per notch.
+            session.scroll_by(steps * 3);
+        }
+        self.request_redraw();
+    }
+
+    fn request_redraw(&mut self) {
+        self.dirty = true;
     }
 
     /// ⌘V: clipboard → focused terminal (bracketed-paste aware).
+    /// Copy the active selection's text to the system clipboard.
+    fn copy(&mut self) {
+        let ws = &self.workspaces[self.active];
+        let Some(tab) = ws.focused().and_then(|t| t.active_tab()) else { return };
+        let Some(text) = tab.session.selected_text() else { return };
+        if let Ok(mut clipboard) = arboard::Clipboard::new() {
+            let _ = clipboard.set_text(text);
+        }
+    }
+
     fn paste(&mut self) {
         let Ok(mut clipboard) = arboard::Clipboard::new() else { return };
-        let Ok(text) = clipboard.get_text() else { return };
-        if text.is_empty() {
-            return;
-        }
         let ws = &self.workspaces[self.active];
-        if let Some(tab) = ws.focused().and_then(|t| t.active_tab()) {
-            tab.session.paste(&text);
+        let Some(tab) = ws.focused().and_then(|t| t.active_tab()) else { return };
+        match clipboard.get_text() {
+            Ok(text) if !text.is_empty() => tab.session.paste(&text),
+            _ if clipboard.get_image().is_ok() => tab.session.write([0x16u8]),
+            _ => return,
         }
+        // Like typing: a paste follows the live output and drops any selection.
+        tab.session.scroll_to_bottom();
+        tab.session.clear_selection();
+        self.request_redraw();
     }
 
     /// True when the session is the *visible* tab of a tile in the active
@@ -298,22 +378,104 @@ impl App {
             .any(|t| t.active_tab().is_some_and(|tab| tab.session.id == id))
     }
 
-    // ── Mouse ──────────────────────────────────────────────────────────
+    // ── cwd picker ──────────────────────────────────────────────────────
 
-    fn resolve_drop(&self, px: f32, py: f32) -> Option<DropTarget> {
-        let renderer = self.renderer.as_ref()?;
-        let scale = renderer.scale;
-        let (_, h) = renderer.surface_size();
+    fn open_picker(&mut self) {
+        self.picker = Some(picker::Picker::new());
+        self.request_redraw();
+    }
 
-        if workspace::sidebar(h, scale, self.sidebar_w).contains(px, py) {
-            for wi in 0..self.workspaces.len() {
-                if workspace::tab_rect(wi, scale, self.sidebar_w).contains(px, py) {
-                    return Some(DropTarget::Group { ws: wi });
-                }
-            }
-            return None;
+    fn confirm_picker(&mut self) {
+        let Some(picker) = self.picker.as_mut() else { return };
+        let Some(entry) = picker.selected_entry().cloned() else {
+            self.picker = None;
+            return;
+        };
+        picker.record_recent(&entry.path);
+        let name = group_name(&entry.path);
+        if entry.is_git {
+            // Step 2: choose where to fork a drop worktree from.
+            let choices = build_fork_choices(&entry.path);
+            self.fork = Some(picker::ForkPicker::new(entry.path, name, choices));
+            self.picker = None;
+        } else {
+            self.picker = None;
+            self.add_group(name, Some(entry.path));
+        }
+    }
+
+    /// Step 2: confirm the fork choice. "repo root"/"attach worktree" open the
+    /// group directly; the forking scopes spawn `drop` on a worker thread and
+    /// show a provisioning message until it reports back over `events_tx`.
+    fn confirm_fork(&mut self) {
+        let Some(picker) = self.fork.as_ref() else { return };
+        let Some(entry) = picker.selected_entry() else { return };
+        let repo = picker.repo.clone();
+        let name = picker.name.clone();
+        let scope = entry.scope;
+        let from = entry.from.clone();
+        let path = entry.path.clone();
+
+        // "repo root" and "attach worktree" skip drop entirely: open the group
+        // directly in that directory (the repo, or the existing worktree).
+        if matches!(scope, picker::ForkScope::RepoRoot | picker::ForkScope::Worktree) {
+            self.fork = None;
+            self.add_group(name, path);
+            return;
         }
 
+        self.message = Some((format!("Provisioning worktree for {name}…"), false));
+        self.fork = None;
+        self.request_redraw();
+
+        let events_tx = self.events_tx.clone();
+        std::thread::spawn(move || {
+            let event = match run_drop(&repo, from.as_deref()) {
+                Ok(cwd) => TermEvent::GroupReady { name, cwd },
+                Err(message) => TermEvent::GroupFailed { message },
+            };
+            let _ = events_tx.send(event);
+        });
+    }
+
+    fn new_tile_in(&mut self, cwd: Option<&std::path::Path>) -> Tile {
+        let id = self.next_tile_id;
+        self.next_tile_id += 1;
+        let session = self.spawn_session_in(cwd);
+        Tile::new(id, session)
+    }
+
+    /// Open a new group named `name`, rooted at `cwd`, and make it active.
+    fn add_group(&mut self, name: String, cwd: Option<std::path::PathBuf>) {
+        let tile = self.new_tile_in(cwd.as_deref());
+        self.workspaces.push(Workspace::new(name, tile, cwd));
+        self.active = self.workspaces.len() - 1;
+        self.sync_layout();
+        self.request_redraw();
+    }
+
+    // ── Tab drag / drop ───────────────────────────────────────────────────
+
+    fn take_tab(&mut self, wi: usize, tile_id: u64, tab_idx: usize) -> Option<Tab> {
+        let ws = self.workspaces.get_mut(wi)?;
+        let tile = ws.root.find_tile_mut(tile_id)?;
+        if tab_idx >= tile.tabs.len() {
+            return None;
+        }
+        let tab = tile.tabs.remove(tab_idx);
+        if tile.active >= tile.tabs.len() {
+            tile.active = tile.tabs.len().saturating_sub(1);
+        }
+        if tile.tabs.is_empty() {
+            let _ = ws.root.remove_tile(tile_id);
+            // The removed tile may have been the focused one.
+            ws.fix_focus();
+        }
+        Some(tab)
+    }
+
+    fn resolve_drop(&self, px: f32, py: f32) -> Option<DropTarget> {
+        let scale = self.scale();
         let ws = &self.workspaces[self.active];
         let (tiles, _) = workspace::layout_tiles(&ws.root, self.area(), scale);
         for (id, rect) in &tiles {
@@ -322,35 +484,51 @@ impl App {
             }
             let bar = workspace::tile_tab_bar(rect, scale);
             if bar.contains(px, py) {
-                let n = ws.root.find_tile(*id).map_or(0, |t| t.tabs.len());
-                let tab_w = workspace::tile_tab_rect(rect, 0, n.max(1), scale).w;
-                let index = (((px - bar.x) / tab_w).floor() as usize).min(n);
+                let n = ws.root.find_tile(*id).map_or(1, |t| t.tabs.len()).max(1);
+                let tab_w = workspace::tile_tab_rect(rect, 0, n, scale).w;
+                let index = (((px - bar.x) / tab_w).floor().max(0.0) as usize).min(n);
                 return Some(DropTarget::TabBar { tile: *id, index });
             }
             let content = workspace::tile_content(rect, scale);
-            let rx = (px - content.x) / content.w;
-            let ry = (py - content.y) / content.h;
-            return Some(if rx < 0.25 {
-                DropTarget::Edge { tile: *id, dir: Dir::Row, first: true }
-            } else if rx > 0.75 {
-                DropTarget::Edge { tile: *id, dir: Dir::Row, first: false }
-            } else if ry < 0.25 {
-                DropTarget::Edge { tile: *id, dir: Dir::Column, first: true }
-            } else if ry > 0.75 {
-                DropTarget::Edge { tile: *id, dir: Dir::Column, first: false }
-            } else {
-                DropTarget::Center { tile: *id }
-            });
+            // Edge bands: outer eighth of the content on each side splits.
+            let ex = content.w / 4.0;
+            let ey = content.h / 4.0;
+            if px < content.x + ex {
+                return Some(DropTarget::Edge { tile: *id, dir: Dir::Row, first: true });
+            }
+            if px > content.x + content.w - ex {
+                return Some(DropTarget::Edge { tile: *id, dir: Dir::Row, first: false });
+            }
+            if py < content.y + ey {
+                return Some(DropTarget::Edge { tile: *id, dir: Dir::Column, first: true });
+            }
+            if py > content.y + content.h - ey {
+                return Some(DropTarget::Edge { tile: *id, dir: Dir::Column, first: false });
+            }
+            return Some(DropTarget::Center { tile: *id });
+        }
+        // Sidebar group tabs.
+        let (_, h) = self.renderer.surface_size();
+        if workspace::sidebar(h, scale, self.sidebar_w).contains(px, py) {
+            for wi in 0..self.workspaces.len() {
+                if workspace::tab_rect(wi, scale, self.sidebar_w).contains(px, py) {
+                    return Some(DropTarget::Group { ws: wi });
+                }
+            }
         }
         None
     }
 
-    fn drop_hint(&self, target: DropTarget) -> Option<LayoutRect> {
-        let renderer = self.renderer.as_ref()?;
-        let scale = renderer.scale;
+    /// The translucent highlight rect for a resolved drop target, in physical
+    /// px. Mirrors `resolve_drop`'s geometry so the preview matches the landing.
+    fn drop_hint(&self, target: DropTarget) -> Option<workspace::LayoutRect> {
+        let scale = self.scale();
         match target {
-            DropTarget::Group { ws } => Some(workspace::tab_rect(ws, scale, self.sidebar_w)),
-            DropTarget::TabBar { tile, .. } | DropTarget::Center { tile }
+            DropTarget::Group { ws } => {
+                Some(workspace::tab_rect(ws, scale, self.sidebar_w))
+            },
+            DropTarget::TabBar { tile, .. }
+            | DropTarget::Center { tile }
             | DropTarget::Edge { tile, .. } => {
                 let wsp = &self.workspaces[self.active];
                 let (tiles, _) = workspace::layout_tiles(&wsp.root, self.area(), scale);
@@ -361,30 +539,31 @@ impl App {
                     DropTarget::Edge { dir, first, .. } => {
                         let c = workspace::tile_content(&rect, scale);
                         match (dir, first) {
-                            (Dir::Row, true) => LayoutRect { w: c.w / 2.0, ..c },
-                            (Dir::Row, false) => {
-                                LayoutRect { x: c.x + c.w / 2.0, w: c.w / 2.0, ..c }
+                            (Dir::Row, true) => {
+                                workspace::LayoutRect { w: c.w / 2.0, ..c }
                             },
-                            (Dir::Column, true) => LayoutRect { h: c.h / 2.0, ..c },
-                            (Dir::Column, false) => {
-                                LayoutRect { y: c.y + c.h / 2.0, h: c.h / 2.0, ..c }
+                            (Dir::Row, false) => workspace::LayoutRect {
+                                x: c.x + c.w / 2.0,
+                                w: c.w / 2.0,
+                                ..c
+                            },
+                            (Dir::Column, true) => {
+                                workspace::LayoutRect { h: c.h / 2.0, ..c }
+                            },
+                            (Dir::Column, false) => workspace::LayoutRect {
+                                y: c.y + c.h / 2.0,
+                                h: c.h / 2.0,
+                                ..c
                             },
                         }
                     },
-                    _ => unreachable!(),
+                    DropTarget::Group { .. } => unreachable!(),
                 })
             },
         }
     }
 
-    fn apply_drop(
-        &mut self,
-        src_tile: u64,
-        src_tab: usize,
-        target: DropTarget,
-        event_loop: &ActiveEventLoop,
-    ) {
-        // No-op guards: dropping a tab onto itself.
+    fn apply_drop(&mut self, src_tile: u64, src_tab: usize, target: DropTarget) {
         let src_len = self.workspaces[self.active]
             .root
             .find_tile(src_tile)
@@ -393,8 +572,6 @@ impl App {
             DropTarget::Center { tile } if tile == src_tile => return,
             DropTarget::Edge { tile, .. } if tile == src_tile && src_len <= 1 => return,
             DropTarget::Group { ws } if ws == self.active && src_len <= 1 => {
-                // Moving the only tab of the only tile to its own group: noop
-                // when the group holds just that tile.
                 let ws_ref = &self.workspaces[self.active];
                 if ws_ref.root.tiles().len() == 1 {
                     return;
@@ -403,7 +580,7 @@ impl App {
             _ => {},
         }
 
-        let Some(mut tab) = self.take_tab(self.active, src_tile, src_tab, event_loop) else {
+        let Some(mut tab) = self.take_tab(self.active, src_tile, src_tab) else {
             return;
         };
 
@@ -414,7 +591,7 @@ impl App {
                     t.tabs.insert(index, tab);
                     t.active = index;
                     self.workspaces[self.active].focused_tile = tile;
-                } // else: tree changed underneath us; tab is dropped (shell dies)
+                }
             },
             DropTarget::Center { tile } => {
                 if let Some(t) = self.workspaces[self.active].root.find_tile_mut(tile) {
@@ -426,7 +603,7 @@ impl App {
             DropTarget::Edge { tile, dir, first } => {
                 let id = self.next_tile_id;
                 self.next_tile_id += 1;
-                tab.cols = 0; // force resize at new geometry
+                tab.cols = 0;
                 let new_tile = Tile { id, tabs: vec![tab], active: 0 };
                 let ws = &mut self.workspaces[self.active];
                 if ws.root.split_tile(tile, dir, &mut Some(new_tile), first) {
@@ -448,8 +625,7 @@ impl App {
 
     /// ⌘-click: open the link under the cursor, if any.
     fn open_link_at(&self, px: f32, py: f32) -> bool {
-        let Some(renderer) = &self.renderer else { return false };
-        let scale = renderer.scale;
+        let scale = self.renderer.scale;
         let ws = &self.workspaces[self.active];
         let (tiles, _) = workspace::layout_tiles(&ws.root, self.area(), scale);
         for (id, rect) in &tiles {
@@ -457,7 +633,7 @@ impl App {
             if !content.contains(px, py) {
                 continue;
             }
-            if let Some((col, row)) = renderer.cell_at(&content, px, py)
+            if let Some((col, row)) = self.renderer.cell_at(&content, px, py)
                 && let Some(tab) = ws.root.find_tile(*id).and_then(|t| t.active_tab())
                 && let Some(url) = tab.session.link_at(col, row)
             {
@@ -468,17 +644,80 @@ impl App {
         false
     }
 
-    fn on_mouse_down(&mut self, event_loop: &ActiveEventLoop) {
-        let _ = event_loop;
-        let Some(renderer) = &self.renderer else { return };
-        let scale = renderer.scale;
+    // ── Pointer events (from the terminal Element) ──────────────────────────
+
+    /// Routes a click to whichever overlay is up, in priority order
+    /// (message → fork picker → dir picker). Ports origin/main's overlay_click
+    /// into the gpui three-field model.
+    fn overlay_click(&mut self, px: f32, py: f32, width: u32, height: u32, scale: f32) {
+        // Message overlay is topmost: a dismissable one clears on any click,
+        // a modal (provisioning) one swallows the click.
+        if let Some((_, dismissable)) = self.message.as_ref() {
+            if *dismissable {
+                self.message = None;
+            }
+            self.request_redraw();
+            return;
+        }
+
+        // Fork picker (step 2): click a row to select+confirm, click outside to
+        // step back to the dir picker.
+        if let Some(fork) = &mut self.fork {
+            let layout =
+                picker::PickerLayout::compute(width, height, scale, fork.rows.len(), fork.selected);
+            if !layout.panel.contains(px, py) {
+                self.fork = None;
+                self.picker = Some(picker::Picker::new());
+                self.request_redraw();
+                return;
+            }
+            if let Some(index) = layout.row_at(px, py) {
+                fork.select(index);
+                self.confirm_fork();
+            }
+            self.request_redraw();
+            return;
+        }
+
+        // Dir picker (step 1): existing behaviour.
+        let Some(picker) = &mut self.picker else { return };
+        let layout = picker::PickerLayout::compute(width, height, scale, picker.rows.len(), picker.selected);
+        if !layout.panel.contains(px, py) {
+            self.picker = None;
+            self.request_redraw();
+            return;
+        }
+        let Some(index) = layout.row_at(px, py) else { return };
+        let Some(rect) = layout.row_rect(index) else { return };
+        let Some(picker::PickerRow::Entry(entry)) = picker.rows.get(index).cloned() else {
+            return;
+        };
+        picker.select(index);
+        if layout.star_rect(&rect).contains(px, py) {
+            picker.toggle_pin(&entry.path);
+            self.request_redraw();
+            return;
+        }
+        self.confirm_picker();
+    }
+
+    fn on_mouse_down(&mut self, window: &mut Window) {
+        let scale = self.renderer.scale;
         let (px, py) = (self.cursor.0 as f32, self.cursor.1 as f32);
-        let (_, h) = renderer.surface_size();
+        let (w, h) = self.renderer.surface_size();
         let grab = GRAB * scale;
+
+        // Overlays are modal: they intercept clicks in priority order
+        // (message → fork picker → dir picker) before anything else.
+        if self.message.is_some() || self.fork.is_some() || self.picker.is_some() {
+            self.overlay_click(px, py, w, h, scale);
+            return;
+        }
+
         let sidebar = workspace::sidebar(h, scale, self.sidebar_w);
 
         // ⌘-click opens links instead of focusing.
-        if self.modifiers.super_key() && self.open_link_at(px, py) {
+        if self.modifiers.platform && self.open_link_at(px, py) {
             return;
         }
 
@@ -488,7 +727,6 @@ impl App {
             return;
         }
 
-        // Split dividers → resize splits.
         let ws = &self.workspaces[self.active];
         let (tiles, dividers) = workspace::layout_tiles(&ws.root, self.area(), scale);
         if let Some(d) = dividers.iter().find(|d| d.rect.inflate(grab).contains(px, py)) {
@@ -498,28 +736,16 @@ impl App {
 
         // Sidebar: titlebar strip = traffic lights + window drag handle.
         if sidebar.contains(px, py) {
+            // Window-drag is scoped to the titlebar strip ONLY so that clicks on
+            // tile tab strips are never treated as a window move.
             if workspace::titlebar(scale, self.sidebar_w).contains(px, py) {
-                let grab_pad = 4.0 * scale;
-                let hit =
-                    (0..3).find(|&i| workspace::traffic_light(i, scale).inflate(grab_pad).contains(px, py));
-                match hit {
-                    Some(0) => event_loop.exit(),
-                    Some(1) => {
-                        if let Some(window) = &self.window {
-                            window.set_minimized(true);
-                        }
-                    },
-                    Some(2) => {
-                        if let Some(window) = &self.window {
-                            window.set_maximized(!window.is_maximized());
-                        }
-                    },
-                    _ => {
-                        if let Some(window) = &self.window {
-                            let _ = window.drag_window();
-                        }
-                    },
-                }
+                // Native traffic-light buttons handle their own clicks; a press
+                // anywhere else in the strip drags the window (we own the drag).
+                window.start_window_move();
+                return;
+            }
+            if workspace::new_group_button(scale, self.sidebar_w).contains(px, py) {
+                self.open_picker();
                 return;
             }
             for wi in 0..self.workspaces.len() {
@@ -549,17 +775,26 @@ impl App {
                     self.sync_layout();
                     self.request_redraw();
                 }
-            } else if ws.focused_tile != *id {
+            } else {
                 ws.focused_tile = *id;
+                let content = workspace::tile_content(rect, scale);
+                if let Some((col, row)) = self.renderer.cell_at(&content, px, py) {
+                    if let Some(tab) =
+                        self.workspaces[self.active].root.find_tile(*id).and_then(|t| t.active_tab())
+                    {
+                        tab.session.begin_selection(col, row);
+                    }
+                    self.drag = Drag::Select { tile: *id };
+                }
                 self.request_redraw();
             }
             return;
         }
     }
 
-    fn on_mouse_move(&mut self) {
-        let Some(renderer) = &self.renderer else { return };
-        let scale = renderer.scale;
+    fn on_mouse_move(&mut self, window: &mut Window) {
+        let _ = window;
+        let scale = self.renderer.scale;
         let (px, py) = (self.cursor.0 as f32, self.cursor.1 as f32);
 
         match &self.drag {
@@ -592,38 +827,58 @@ impl App {
                 }
             },
             Drag::Tab { .. } => self.request_redraw(),
-            Drag::None => {
-                // Hover affordances: resize cursors near grabbable edges.
-                let (_, h) = renderer.surface_size();
-                let grab = GRAB * scale;
-                let sidebar = workspace::sidebar(h, scale, self.sidebar_w);
-                let ws = &self.workspaces[self.active];
-                let (_, dividers) = workspace::layout_tiles(&ws.root, self.area(), scale);
-                let icon = if (px - sidebar.w).abs() <= grab {
-                    CursorIcon::ColResize
-                } else if let Some(d) =
-                    dividers.iter().find(|d| d.rect.inflate(grab).contains(px, py))
-                {
-                    match d.dir {
-                        Dir::Row => CursorIcon::ColResize,
-                        Dir::Column => CursorIcon::RowResize,
+            Drag::Select { tile } => {
+                let tile = *tile;
+                let area = self.area();
+                let scale = self.renderer.scale;
+                if let Some(rect) = self.tile_rect(tile) {
+                    let content = workspace::tile_content(&rect, scale);
+                    if let Some((col, row)) = self.renderer.cell_at(&content, px, py)
+                        && let Some(tab) = self.workspaces[self.active]
+                            .root
+                            .find_tile(tile)
+                            .and_then(|t| t.active_tab())
+                    {
+                        tab.session.update_selection(col, row);
+                        self.request_redraw();
                     }
-                } else {
-                    CursorIcon::Default
-                };
-                if let Some(window) = &self.window {
-                    window.set_cursor(winit::window::Cursor::Icon(icon));
                 }
+                let _ = area;
+            },
+            Drag::None => {
+                // Hover resize-cursor affordances. We compute which resize
+                // orientation the pointer is over (sidebar edge = horizontal,
+                // a divider = its split direction). This references Divider.dir.
+                let sidebar_w = (self.sidebar_w * scale).round();
+                let grab = GRAB * scale;
+                let ws = &self.workspaces[self.active];
+                let (_tiles, dividers) = workspace::layout_tiles(&ws.root, self.area(), scale);
+                let _hover = if (px - sidebar_w).abs() <= grab {
+                    Some(CursorStyle::ResizeLeftRight)
+                } else {
+                    dividers
+                        .iter()
+                        .find(|d| d.rect.inflate(grab).contains(px, py))
+                        .map(|d| match d.dir {
+                            Dir::Row => CursorStyle::ResizeLeftRight,
+                            Dir::Column => CursorStyle::ResizeUpDown,
+                        })
+                };
+                // TODO(gpui-port): gpui's window.set_cursor_style requires a
+                // &Hitbox which is awkward to synthesize from a raw mouse-move
+                // handler; wiring the actual cursor swap is left for later.
+                let _ = _hover;
             },
         }
     }
 
-    fn on_mouse_up(&mut self, event_loop: &ActiveEventLoop) {
+    fn on_mouse_up(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let _ = (window, cx);
         match std::mem::replace(&mut self.drag, Drag::None) {
             Drag::Tab { tile, tab } => {
                 let (px, py) = (self.cursor.0 as f32, self.cursor.1 as f32);
                 if let Some(target) = self.resolve_drop(px, py) {
-                    self.apply_drop(tile, tab, target, event_loop);
+                    self.apply_drop(tile, tab, target);
                 }
                 self.request_redraw();
             },
@@ -631,195 +886,709 @@ impl App {
         }
     }
 
-    fn handle_shortcut(&mut self, event: &KeyEvent, event_loop: &ActiveEventLoop) {
-        let shift = self.modifiers.shift_key();
-        if let Key::Character(text) = &event.logical_key {
-            match (text.to_lowercase().as_str(), shift) {
-                ("d", false) => self.split(Dir::Row),
-                ("d", true) => self.split(Dir::Column),
-                ("t", false) => self.new_tab(),
-                ("t", true) => self.add_workspace(),
-                ("w", _) => self.close_active_tab(event_loop),
-                ("q", _) => event_loop.exit(),
-                ("v", _) => self.paste(),
-                ("[" | "{", false) => self.cycle_tile(-1),
-                ("]" | "}", false) => self.cycle_tile(1),
-                ("[" | "{", true) => self.cycle_tab(-1),
-                ("]" | "}", true) => self.cycle_tab(1),
-                (s, _) => {
-                    if let Some(d) = s.chars().next().and_then(|c| c.to_digit(10))
-                        && d >= 1
+    // ── Keyboard ────────────────────────────────────────────────────────
+
+    fn on_key_down(&mut self, ev: &KeyDownEvent) {
+        self.modifiers = ev.keystroke.modifiers;
+        // An open overlay owns the keyboard: route to it before ⌘ shortcuts or
+        // the PTY so typing filters the list rather than reaching the shell.
+        if self.message.is_some() || self.fork.is_some() || self.picker.is_some() {
+            self.handle_picker_key(ev);
+            return;
+        }
+        // ⌘ shortcuts take priority over passing bytes to the shell.
+        if ev.keystroke.modifiers.platform {
+            self.handle_shortcut(ev);
+            return;
+        }
+        if let Some(bytes) = key_to_bytes(ev) {
+            let ws = &self.workspaces[self.active];
+            if let Some(tab) = ws.focused().and_then(|t| t.active_tab()) {
+                tab.session.write(bytes);
+                // Typing snaps back to the live bottom and drops any
+                // selection, like every other terminal.
+                tab.session.scroll_to_bottom();
+                tab.session.clear_selection();
+            }
+        }
+    }
+
+    /// Route a keystroke to the active overlay in priority order (message →
+    /// fork → dir picker): typing filters, arrows move the highlight, Enter
+    /// confirms, Escape closes/steps back. Called only while an overlay is
+    /// open, so it always consumes the key.
+    fn handle_picker_key(&mut self, ev: &KeyDownEvent) {
+        let key = ev.keystroke.key.as_str();
+        // A provisioning/error message overlay is topmost. A dismissable one
+        // clears on any key; a non-dismissable one swallows the key while work
+        // is in flight. Either way the key is consumed here.
+        if let Some((_, dismissable)) = self.message.as_ref() {
+            if *dismissable {
+                self.message = None;
+            }
+            self.request_redraw();
+            return;
+        }
+        // Step 2: the fork picker. Escape steps back to the dir picker.
+        if self.fork.is_some() {
+            match key {
+                "escape" => {
+                    self.fork = None;
+                    self.picker = Some(picker::Picker::new());
+                },
+                "enter" => self.confirm_fork(),
+                "up" => {
+                    if let Some(f) = self.fork.as_mut() {
+                        f.move_selection(-1);
+                    }
+                },
+                "down" => {
+                    if let Some(f) = self.fork.as_mut() {
+                        f.move_selection(1);
+                    }
+                },
+                "backspace" => {
+                    if let Some(f) = self.fork.as_mut() {
+                        f.backspace();
+                    }
+                },
+                _ => {
+                    if !ev.keystroke.modifiers.control
+                        && let Some(text) = ev.keystroke.key_char.as_deref()
+                        && let Some(f) = self.fork.as_mut()
                     {
-                        self.switch_workspace(d as usize - 1);
+                        for ch in text.chars().filter(|c| !c.is_control()) {
+                            f.push_char(ch);
+                        }
                     }
                 },
             }
-        }
-    }
-}
-
-impl ApplicationHandler<TermEvent> for App {
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_some() {
+            self.request_redraw();
             return;
         }
-        // Fully borderless: we draw our own traffic lights and confine the
-        // window-drag region to the sidebar's top strip. (A transparent
-        // titlebar would leave AppKit intercepting drags across the whole
-        // top edge — including tile tabs.)
-        let attrs = Window::default_attributes()
-            .with_title("pwrde")
-            .with_decorations(false)
-            .with_transparent(true) // rounded corners composite over the desktop
-            .with_inner_size(LogicalSize::new(1200.0, 720.0));
-        let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
-        self.window = Some(Arc::clone(&window));
-        self.renderer = Some(Renderer::new(window));
-
-        let tile = self.new_tile();
-        self.workspaces.push(Workspace::new("group 1".into(), tile));
-        self.sync_layout();
-    }
-
-    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: TermEvent) {
-        match event {
-            // Grid changed: coalesced into at most one redraw per frame.
-            // Output in hidden tabs/groups still advances its grid; it just
-            // doesn't wake the renderer.
-            TermEvent::Wakeup(id) => {
-                if self.is_visible(id) {
-                    // Keep the window title in sync with the focused tab.
-                    let ws = &self.workspaces[self.active];
-                    if let Some(tab) = ws.focused().and_then(|t| t.active_tab())
-                        && tab.session.id == id
-                    {
-                        let title = tab.session.title();
-                        if title != self.title {
-                            if let Some(window) = &self.window {
-                                window.set_title(if title.is_empty() { "pwrde" } else { &title });
-                            }
-                            self.title = title;
-                        }
-                    }
-                    self.request_redraw();
+        // Step 1: the dir picker. Escape closes the overlay entirely.
+        match key {
+            "escape" => self.picker = None,
+            "enter" => self.confirm_picker(),
+            "up" => {
+                if let Some(p) = self.picker.as_mut() {
+                    p.move_selection(-1);
                 }
             },
-            TermEvent::Exit(id) => self.remove_session(id, event_loop),
+            "down" => {
+                if let Some(p) = self.picker.as_mut() {
+                    p.move_selection(1);
+                }
+            },
+            "backspace" => {
+                if let Some(p) = self.picker.as_mut() {
+                    p.backspace();
+                }
+            },
+            _ => {
+                // A printable character extends the query. gpui hands us the
+                // already-composed text (respecting shift/dead keys) in
+                // key_char; ignore control chords and non-text keys.
+                if !ev.keystroke.modifiers.control
+                    && let Some(text) = ev.keystroke.key_char.as_deref()
+                    && let Some(p) = self.picker.as_mut()
+                {
+                    for ch in text.chars().filter(|c| !c.is_control()) {
+                        p.push_char(ch);
+                    }
+                }
+            },
+        }
+        self.request_redraw();
+    }
+
+    fn handle_shortcut(&mut self, ev: &KeyDownEvent) {
+        let shift = ev.keystroke.modifiers.shift;
+        let key = ev.keystroke.key.as_str();
+        match (key, shift) {
+            ("d", false) => self.split(Dir::Row),
+            ("d", true) => self.split(Dir::Column),
+            ("t", false) => self.new_tab(),
+            ("t", true) => self.open_picker(),
+            ("c", _) => self.copy(),
+            ("w", _) => self.close_active_tab(),
+            ("q", _) => std::process::exit(0),
+            ("v", _) => self.paste(),
+            ("[" | "{", false) => self.cycle_tile(-1),
+            ("]" | "}", false) => self.cycle_tile(1),
+            ("[" | "{", true) => self.cycle_tab(-1),
+            ("]" | "}", true) => self.cycle_tab(1),
+            (s, _) => {
+                if let Some(d) = s.chars().next().and_then(|c| c.to_digit(10))
+                    && d >= 1
+                {
+                    self.switch_workspace(d as usize - 1);
+                }
+            },
+        }
+        self.request_redraw();
+    }
+
+    /// Drain PTY wakeups coalesced since the last frame; returns true if a
+    /// redraw is needed.
+    fn drain_events(&mut self) -> bool {
+        let mut redraw = false;
+        while let Ok(event) = self.events_rx.try_recv() {
+            match event {
+                TermEvent::Wakeup(id) => {
+                    if self.is_visible(id) {
+                        let ws = &self.workspaces[self.active];
+                        if let Some(tab) = ws.focused().and_then(|t| t.active_tab())
+                            && tab.session.id == id
+                        {
+                            let title = tab.session.title();
+                            if title != self.title {
+                                self.title = title;
+                            }
+                        }
+                        redraw = true;
+                    }
+                },
+                TermEvent::Exit(id) => {
+                    self.remove_session(id);
+                    redraw = true;
+                },
+                // A backgrounded worktree drop finished: clear the provisioning
+                // message and open the new group, or surface the failure.
+                TermEvent::GroupReady { name, cwd } => {
+                    self.message = None;
+                    self.add_group(name, Some(cwd));
+                    redraw = true;
+                },
+                TermEvent::GroupFailed { message } => {
+                    self.message = Some((format!("drop failed: {message}"), true));
+                    redraw = true;
+                },
+            }
+        }
+        redraw || self.dirty
+    }
+
+    fn remove_session(&mut self, id: u64) {
+        // Find and remove the tab whose session matches, cascading empties.
+        for wi in 0..self.workspaces.len() {
+            let tile_tab = {
+                let ws = &self.workspaces[wi];
+                ws.root.tiles().iter().find_map(|t| {
+                    t.tabs
+                        .iter()
+                        .position(|tab| tab.session.id == id)
+                        .map(|ti| (t.id, ti))
+                })
+            };
+            if let Some((tile_id, tab_idx)) = tile_tab {
+                let _ = self.take_tab(wi, tile_id, tab_idx);
+                // A sole emptied tile stays present but tab-less, so
+                // `tiles().is_empty()` never fires — test for zero tabs.
+                let group_empty = |ws: &Workspace| ws.root.tiles().iter().all(|t| t.tabs.is_empty());
+                if group_empty(&self.workspaces[wi]) && self.workspaces.len() > 1 {
+                    self.workspaces.remove(wi);
+                    if self.active >= self.workspaces.len() {
+                        self.active = self.workspaces.len().saturating_sub(1);
+                    }
+                } else if self.workspaces.len() == 1 && group_empty(&self.workspaces[0]) {
+                    std::process::exit(0);
+                } else {
+                    self.workspaces[wi].fix_focus();
+                }
+                self.sync_layout();
+                return;
+            }
         }
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::ModifiersChanged(mods) => self.modifiers = mods.state(),
-            WindowEvent::Resized(size) => {
-                if let Some(renderer) = &mut self.renderer {
-                    renderer.resize(size.width, size.height);
+    /// Call begin_frame() on every visible session to keep wakeup coalescing.
+    fn begin_frame(&self) {
+        for ws in &self.workspaces {
+            for tile in ws.root.tiles() {
+                if let Some(tab) = tile.active_tab() {
+                    tab.session.begin_frame();
                 }
-                self.sync_layout();
-                self.request_redraw();
-            },
-            WindowEvent::CursorMoved { position, .. } => {
-                self.cursor = (position.x, position.y);
-                self.on_mouse_move();
-            },
-            WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => match state {
-                ElementState::Pressed => self.on_mouse_down(event_loop),
-                ElementState::Released => self.on_mouse_up(event_loop),
-            },
-            WindowEvent::KeyboardInput { event, .. } => {
-                if event.state != ElementState::Pressed {
-                    return;
-                }
-                if self.modifiers.super_key() {
-                    self.handle_shortcut(&event, event_loop);
-                    return;
-                }
-                let ws = &self.workspaces[self.active];
-                if let Some(tab) = ws.focused().and_then(|t| t.active_tab())
-                    && let Some(bytes) = key_to_bytes(&event, self.modifiers)
-                {
-                    tab.session.write(bytes);
-                }
-            },
-            WindowEvent::RedrawRequested => {
-                let hint = if let Drag::Tab { .. } = self.drag {
-                    self.resolve_drop(self.cursor.0 as f32, self.cursor.1 as f32)
-                        .and_then(|t| self.drop_hint(t))
-                } else {
-                    None
-                };
-                if let Some(renderer) = &mut self.renderer
-                    && !self.workspaces.is_empty()
-                {
-                    renderer.draw(&self.workspaces, self.active, self.sidebar_w, hint);
-                }
-            },
-            _ => {},
+            }
         }
     }
 }
 
-/// Encode a key press as the byte sequence the PTY expects.
-fn key_to_bytes(event: &KeyEvent, mods: ModifiersState) -> Option<Cow<'static, [u8]>> {
-    match &event.logical_key {
-        Key::Named(named) => {
-            let bytes: &'static [u8] = match named {
-                NamedKey::Enter => b"\r",
-                NamedKey::Backspace => b"\x7f",
-                NamedKey::Tab => b"\t",
-                NamedKey::Escape => b"\x1b",
-                NamedKey::Space => b" ",
-                NamedKey::ArrowUp => b"\x1b[A",
-                NamedKey::ArrowDown => b"\x1b[B",
-                NamedKey::ArrowRight => b"\x1b[C",
-                NamedKey::ArrowLeft => b"\x1b[D",
-                NamedKey::Home => b"\x1b[H",
-                NamedKey::End => b"\x1b[F",
-                NamedKey::PageUp => b"\x1b[5~",
-                NamedKey::PageDown => b"\x1b[6~",
-                NamedKey::Delete => b"\x1b[3~",
-                _ => return None,
-            };
-            Some(Cow::Borrowed(bytes))
+/// Human-friendly group name for a cwd: `~` for the home dir, else the last
+/// path component.
+fn group_name(dir: &std::path::Path) -> String {
+    if dirs::home_dir().is_some_and(|home| home == dir) {
+        return "~".into();
+    }
+    dir.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| dir.to_string_lossy().into_owned())
+}
+
+/// Build the fork picker's rows for a git repo: a default "new branch" row and
+/// a repo-root row, followed by existing worktrees, then local and remote
+/// branches.
+fn build_fork_choices(repo: &std::path::Path) -> Vec<picker::ForkEntry> {
+    use picker::{ForkEntry, ForkScope};
+    let default = git::default_remote_branch(repo);
+    let base_label = default.clone().unwrap_or_else(|| "HEAD".into());
+    let branches = git::list_branches(repo);
+
+    let mut out = vec![
+        ForkEntry {
+            label: format!("↪ new branch off default ({base_label})"),
+            from: None,
+            path: None,
+            scope: ForkScope::Default,
         },
-        Key::Character(text) => {
-            // Ctrl+letter → C0 control byte (Ctrl+C = 0x03, etc.).
-            if mods.control_key() {
-                let ch = text.chars().next()?;
-                if ch.is_ascii_alphabetic() || "[\\]^_@".contains(ch) {
-                    return Some(Cow::Owned(vec![ch.to_ascii_uppercase() as u8 & 0x1f]));
+        ForkEntry {
+            label: "⌂ repo root (no worktree)".into(),
+            from: None,
+            path: Some(repo.to_path_buf()),
+            scope: ForkScope::RepoRoot,
+        },
+    ];
+    // Existing worktrees (drop's and any others) — attach a group to one
+    // instead of forking a new tree. The main working tree is the repo root,
+    // already offered above, so skip it.
+    for wt in git::list_worktrees(repo).into_iter().filter(|w| !w.is_main) {
+        let location = wt
+            .path
+            .strip_prefix(repo)
+            .unwrap_or(&wt.path)
+            .to_string_lossy()
+            .into_owned();
+        let branch = wt.branch.as_deref().unwrap_or("detached");
+        out.push(ForkEntry {
+            label: format!("worktree  {branch}  ({location})"),
+            from: None,
+            path: Some(wt.path),
+            scope: ForkScope::Worktree,
+        });
+    }
+    for b in branches.iter().filter(|b| !b.is_remote) {
+        let mut marks = Vec::new();
+        if b.is_current {
+            marks.push("current");
+        }
+        if b.is_default {
+            marks.push("default");
+        }
+        let suffix = if marks.is_empty() { String::new() } else { format!("  ({})", marks.join(", ")) };
+        out.push(ForkEntry {
+            label: format!("local   {}{}", b.name, suffix),
+            from: Some(b.name.clone()),
+            path: None,
+            scope: ForkScope::Local,
+        });
+    }
+    for b in branches.iter().filter(|b| b.is_remote) {
+        out.push(ForkEntry {
+            label: format!("remote  {}", b.name),
+            from: Some(b.name.clone()),
+            path: None,
+            scope: ForkScope::Remote,
+        });
+    }
+    out
+}
+
+/// Provision a new worktree via `drop new`, returning its path. Runs
+/// synchronously — callers spawn it on a background thread.
+fn run_drop(repo: &std::path::Path, from: Option<&str>) -> Result<std::path::PathBuf, String> {
+    let mut cmd = git::augmented_command("drop");
+    cmd.arg("new").arg("--repo").arg(repo).arg("--print-path").arg("--yes");
+    if let Some(from) = from {
+        cmd.arg("--from").arg(from);
+    }
+    let output = cmd.output().map_err(|e| format!("could not run drop: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let reason = stderr.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+        return Err(if reason.is_empty() { "drop exited with an error".into() } else { reason.to_string() });
+    }
+    // With --print-path, stdout is just the worktree path.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let path = stdout.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+    if path.is_empty() {
+        return Err("drop produced no worktree path".into());
+    }
+    Ok(std::path::PathBuf::from(path))
+}
+
+/// Convert accumulated fractional wheel travel into whole scroll steps,
+/// carrying the sub-step remainder in `accum` so tiny deltas aren't lost.
+fn scroll_steps(accum: &mut f64, notches: f64) -> isize {
+    *accum += notches;
+    let steps = accum.trunc() as isize;
+    *accum -= steps as f64;
+    steps
+}
+
+/// Map a gpui key event to the bytes a terminal expects, or `None` when the
+/// key is not something we send to the PTY.
+fn key_to_bytes(ev: &KeyDownEvent) -> Option<Vec<u8>> {
+    let m = ev.keystroke.modifiers;
+    let key = ev.keystroke.key.as_str();
+
+    // Named keys → control sequences.
+    let seq: Option<&[u8]> = match key {
+        "enter" => Some(b"\r"),
+        "tab" => Some(b"\t"),
+        "backspace" => Some(b"\x7f"),
+        "escape" => Some(b"\x1b"),
+        "up" => Some(b"\x1b[A"),
+        "down" => Some(b"\x1b[B"),
+        "right" => Some(b"\x1b[C"),
+        "left" => Some(b"\x1b[D"),
+        "home" => Some(b"\x1b[H"),
+        "end" => Some(b"\x1b[F"),
+        "pageup" => Some(b"\x1b[5~"),
+        "pagedown" => Some(b"\x1b[6~"),
+        "delete" => Some(b"\x1b[3~"),
+        _ => None,
+    };
+    if let Some(seq) = seq {
+        return Some(seq.to_vec());
+    }
+
+    // gpui gives the already-composed text for character keys (respecting
+    // shift/dead keys) in key_char.
+    if let Some(ref text) = ev.keystroke.key_char {
+        if !text.is_empty() {
+            // Ctrl+letter → control byte.
+            if m.control && text.len() == 1 {
+                let c = text.as_bytes()[0];
+                if c.is_ascii_alphabetic() {
+                    return Some(vec![c.to_ascii_uppercase() & 0x1f]);
                 }
             }
-            // Alt as Meta: ESC-prefix the character (readline word motions).
-            if mods.alt_key() {
-                let mut bytes = vec![0x1b];
-                bytes.extend_from_slice(text.as_str().as_bytes());
-                return Some(Cow::Owned(bytes));
-            }
-            Some(Cow::Owned(text.as_str().as_bytes().to_vec()))
-        },
-        _ => None,
+            return Some(text.as_bytes().to_vec());
+        }
     }
+
+    // Fall back to single-character keys (e.g. "a").
+    if key.chars().count() == 1 {
+        let c = key.chars().next().unwrap();
+        if m.control && c.is_ascii_alphabetic() {
+            return Some(vec![(c as u8).to_ascii_uppercase() & 0x1f]);
+        }
+        let mut buf = [0u8; 4];
+        return Some(c.encode_utf8(&mut buf).as_bytes().to_vec());
+    }
+
+    None
+}
+
+// ── gpui Render / Element wiring ──────────────────────────────────────────
+
+impl Render for App {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // A full-window canvas element that paints the terminal frame.
+        let view = cx.entity();
+        div()
+            .size_full()
+            .track_focus(&self.focus_handle)
+            .key_context("Terminal")
+            .on_key_down(cx.listener(|app, ev: &KeyDownEvent, _win, cx| {
+                app.on_key_down(ev);
+                cx.notify();
+            }))
+            .on_mouse_move(cx.listener(|app, ev: &MouseMoveEvent, window, cx| {
+                app.cursor = (f64::from(ev.position.x), f64::from(ev.position.y));
+                // Scale logical → physical for internal geometry.
+                let s = app.scale() as f64;
+                app.cursor = (app.cursor.0 * s, app.cursor.1 * s);
+                app.on_mouse_move(window);
+                cx.notify();
+            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|app, ev: &MouseDownEvent, window, cx| {
+                    let s = app.scale() as f64;
+                    app.cursor = (f64::from(ev.position.x) * s, f64::from(ev.position.y) * s);
+                    app.modifiers = ev.modifiers;
+                    app.on_mouse_down(window);
+                    cx.notify();
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|app, _ev: &MouseUpEvent, window, cx| {
+                    app.on_mouse_up(window, cx);
+                    cx.notify();
+                }),
+            )
+            .on_scroll_wheel(cx.listener(|app, ev: &gpui::ScrollWheelEvent, _win, cx| {
+                app.on_scroll(ev.delta, app.renderer.cell_height);
+                cx.notify();
+            }))
+            .child(
+                canvas(
+                    move |_bounds, _window, _cx| {},
+                    move |bounds, _prepaint, window, cx| {
+                        view.update(cx, |app, cx| {
+                            app.paint_terminal(bounds, window, cx);
+                        });
+                    },
+                )
+                // Without an explicit size the canvas resolves to 0 width and
+                // the terminal never paints.
+                .size_full(),
+            )
+    }
+}
+
+
+impl App {
+    /// Paint the whole terminal frame into `bounds`. Follows the verified
+    /// build order: bg quads → per-pane text → fg quads → labels → picker.
+    fn paint_terminal(&mut self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut GpuiApp) {
+        // Keep the renderer's surface size in sync with the window.
+        let scale = window.scale_factor();
+        let phys_w = (f32::from(bounds.size.width) * scale) as u32;
+        let phys_h = (f32::from(bounds.size.height) * scale) as u32;
+        self.renderer.scale = scale;
+        self.renderer.resize(phys_w, phys_h);
+        self.sync_layout();
+        self.begin_frame();
+
+        // While a tab is being dragged, resolve the current landing zone and
+        // compute its translucent preview rect.
+        let drop_hint = if let Drag::Tab { .. } = self.drag {
+            // `self.cursor` is already physical px (see the mouse listeners), so
+            // it must NOT be scaled again — doing so put the preview at cursor×
+            // scale² and made it disagree with the drop resolved on mouse-up.
+            let (px, py) = self.cursor;
+            self.resolve_drop(px as f32, py as f32).and_then(|t| self.drop_hint(t))
+        } else {
+            None
+        };
+
+        let frame = self.renderer.build_frame(
+            &self.workspaces,
+            self.active,
+            self.sidebar_w,
+            drop_hint,
+            self.picker.as_ref(),
+            self.fork.as_ref(),
+            self.message.as_ref(),
+        );
+
+        let origin = bounds.origin;
+        let inv = 1.0 / scale; // physical px → logical px for gpui coords.
+        let font = gpui::font(renderer::FONT_FAMILY);
+        let font_size = px(self.renderer.font_size() * inv);
+        let line_height = px(self.renderer.cell_height * inv);
+        let cell_height = self.renderer.cell_height;
+
+        // Paint inside an explicit content mask over our bounds. Text glyphs
+        // paint into their own pushed layer (via gpui's paint_layer); without an
+        // established content-mask context those sub-layers don't composite —
+        // this mirrors how Zed's own TerminalElement paints.
+        window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
+            // 1) background quads.
+            for q in &frame.bg_quads {
+                paint_quad(window, origin, inv, q);
+            }
+
+            // 2) per-pane foreground text.
+            for pane in &frame.panes {
+                let (ox, oy) = pane.origin;
+                for (ri, row) in pane.rows.iter().enumerate() {
+                    if row.is_empty() {
+                        continue;
+                    }
+                    let mut text = String::new();
+                    let mut runs: Vec<TextRun> = Vec::new();
+                    for span in row {
+                        text.push_str(&span.text);
+                        runs.push(TextRun {
+                            len: span.text.len(),
+                            font: font.clone(),
+                            color: span.color,
+                            background_color: None,
+                            underline: None,
+                            strikethrough: None,
+                        });
+                    }
+                    let shaped: ShapedLine =
+                        window.text_system().shape_line(text.into(), font_size, &runs, None);
+                    let p = Point::new(
+                        origin.x + px(ox * inv),
+                        origin.y + px((oy + ri as f32 * cell_height) * inv),
+                    );
+                    let _ = shaped.paint(p, line_height, TextAlign::Left, None, window, cx);
+                }
+            }
+
+            // 3) foreground quads (box-drawing / block glyphs from rect.rs).
+            for q in &frame.fg_quads {
+                paint_quad(window, origin, inv, q);
+            }
+
+            // 4) labels (tab titles, sidebar text, etc.).
+            for label in &frame.labels {
+                let runs = [TextRun {
+                    len: label.text.len(),
+                    font: font.clone(),
+                    color: label.color,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                }];
+                let shaped =
+                    window.text_system().shape_line(label.text.clone().into(), font_size, &runs, None);
+                let p = Point::new(origin.x + px(label.left * inv), origin.y + px(label.top * inv));
+                let clip_bounds = Bounds {
+                    origin: Point::new(
+                        origin.x + px(label.clip.x * inv),
+                        origin.y + px(label.clip.y * inv),
+                    ),
+                    size: Size::new(px(label.clip.w * inv), px(label.clip.h * inv)),
+                };
+                window.with_content_mask(Some(gpui::ContentMask { bounds: clip_bounds }), |window| {
+                    let _ = shaped.paint(p, line_height, TextAlign::Left, None, window, cx);
+                });
+            }
+
+            // 5) picker / fork / message overlay.
+            for q in &frame.picker_quads {
+                paint_quad(window, origin, inv, q);
+            }
+            for label in &frame.picker_labels {
+                let runs = [TextRun {
+                    len: label.text.len(),
+                    font: font.clone(),
+                    color: label.color,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                }];
+                let shaped =
+                    window.text_system().shape_line(label.text.clone().into(), font_size, &runs, None);
+                let p = Point::new(origin.x + px(label.left * inv), origin.y + px(label.top * inv));
+                let clip_bounds = Bounds {
+                    origin: Point::new(
+                        origin.x + px(label.clip.x * inv),
+                        origin.y + px(label.clip.y * inv),
+                    ),
+                    size: Size::new(px(label.clip.w * inv), px(label.clip.h * inv)),
+                };
+                window.with_content_mask(Some(gpui::ContentMask { bounds: clip_bounds }), |window| {
+                    let _ = shaped.paint(p, line_height, TextAlign::Left, None, window, cx);
+                });
+            }
+        });
+
+        self.dirty = false;
+    }
+}
+
+/// Paint one renderer `Quad` (physical-px coords) as a gpui fill.
+fn paint_quad(window: &mut Window, origin: Point<Pixels>, inv: f32, q: &renderer::Quad) {
+    let b = Bounds {
+        origin: Point::new(origin.x + px(q.x * inv), origin.y + px(q.y * inv)),
+        size: Size::new(px(q.w * inv), px(q.h * inv)),
+    };
+    let mut quad = gpui::fill(b, q.color);
+    // Honor the renderer's corner radius (physical px → logical), so the custom
+    // traffic lights render as circles and the picker panel/search box round.
+    if q.radius > 0.0 {
+        quad.corner_radii = gpui::Corners::all(px(q.radius * inv));
+    }
+    window.paint_quad(quad);
 }
 
 fn main() {
-    let event_loop = EventLoop::<TermEvent>::with_user_event().build().expect("event loop");
-    event_loop.set_control_flow(ControlFlow::Wait);
+    // At this gpui rev the platform lives in the gpui_platform crate; zed's own
+    // main builds it the same way (current_platform → Application::with_platform).
+    let platform = gpui_platform::current_platform(false);
+    Application::with_platform(platform).run(|cx: &mut GpuiApp| {
+        let bounds = Bounds::centered(None, gpui::size(px(1200.0), px(720.0)), cx);
+        let (events_tx, events_rx) = mpsc::channel::<TermEvent>();
 
-    let mut app = App {
-        proxy: event_loop.create_proxy(),
-        window: None,
-        renderer: None,
-        workspaces: Vec::new(),
-        active: 0,
-        next_session_id: 0,
-        next_tile_id: 0,
-        sidebar_w: 170.0,
-        modifiers: ModifiersState::default(),
-        title: String::new(),
-        cursor: (0.0, 0.0),
-        drag: Drag::None,
-    };
-    event_loop.run_app(&mut app).expect("run event loop");
+        cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                // A transparent native titlebar keeps OS edge-resize and the
+                // native traffic-light buttons, while our content draws under a
+                // full-size content view. `app_owns_titlebar_drag` stops AppKit
+                // from dragging the window off the whole top bar — we move it
+                // ourselves from the sidebar strip via `start_window_move`, so
+                // dragging a tile's tab no longer moves the window.
+                titlebar: Some(gpui::TitlebarOptions {
+                    title: None,
+                    appears_transparent: true,
+                    traffic_light_position: None,
+                }),
+                is_resizable: true,
+                app_owns_titlebar_drag: true,
+                ..Default::default()
+            },
+            |window, cx| {
+                let scale = window.scale_factor();
+                // Measure a monospace cell at the default font size.
+                let cell_width = renderer::measure_cell_width(window, scale);
+                let phys_w = (f32::from(window.viewport_size().width) * scale) as u32;
+                let phys_h = (f32::from(window.viewport_size().height) * scale) as u32;
+                let renderer = Renderer::new(scale, cell_width, phys_w.max(1), phys_h.max(1));
+
+                let entity = cx.new(|cx| {
+                    let mut app = App {
+                        events_rx,
+                        events_tx: events_tx.clone(),
+                        renderer,
+                        workspaces: Vec::new(),
+                        active: 0,
+                        next_session_id: 0,
+                        next_tile_id: 0,
+                        sidebar_w: workspace::SIDEBAR_MIN_W,
+                        modifiers: Modifiers::default(),
+                        title: String::new(),
+                        cursor: (0.0, 0.0),
+                        drag: Drag::None,
+                        picker: None,
+                        fork: None,
+                        message: None,
+                        // Single focus handle, minted once; focused below.
+                        focus_handle: cx.focus_handle(),
+                        dirty: true,
+                        scroll_accum: 0.0,
+                    };
+                    let tile = app.new_tile();
+                    app.workspaces.push(Workspace::new("group 1".into(), tile, None));
+                    app.sync_layout();
+
+                    // Drain PTY wakeups on the foreground executor: poll the
+                    // mpsc channel and notify when a redraw is needed. This
+                    // preserves the old coalescing (begin_frame per paint).
+                    let handle = cx.entity().downgrade();
+                    cx.spawn(async move |_this, cx| {
+                        loop {
+                            cx.background_executor()
+                                .timer(Duration::from_millis(16))
+                                .await;
+                            let Some(app) = handle.upgrade() else { break };
+                            let _ = app.update(cx, |app: &mut App, cx| {
+                                if app.drain_events() {
+                                    cx.notify();
+                                }
+                            });
+                        }
+                    })
+                    .detach();
+
+                    app
+                });
+                // Establish keyboard focus so key events reach the terminal.
+                let handle = entity.read(cx).focus_handle.clone();
+                window.focus(&handle, cx);
+                entity
+            },
+        )
+        .expect("open window");
+
+        cx.activate(true);
+    });
 }

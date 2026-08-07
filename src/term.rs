@@ -10,22 +10,27 @@
 //!   thousands.
 
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use wezterm_term::color::ColorPalette;
-use wezterm_term::{Terminal, TerminalConfiguration, TerminalSize};
-use winit::event_loop::EventLoopProxy;
-
-/// User events forwarded into the winit event loop, tagged with the
-/// originating session's id.
-#[derive(Debug, Clone, Copy)]
+use wezterm_term::{
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind, StableRowIndex, Terminal,
+    TerminalConfiguration, TerminalSize, VisibleRowIndex,
+};
+/// User events forwarded to the gpui app over an mpsc channel.
+#[derive(Debug, Clone)]
 pub enum TermEvent {
-    /// Grid changed; a redraw is needed (coalesced).
+    /// Grid changed; a redraw is needed (coalesced). Tagged with the session id.
     Wakeup(u64),
-    /// Shell exited.
+    /// Shell exited. Tagged with the session id.
     Exit(u64),
+    /// A `drop` worktree finished provisioning: create its group at `cwd`.
+    GroupReady { name: String, cwd: std::path::PathBuf },
+    /// `drop` failed; show `message` in the picker overlay.
+    GroupFailed { message: String },
 }
 
 #[derive(Debug)]
@@ -52,15 +57,41 @@ impl Write for PtyWriter {
     }
 }
 
+/// A text selection, anchored in scrollback-*stable* row coordinates so it
+/// stays pinned to its content as the viewport scrolls. `anchor` is where the
+/// drag began; `head` is the cell under the cursor now. Both cols are cell
+/// indices; the cell under `head` is included.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Sel {
+    anchor: (usize, StableRowIndex),
+    head: (usize, StableRowIndex),
+}
+
+impl Sel {
+    /// Reading-order (start, end): the earlier point first, by (row, col).
+    fn ordered(self) -> ((usize, StableRowIndex), (usize, StableRowIndex)) {
+        let a = (self.anchor.1, self.anchor.0);
+        let h = (self.head.1, self.head.0);
+        if a <= h { (self.anchor, self.head) } else { (self.head, self.anchor) }
+    }
+}
+
 pub struct Session {
     pub id: u64,
     pub term: Arc<Mutex<Terminal>>,
     writer: PtyWriter,
     master: Box<dyn MasterPty + Send>,
     redraw_pending: Arc<AtomicBool>,
+    /// Lines scrolled up from the live bottom (0 = following new output).
+    scroll_offset: AtomicUsize,
+    /// Active mouse selection, if any (in stable-row coordinates).
+    selection: Mutex<Option<Sel>>,
 }
 
 impl Session {
+    /// Spawn the user's shell on a fresh PTY. `cwd` sets the shell's working
+    /// directory; `None` inherits pwrde's own working directory.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: u64,
         cols: usize,
@@ -68,7 +99,8 @@ impl Session {
         cell_width: u16,
         cell_height: u16,
         dpi: u32,
-        proxy: EventLoopProxy<TermEvent>,
+        cwd: Option<&std::path::Path>,
+        events: Sender<TermEvent>,
     ) -> Self {
         let pty_size = PtySize {
             rows: rows as u16,
@@ -80,6 +112,12 @@ impl Session {
 
         let mut cmd = CommandBuilder::new_default_prog(); // user's shell
         cmd.env("TERM", "xterm-256color");
+        // Only honor a cwd that still exists — a pinned/recent dir may have
+        // been deleted since it was saved, and spawning a shell in a missing
+        // directory would fail. Fall back to inheriting our own cwd.
+        if let Some(dir) = cwd.filter(|d| d.is_dir()) {
+            cmd.cwd(dir);
+        }
         let mut child = pair.slave.spawn_command(cmd).expect("spawn shell");
         drop(pair.slave);
 
@@ -109,7 +147,7 @@ impl Session {
         {
             let term = Arc::clone(&term);
             let redraw_pending = Arc::clone(&redraw_pending);
-            let proxy = proxy.clone();
+            let events = events.clone();
             let mut reader = reader;
             std::thread::spawn(move || {
                 let mut buf = [0u8; 64 * 1024];
@@ -121,7 +159,7 @@ impl Session {
                             // Only signal the UI if it hasn't been signaled
                             // since it last drew.
                             if !redraw_pending.swap(true, Ordering::AcqRel) {
-                                let _ = proxy.send_event(TermEvent::Wakeup(id));
+                                let _ = events.send(TermEvent::Wakeup(id));
                             }
                         },
                     }
@@ -132,10 +170,18 @@ impl Session {
         // Child watcher: shell exit closes the window.
         std::thread::spawn(move || {
             let _ = child.wait();
-            let _ = proxy.send_event(TermEvent::Exit(id));
+            let _ = events.send(TermEvent::Exit(id));
         });
 
-        Self { id, term, writer, master: pair.master, redraw_pending }
+        Self {
+            id,
+            term,
+            writer,
+            master: pair.master,
+            redraw_pending,
+            scroll_offset: AtomicUsize::new(0),
+            selection: Mutex::new(None),
+        }
     }
 
     /// Write user input to the PTY.
@@ -160,6 +206,131 @@ impl Session {
     /// ESC[200~ / ESC[201~ when the app has requested that).
     pub fn paste(&self, text: &str) {
         let _ = self.term.lock().unwrap().send_paste(text);
+    }
+
+    // ── Scrollback ──────────────────────────────────────────────────────
+
+    /// Lines the viewport is scrolled up from the live bottom (0 = following).
+    pub fn scroll_offset(&self) -> usize {
+        self.scroll_offset.load(Ordering::Relaxed)
+    }
+
+    /// Scroll the viewport by `lines` (positive = back into history), clamped
+    /// to the available scrollback. The maximum offset is the number of rows
+    /// *above* the visible top — `scrollback_rows()` counts the whole buffer
+    /// (visible screen included), so subtract the viewport, or the viewport
+    /// slides off the top of the buffer and renders blank.
+    pub fn scroll_by(&self, lines: isize) {
+        let max = {
+            let term = self.term.lock().unwrap();
+            let screen = term.screen();
+            screen.scrollback_rows().saturating_sub(screen.physical_rows) as isize
+        };
+        let cur = self.scroll_offset.load(Ordering::Relaxed) as isize;
+        let next = (cur + lines).clamp(0, max);
+        self.scroll_offset.store(next as usize, Ordering::Relaxed);
+    }
+
+    /// Snap back to the live bottom (called on keystroke, like every terminal).
+    pub fn scroll_to_bottom(&self) {
+        self.scroll_offset.store(0, Ordering::Relaxed);
+    }
+
+    /// True when wheel events belong to the *app*, not our scrollback: either
+    /// the app enabled mouse tracking (it handles the wheel itself) or it's on
+    /// the alternate screen (a full-screen TUI like vim/less/Claude Code, which
+    /// has no scrollback — the wheel should scroll *its* content instead).
+    pub fn app_consumes_wheel(&self) -> bool {
+        let term = self.term.lock().unwrap();
+        term.is_mouse_grabbed() || term.is_alt_screen_active()
+    }
+
+    /// Forward one wheel step to the app at cell (`col`, `row`). wezterm-term
+    /// encodes it as a mouse report when the app enabled tracking, or (on the
+    /// alternate screen) translates it into arrow keys — xterm alternate-scroll,
+    /// which is how the wheel scrolls a full-screen TUI.
+    pub fn forward_wheel(&self, up: bool, col: usize, row: usize) {
+        let button = if up { MouseButton::WheelUp(1) } else { MouseButton::WheelDown(1) };
+        let event = MouseEvent {
+            kind: MouseEventKind::Press,
+            x: col,
+            y: row as VisibleRowIndex,
+            x_pixel_offset: 0,
+            y_pixel_offset: 0,
+            button,
+            modifiers: KeyModifiers::NONE,
+        };
+        let _ = self.term.lock().unwrap().mouse_event(event);
+    }
+
+    /// The stable row index at the top of the currently displayed viewport.
+    /// Holds the terminal lock only for the lookup.
+    fn viewport_top_stable(&self) -> StableRowIndex {
+        let offset = self.scroll_offset.load(Ordering::Relaxed) as i32;
+        let term = self.term.lock().unwrap();
+        let screen = term.screen();
+        let phys = screen.scrollback_or_visible_row(-offset);
+        screen.phys_to_stable_row_index(phys)
+    }
+
+    // ── Selection ─────────────────────────────────────────────────────────
+
+    /// Begin a selection at viewport cell (`col`, `row`) — `row` counts from
+    /// the top of the currently displayed viewport.
+    pub fn begin_selection(&self, col: usize, row: usize) {
+        let stable = self.viewport_top_stable() + row as StableRowIndex;
+        let point = (col, stable);
+        *self.selection.lock().unwrap() = Some(Sel { anchor: point, head: point });
+    }
+
+    /// Extend the active selection's head to viewport cell (`col`, `row`).
+    pub fn update_selection(&self, col: usize, row: usize) {
+        let stable = self.viewport_top_stable() + row as StableRowIndex;
+        if let Some(sel) = self.selection.lock().unwrap().as_mut() {
+            sel.head = (col, stable);
+        }
+    }
+
+    /// Drop any active selection.
+    pub fn clear_selection(&self) {
+        *self.selection.lock().unwrap() = None;
+    }
+
+    /// The active selection as an ordered (start, end) pair in stable-row
+    /// coordinates, or `None` if there is no selection. `end`'s column is the
+    /// last selected cell (inclusive).
+    pub fn selection_span(
+        &self,
+    ) -> Option<((usize, StableRowIndex), (usize, StableRowIndex))> {
+        self.selection.lock().unwrap().map(|s| s.ordered())
+    }
+
+    /// The selected text, joined with newlines and with trailing blanks on
+    /// each row trimmed (the usual terminal copy behavior). `None` when the
+    /// selection is empty (a click with no drag).
+    pub fn selected_text(&self) -> Option<String> {
+        let (start, end) = self.selection.lock().unwrap().map(|s| s.ordered())?;
+        if start == end {
+            return None;
+        }
+        let term = self.term.lock().unwrap();
+        let screen = term.screen();
+        let cols = screen.physical_cols;
+        let phys = screen.stable_range(&(start.1..end.1 + 1));
+        let lines = screen.lines_in_phys_range(phys);
+        let n = lines.len();
+        let mut out = String::new();
+        for (i, line) in lines.iter().enumerate() {
+            let start_col = if i == 0 { start.0 } else { 0 };
+            let end_col = if i == n - 1 { (end.0 + 1).min(cols) } else { cols };
+            if end_col > start_col {
+                out.push_str(line.columns_as_str(start_col..end_col).trim_end());
+            }
+            if i != n - 1 {
+                out.push('\n');
+            }
+        }
+        if out.is_empty() { None } else { Some(out) }
     }
 
     /// The URL under the given visible cell, if any (OSC 8 or plain text).
@@ -196,5 +367,77 @@ impl Session {
             pixel_height: rows * cell_height as usize,
             dpi,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_term(cols: usize, rows: usize) -> Terminal {
+        let size =
+            TerminalSize { rows, cols, pixel_width: cols * 8, pixel_height: rows * 16, dpi: 96 };
+        Terminal::new(size, Arc::new(TermConfig), "pwrde-test", "0", Box::new(std::io::sink()))
+    }
+
+    /// The scrollback viewport must never slide off the top of the buffer and
+    /// render blank. `scroll_by` clamps the offset to `scrollback_rows() -
+    /// physical_rows`; this checks that every offset in that range yields a
+    /// full `physical_rows`-tall viewport, and that going past it (the old
+    /// bug, clamping to `scrollback_rows()` itself) is what blanks the screen.
+    #[test]
+    fn scrollback_offset_never_blanks_the_viewport() {
+        let p = 5;
+        let mut term = make_term(20, p);
+        for i in 0..40 {
+            term.advance_bytes(format!("line{i}\r\n").as_bytes());
+        }
+
+        let max_offset = {
+            let s = term.screen();
+            s.scrollback_rows().saturating_sub(s.physical_rows)
+        };
+        assert!(max_offset > 0, "expected scrollback to accumulate");
+
+        for offset in 0..=max_offset {
+            let o = offset as i32;
+            let screen = term.screen();
+            let range = screen.scrollback_or_visible_range(&(-o..p as i32 - o));
+            let lines = screen.lines_in_phys_range(range);
+            assert_eq!(lines.len(), p, "offset {offset} rendered {} rows, not {p}", lines.len());
+        }
+
+        // The regression: clamping to the whole buffer (`scrollback_rows()`)
+        // let the offset reach here, where the viewport is starved of rows.
+        let bad = term.screen().scrollback_rows() as i32;
+        let screen = term.screen();
+        let range = screen.scrollback_or_visible_range(&(-bad..p as i32 - bad));
+        assert!(
+            screen.lines_in_phys_range(range).len() < p,
+            "over-scroll must be clamped away by scroll_by"
+        );
+    }
+
+    /// The wheel belongs to the app (not our scrollback) when it's on the
+    /// alternate screen or has grabbed the mouse — this is exactly the gate
+    /// `app_consumes_wheel` uses so full-screen TUIs (vim/less/Claude Code)
+    /// scroll their own content.
+    #[test]
+    fn full_screen_apps_claim_the_wheel() {
+        let mut term = make_term(20, 5);
+        assert!(
+            !term.is_mouse_grabbed() && !term.is_alt_screen_active(),
+            "a fresh primary screen claims no wheel"
+        );
+
+        // Enter/leave the alternate screen (DECSET 1049), as full-screen TUIs do.
+        term.advance_bytes(b"\x1b[?1049h");
+        assert!(term.is_alt_screen_active(), "alt screen should claim the wheel");
+        term.advance_bytes(b"\x1b[?1049l");
+        assert!(!term.is_alt_screen_active(), "leaving alt screen releases it");
+
+        // Mouse tracking (DECSET 1000) claims the wheel on the primary screen.
+        term.advance_bytes(b"\x1b[?1000h");
+        assert!(term.is_mouse_grabbed(), "mouse-tracking apps claim the wheel");
     }
 }

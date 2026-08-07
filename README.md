@@ -11,21 +11,31 @@ cargo run --release
 ## UI model
 
 Borderless window with custom traffic lights. The left sidebar (resizable —
-drag its edge) holds vertical *group* tabs; its top strip is the window drag
-handle. Each group is a binary split tree of *tiles*; every tile has a
-horizontal tab strip (cmux-style) holding one or more terminals.
+drag its edge) holds a `+` new-group button under the drag-handle strip, then
+vertical *group* tabs. Each group is a binary split tree of *tiles*; every tile
+has a horizontal tab strip (cmux-style) holding one or more terminals.
+
+Each group has its own working directory: the `+` button (or `⇧⌘T`) opens a
+searchable cwd picker over `~`, `~/src` and its immediate subdirectories, with
+pinned favorites and recents (persisted to `groups.json` in the data dir) and a
+git marker on repos. Every terminal opened in that group — new tab or split —
+spawns in the group's cwd (dropping a tab moves an existing shell, so it keeps
+its own). The startup group inherits the launch directory.
 
 ## Shortcuts
 
 | Keys | Action |
 |---|---|
 | `⌘D` / `⇧⌘D` | Split side-by-side / stacked |
-| `⌘T` / `⇧⌘T` | New tab in focused tile / new group |
+| `⌘T` / `⇧⌘T` | New tab in focused tile / new group (cwd picker) |
 | `⌘W` | Close active tab (last tab closes the tile, last tile the group) |
 | `⌘1`–`⌘9` | Switch group |
 | `⌘]` / `⌘[` | Cycle tile focus |
 | `⇧⌘]` / `⇧⌘[` | Next / previous tab in the tile |
 | `⌘Q` | Quit |
+
+In the cwd picker: type to filter, `↑`/`↓` to select, `⏎` to create the group,
+`⌘P` to pin/unpin the selected directory, `Esc` to cancel.
 
 Mouse: drag split dividers to resize; drag the sidebar edge to resize it;
 drag a tile tab to reorder it, drop it on another tile's tab strip or center
