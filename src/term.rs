@@ -156,6 +156,28 @@ impl Session {
         self.term.lock().unwrap().get_title().to_string()
     }
 
+    /// Paste text, honoring bracketed-paste mode (the terminal wraps it in
+    /// ESC[200~ / ESC[201~ when the app has requested that).
+    pub fn paste(&self, text: &str) {
+        let _ = self.term.lock().unwrap().send_paste(text);
+    }
+
+    /// The URL under the given visible cell, if any (OSC 8 or plain text).
+    /// Wrap-aware: clicking any row of a wrapped URL yields the whole URL.
+    pub fn link_at(&self, col: usize, row: usize) -> Option<String> {
+        let term = self.term.lock().unwrap();
+        let screen = term.screen();
+        if row >= screen.physical_rows {
+            return None;
+        }
+        let lines =
+            screen.lines_in_phys_range(screen.phys_range(&(0..screen.physical_rows as i64)));
+        crate::links::links_in_lines(&lines)
+            .into_iter()
+            .find(|h| h.contains(row, col))
+            .map(|h| h.url)
+    }
+
     /// Propagate a window resize to both the grid and the PTY (SIGWINCH).
     pub fn resize(&self, cols: usize, rows: usize, cell_width: u16, cell_height: u16, dpi: u32) {
         if cols == 0 || rows == 0 {
