@@ -1,197 +1,174 @@
-//! GPU renderer: wgpu (Metal on macOS) + glyphon glyph atlas.
+//! Stateless layout / metrics / color helper for the gpui renderer.
 //!
-//! Same rendering model as iTerm2's Metal renderer:
-//! - Glyphs are rasterized once (cosmic-text/swash) into a texture atlas kept
-//!   on the GPU; frames draw instanced textured quads — no per-frame font
-//!   rasterization.
-//! - The surface presents with Fifo (vsync), so redraws are naturally capped
-//!   at display refresh; PTY floods never outpace the display.
+//! In the old wgpu+glyphon design this module owned a GPU surface and drew
+//! frames immediate-mode. Under gpui the paint model is inverted: painting
+//! happens inside a gpui `Element`'s `paint()` (see `main.rs`), which calls
+//! `window.paint_quad(...)` for fills and shapes text via
+//! `window.text_system().shape_line(...)`. So this module no longer touches
+//! the GPU at all — it is pure geometry, color, and terminal-snapshot logic.
 //!
-//! Frame structure: chrome rects (sidebar, tab strips, dividers) → text
-//! (terminal grids + labels) → foreground rects (block glyph geometry,
-//! cursor, focus border, drag-drop hint).
+//! `build_frame` walks the workspace tree + terminal grids and produces a
+//! [`Frame`] of plain data (background/foreground quads, per-pane colored text
+//! runs, and chrome/picker labels). `main.rs`'s terminal `Element` consumes
+//! that data and does the actual painting.
+//!
+//! Frame structure (paint order): chrome quads (sidebar, tab strips, dividers)
+//! → per-pane text (terminal grids) → foreground quads (block glyph geometry,
+//! cursor, links) → labels (tab titles, picker) → picker overlay.
 
-use std::sync::Arc;
-
-use glyphon::{
-    Attrs, Buffer as TextBuffer, Cache, Color, ColorMode, Family, FontSystem, Metrics, Resolution,
-    Shaping, SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Wrap,
-};
+use gpui::Hsla;
 use termwiz::surface::CursorVisibility;
 use wezterm_term::color::ColorPalette;
-use winit::window::Window;
 
-use crate::rect::{RectInstance, RectRenderer, char_rects};
+use crate::picker::{ForkPicker, Picker, PickerLayout, PickerRow};
+use crate::rect::char_rects;
 use crate::term::Session;
 use crate::workspace::{self, LayoutRect, Workspace};
 
 const FONT_SIZE: f32 = 15.0;
 const LINE_HEIGHT_FACTOR: f32 = 1.25;
-/// Background color, in sRGB (as you'd write it in CSS).
-const BG_SRGB: [f64; 3] = [0.086, 0.09, 0.11];
-
+/// Concrete monospace family. Naming a real installed font (not the generic
+/// `Family::Monospace`) skips per-word font-fallback resolution, and the Nerd
+/// Font glyph coverage keeps fallback from firing on powerline/icon glyphs.
+pub const FONT_FAMILY: &str = "JetBrainsMono Nerd Font Mono";
 /// Content inset inside each tile's terminal region, logical px.
 const PANE_PAD: f32 = 5.0;
-/// Window corner radius, logical px (macOS-native look).
-const CORNER_RADIUS: f32 = 12.0;
 /// UI colors (sRGB u8).
 const TERM_BG: (u8, u8, u8) = (22, 23, 28);
 const SIDEBAR_BG: (u8, u8, u8) = (30, 33, 41);
 const TAB_ACTIVE_BG: (u8, u8, u8) = (48, 53, 66);
 const DIVIDER_BG: (u8, u8, u8) = (45, 49, 61);
-const ACCENT: (u8, u8, u8) = (122, 162, 247);
-const TEXT_BRIGHT: Color = Color::rgb(220, 222, 228);
-const TEXT_DIM: Color = Color::rgb(130, 135, 148);
+pub const ACCENT: (u8, u8, u8) = (122, 162, 247);
+const TEXT_BRIGHT: (u8, u8, u8) = (220, 222, 228);
+const TEXT_DIM: (u8, u8, u8) = (130, 135, 148);
+/// Dimming scrim painted behind the cwd-picker popover.
+const SCRIM: (u8, u8, u8) = (0, 0, 0);
 
-/// sRGB electro-optical transfer function: gamma-encoded → linear.
-fn srgb_to_linear(c: f64) -> f64 {
-    if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+/// An sRGB u8 color mapped to a gpui [`Hsla`] with an explicit alpha.
+pub fn color(rgb: (u8, u8, u8), alpha: f32) -> Hsla {
+    gpui::Rgba {
+        r: rgb.0 as f32 / 255.0,
+        g: rgb.1 as f32 / 255.0,
+        b: rgb.2 as f32 / 255.0,
+        a: alpha,
+    }
+    .into()
 }
 
-struct LabelSpec {
-    text: String,
-    color: Color,
-    left: f32,
-    top: f32,
-    bounds: TextBounds,
+/// A solid (optionally rounded) fill quad, in physical px. `main.rs` converts
+/// these to gpui `Bounds<Pixels>` + `paint_quad` at paint time.
+#[derive(Clone, Copy)]
+pub struct Quad {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub color: Hsla,
+    /// Corner radius in physical px (0 = square).
+    pub radius: f32,
 }
 
+/// One colored run of text within a grid row (or a label line).
+#[derive(Clone)]
+pub struct TextSpan {
+    pub text: String,
+    pub color: Hsla,
+}
+
+/// A pane's text laid out for painting: origin (physical px) plus one span-list
+/// per grid row (already coalesced into same-colored runs).
+pub struct PaneText {
+    pub origin: (f32, f32),
+    pub rows: Vec<Vec<TextSpan>>,
+}
+
+/// A single line of chrome/picker text, positioned in physical px. `clip` is
+/// the rect the text must not overflow (right/bottom edges), used by `main.rs`
+/// to clip long titles.
+#[derive(Clone)]
+pub struct LabelSpec {
+    pub text: String,
+    pub color: Hsla,
+    pub left: f32,
+    pub top: f32,
+    pub clip: LayoutRect,
+}
+
+/// Everything `main.rs`'s terminal `Element` needs to paint one frame — all
+/// plain data, no GPU or shaping state.
+pub struct Frame {
+    /// Chrome fills painted under the text (sidebar, tab strips, dividers).
+    pub bg_quads: Vec<Quad>,
+    /// Per-pane colored text runs.
+    pub panes: Vec<PaneText>,
+    /// Foreground fills painted over the text (block/box geometry, cursor,
+    /// link underlines).
+    pub fg_quads: Vec<Quad>,
+    /// Chrome labels (tab titles).
+    pub labels: Vec<LabelSpec>,
+    /// Picker overlay fills painted over everything else (scrim, panel, rows).
+    pub picker_quads: Vec<Quad>,
+    /// Picker overlay labels, painted last.
+    pub picker_labels: Vec<LabelSpec>,
+}
+
+/// Stateless renderer: owns only cell metrics, scale, and the terminal color
+/// palette. All measurements come from gpui's text system (see `main.rs`), so
+/// `new` takes them as arguments instead of creating a GPU surface.
 pub struct Renderer {
-    surface: wgpu::Surface<'static>,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    config: wgpu::SurfaceConfiguration,
-
-    font_system: FontSystem,
-    swash_cache: SwashCache,
-    viewport: Viewport,
-    atlas: TextAtlas,
-    text_renderer: TextRenderer,
-
-    /// Reusable per-tile text buffers (index-aligned with the visible tiles;
-    /// grown on demand).
-    pane_buffers: Vec<TextBuffer>,
-    /// Reusable buffers for sidebar/tile tab labels + hints.
-    label_buffers: Vec<TextBuffer>,
-    rect_renderer: RectRenderer,
-
-    metrics: Metrics,
-    clear_color: wgpu::Color,
     palette: ColorPalette,
-    srgb: bool,
+    width: u32,
+    height: u32,
 
     pub scale: f32,
     pub cell_width: f32,
     pub cell_height: f32,
 }
 
+/// Measure the advance width of a monospace cell (physical px) by shaping a
+/// representative glyph at the current font size in gpui's text system.
+pub fn measure_cell_width(window: &mut gpui::Window, scale: f32) -> f32 {
+    let font_size = gpui::px(FONT_SIZE * scale);
+    let run = gpui::TextRun {
+        len: 1,
+        font: gpui::font(FONT_FAMILY),
+        color: gpui::Hsla::default(),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let line = window
+        .text_system()
+        .shape_line("M".into(), font_size, &[run], None);
+    f32::from(line.width).max(1.0)
+}
+
 impl Renderer {
-    pub fn new(window: Arc<Window>) -> Self {
-        let scale = window.scale_factor() as f32;
-        let size = window.inner_size();
-
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-        let surface = instance.create_surface(window).expect("create surface");
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: Some(&surface),
-            force_fallback_adapter: false,
-            apply_limit_buckets: false,
-        }))
-        .expect("no gpu adapter");
-        let (device, queue) =
-            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
-                .expect("request device");
-
-        let caps = surface.get_capabilities(&adapter);
-        // Prefer an sRGB format: the hardware then handles gamma encoding, and
-        // glyphon's ColorMode::Accurate linearizes glyph colors to match.
-        // Clear colors are given to wgpu in *linear* space, so convert.
-        let format =
-            caps.formats.iter().copied().find(|f| f.is_srgb()).unwrap_or(caps.formats[0]);
-        let (color_mode, clear_color) = if format.is_srgb() {
-            let [r, g, b] = BG_SRGB.map(srgb_to_linear);
-            (ColorMode::Accurate, wgpu::Color { r, g, b, a: 1.0 })
-        } else {
-            let [r, g, b] = BG_SRGB;
-            (ColorMode::Web, wgpu::Color { r, g, b, a: 1.0 })
-        };
-        let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format,
-            color_space: wgpu::SurfaceColorSpace::Auto,
-            width: size.width.max(1),
-            height: size.height.max(1),
-            present_mode: wgpu::PresentMode::Fifo,
-            // Non-opaque so the corner mask can show the desktop through the
-            // rounded corners of our borderless window.
-            alpha_mode: caps
-                .alpha_modes
-                .iter()
-                .copied()
-                .find(|m| *m != wgpu::CompositeAlphaMode::Opaque)
-                .unwrap_or(caps.alpha_modes[0]),
-            view_formats: vec![],
-            desired_maximum_frame_latency: 2,
-        };
-        surface.configure(&device, &config);
-
-        let mut font_system = FontSystem::new();
-        let swash_cache = SwashCache::new();
-        let cache = Cache::new(&device);
-        let viewport = Viewport::new(&device, &cache);
-        let mut atlas = TextAtlas::with_color_mode(&device, &queue, &cache, format, color_mode);
-        let text_renderer =
-            TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
-
-        // Measure the monospace cell once (iTerm2 does the same with Core Text
-        // metrics): shape a reference glyph and take its advance width.
+    pub fn new(scale: f32, cell_width: f32, width: u32, height: u32) -> Self {
         let font_size = FONT_SIZE * scale;
         let line_height = (font_size * LINE_HEIGHT_FACTOR).round();
-        let metrics = Metrics::new(font_size, line_height);
-        let mut probe = TextBuffer::new(&mut font_system, metrics);
-        probe.set_text("M", &Attrs::new().family(Family::Monospace), Shaping::Advanced, None);
-        probe.shape_until_scroll(&mut font_system, false);
-        let cell_width = probe
-            .layout_runs()
-            .next()
-            .and_then(|run| run.glyphs.first().map(|g| g.w))
-            .unwrap_or(font_size * 0.6)
-            .round();
-
-        let rect_renderer = RectRenderer::new(&device, format);
-
         Self {
-            surface,
-            device,
-            queue,
-            config,
-            font_system,
-            swash_cache,
-            viewport,
-            atlas,
-            text_renderer,
-            pane_buffers: Vec::new(),
-            label_buffers: Vec::new(),
-            rect_renderer,
-            metrics,
-            clear_color,
             palette: ColorPalette::default(),
-            srgb: format.is_srgb(),
+            width: width.max(1),
+            height: height.max(1),
             scale,
-            cell_width,
+            cell_width: cell_width.round(),
             cell_height: line_height,
         }
     }
 
+    /// Physical-px font size for shaping (logical size × scale).
+    pub fn font_size(&self) -> f32 {
+        FONT_SIZE * self.scale
+    }
+
     pub fn resize(&mut self, width: u32, height: u32) {
-        self.config.width = width.max(1);
-        self.config.height = height.max(1);
-        self.surface.configure(&self.device, &self.config);
+        self.width = width.max(1);
+        self.height = height.max(1);
     }
 
     pub fn surface_size(&self) -> (u32, u32) {
-        (self.config.width, self.config.height)
+        (self.width, self.height)
     }
 
     /// Grid dimensions that fit inside a tile's *content* rect (minus pad).
@@ -220,70 +197,163 @@ impl Renderer {
         ))
     }
 
-    pub fn draw(
-        &mut self,
+    /// Translucent highlight quads for the session's active selection, one
+    /// per visible row of the span. No-op for an empty (zero-width) selection.
+    fn selection_rects(&self, session: &Session, origin: (f32, f32), rects: &mut Vec<Quad>) {
+        let Some((start, end)) = session.selection_span() else { return };
+        // A zero-width selection (a bare click, no drag) paints nothing —
+        // mirrors `selected_text`, which returns no text for the same state.
+        if start == end {
+            return;
+        }
+        let offset = session.scroll_offset() as i32;
+        let term = session.term.lock().unwrap();
+        let screen = term.screen();
+        let rows = screen.physical_rows;
+        let cols = screen.physical_cols;
+        let phys = screen.scrollback_or_visible_range(&(-offset..rows as i32 - offset));
+        let s_top = screen.phys_to_stable_row_index(phys.start);
+        drop(term);
+
+        for vrow in 0..rows {
+            let r = s_top + vrow as isize;
+            if r < start.1 || r > end.1 {
+                continue;
+            }
+            // Column span for this row: the first row starts at the anchor
+            // col, the last row ends after the head cell, rows between are
+            // full-width.
+            let (c0, c1) = if start.1 == end.1 {
+                (start.0, end.0 + 1)
+            } else if r == start.1 {
+                (start.0, cols)
+            } else if r == end.1 {
+                (0, end.0 + 1)
+            } else {
+                (0, cols)
+            };
+            let c1 = c1.min(cols);
+            if c1 <= c0 {
+                continue;
+            }
+            rects.push(self.cell_rect(
+                origin,
+                c0,
+                vrow,
+                0.0,
+                0.0,
+                (c1 - c0) as f32,
+                1.0,
+                ACCENT,
+                0.30,
+            ));
+        }
+    }
+
+    /// Walk the active workspace + terminal grids and produce a [`Frame`] of
+    /// plain data for `main.rs`'s `Element` to paint. Replaces the old wgpu
+    /// `draw()`; the per-frame painting now lives in the gpui element.
+    pub fn build_frame(
+        &self,
         workspaces: &[Workspace],
         active: usize,
         sidebar_w: f32,
         drop_hint: Option<LayoutRect>,
-    ) {
+        picker: Option<&Picker>,
+        fork: Option<&ForkPicker>,
+        message: Option<&(String, bool)>,
+    ) -> Frame {
         let ws = &workspaces[active];
-        let (width, height) = (self.config.width, self.config.height);
+        let (width, height) = (self.width, self.height);
         let sidebar = workspace::sidebar(height, self.scale, sidebar_w);
         let area = workspace::terminal_area(width, height, self.scale, sidebar_w);
         let (tiles, dividers) = workspace::layout_tiles(&ws.root, area, self.scale);
 
-        let mut rects: Vec<RectInstance> = Vec::new();
+        let mut bg_quads: Vec<Quad> = Vec::new();
+        let mut fg_quads: Vec<Quad> = Vec::new();
+        let mut labels: Vec<LabelSpec> = Vec::new();
+        let mut panes: Vec<PaneText> = Vec::new();
 
         // ── Chrome (under text) ────────────────────────────────────────
-        rects.push(self.px_rect(&sidebar, SIDEBAR_BG, 1.0));
-        // Custom traffic lights (window is borderless).
-        const LIGHTS: [(u8, u8, u8); 3] = [(255, 95, 87), (254, 188, 46), (40, 200, 64)];
-        for (i, color) in LIGHTS.iter().enumerate() {
-            let r = workspace::traffic_light(i, self.scale);
-            let mut inst = self.px_rect(&r, *color, 1.0);
-            inst.radius = r.w / 2.0;
-            rects.push(inst);
-        }
-        for (i, _) in workspaces.iter().enumerate() {
+        bg_quads.push(self.px_rect(&sidebar, SIDEBAR_BG, 1.0, 0.0));
+        // Traffic lights are the native macOS buttons now (transparent titlebar),
+        // so we no longer draw our own here.
+        // "+" new-group button, just below the titlebar strip.
+        let new_group = workspace::new_group_button(self.scale, sidebar_w);
+        bg_quads.push(self.px_rect(&new_group, TAB_ACTIVE_BG, 1.0, 0.0));
+        labels.push(LabelSpec {
+            text: "+".into(),
+            color: color(TEXT_BRIGHT, 1.0),
+            left: (new_group.x + (new_group.w - self.cell_width) / 2.0).round(),
+            top: (new_group.y + (new_group.h - self.cell_height) / 2.0).round(),
+            clip: new_group,
+        });
+        let group_pad = (12.0 * self.scale).round();
+        for (i, ws_item) in workspaces.iter().enumerate() {
+            let tab = workspace::tab_rect(i, self.scale, sidebar_w);
             if i == active {
-                let tab = workspace::tab_rect(i, self.scale, sidebar_w);
-                rects.push(self.px_rect(&tab, TAB_ACTIVE_BG, 1.0));
+                bg_quads.push(self.px_rect(&tab, TAB_ACTIVE_BG, 1.0, 0.0));
                 let bar = LayoutRect { w: (3.0 * self.scale).round(), ..tab };
-                rects.push(self.px_rect(&bar, ACCENT, 1.0));
+                bg_quads.push(self.px_rect(&bar, ACCENT, 1.0, 0.0));
             }
+            // The group's name, so the sidebar tab isn't blank.
+            labels.push(LabelSpec {
+                text: ws_item.name.clone(),
+                color: color(if i == active { TEXT_BRIGHT } else { TEXT_DIM }, 1.0),
+                left: tab.x + group_pad,
+                top: (tab.y + (tab.h - self.cell_height) / 2.0).round(),
+                clip: LayoutRect { w: tab.w - group_pad, ..tab },
+            });
         }
         for d in &dividers {
-            rects.push(self.px_rect(&d.rect, DIVIDER_BG, 1.0));
+            bg_quads.push(self.px_rect(&d.rect, DIVIDER_BG, 1.0, 0.0));
         }
         for (id, rect) in &tiles {
             let bar = workspace::tile_tab_bar(rect, self.scale);
-            rects.push(self.px_rect(&bar, SIDEBAR_BG, 1.0));
+            bg_quads.push(self.px_rect(&bar, SIDEBAR_BG, 1.0, 0.0));
             if let Some(tile) = ws.root.find_tile(*id) {
                 // Active tab slot in terminal-bg so it merges with content.
                 let tr = workspace::tile_tab_rect(rect, tile.active, tile.tabs.len(), self.scale);
-                rects.push(self.px_rect(&tr, TERM_BG, 1.0));
+                bg_quads.push(self.px_rect(&tr, TERM_BG, 1.0, 0.0));
             }
         }
-        let bg_rects = rects.len() as u32;
 
-        // ── Terminal snapshots (short critical sections) ───────────────
-        let mut pane_spans: Vec<Vec<(String, Color)>> = Vec::with_capacity(tiles.len());
+        // ── Terminal snapshots + per-tile chrome (tab strips) ──────────
+        let focused_tile = Some(ws.focused_tile);
         for (id, rect) in &tiles {
-            let Some(tab) = ws.root.find_tile(*id).and_then(|t| t.active_tab()) else {
-                pane_spans.push(Vec::new());
-                continue;
-            };
-            tab.session.begin_frame();
+            let Some(tile) = ws.root.find_tile(*id) else { continue };
             let content = workspace::tile_content(rect, self.scale);
             let origin = self.content_origin(&content);
-            let draw_cursor = *id == ws.focused_tile;
-            pane_spans.push(self.snapshot_pane(&tab.session, origin, draw_cursor, &mut rects));
+            if let Some(session) = tile.tabs.get(tile.active).map(|t| &t.session) {
+                let draw_cursor = Some(*id) == focused_tile
+                    && picker.is_none()
+                    && fork.is_none()
+                    && message.is_none();
+                let rows =
+                    self.snapshot_pane(session, origin, draw_cursor, &mut bg_quads, &mut fg_quads);
+                panes.push(PaneText { origin, rows });
+                self.selection_rects(session, origin, &mut fg_quads);
+            }
+
+            // Tab labels for this tile's tab strip.
+            let tab_text_pad = (8.0 * self.scale).round();
+            for (ti, tab) in tile.tabs.iter().enumerate() {
+                let tr = workspace::tile_tab_rect(rect, ti, tile.tabs.len(), self.scale);
+                let title = tab.session.title();
+                let text = if title.is_empty() { "shell".to_string() } else { title };
+                labels.push(LabelSpec {
+                    text,
+                    color: color(if ti == tile.active { TEXT_BRIGHT } else { TEXT_DIM }, 1.0),
+                    left: tr.x + tab_text_pad,
+                    top: (tr.y + (tr.h - self.cell_height) / 2.0).round(),
+                    clip: LayoutRect { w: tr.w - tab_text_pad, ..tr },
+                });
+            }
         }
 
-        // Focused tile border (only interesting with multiple tiles).
+        // Focused-tile border (only interesting with multiple tiles).
         if tiles.len() > 1
-            && let Some((_, rect)) = tiles.iter().find(|(id, _)| *id == ws.focused_tile)
+            && let Some((_, rect)) = tiles.iter().find(|(id, _)| Some(*id) == focused_tile)
         {
             let t = (1.5 * self.scale).round();
             let sides = [
@@ -292,200 +362,253 @@ impl Renderer {
                 LayoutRect { x: rect.x, y: rect.y, w: t, h: rect.h },
                 LayoutRect { x: rect.x + rect.w - t, y: rect.y, w: t, h: rect.h },
             ];
-            rects.extend(sides.iter().map(|s| self.px_rect(s, ACCENT, 1.0)));
+            fg_quads.extend(sides.iter().map(|s| self.px_rect(s, ACCENT, 1.0, 0.0)));
         }
 
-        // Drag-and-drop target hint, on top of everything.
+        // Drag-drop target hint (a translucent accent overlay).
         if let Some(hint) = drop_hint {
-            rects.push(self.px_rect(&hint, ACCENT, 0.3));
+            fg_quads.push(self.px_rect(&hint, ACCENT, 0.3, 0.0));
         }
 
-        // ── Labels ─────────────────────────────────────────────────────
-        let label_pad = (12.0 * self.scale).round();
-        let mut labels: Vec<LabelSpec> = Vec::new();
-        for (i, w) in workspaces.iter().enumerate() {
-            let tab = workspace::tab_rect(i, self.scale, sidebar_w);
-            labels.push(LabelSpec {
-                text: format!("{}  {}", i + 1, w.name),
-                color: if i == active { TEXT_BRIGHT } else { TEXT_DIM },
-                left: tab.x + label_pad,
-                top: (tab.y + (tab.h - self.cell_height) / 2.0).round(),
-                bounds: bounds_of(&tab),
-            });
-        }
-        labels.push(LabelSpec {
-            text: "⌘T tab · ⌘D split · ⇧⌘T group".into(),
-            color: TEXT_DIM,
-            left: label_pad,
-            top: sidebar.h - self.cell_height - label_pad,
-            bounds: bounds_of(&sidebar),
-        });
-        let tab_text_pad = (8.0 * self.scale).round();
-        for (id, rect) in &tiles {
-            let Some(tile) = ws.root.find_tile(*id) else { continue };
-            let n = tile.tabs.len();
-            for (ti, tab) in tile.tabs.iter().enumerate() {
-                let tr = workspace::tile_tab_rect(rect, ti, n, self.scale);
-                let title = tab.session.title();
-                let text = if title.is_empty() { "shell".to_string() } else { title };
-                labels.push(LabelSpec {
-                    text,
-                    color: if ti == tile.active { TEXT_BRIGHT } else { TEXT_DIM },
-                    left: tr.x + tab_text_pad,
-                    top: (tr.y + (tr.h - self.cell_height) / 2.0).round(),
-                    bounds: bounds_of(&LayoutRect { w: tr.w - tab_text_pad, ..tr }),
-                });
-            }
+        // ── Picker overlay (over everything) ───────────────────────────
+        let mut picker_quads: Vec<Quad> = Vec::new();
+        let mut picker_labels: Vec<LabelSpec> = Vec::new();
+        if let Some(p) = picker {
+            let layout = PickerLayout::compute(width, height, self.scale, p.rows.len(), p.selected);
+            picker_labels = self.picker_overlay(p, &layout, &mut picker_quads);
+        } else if let Some(f) = fork {
+            picker_labels = self.fork_overlay(f, &mut picker_quads);
+        } else if let Some((text, _)) = message {
+            picker_labels = self.message_overlay(text, &mut picker_quads);
         }
 
-        // ── Shape text into pooled buffers ─────────────────────────────
-        let attrs = Attrs::new().family(Family::Monospace);
-        while self.pane_buffers.len() < pane_spans.len() {
-            let mut buf = TextBuffer::new(&mut self.font_system, self.metrics);
-            buf.set_wrap(Wrap::None);
-            self.pane_buffers.push(buf);
-        }
-        for (i, spans) in pane_spans.iter().enumerate() {
-            let rich =
-                spans.iter().map(|(text, color)| (text.as_str(), attrs.clone().color(*color)));
-            let buf = &mut self.pane_buffers[i];
-            buf.set_rich_text(rich, &attrs, Shaping::Advanced, None);
-            buf.set_size(Some(tiles[i].1.w), Some(tiles[i].1.h));
-            buf.shape_until_scroll(&mut self.font_system, false);
-        }
-        while self.label_buffers.len() < labels.len() {
-            let mut buf = TextBuffer::new(&mut self.font_system, self.metrics);
-            buf.set_wrap(Wrap::None);
-            self.label_buffers.push(buf);
-        }
-        for (i, spec) in labels.iter().enumerate() {
-            let buf = &mut self.label_buffers[i];
-            buf.set_text(&spec.text, &attrs, Shaping::Advanced, None);
-            buf.shape_until_scroll(&mut self.font_system, false);
-        }
-
-        // ── Assemble text areas (immutable borrows of the pools) ───────
-        let mut text_areas: Vec<TextArea> = Vec::new();
-        for (i, (_, rect)) in tiles.iter().enumerate() {
-            let content = workspace::tile_content(rect, self.scale);
-            let (left, top) = self.content_origin(&content);
-            text_areas.push(TextArea {
-                buffer: &self.pane_buffers[i],
-                left,
-                top,
-                scale: 1.0,
-                bounds: bounds_of(&content),
-                default_color: TEXT_BRIGHT,
-                custom_glyphs: &[],
-            });
-        }
-        for (i, spec) in labels.iter().enumerate() {
-            text_areas.push(TextArea {
-                buffer: &self.label_buffers[i],
-                left: spec.left,
-                top: spec.top,
-                scale: 1.0,
-                bounds: spec.bounds,
-                default_color: spec.color,
-                custom_glyphs: &[],
-            });
-        }
-
-        self.rect_renderer.prepare(
-            &self.device,
-            &self.queue,
-            &rects,
-            self.config.width,
-            self.config.height,
-        );
-        self.rect_renderer.prepare_mask(
-            &self.queue,
-            self.config.width,
-            self.config.height,
-            CORNER_RADIUS * self.scale,
-        );
-        self.viewport.update(
-            &self.queue,
-            Resolution { width: self.config.width, height: self.config.height },
-        );
-        self.text_renderer
-            .prepare(
-                &self.device,
-                &self.queue,
-                &mut self.font_system,
-                &mut self.atlas,
-                &self.viewport,
-                text_areas,
-                &mut self.swash_cache,
-            )
-            .expect("prepare text");
-
-        use wgpu::CurrentSurfaceTexture::*;
-        let frame = match self.surface.get_current_texture() {
-            Success(frame) | Suboptimal(frame) => frame,
-            Outdated | Lost => {
-                self.surface.configure(&self.device, &self.config);
-                return;
-            },
-            Timeout | Occluded | Validation => return,
-        };
-        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder =
-            self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("terminal"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(self.clear_color),
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            // Chrome under the text…
-            self.rect_renderer.render_range(&mut pass, 0..bg_rects);
-            self.text_renderer
-                .render(&self.atlas, &self.viewport, &mut pass)
-                .expect("render text");
-            // …blocks/cursor/border/drop-hint on top (blocks never overlap
-            // glyphs: their cells hold spaces).
-            self.rect_renderer.render_range(&mut pass, bg_rects..u32::MAX);
-            // Finally, punch out the rounded window corners.
-            self.rect_renderer.render_mask(&mut pass);
-        }
-        self.queue.submit(Some(encoder.finish()));
-        self.queue.present(frame);
-        self.atlas.trim();
+        Frame { bg_quads, panes, fg_quads, labels, picker_quads, picker_labels }
     }
 
-    /// Snapshot one pane's grid into text spans + geometry rects, offset to
-    /// `origin`. Holds the terminal lock only for the walk.
+    fn picker_overlay(
+        &self,
+        picker: &Picker,
+        layout: &PickerLayout,
+        rects: &mut Vec<Quad>,
+    ) -> Vec<LabelSpec> {
+        let scale = self.scale;
+        let pad = (12.0 * scale).round();
+        let mut labels = Vec::new();
+
+        // Full-window dimming scrim behind the popover.
+        let scrim = LayoutRect { x: 0.0, y: 0.0, w: self.width as f32, h: self.height as f32 };
+        rects.push(self.px_rect(&scrim, SCRIM, 0.55, 0.0));
+
+        // The popover panel and its search box (both rounded).
+        rects.push(self.px_rect(&layout.panel, SIDEBAR_BG, 1.0, (10.0 * scale).round()));
+        rects.push(self.px_rect(&layout.search, TERM_BG, 1.0, (6.0 * scale).round()));
+
+        // Search text (or placeholder) with a caret trailing the query.
+        let search_top = (layout.search.y + (layout.search.h - self.cell_height) / 2.0).round();
+        let (text, c) = if picker.query.is_empty() {
+            ("Search repos…".to_string(), TEXT_DIM)
+        } else {
+            (picker.query.clone(), TEXT_BRIGHT)
+        };
+        labels.push(LabelSpec {
+            text,
+            color: color(c, 1.0),
+            left: layout.search.x + pad,
+            top: search_top,
+            clip: layout.search,
+        });
+        let caret_x = layout.search.x + pad + picker.query.chars().count() as f32 * self.cell_width;
+        let caret = LayoutRect {
+            x: caret_x,
+            y: search_top,
+            w: (2.0 * scale).round().max(1.0),
+            h: self.cell_height,
+        };
+        rects.push(self.px_rect(&caret, ACCENT, 1.0, 0.0));
+
+        // Visible rows: headers, selected-row highlight, labels, glyphs.
+        for i in layout.first_visible..(layout.first_visible + layout.visible) {
+            let (Some(row), Some(prow)) = (layout.row_rect(i), picker.rows.get(i)) else {
+                continue;
+            };
+            let top = (row.y + (row.h - self.cell_height) / 2.0).round();
+            match prow {
+                PickerRow::Header(title) => labels.push(LabelSpec {
+                    text: title.to_string(),
+                    color: color(TEXT_DIM, 1.0),
+                    left: row.x + pad,
+                    top,
+                    clip: row,
+                }),
+                PickerRow::Entry(entry) => {
+                    if i == picker.selected {
+                        rects.push(self.px_rect(&row, TAB_ACTIVE_BG, 1.0, 0.0));
+                    }
+                    // Label, clipped short of the glyph gutter on the right.
+                    let label_bounds =
+                        LayoutRect { w: (row.w - 2.0 * layout.row_h).max(0.0), ..row };
+                    labels.push(LabelSpec {
+                        text: entry.label.clone(),
+                        color: color(TEXT_BRIGHT, 1.0),
+                        left: row.x + pad,
+                        top,
+                        clip: label_bounds,
+                    });
+                    if entry.is_git {
+                        let gx = row.x + row.w - 2.0 * layout.row_h;
+                        let cell = LayoutRect { x: gx, y: row.y, w: layout.row_h, h: row.h };
+                        labels.push(LabelSpec {
+                            text: "\u{e0a0}".to_string(),
+                            color: color(ACCENT, 1.0),
+                            left: gx + (layout.row_h - self.cell_width) / 2.0,
+                            top,
+                            clip: cell,
+                        });
+                    }
+                    if picker.is_pinned(&entry.path) {
+                        let star = layout.star_rect(&row);
+                        labels.push(LabelSpec {
+                            text: "★".to_string(),
+                            color: color((240, 190, 70), 1.0),
+                            left: star.x + (layout.row_h - self.cell_width) / 2.0,
+                            top,
+                            clip: star,
+                        });
+                    }
+                },
+            }
+        }
+        labels
+    }
+
+    /// Step-2 fork-source overlay: a centered, filterable list of the branch /
+    /// worktree choices for the group being forked. Styled like the dir picker.
+    /// TODO(gpui-port): per-scope tag colors and scroll-to-selection.
+    fn fork_overlay(&self, fork: &ForkPicker, rects: &mut Vec<Quad>) -> Vec<LabelSpec> {
+        let scale = self.scale;
+        let pad = (12.0 * scale).round();
+        let mut labels = Vec::new();
+
+        // Dimming scrim behind the popover.
+        let scrim = LayoutRect { x: 0.0, y: 0.0, w: self.width as f32, h: self.height as f32 };
+        rects.push(self.px_rect(&scrim, SCRIM, 0.55, 0.0));
+
+        // Centered panel sized to the (capped) row count.
+        let row_h = (self.cell_height + 8.0 * scale).round();
+        let visible = fork.rows.len().min(12);
+        let panel_w = (self.width as f32 * 0.5).min(560.0 * scale).round();
+        let panel_h = (row_h * (visible as f32 + 2.0) + pad * 2.0).round();
+        let panel_x = ((self.width as f32 - panel_w) / 2.0).round();
+        let panel_y = ((self.height as f32 - panel_h) / 3.0).round().max(pad);
+        let panel = LayoutRect { x: panel_x, y: panel_y, w: panel_w, h: panel_h };
+        rects.push(self.px_rect(&panel, SIDEBAR_BG, 1.0, (10.0 * scale).round()));
+
+        // Header: "fork <name> from…".
+        let header = LayoutRect { x: panel_x, y: panel_y + pad, w: panel_w, h: row_h };
+        labels.push(LabelSpec {
+            text: format!("fork {} from…", fork.name),
+            color: color(TEXT_DIM, 1.0),
+            left: panel_x + pad,
+            top: (header.y + (row_h - self.cell_height) / 2.0).round(),
+            clip: header,
+        });
+
+        // Filter box + caret.
+        let search =
+            LayoutRect { x: panel_x + pad, y: panel_y + pad + row_h, w: panel_w - 2.0 * pad, h: row_h };
+        rects.push(self.px_rect(&search, TERM_BG, 1.0, (6.0 * scale).round()));
+        let search_top = (search.y + (search.h - self.cell_height) / 2.0).round();
+        let (text, c) = if fork.query.is_empty() {
+            ("Filter branches…".to_string(), TEXT_DIM)
+        } else {
+            (fork.query.clone(), TEXT_BRIGHT)
+        };
+        labels.push(LabelSpec {
+            text,
+            color: color(c, 1.0),
+            left: search.x + pad,
+            top: search_top,
+            clip: search,
+        });
+        let caret_x = search.x + pad + fork.query.chars().count() as f32 * self.cell_width;
+        let caret = LayoutRect {
+            x: caret_x,
+            y: search_top,
+            w: (2.0 * scale).round().max(1.0),
+            h: self.cell_height,
+        };
+        rects.push(self.px_rect(&caret, ACCENT, 1.0, 0.0));
+
+        // Rows.
+        let rows_top = panel_y + pad + row_h * 2.0;
+        for (i, entry) in fork.rows.iter().take(visible).enumerate() {
+            let row = LayoutRect { x: panel_x, y: rows_top + row_h * i as f32, w: panel_w, h: row_h };
+            let top = (row.y + (row.h - self.cell_height) / 2.0).round();
+            if i == fork.selected {
+                rects.push(self.px_rect(&row, TAB_ACTIVE_BG, 1.0, 0.0));
+            }
+            labels.push(LabelSpec {
+                text: entry.label.clone(),
+                color: color(TEXT_BRIGHT, 1.0),
+                left: row.x + pad,
+                top,
+                clip: LayoutRect { w: panel_w - 2.0 * pad, ..row },
+            });
+        }
+        labels
+    }
+
+    /// Centered one-line message panel (worktree provisioning / failure note).
+    fn message_overlay(&self, text: &str, rects: &mut Vec<Quad>) -> Vec<LabelSpec> {
+        let scale = self.scale;
+        let pad = (16.0 * scale).round();
+        let scrim = LayoutRect { x: 0.0, y: 0.0, w: self.width as f32, h: self.height as f32 };
+        rects.push(self.px_rect(&scrim, SCRIM, 0.55, 0.0));
+
+        let w = (text.chars().count() as f32 * self.cell_width + pad * 2.0)
+            .min(self.width as f32 - pad * 2.0);
+        let h = (self.cell_height + pad * 2.0).round();
+        let x = ((self.width as f32 - w) / 2.0).round();
+        let y = ((self.height as f32 - h) / 2.0).round();
+        let panel = LayoutRect { x, y, w, h };
+        rects.push(self.px_rect(&panel, SIDEBAR_BG, 1.0, (8.0 * scale).round()));
+        vec![LabelSpec {
+            text: text.to_string(),
+            color: color(TEXT_BRIGHT, 1.0),
+            left: x + pad,
+            top: (y + (h - self.cell_height) / 2.0).round(),
+            clip: panel,
+        }]
+    }
+
+    /// Snapshot one pane's grid into per-row text spans + geometry quads,
+    /// offset to `origin`. One `Vec<TextSpan>` per grid row (so the caller can
+    /// shape each row independently). Holds the terminal lock only for the walk.
     fn snapshot_pane(
         &self,
         session: &Session,
         origin: (f32, f32),
         draw_cursor: bool,
-        rects: &mut Vec<RectInstance>,
-    ) -> Vec<(String, Color)> {
+        bg_rects: &mut Vec<Quad>,
+        rects: &mut Vec<Quad>,
+    ) -> Vec<Vec<TextSpan>> {
         // Box-drawing line thickness in px, and in cell-relative units.
         let thickness = (self.cell_width / 8.0).round().max(1.0);
         let (tx, ty) = (thickness / self.cell_width, thickness / self.cell_height);
 
+        // Honor scrollback: render the viewport shifted up by `scroll_offset`
+        // lines into history instead of always the live bottom.
+        let offset = session.scroll_offset() as i32;
         let term = session.term.lock().unwrap();
         let screen = term.screen();
         let rows = screen.physical_rows;
-        let lines = screen.lines_in_phys_range(screen.phys_range(&(0..rows as i64)));
+        let lines = screen.lines_in_phys_range(
+            screen.scrollback_or_visible_range(&(-offset..rows as i32 - offset)),
+        );
 
-        // Coalesce per-cell colors into runs: one (String, Color) span per
-        // same-colored stretch keeps the shaping input small.
-        // Links get the accent color + an underline rect; ⌘-click opens.
+        // Coalesce per-cell colors into runs: one span per same-colored
+        // stretch keeps the shaping input small.
+        // Links get the accent color + an underline quad; ⌘-click opens.
         // Detection is wrap-aware: a URL broken across rows is one link.
         let links = crate::links::links_in_lines(&lines);
         for l in &links {
@@ -495,22 +618,39 @@ impl Renderer {
             ));
         }
 
-        let mut spans: Vec<(String, Color)> = Vec::new();
+        let mut rows_spans: Vec<Vec<TextSpan>> = Vec::with_capacity(lines.len());
         for (row, line) in lines.iter().enumerate() {
-            if row > 0 {
-                spans.push(("\n".into(), Color::rgb(0, 0, 0)));
-            }
+            let mut spans: Vec<TextSpan> = Vec::new();
             for cell in line.visible_cells() {
                 let col = cell.cell_index();
                 let attrs = cell.attrs();
-                // No bg quads yet: reversed cells draw in their bg color.
-                let srgba = if attrs.reverse() {
-                    self.palette.resolve_bg(attrs.background())
+                // Reverse video swaps fg/bg: the cell fills with the resolved
+                // foreground and the glyph is shaped in the resolved background,
+                // so reversed cells stay legible instead of vanishing.
+                let (fg, bg) = if attrs.reverse() {
+                    (
+                        self.palette.resolve_bg(attrs.background()),
+                        self.palette.resolve_fg(attrs.foreground()),
+                    )
                 } else {
-                    self.palette.resolve_fg(attrs.foreground())
+                    (
+                        self.palette.resolve_fg(attrs.foreground()),
+                        self.palette.resolve_bg(attrs.background()),
+                    )
                 };
-                let (r, g, b, _) = srgba.to_srgb_u8();
-                let (r, g, b) = if links.iter().any(|l| l.contains(row, col)) {
+                // Cell background fill goes in the BG layer (painted before the
+                // glyphs), so reverse/standout cells (zsh's bracketed-paste
+                // highlight, Claude's selected rows) don't cover their text with
+                // a solid box. Skip the terminal default bg (window clear covers
+                // it) so we only emit quads for cells that actually differ.
+                if bg != self.palette.background {
+                    let (br, bg8, bb, _) = bg.to_srgb_u8();
+                    bg_rects.push(self.cell_rect(
+                        origin, col, row, 0.0, 0.0, 1.0, 1.0, (br, bg8, bb), 1.0,
+                    ));
+                }
+                let (r, g, b, _) = fg.to_srgb_u8();
+                let rgb = if links.iter().any(|l| l.contains(row, col)) {
                     ACCENT
                 } else {
                     (r, g, b)
@@ -525,27 +665,26 @@ impl Renderer {
                     && let Some(units) = char_rects(ch, tx, ty)
                 {
                     rects.extend(units.iter().map(|u| {
-                        self.cell_rect(origin, col, row, u.x, u.y, u.w, u.h, (r, g, b), u.alpha)
+                        self.cell_rect(origin, col, row, u.x, u.y, u.w, u.h, rgb, u.alpha)
                     }));
                     // Keep column alignment in the text run.
                     match spans.last_mut() {
-                        Some((text, _)) if !text.ends_with('\n') => text.push(' '),
-                        _ => spans.push((" ".into(), Color::rgb(r, g, b))),
+                        Some(span) => span.text.push(' '),
+                        _ => spans.push(TextSpan { text: " ".into(), color: color(rgb, 1.0) }),
                     }
                     continue;
                 }
 
-                let color = Color::rgb(r, g, b);
+                let hsla = color(rgb, 1.0);
                 match spans.last_mut() {
-                    Some((text, c)) if *c == color && !text.ends_with('\n') => {
-                        text.push_str(cell.str())
-                    },
-                    _ => spans.push((cell.str().to_string(), color)),
+                    Some(span) if span.color == hsla => span.text.push_str(cell.str()),
+                    _ => spans.push(TextSpan { text: cell.str().to_string(), color: hsla }),
                 }
             }
+            rows_spans.push(spans);
         }
 
-        // Cursor: a solid rect, drawn on top of the text (focused tile only).
+        // Cursor: a solid quad, drawn on top of the text (focused tile only).
         let cur = term.cursor_pos();
         if draw_cursor && cur.visibility == CursorVisibility::Visible && cur.y >= 0 {
             let (r, g, b, _) = self.palette.foreground.to_srgb_u8();
@@ -562,25 +701,15 @@ impl Renderer {
             ));
         }
 
-        spans
+        rows_spans
     }
 
-    /// A rect straight from layout coordinates (already physical px).
-    fn px_rect(&self, r: &LayoutRect, (cr, cg, cb): (u8, u8, u8), alpha: f32) -> RectInstance {
-        let comp = |v: u8| {
-            let c = v as f64 / 255.0;
-            if self.srgb { srgb_to_linear(c) as f32 } else { c as f32 }
-        };
-        RectInstance {
-            pos: [r.x, r.y],
-            size: [r.w, r.h],
-            color: [comp(cr), comp(cg), comp(cb), alpha],
-            radius: 0.0,
-            _pad: [0.0; 3],
-        }
+    /// A quad straight from layout coordinates (already physical px).
+    fn px_rect(&self, r: &LayoutRect, rgb: (u8, u8, u8), alpha: f32, radius: f32) -> Quad {
+        Quad { x: r.x, y: r.y, w: r.w, h: r.h, color: color(rgb, alpha), radius }
     }
 
-    /// Build a pixel-space rect for a sub-region of a cell, with edges snapped
+    /// Build a pixel-space quad for a sub-region of a cell, with edges snapped
     /// to physical pixels so adjacent cells tile without seams.
     #[allow(clippy::too_many_arguments)]
     fn cell_rect(
@@ -592,9 +721,9 @@ impl Renderer {
         uy: f32,
         uw: f32,
         uh: f32,
-        (r, g, b): (u8, u8, u8),
+        rgb: (u8, u8, u8),
         alpha: f32,
-    ) -> RectInstance {
+    ) -> Quad {
         let base_x = origin.0 + col as f32 * self.cell_width;
         let base_y = origin.1 + row as f32 * self.cell_height;
         // Round each edge (not pos+size) so neighbors share exact edges.
@@ -602,25 +731,6 @@ impl Renderer {
         let y0 = (base_y + uy * self.cell_height).round();
         let x1 = (base_x + (ux + uw) * self.cell_width).round();
         let y1 = (base_y + (uy + uh) * self.cell_height).round();
-        let comp = |v: u8| {
-            let c = v as f64 / 255.0;
-            if self.srgb { srgb_to_linear(c) as f32 } else { c as f32 }
-        };
-        RectInstance {
-            pos: [x0, y0],
-            size: [x1 - x0, y1 - y0],
-            color: [comp(r), comp(g), comp(b), alpha],
-            radius: 0.0,
-            _pad: [0.0; 3],
-        }
-    }
-}
-
-fn bounds_of(rect: &LayoutRect) -> TextBounds {
-    TextBounds {
-        left: rect.x as i32,
-        top: rect.y as i32,
-        right: (rect.x + rect.w) as i32,
-        bottom: (rect.y + rect.h) as i32,
+        Quad { x: x0, y: y0, w: x1 - x0, h: y1 - y0, color: color(rgb, alpha), radius: 0.0 }
     }
 }
