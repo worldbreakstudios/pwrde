@@ -208,6 +208,18 @@ impl Renderer {
         (rect.x + pad, rect.y + pad)
     }
 
+    /// The (col, row) cell under a point within a tile's content rect.
+    pub fn cell_at(&self, content: &LayoutRect, px: f32, py: f32) -> Option<(usize, usize)> {
+        let (ox, oy) = self.content_origin(content);
+        if px < ox || py < oy {
+            return None;
+        }
+        Some((
+            ((px - ox) / self.cell_width) as usize,
+            ((py - oy) / self.cell_height) as usize,
+        ))
+    }
+
     pub fn draw(
         &mut self,
         workspaces: &[Workspace],
@@ -473,12 +485,23 @@ impl Renderer {
 
         // Coalesce per-cell colors into runs: one (String, Color) span per
         // same-colored stretch keeps the shaping input small.
+        // Links get the accent color + an underline rect; ⌘-click opens.
+        // Detection is wrap-aware: a URL broken across rows is one link.
+        let links = crate::links::links_in_lines(&lines);
+        for l in &links {
+            let span = (l.end_col - l.start_col + 1) as f32;
+            rects.push(self.cell_rect(
+                origin, l.start_col, l.row, 0.0, 0.92, span, 0.06, ACCENT, 1.0,
+            ));
+        }
+
         let mut spans: Vec<(String, Color)> = Vec::new();
         for (row, line) in lines.iter().enumerate() {
             if row > 0 {
                 spans.push(("\n".into(), Color::rgb(0, 0, 0)));
             }
             for cell in line.visible_cells() {
+                let col = cell.cell_index();
                 let attrs = cell.attrs();
                 // No bg quads yet: reversed cells draw in their bg color.
                 let srgba = if attrs.reverse() {
@@ -487,6 +510,11 @@ impl Renderer {
                     self.palette.resolve_fg(attrs.foreground())
                 };
                 let (r, g, b, _) = srgba.to_srgb_u8();
+                let (r, g, b) = if links.iter().any(|l| l.contains(row, col)) {
+                    ACCENT
+                } else {
+                    (r, g, b)
+                };
 
                 // Block elements and box-drawing lines are drawn as exact
                 // cell-filling geometry, never as glyphs: fonts don't
@@ -496,7 +524,6 @@ impl Renderer {
                 if let (Some(ch), None) = single
                     && let Some(units) = char_rects(ch, tx, ty)
                 {
-                    let col = cell.cell_index();
                     rects.extend(units.iter().map(|u| {
                         self.cell_rect(origin, col, row, u.x, u.y, u.w, u.h, (r, g, b), u.alpha)
                     }));

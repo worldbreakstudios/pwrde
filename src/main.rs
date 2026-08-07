@@ -14,6 +14,7 @@
 //! drag a tile tab to reorder, move to another tile, drop on a tile edge to
 //! split it out, or drop on a sidebar group to send it there.
 
+mod links;
 mod rect;
 mod renderer;
 mod term;
@@ -274,6 +275,19 @@ impl App {
         }
     }
 
+    /// ⌘V: clipboard → focused terminal (bracketed-paste aware).
+    fn paste(&mut self) {
+        let Ok(mut clipboard) = arboard::Clipboard::new() else { return };
+        let Ok(text) = clipboard.get_text() else { return };
+        if text.is_empty() {
+            return;
+        }
+        let ws = &self.workspaces[self.active];
+        if let Some(tab) = ws.focused().and_then(|t| t.active_tab()) {
+            tab.session.paste(&text);
+        }
+    }
+
     /// True when the session is the *visible* tab of a tile in the active
     /// workspace.
     fn is_visible(&self, id: u64) -> bool {
@@ -432,6 +446,28 @@ impl App {
         self.request_redraw();
     }
 
+    /// ⌘-click: open the link under the cursor, if any.
+    fn open_link_at(&self, px: f32, py: f32) -> bool {
+        let Some(renderer) = &self.renderer else { return false };
+        let scale = renderer.scale;
+        let ws = &self.workspaces[self.active];
+        let (tiles, _) = workspace::layout_tiles(&ws.root, self.area(), scale);
+        for (id, rect) in &tiles {
+            let content = workspace::tile_content(rect, scale);
+            if !content.contains(px, py) {
+                continue;
+            }
+            if let Some((col, row)) = renderer.cell_at(&content, px, py)
+                && let Some(tab) = ws.root.find_tile(*id).and_then(|t| t.active_tab())
+                && let Some(url) = tab.session.link_at(col, row)
+            {
+                let _ = std::process::Command::new("open").arg(url).spawn();
+                return true;
+            }
+        }
+        false
+    }
+
     fn on_mouse_down(&mut self, event_loop: &ActiveEventLoop) {
         let _ = event_loop;
         let Some(renderer) = &self.renderer else { return };
@@ -440,6 +476,11 @@ impl App {
         let (_, h) = renderer.surface_size();
         let grab = GRAB * scale;
         let sidebar = workspace::sidebar(h, scale, self.sidebar_w);
+
+        // ⌘-click opens links instead of focusing.
+        if self.modifiers.super_key() && self.open_link_at(px, py) {
+            return;
+        }
 
         // Sidebar edge → resize sidebar.
         if (px - sidebar.w).abs() <= grab {
@@ -600,6 +641,7 @@ impl App {
                 ("t", true) => self.add_workspace(),
                 ("w", _) => self.close_active_tab(event_loop),
                 ("q", _) => event_loop.exit(),
+                ("v", _) => self.paste(),
                 ("[" | "{", false) => self.cycle_tile(-1),
                 ("]" | "}", false) => self.cycle_tile(1),
                 ("[" | "{", true) => self.cycle_tab(-1),
