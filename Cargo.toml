@@ -1,0 +1,28 @@
+[package]
+name = "pwrde"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+glyphon = "0.12.0"
+wgpu = "30.0.0"
+winit = "0.30.13"
+pollster = "0.4"
+portable-pty = "0.9.0"
+# wezterm-term isn't published to crates.io; pull it (and termwiz, so the
+# cell/color types are the same version) from the wezterm repo.
+wezterm-term = { git = "https://github.com/wezterm/wezterm", branch = "main" }
+termwiz = { git = "https://github.com/wezterm/wezterm", branch = "main" }
+bytemuck = { version = "1.25.2", features = ["derive"] }
+
+# Perf: fat LTO + single codegen unit for release builds — meaningful wins in
+# the hot glyph/grid paths, same tricks Alacritty ships with.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+
+# Keep dev builds usable: optimize dependencies (wgpu, cosmic-text shaping)
+# even in debug so the terminal is snappy during development.
+[profile.dev.package."*"]
+opt-level = 2
