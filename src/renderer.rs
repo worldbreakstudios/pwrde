@@ -137,7 +137,8 @@ pub struct ConfirmLayout {
 
 /// Per-frame page/navigation state the renderer needs beyond the workspaces:
 /// which page is up, which settings section, the dot-strip animation
-/// progresses (0..1 per page), and the keyboard row being rebound, if any.
+/// progresses (0..1 per page), the keyboard row being rebound, sidebar
+/// sections, and any in-progress inline editors.
 pub struct ChromeState<'a> {
     pub page: Page,
     pub section: Section,
@@ -146,6 +147,12 @@ pub struct ChromeState<'a> {
     /// In-progress edit buffer for the primary-command settings row, if the
     /// row is being edited.
     pub editing_command: Option<&'a str>,
+    /// Sidebar section definitions (Sessions page). Display order is derived
+    /// via [`workspace::sidebar_rows`]; empty sections append at the end.
+    pub sections: &'a [workspace::Section],
+    /// In-progress section rename: `(section_id, buffer)`. When set, that
+    /// section header paints the buffer + caret instead of emoji/name.
+    pub editing_section: Option<(u64, &'a str)>,
 }
 
 /// Everything `main.rs`'s terminal `Element` needs to paint one frame — all
@@ -378,20 +385,30 @@ impl Renderer {
         // so we no longer draw our own here.
         match chrome.page {
             Page::Sessions => {
-                // "+" new-group button: a translucent rounded field below the
-                // titlebar, then one row per group.
+                // Side-by-side "+ group" / "+ section" buttons below the titlebar.
                 let new_group = workspace::new_group_button(self.scale, sidebar_w);
                 bg_quads.push(self.px_rect(&new_group, th.card, 0.55, row_r));
                 labels.push(LabelSpec {
-                    text: "+ new group".into(),
+                    text: "+ group".into(),
                     color: color(th.ink_dim, 1.0),
                     left: (new_group.x + group_pad).round(),
                     top: (new_group.y + (new_group.h - self.cell_height) / 2.0).round(),
                     clip: new_group,
                     size: None,
                 });
+                let new_section = workspace::new_section_button(self.scale, sidebar_w);
+                bg_quads.push(self.px_rect(&new_section, th.card, 0.55, row_r));
+                labels.push(LabelSpec {
+                    text: "+ section".into(),
+                    color: color(th.ink_dim, 1.0),
+                    left: (new_section.x + group_pad).round(),
+                    top: (new_section.y + (new_section.h - self.cell_height) / 2.0).round(),
+                    clip: new_section,
+                    size: None,
+                });
                 if empty {
                     // Empty state: a centered CTA instead of group rows.
+                    // Empty sections (if any) still render below the buttons.
                     let cta = workspace::empty_state_cta(width, height, self.scale, sidebar_w);
                     let hint = workspace::empty_state_hint(width, height, self.scale, sidebar_w);
                     bg_quads.push(self.px_rect(&cta, th.card, 0.62, row_r).shadow(Shadow::Soft));
@@ -415,36 +432,31 @@ impl Renderer {
                         clip: hint,
                         size: None,
                     });
+                    // Still paint empty-section headers under the CTA so a just-
+                    // created section is visible before it gains members.
+                    self.paint_sidebar_rows(
+                        workspaces,
+                        active,
+                        sidebar_w,
+                        chrome,
+                        th,
+                        row_r,
+                        group_pad,
+                        &mut bg_quads,
+                        &mut labels,
+                    );
                 } else {
-                    // Group cards are two lines: the primary pane's title on
-                    // top, the group's cwd below in smaller, dimmer text.
-                    let cwd_size = self.font_size() * 0.85;
-                    let cwd_line_h = self.cell_height * 0.85;
-                    for (i, ws_item) in workspaces.iter().enumerate() {
-                        let tab = workspace::tab_rect(i, self.scale, sidebar_w);
-                        if i == active {
-                            // Active row: a raised rounded pill with a subtle shadow.
-                            bg_quads
-                                .push(self.px_rect(&tab, th.card, 0.78, row_r).shadow(Shadow::Soft));
-                        }
-                        let inset = ((tab.h - (self.cell_height + cwd_line_h)) / 2.0).max(0.0);
-                        labels.push(LabelSpec {
-                            text: ws_item.name.clone(),
-                            color: color(if i == active { th.ink } else { th.ink_dim }, 1.0),
-                            left: tab.x + group_pad,
-                            top: (tab.y + inset).round(),
-                            clip: LayoutRect { w: tab.w - group_pad, ..tab },
-                            size: None,
-                        });
-                        labels.push(LabelSpec {
-                            text: workspace::display_cwd(ws_item.cwd.as_deref()),
-                            color: color(th.ink_dim, 0.8),
-                            left: tab.x + group_pad,
-                            top: (tab.y + inset + self.cell_height).round(),
-                            clip: LayoutRect { w: tab.w - group_pad, ..tab },
-                            size: Some(cwd_size),
-                        });
-                    }
+                    self.paint_sidebar_rows(
+                        workspaces,
+                        active,
+                        sidebar_w,
+                        chrome,
+                        th,
+                        row_r,
+                        group_pad,
+                        &mut bg_quads,
+                        &mut labels,
+                    );
                 }
             },
             Page::Settings => {
@@ -628,6 +640,132 @@ impl Renderer {
         }
 
         Frame { bg_quads, panes, fg_quads, labels, picker_quads, picker_labels }
+    }
+
+    /// Paint Sessions sidebar rows (section headers + group cards) using the
+    /// pure `sidebar_rows` / `sidebar_row_rect` geometry so hit-testing and
+    /// drop resolution can share the same layout.
+    fn paint_sidebar_rows(
+        &self,
+        workspaces: &[Workspace],
+        active: usize,
+        sidebar_w: f32,
+        chrome: &ChromeState,
+        th: &Theme,
+        row_r: f32,
+        group_pad: f32,
+        bg_quads: &mut Vec<Quad>,
+        labels: &mut Vec<LabelSpec>,
+    ) {
+        let rows = workspace::sidebar_rows(workspaces, chrome.sections);
+        let active_row = workspace::active_row_index(&rows, workspaces, chrome.sections, active);
+        let cwd_size = self.font_size() * 0.85;
+        let cwd_line_h = self.cell_height * 0.85;
+        let header_size = self.font_size() * 0.9;
+
+        for (i, row) in rows.iter().enumerate() {
+            let rect = workspace::sidebar_row_rect(&rows, i, workspaces, self.scale, sidebar_w);
+            let is_active_row = active_row == Some(i);
+            match *row {
+                workspace::SidebarRow::SectionHeader { section_idx } => {
+                    let Some(sec) = chrome.sections.get(section_idx) else {
+                        continue;
+                    };
+                    if is_active_row {
+                        bg_quads
+                            .push(self.px_rect(&rect, th.card, 0.78, row_r).shadow(Shadow::Soft));
+                    }
+                    let editing = chrome
+                        .editing_section
+                        .filter(|(id, _)| *id == sec.id)
+                        .map(|(_, buf)| buf);
+                    if let Some(buf) = editing {
+                        bg_quads.push(self.px_rect(&rect, th.accent, 0.18, row_r));
+                        let caret_w = (2.0 * self.scale).round().max(1.0);
+                        let text_left = (rect.x + group_pad).round();
+                        let top =
+                            (rect.y + (rect.h - self.cell_height) / 2.0).round();
+                        labels.push(LabelSpec {
+                            text: buf.to_string(),
+                            color: color(th.ink, 1.0),
+                            left: text_left,
+                            top,
+                            clip: LayoutRect {
+                                w: (rect.w - group_pad - caret_w - 2.0).max(0.0),
+                                ..rect
+                            },
+                            size: Some(header_size),
+                        });
+                        let w = buf.chars().count() as f32 * self.cell_width * 0.9;
+                        let caret = LayoutRect {
+                            x: (text_left + w).round(),
+                            y: top,
+                            w: caret_w,
+                            h: self.cell_height,
+                        };
+                        bg_quads.push(self.px_rect(&caret, th.accent, 1.0, 0.0));
+                    } else {
+                        let chevron = if sec.collapsed { "▸" } else { "▾" };
+                        let member_count = workspaces
+                            .iter()
+                            .filter(|w| w.section == Some(sec.id))
+                            .count();
+                        let mut text = String::new();
+                        text.push_str(chevron);
+                        text.push(' ');
+                        if !sec.emoji.is_empty() {
+                            text.push_str(&sec.emoji);
+                            text.push(' ');
+                        }
+                        text.push_str(&sec.name);
+                        if sec.collapsed && member_count > 0 {
+                            text.push_str(&format!(" · {member_count}"));
+                        }
+                        labels.push(LabelSpec {
+                            text,
+                            color: color(
+                                if is_active_row { th.ink } else { th.ink_dim },
+                                1.0,
+                            ),
+                            left: (rect.x + group_pad).round(),
+                            top: (rect.y + (rect.h - self.cell_height) / 2.0).round(),
+                            clip: LayoutRect { w: rect.w - group_pad, ..rect },
+                            size: Some(header_size),
+                        });
+                    }
+                }
+                workspace::SidebarRow::Group { ws_idx } => {
+                    let Some(ws_item) = workspaces.get(ws_idx) else {
+                        continue;
+                    };
+                    if is_active_row {
+                        bg_quads
+                            .push(self.px_rect(&rect, th.card, 0.78, row_r).shadow(Shadow::Soft));
+                    }
+                    let inset =
+                        ((rect.h - (self.cell_height + cwd_line_h)) / 2.0).max(0.0);
+                    labels.push(LabelSpec {
+                        text: ws_item.name.clone(),
+                        color: color(
+                            if is_active_row { th.ink } else { th.ink_dim },
+                            1.0,
+                        ),
+                        left: rect.x + group_pad,
+                        top: (rect.y + inset).round(),
+                        clip: LayoutRect { w: rect.w - group_pad, ..rect },
+                        size: None,
+                    });
+                    labels.push(LabelSpec {
+                        text: workspace::display_cwd(ws_item.cwd.as_deref()),
+                        color: color(th.ink_dim, 0.8),
+                        left: rect.x + group_pad,
+                        top: (rect.y + inset + self.cell_height).round(),
+                        clip: LayoutRect { w: rect.w - group_pad, ..rect },
+                        size: Some(cwd_size),
+                    });
+                }
+            }
+        }
     }
 
     /// The Settings page: a single card styled exactly like a terminal tile
