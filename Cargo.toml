@@ -23,6 +23,10 @@ gpui = { git = "https://github.com/zed-industries/zed", rev = "027cf0def75e5c027
 # NO glyphs render (quads still do). With it we get the real CoreText MacTextSystem.
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "027cf0def75e5c027504f402a6a6c0dcac11f178", package = "gpui_platform", features = ["font-kit"] }
 arboard = "3.6.1"
+# Both already in gpui's dependency tree at these versions; used to reach the
+# NSWindow and hide AppKit's titlebar top-highlight hairline (see main.rs).
+objc = "0.2"
+raw-window-handle = "0.6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dirs = "6"

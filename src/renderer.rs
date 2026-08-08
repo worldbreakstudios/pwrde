@@ -145,16 +145,25 @@ pub fn measure_cell_width(window: &mut gpui::Window, scale: f32) -> f32 {
 
 impl Renderer {
     pub fn new(scale: f32, cell_width: f32, width: u32, height: u32) -> Self {
-        let font_size = FONT_SIZE * scale;
-        let line_height = (font_size * LINE_HEIGHT_FACTOR).round();
-        Self {
+        let mut renderer = Self {
             palette: ColorPalette::default(),
             width: width.max(1),
             height: height.max(1),
             scale,
-            cell_width: cell_width.round(),
-            cell_height: line_height,
-        }
+            cell_width: 0.0,
+            cell_height: 0.0,
+        };
+        renderer.update_scale(scale, cell_width);
+        renderer
+    }
+
+    /// Recompute cell metrics for a new display scale (the window moved to a
+    /// monitor with a different backing scale factor). `cell_width` must be
+    /// re-measured by the caller at the new scale via [`measure_cell_width`].
+    pub fn update_scale(&mut self, scale: f32, cell_width: f32) {
+        self.scale = scale;
+        self.cell_width = cell_width.round();
+        self.cell_height = (FONT_SIZE * scale * LINE_HEIGHT_FACTOR).round();
     }
 
     /// Physical-px font size for shaping (logical size × scale).
