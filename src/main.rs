@@ -16,6 +16,7 @@
 //! `Application`, a window, and a terminal `Element`. Terminal wakeups arrive
 //! over an `mpsc` channel drained on gpui's foreground executor.
 
+mod claude_hooks;
 mod git;
 mod links;
 mod pages;
@@ -314,7 +315,9 @@ impl App {
                     let tab_cwd = st.cwd.as_ref().map(std::path::PathBuf::from);
                     let session = self
                         .spawn_session_named(tab_cwd.as_deref().or(cwd), st.shpool_session.clone());
-                    restored.tabs.push(Tab::new(session));
+                    let mut tab = Tab::new(session);
+                    tab.unread = st.unread;
+                    restored.tabs.push(tab);
                 }
                 restored.active = saved.iter().position(|st| st.active).unwrap_or(0);
                 Node::Leaf(restored)
@@ -420,6 +423,7 @@ impl App {
                 self.persist_snapshot();
             }
             self.sync_layout();
+            self.mark_visible_read();
             self.request_redraw();
         }
     }
@@ -434,6 +438,7 @@ impl App {
         let n = ids.len() as isize;
         let next = (((cur as isize + delta) % n + n) % n) as usize;
         ws.focused_tile = ids[next];
+        self.mark_visible_read();
         self.request_redraw();
     }
 
@@ -450,6 +455,7 @@ impl App {
             tile.active = (((cur + delta) % n + n) % n) as usize;
         }
         self.sync_layout();
+        self.mark_visible_read();
         self.request_redraw();
     }
 
@@ -665,6 +671,124 @@ impl App {
             .tiles()
             .iter()
             .any(|t| t.active_tab().is_some_and(|tab| tab.session.id == id))
+    }
+
+    /// Mark the tab owning session `id` unread. Returns true (and persists)
+    /// only on a false→true transition, so repeated attention signals from
+    /// one pane don't churn the snapshot.
+    fn set_unread_by_session(&mut self, id: u64) -> bool {
+        let changed = self.workspaces.iter_mut().any(|ws| {
+            ws.root.tiles_mut().into_iter().any(|t| {
+                t.tabs.iter_mut().any(|tab| {
+                    let hit = tab.session.id == id && !tab.unread;
+                    if hit {
+                        tab.unread = true;
+                    }
+                    hit
+                })
+            })
+        });
+        if changed {
+            self.persist_snapshot();
+        }
+        changed
+    }
+
+    /// The "visible = read" sweep: clear the unread dot on every on-screen
+    /// tab (each tile's active tab) of the active group. Called after actions
+    /// that change what's on screen — never per frame, or a manual
+    /// mark-as-unread on a visible tab would clear before it could be seen.
+    fn mark_visible_read(&mut self) {
+        if self.page != Page::Sessions {
+            return;
+        }
+        let mut changed = false;
+        for tile in self.workspaces[self.active].root.tiles_mut() {
+            if let Some(tab) = tile.active_tab_mut()
+                && tab.unread
+            {
+                tab.unread = false;
+                changed = true;
+            }
+        }
+        if changed {
+            self.persist_snapshot();
+            self.request_redraw();
+        }
+    }
+
+    /// Right-click marks things unread again — the "come back to this later"
+    /// gesture. A sidebar group card re-dots its primary pane's active tab
+    /// (the same tab the card's dot mirrors); a tile tab re-dots that tab.
+    /// Never changes focus.
+    fn on_right_mouse_down(&mut self) {
+        if self.page != Page::Sessions
+            || self.confirm.is_some()
+            || self.message.is_some()
+            || self.fork.is_some()
+            || self.picker.is_some()
+        {
+            return;
+        }
+        let scale = self.scale();
+        let (px, py) = (self.cursor.0 as f32, self.cursor.1 as f32);
+        let (_, h) = self.renderer.surface_size();
+
+        if workspace::sidebar(h, scale, self.sidebar_w).contains(px, py) {
+            let rows = workspace::sidebar_rows(&self.workspaces, &self.sections);
+            for (ri, row) in rows.iter().enumerate() {
+                let rect = workspace::sidebar_row_rect(
+                    &rows,
+                    ri,
+                    &self.workspaces,
+                    scale,
+                    self.sidebar_w,
+                );
+                if !rect.contains(px, py) {
+                    continue;
+                }
+                if let workspace::SidebarRow::Group { ws_idx } = *row {
+                    let ws = &mut self.workspaces[ws_idx];
+                    let primary = ws.primary_tile;
+                    if let Some(tab) =
+                        ws.root.find_tile_mut(primary).and_then(|t| t.active_tab_mut())
+                        && !tab.unread
+                    {
+                        tab.unread = true;
+                        self.persist_snapshot();
+                        self.request_redraw();
+                    }
+                }
+                return;
+            }
+            return;
+        }
+
+        // Tile tab strips of the active group.
+        let ws = &self.workspaces[self.active];
+        let (tiles, _) = workspace::layout_tiles(&ws.root, self.area(), scale);
+        for (id, rect) in &tiles {
+            let bar = workspace::tile_tab_bar(rect, scale);
+            if !bar.contains(px, py) {
+                continue;
+            }
+            if let Some(tile) = self.workspaces[self.active].root.find_tile_mut(*id) {
+                let n = tile.tabs.len();
+                if n == 0 {
+                    return;
+                }
+                let tab_w = workspace::tile_tab_rect(rect, 0, n, scale).w;
+                let ti = (((px - bar.x) / tab_w).floor() as usize).min(n - 1);
+                if let Some(tab) = tile.tabs.get_mut(ti)
+                    && !tab.unread
+                {
+                    tab.unread = true;
+                    self.persist_snapshot();
+                    self.request_redraw();
+                }
+            }
+            return;
+        }
     }
 
     // ── cwd picker ──────────────────────────────────────────────────────
@@ -1363,6 +1487,7 @@ impl App {
             _ => {},
         }
         self.sync_layout();
+        self.mark_visible_read();
         self.request_redraw();
         self.persist_snapshot();
     }
@@ -1733,6 +1858,7 @@ impl App {
                     }
                     self.drag = Drag::TabPress { tile: *id, tab: ti, start: self.cursor };
                     self.sync_layout();
+                    self.mark_visible_read();
                     self.request_redraw();
                 }
             } else {
@@ -1746,6 +1872,7 @@ impl App {
                     }
                     self.drag = Drag::Select { tile: *id };
                 }
+                self.mark_visible_read();
                 self.request_redraw();
             }
             return;
@@ -2242,6 +2369,7 @@ impl App {
             // Grids may have gone stale while the Settings page was up.
             if page == Page::Sessions {
                 self.sync_layout();
+                self.mark_visible_read();
             }
         }
         self.request_redraw();
@@ -2391,6 +2519,15 @@ impl App {
                 TermEvent::GroupFailed { message } => {
                     self.message = Some((format!("drop failed: {message}"), true));
                     redraw = true;
+                },
+                // A pane signaled for attention (OSC 9, emitted by the Claude
+                // Code hooks). On-screen tabs of the active group are being
+                // watched, so only hidden tabs gain the unread dot.
+                TermEvent::Attention(id) => {
+                    let watched = self.page == Page::Sessions && self.is_visible(id);
+                    if !watched && self.set_unread_by_session(id) {
+                        redraw = true;
+                    }
                 },
             }
         }
@@ -2696,6 +2833,16 @@ impl Render for App {
                     app.cursor = (f64::from(ev.position.x) * s, f64::from(ev.position.y) * s);
                     app.modifiers = ev.modifiers;
                     app.on_mouse_down(window, ev.click_count);
+                    cx.notify();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|app, ev: &MouseDownEvent, _window, cx| {
+                    let s = app.scale() as f64;
+                    app.cursor = (f64::from(ev.position.x) * s, f64::from(ev.position.y) * s);
+                    app.modifiers = ev.modifiers;
+                    app.on_right_mouse_down();
                     cx.notify();
                 }),
             )
@@ -3043,6 +3190,9 @@ fn paint_quad(
 fn main() {
     // Settings must be in memory before anything reads a binding or theme.
     settings::init();
+    // Install the Claude Code attention hooks (script + settings merge);
+    // warns and continues on any failure, never blocks launch.
+    claude_hooks::install();
     // At this gpui rev the platform lives in the gpui_platform crate; zed's own
     // main builds it the same way (current_platform → Application::with_platform).
     let platform = gpui_platform::current_platform(false);

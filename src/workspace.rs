@@ -19,11 +19,13 @@ pub struct Tab {
     /// Cached grid size; used to skip redundant PTY resizes.
     pub cols: usize,
     pub rows: usize,
+    /// Whether this tab has unseen output (set by attention signal, cleared on focus).
+    pub unread: bool,
 }
 
 impl Tab {
     pub fn new(session: Session) -> Self {
-        Self { session, cols: 0, rows: 0 }
+        Self { session, cols: 0, rows: 0, unread: false }
     }
 }
 
@@ -231,6 +233,15 @@ impl Workspace {
             .map(|tab| tab.session.title())
             .filter(|t| !t.is_empty())
             .unwrap_or_else(|| self.name.clone())
+    }
+
+    /// Whether the primary tile's active tab has unread output.
+    pub fn primary_unread(&self) -> bool {
+        self.root
+            .find_tile(self.primary_tile)
+            .and_then(|t| t.active_tab())
+            .map(|tab| tab.unread)
+            .unwrap_or(false)
     }
 
     /// Ensure `focused_tile` points at an existing tile.
@@ -1054,6 +1065,32 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn primary_unread_false_on_placeholder_or_missing_primary() {
+        // Empty tile has no active tab → false.
+        let ws = Workspace::new("g".into(), Tile::empty(7), None);
+        assert!(!ws.primary_unread());
+
+        // Vanished primary tile → false, no panic.
+        let mut ws = Workspace::new("g".into(), Tile::empty(7), None);
+        ws.primary_tile = 999;
+        assert!(!ws.primary_unread());
+    }
+
+    #[test]
+    fn primary_unread_true_when_active_tab_is_unread() {
+        use crate::term::Session;
+        let sess = Session::placeholder();
+        let mut tile = Tile::new(42, sess);
+        let tile_id = tile.id;
+        if let Some(tab) = tile.active_tab_mut() {
+            tab.unread = true;
+        }
+        let ws = Workspace::new("g".into(), tile, None);
+        assert_eq!(ws.primary_tile, tile_id);
+        assert!(ws.primary_unread());
     }
 
     #[test]

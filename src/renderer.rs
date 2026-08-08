@@ -575,6 +575,20 @@ impl Renderer {
                         workspace::tile_tab_close_rect(rect, ti, tile.tabs.len(), self.scale);
                     let title = tab.session.title();
                     let text = if title.is_empty() { "shell".to_string() } else { title };
+                    // Unread: an accent dot before the title, which shifts
+                    // right to make room (the clip's right edge is unchanged).
+                    let mut text_left = tr.x + tab_text_pad;
+                    if tab.unread {
+                        let ds = (6.0 * self.scale).round();
+                        let dot = LayoutRect {
+                            x: text_left,
+                            y: (tr.y + (tr.h - ds) / 2.0).round(),
+                            w: ds,
+                            h: ds,
+                        };
+                        fg_quads.push(self.px_rect(&dot, th.accent, 1.0, ds / 2.0));
+                        text_left += ds + (5.0 * self.scale).round();
+                    }
                     labels.push(LabelSpec {
                         text,
                         color: if ti == tile.active {
@@ -582,7 +596,7 @@ impl Renderer {
                         } else {
                             color(pane_ink_dim.0, pane_ink_dim.1)
                         },
-                        left: tr.x + tab_text_pad,
+                        left: text_left,
                         top: (tr.y + (tr.h - self.cell_height) / 2.0).round(),
                         clip: LayoutRect {
                             w: (close.x - tr.x - tab_text_pad).max(0.0),
@@ -784,6 +798,21 @@ impl Renderer {
                         bg_quads
                             .push(self.px_rect(&rect, th.card, 0.78, row_r).shadow(Shadow::Soft));
                     }
+                    // Unread (mirrors the title: the primary pane's active
+                    // tab): an accent dot at the card's right edge, with the
+                    // text clips shortened so titles never run under it.
+                    let mut clip_w = rect.w - group_pad;
+                    if ws_item.primary_unread() {
+                        let ds = (7.0 * self.scale).round();
+                        let dot = LayoutRect {
+                            x: rect.x + rect.w - group_pad - ds,
+                            y: (rect.y + (rect.h - ds) / 2.0).round(),
+                            w: ds,
+                            h: ds,
+                        };
+                        bg_quads.push(self.px_rect(&dot, th.accent, 1.0, ds / 2.0));
+                        clip_w -= ds + group_pad;
+                    }
                     let inset =
                         ((rect.h - (self.cell_height + cwd_line_h)) / 2.0).max(0.0);
                     labels.push(LabelSpec {
@@ -794,7 +823,7 @@ impl Renderer {
                         ),
                         left: rect.x + group_pad,
                         top: (rect.y + inset).round(),
-                        clip: LayoutRect { w: rect.w - group_pad, ..rect },
+                        clip: LayoutRect { w: clip_w, ..rect },
                         size: None,
                     });
                     labels.push(LabelSpec {
@@ -802,7 +831,7 @@ impl Renderer {
                         color: color(th.ink_dim, 0.8),
                         left: rect.x + group_pad,
                         top: (rect.y + inset + self.cell_height).round(),
-                        clip: LayoutRect { w: rect.w - group_pad, ..rect },
+                        clip: LayoutRect { w: clip_w, ..rect },
                         size: Some(cwd_size),
                     });
                 }
