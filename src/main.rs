@@ -18,10 +18,13 @@
 
 mod git;
 mod links;
+mod pages;
 mod picker;
 mod rect;
 mod renderer;
+mod settings;
 mod term;
+mod theme;
 mod workspace;
 
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -35,6 +38,7 @@ use gpui::{
     Size, Styled, TextAlign, TextRun, Window, WindowBounds, WindowOptions,
 };
 
+use pages::{Action, Binding, Page, Section};
 use renderer::Renderer;
 use term::{Session, TermEvent};
 use workspace::{Dir, Node, Tab, Tile, Workspace};
@@ -110,6 +114,17 @@ struct App {
     /// Sub-notch wheel travel carried between scroll events so tiny deltas
     /// accumulate into whole scroll steps instead of being lost.
     scroll_accum: f64,
+    /// The active top-level page (Sessions / Settings).
+    page: Page,
+    /// The active section while the Settings page is up.
+    section: Section,
+    /// Keyboard-page row currently capturing a new binding, if any.
+    recording: Option<Action>,
+    /// Dot↔glyph crossfade progress per page slot (0..1), advanced each tick
+    /// toward 1 for the hovered/active slot and 0 otherwise.
+    dot_anim: Vec<f32>,
+    /// Page slot currently under the pointer.
+    dot_hover: Option<usize>,
 }
 
 impl App {
@@ -305,6 +320,10 @@ impl App {
     /// scrollback of ours to move.
     fn on_scroll(&mut self, delta: gpui::ScrollDelta, cell_height: f32) {
         if self.message.is_some() || self.fork.is_some() || self.picker.is_some() {
+            return;
+        }
+        // Only the Sessions page has terminals to scroll.
+        if self.page != Page::Sessions {
             return;
         }
         let scale = self.scale();
@@ -748,31 +767,35 @@ impl App {
 
         let sidebar = workspace::sidebar(h, scale, self.sidebar_w);
 
-        // ⌘-click opens links instead of focusing.
-        if self.modifiers.platform && self.open_link_at(px, py) {
+        // ⌘-click opens links instead of focusing (Sessions only — the
+        // terminal grids aren't visible on other pages).
+        if self.page == Page::Sessions && self.modifiers.platform && self.open_link_at(px, py) {
             return;
         }
 
-        // Sidebar edge → resize sidebar.
+        // Sidebar edge → resize sidebar (every page shares the width).
         if (px - sidebar.w).abs() <= grab {
             self.drag = Drag::Sidebar;
             return;
         }
 
-        // Empty state: the centered CTA is the only interactive element in
-        // the content area (the placeholder tile must not arm tab drags).
-        if self.is_empty_state() && !sidebar.contains(px, py) {
+        // Empty state (Sessions only): the centered CTA is the only
+        // interactive element in the content area (the placeholder tile must
+        // not arm tab drags). The Settings page keeps its own hit-testing.
+        if self.page == Page::Sessions && self.is_empty_state() && !sidebar.contains(px, py) {
             if workspace::empty_state_cta(w, h, scale, self.sidebar_w).contains(px, py) {
                 self.open_picker();
             }
             return;
         }
 
-        let ws = &self.workspaces[self.active];
-        let (tiles, dividers) = workspace::layout_tiles(&ws.root, self.area(), scale);
-        if let Some(d) = dividers.iter().find(|d| d.rect.inflate(grab).contains(px, py)) {
-            self.drag = Drag::Divider { path: d.path.clone() };
-            return;
+        if self.page == Page::Sessions {
+            let ws = &self.workspaces[self.active];
+            let (_, dividers) = workspace::layout_tiles(&ws.root, self.area(), scale);
+            if let Some(d) = dividers.iter().find(|d| d.rect.inflate(grab).contains(px, py)) {
+                self.drag = Drag::Divider { path: d.path.clone() };
+                return;
+            }
         }
 
         // Sidebar: titlebar strip = traffic lights + window drag handle.
@@ -783,6 +806,23 @@ impl App {
                 // Native traffic-light buttons handle their own clicks; a press
                 // anywhere else in the strip drags the window (we own the drag).
                 window.start_window_move();
+                return;
+            }
+            // Page-dot strip at the sidebar's bottom: click navigates.
+            if let Some(i) = self.page_slot_at(px, py) {
+                self.set_page(Page::ALL[i]);
+                return;
+            }
+            if self.page == Page::Settings {
+                // Settings sections sit in the group rows' slots.
+                for (i, section) in Section::ALL.iter().enumerate() {
+                    if workspace::tab_rect(i, scale, self.sidebar_w).contains(px, py) {
+                        self.section = *section;
+                        self.recording = None;
+                        self.request_redraw();
+                        return;
+                    }
+                }
                 return;
             }
             if workspace::new_group_button(scale, self.sidebar_w).contains(px, py) {
@@ -797,6 +837,14 @@ impl App {
             }
             return;
         }
+
+        // Settings page: the content area is the settings card.
+        if self.page == Page::Settings {
+            self.settings_click(px, py);
+            return;
+        }
+        let ws = &self.workspaces[self.active];
+        let (tiles, _) = workspace::layout_tiles(&ws.root, self.area(), scale);
 
         // Tiles: tab strip press (activate + arm drag) or content focus.
         for (id, rect) in &tiles {
@@ -887,6 +935,9 @@ impl App {
                 let _ = area;
             },
             Drag::None => {
+                // Page-dot hover: the crossfade animation is driven by the
+                // 16ms tick in drain_events; here we only track the target.
+                self.dot_hover = self.page_slot_at(px, py);
                 // Hover resize-cursor affordances. We compute which resize
                 // orientation the pointer is over (sidebar edge = horizontal,
                 // a divider = its split direction). This references Divider.dir.
@@ -935,6 +986,11 @@ impl App {
         // the PTY so typing filters the list rather than reaching the shell.
         if self.message.is_some() || self.fork.is_some() || self.picker.is_some() {
             self.handle_picker_key(ev);
+            return;
+        }
+        // The Settings page owns the keyboard: no PTY to type into.
+        if self.page == Page::Settings {
+            self.handle_settings_key(ev);
             return;
         }
         // ⌘ shortcuts take priority over passing bytes to the shell.
@@ -1043,38 +1099,138 @@ impl App {
         self.request_redraw();
     }
 
-    fn handle_shortcut(&mut self, ev: &KeyDownEvent) {
-        let shift = ev.keystroke.modifiers.shift;
-        let key = ev.keystroke.key.as_str();
-        // Empty state: there is no pane to act on. ⌘T/⇧⌘T start a group via
-        // the picker, ⌘Q still quits, everything else is a no-op.
-        if self.is_empty_state() {
-            match key {
-                "t" => self.open_picker(),
-                "q" => std::process::exit(0),
-                _ => {},
+    /// Keyboard routing while the Settings page is up. A recording keyboard
+    /// row captures the next ⌘ chord as its new binding; otherwise ⌘
+    /// shortcuts still dispatch and plain typing is swallowed.
+    fn handle_settings_key(&mut self, ev: &KeyDownEvent) {
+        if let Some(action) = self.recording {
+            if ev.keystroke.key == "escape" {
+                self.recording = None;
+            } else if let Some(binding) = Binding::from_keystroke(&ev.keystroke) {
+                settings::set(&action.setting_key(), binding.serialize().into());
+                self.recording = None;
             }
             self.request_redraw();
             return;
         }
-        match (key, shift) {
-            ("d", false) => self.split(Dir::Row),
-            ("d", true) => self.split(Dir::Column),
-            ("t", false) => self.new_tab(),
-            ("t", true) => self.open_picker(),
-            ("c", _) => self.copy(),
-            ("w", _) => self.close_active_tab(),
-            ("q", _) => std::process::exit(0),
-            ("v", _) => self.paste(),
-            ("[" | "{", false) => self.cycle_tile(-1),
-            ("]" | "}", false) => self.cycle_tile(1),
-            ("[" | "{", true) => self.cycle_tab(-1),
-            ("]" | "}", true) => self.cycle_tab(1),
-            (s, _) => {
-                if let Some(d) = s.chars().next().and_then(|c| c.to_digit(10))
-                    && d >= 1
-                {
-                    self.switch_workspace(d as usize - 1);
+        if ev.keystroke.modifiers.platform {
+            self.handle_shortcut(ev);
+        }
+    }
+
+    /// Dispatch a ⌘ chord through the rebindable-action table (settings-backed
+    /// bindings with defaults). ⌘1–9 group switching stays fixed.
+    fn handle_shortcut(&mut self, ev: &KeyDownEvent) {
+        if let Some(action) = pages::match_action(&ev.keystroke) {
+            self.run_action(action);
+            self.request_redraw();
+            return;
+        }
+        if self.page == Page::Sessions
+            && let Some(d) = ev.keystroke.key.chars().next().and_then(|c| c.to_digit(10))
+            && d >= 1
+        {
+            self.switch_workspace(d as usize - 1);
+        }
+        self.request_redraw();
+    }
+
+    /// Run a rebindable action. Page navigation and quit work everywhere;
+    /// terminal-layout actions only make sense on the Sessions page.
+    fn run_action(&mut self, action: Action) {
+        match action {
+            Action::PrevPage => return self.cycle_page(-1),
+            Action::NextPage => return self.cycle_page(1),
+            Action::Quit => std::process::exit(0),
+            _ => {},
+        }
+        if self.page != Page::Sessions {
+            return;
+        }
+        // Empty state: there is no pane to act on. New tab / new group start
+        // a group via the picker; everything else is a no-op.
+        if self.is_empty_state() {
+            if matches!(action, Action::NewTab | Action::NewGroup) {
+                self.open_picker();
+            }
+            return;
+        }
+        match action {
+            Action::SplitRight => self.split(Dir::Row),
+            Action::SplitDown => self.split(Dir::Column),
+            Action::NewTab => self.new_tab(),
+            Action::NewGroup => self.open_picker(),
+            Action::Copy => self.copy(),
+            Action::Paste => self.paste(),
+            Action::CloseTab => self.close_active_tab(),
+            Action::PrevTile => self.cycle_tile(-1),
+            Action::NextTile => self.cycle_tile(1),
+            Action::PrevTab => self.cycle_tab(-1),
+            Action::NextTab => self.cycle_tab(1),
+            Action::PrevPage | Action::NextPage | Action::Quit => {},
+        }
+    }
+
+    /// ⌘⇧←/→: step through `Page::ALL`, wrapping at both ends.
+    fn cycle_page(&mut self, delta: isize) {
+        let i = pages::cycle(self.page.index(), Page::ALL.len(), delta);
+        self.set_page(Page::ALL[i]);
+    }
+
+    fn set_page(&mut self, page: Page) {
+        if self.page != page {
+            self.page = page;
+            self.recording = None;
+            // Grids may have gone stale while the Settings page was up.
+            if page == Page::Sessions {
+                self.sync_layout();
+            }
+        }
+        self.request_redraw();
+    }
+
+    /// The page slot under a point in the sidebar's bottom strip, if any
+    /// (slightly inflated so the small dots are easy to hit).
+    fn page_slot_at(&self, px: f32, py: f32) -> Option<usize> {
+        let (_, h) = self.renderer.surface_size();
+        let scale = self.scale();
+        let n = Page::ALL.len();
+        (0..n).find(|&i| {
+            workspace::page_slot_rect(i, n, h, scale, self.sidebar_w)
+                .inflate((3.0 * scale).round())
+                .contains(px, py)
+        })
+    }
+
+    /// Route a click inside the settings card to the row it hit.
+    fn settings_click(&mut self, px: f32, py: f32) {
+        let area = self.area();
+        let scale = self.scale();
+        match self.section {
+            Section::Keyboard => {
+                for (i, action) in Action::ALL.iter().enumerate() {
+                    if workspace::settings_row_rect(&area, i, scale).contains(px, py) {
+                        self.recording = Some(*action);
+                        self.request_redraw();
+                        return;
+                    }
+                }
+                // A click anywhere else cancels an armed recording.
+                self.recording = None;
+            },
+            Section::Themes => {
+                for (i, preset) in theme::ALL.iter().enumerate() {
+                    if workspace::settings_row_rect(&area, i, scale).contains(px, py) {
+                        settings::set("theme", preset.name.into());
+                        break;
+                    }
+                }
+            },
+            Section::Debug => {
+                let row = workspace::settings_row_rect(&area, pages::DEBUG_TOGGLE_ROW, scale);
+                if row.contains(px, py) {
+                    let on = settings::get_bool("debug.overlay", false);
+                    settings::set("debug.overlay", (!on).into());
                 }
             },
         }
@@ -1116,6 +1272,18 @@ impl App {
                     self.message = Some((format!("drop failed: {message}"), true));
                     redraw = true;
                 },
+            }
+        }
+        // Advance the page-dot crossfades: hovered or active slots head to 1,
+        // the rest back to 0. Redraw while any slot is mid-flight.
+        let active = self.page.index();
+        for (i, p) in self.dot_anim.iter_mut().enumerate() {
+            let target = if i == active || Some(i) == self.dot_hover { 1.0 } else { 0.0 };
+            let next =
+                if *p < target { (*p + 0.15).min(target) } else { (*p - 0.15).max(target) };
+            if next != *p {
+                *p = next;
+                redraw = true;
             }
         }
         redraw || self.dirty
@@ -1455,6 +1623,12 @@ impl App {
             None
         };
 
+        let chrome = renderer::ChromeState {
+            page: self.page,
+            section: self.section,
+            dot_anim: &self.dot_anim,
+            recording: self.recording,
+        };
         let frame = self.renderer.build_frame(
             &self.workspaces,
             self.active,
@@ -1463,6 +1637,7 @@ impl App {
             self.picker.as_ref(),
             self.fork.as_ref(),
             self.message.as_ref(),
+            &chrome,
         );
 
         let origin = bounds.origin;
@@ -1472,25 +1647,29 @@ impl App {
         let line_height = px(self.renderer.cell_height * inv);
         let cell_height = self.renderer.cell_height;
 
+        // Theme colors resolved once per frame (gradient + shadow ink).
+        let th = self.renderer.theme();
+        let shadow_rgb = th.shadow;
+
         // Paint inside an explicit content mask over our bounds. Text glyphs
         // paint into their own pushed layer (via gpui's paint_layer); without an
         // established content-mask context those sub-layers don't composite —
         // this mirrors how Zed's own TerminalElement paints.
         window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
-            // 0) the warm window gradient every card and sidebar row floats on
-            // (mockup 3a's tinted wrapper).
+            // 0) the themed window gradient every card and sidebar row floats
+            // on (mockup 3a's tinted wrapper).
             window.paint_quad(gpui::fill(
                 bounds,
                 gpui::linear_gradient(
                     135.0,
-                    gpui::linear_color_stop(renderer::color(renderer::GRADIENT_FROM, 1.0), 0.0),
-                    gpui::linear_color_stop(renderer::color(renderer::GRADIENT_TO, 1.0), 1.0),
+                    gpui::linear_color_stop(renderer::color(th.gradient_from, 1.0), 0.0),
+                    gpui::linear_color_stop(renderer::color(th.gradient_to, 1.0), 1.0),
                 ),
             ));
 
             // 1) background quads.
             for q in &frame.bg_quads {
-                paint_quad(window, origin, inv, q);
+                paint_quad(window, origin, inv, q, shadow_rgb);
             }
 
             // 2) per-pane foreground text.
@@ -1525,7 +1704,7 @@ impl App {
 
             // 3) foreground quads (box-drawing / block glyphs from rect.rs).
             for q in &frame.fg_quads {
-                paint_quad(window, origin, inv, q);
+                paint_quad(window, origin, inv, q, shadow_rgb);
             }
 
             // 4) labels (tab titles, sidebar text, etc.).
@@ -1555,7 +1734,7 @@ impl App {
 
             // 5) picker / fork / message overlay.
             for q in &frame.picker_quads {
-                paint_quad(window, origin, inv, q);
+                paint_quad(window, origin, inv, q, shadow_rgb);
             }
             for label in &frame.picker_labels {
                 let runs = [TextRun {
@@ -1638,8 +1817,14 @@ fn hide_titlebar_decoration(window: &Window) {
 }
 
 /// Paint one renderer `Quad` (physical-px coords) as a gpui fill, with its
-/// optional drop shadow (under) and border.
-fn paint_quad(window: &mut Window, origin: Point<Pixels>, inv: f32, q: &renderer::Quad) {
+/// optional drop shadow (under, in the theme's shadow ink) and border.
+fn paint_quad(
+    window: &mut Window,
+    origin: Point<Pixels>,
+    inv: f32,
+    q: &renderer::Quad,
+    shadow_rgb: (u8, u8, u8),
+) {
     let b = Bounds {
         origin: Point::new(origin.x + px(q.x * inv), origin.y + px(q.y * inv)),
         size: Size::new(px(q.w * inv), px(q.h * inv)),
@@ -1656,7 +1841,7 @@ fn paint_quad(window: &mut Window, origin: Point<Pixels>, inv: f32, q: &renderer
             b,
             radii,
             &[gpui::BoxShadow {
-                color: renderer::color((32, 30, 29), alpha),
+                color: renderer::color(shadow_rgb, alpha),
                 offset: Point::new(px(0.0), px(dy)),
                 blur_radius: px(blur),
                 spread_radius: px(0.0),
@@ -1676,6 +1861,8 @@ fn paint_quad(window: &mut Window, origin: Point<Pixels>, inv: f32, q: &renderer
 }
 
 fn main() {
+    // Settings must be in memory before anything reads a binding or theme.
+    settings::init();
     // At this gpui rev the platform lives in the gpui_platform crate; zed's own
     // main builds it the same way (current_platform → Application::with_platform).
     let platform = gpui_platform::current_platform(false);
@@ -1733,6 +1920,16 @@ fn main() {
                         focus_handle: cx.focus_handle(),
                         dirty: true,
                         scroll_accum: 0.0,
+                        page: Page::Sessions,
+                        section: Section::Keyboard,
+                        recording: None,
+                        // The active page's slot starts fully glyphed.
+                        dot_anim: {
+                            let mut v = vec![0.0; Page::ALL.len()];
+                            v[Page::Sessions.index()] = 1.0;
+                            v
+                        },
+                        dot_hover: None,
                     };
                     // Launch into the empty state: no shell is spawned until
                     // the user starts a group (CTA click or ⇧⌘T).

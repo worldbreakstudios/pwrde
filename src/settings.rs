@@ -1,0 +1,126 @@
+//! Persistent key-value settings.
+//!
+//! `~/.pwrde/settings.json` is a flat JSON object (key → value). It is read
+//! once at startup into a global in-memory store; `set` updates the store and
+//! rewrites the file, so the file is always the durable truth and the store is
+//! always current. A missing or corrupt file yields an empty store — settings
+//! must never prevent the app from launching.
+//!
+//! Load/save are pure functions over an explicit path so tests can run
+//! against a temp directory without touching the real config.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::{OnceLock, RwLock};
+
+use serde_json::Value;
+
+/// BTreeMap so the serialized file has a stable key order (diff-friendly).
+type Map = BTreeMap<String, Value>;
+
+static STORE: OnceLock<RwLock<Map>> = OnceLock::new();
+
+/// `~/.pwrde` — the config directory for all pwrde user files.
+pub fn config_dir() -> PathBuf {
+    dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".pwrde")
+}
+
+pub fn path() -> PathBuf {
+    config_dir().join("settings.json")
+}
+
+/// Load `settings.json` into the global store. Call once at startup, before
+/// anything reads a setting.
+pub fn init() {
+    let _ = STORE.set(RwLock::new(load(&path())));
+}
+
+fn store() -> &'static RwLock<Map> {
+    // Tolerate a missing init() (tests, future call sites): an empty store
+    // behaves like a fresh install.
+    STORE.get_or_init(|| RwLock::new(Map::new()))
+}
+
+pub fn get_str(key: &str) -> Option<String> {
+    store().read().ok()?.get(key)?.as_str().map(str::to_owned)
+}
+
+pub fn get_bool(key: &str, default: bool) -> bool {
+    store()
+        .read()
+        .ok()
+        .and_then(|map| map.get(key)?.as_bool())
+        .unwrap_or(default)
+}
+
+/// Update one key in memory and persist the whole store to disk. A write
+/// failure keeps the in-memory value (the session still works; only
+/// persistence is lost).
+pub fn set(key: &str, value: Value) {
+    if let Ok(mut map) = store().write() {
+        map.insert(key.to_owned(), value);
+        let _ = save(&path(), &map);
+    }
+}
+
+/// Read a settings map from `path`. Missing file, unreadable file, invalid
+/// JSON, or a non-object root all yield an empty map.
+fn load(path: &Path) -> Map {
+    let Ok(bytes) = std::fs::read(path) else { return Map::new() };
+    match serde_json::from_slice::<Value>(&bytes) {
+        Ok(Value::Object(obj)) => obj.into_iter().collect(),
+        _ => Map::new(),
+    }
+}
+
+/// Write `map` to `path` as pretty-printed JSON, creating parent directories
+/// (the `~/.pwrde` dir on first save).
+fn save(path: &Path, map: &Map) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let obj: serde_json::Map<String, Value> =
+        map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    let text = serde_json::to_string_pretty(&Value::Object(obj))?;
+    std::fs::write(path, text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_file(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("pwrde-settings-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir.join("settings.json")
+    }
+
+    #[test]
+    fn save_load_roundtrip() {
+        let path = temp_file("roundtrip");
+        let mut map = Map::new();
+        map.insert("theme".into(), Value::String("midnight".into()));
+        map.insert("debug.overlay".into(), Value::Bool(true));
+        save(&path, &map).unwrap();
+        assert_eq!(load(&path), map);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn missing_file_loads_empty() {
+        assert!(load(Path::new("/nonexistent/pwrde/settings.json")).is_empty());
+    }
+
+    #[test]
+    fn corrupt_file_loads_empty() {
+        let path = temp_file("corrupt");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"{not json").unwrap();
+        assert!(load(&path).is_empty());
+        // A JSON root that isn't an object is also "corrupt" for our schema.
+        std::fs::write(&path, b"[1,2,3]").unwrap();
+        assert!(load(&path).is_empty());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+}

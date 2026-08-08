@@ -301,6 +301,56 @@ pub fn tab_rect(index: usize, scale: f32, sidebar_w: f32) -> LayoutRect {
     }
 }
 
+/// Height of the page-dot strip pinned to the sidebar's bottom edge.
+pub const PAGE_STRIP_H: f32 = 36.0;
+/// Square hit target for one page slot in the strip.
+const PAGE_SLOT: f32 = 22.0;
+const PAGE_SLOT_GAP: f32 = 10.0;
+
+/// The page-dot strip across the bottom of the sidebar (present on every
+/// page, so the sidebar chrome is identical everywhere).
+pub fn page_strip(height: u32, scale: f32, sidebar_w: f32) -> LayoutRect {
+    let h = (PAGE_STRIP_H * scale).round();
+    LayoutRect { x: 0.0, y: height as f32 - h, w: (sidebar_w * scale).round(), h }
+}
+
+/// Slot `i` of `n` in the page strip: a horizontally centered row of squares.
+pub fn page_slot_rect(i: usize, n: usize, height: u32, scale: f32, sidebar_w: f32) -> LayoutRect {
+    let strip = page_strip(height, scale, sidebar_w);
+    let slot = (PAGE_SLOT * scale).round();
+    let gap = (PAGE_SLOT_GAP * scale).round();
+    let total = n as f32 * slot + n.saturating_sub(1) as f32 * gap;
+    let x0 = strip.x + ((strip.w - total) / 2.0).round();
+    LayoutRect {
+        x: x0 + i as f32 * (slot + gap),
+        y: strip.y + ((strip.h - slot) / 2.0).round(),
+        w: slot,
+        h: slot,
+    }
+}
+
+/// Header band inside the settings card (the section title).
+pub const SETTINGS_HEADER_H: f32 = 52.0;
+/// One settings row inside the card.
+pub const SETTINGS_ROW_H: f32 = 36.0;
+/// Inset of settings rows from the card edges.
+const SETTINGS_PAD: f32 = 14.0;
+
+/// Row `i` of the settings card `card` (which is the whole terminal area —
+/// the settings page renders as one tile-style card). Shared by the renderer
+/// (drawing) and main.rs (hit-testing) so clicks always agree with pixels.
+pub fn settings_row_rect(card: &LayoutRect, i: usize, scale: f32) -> LayoutRect {
+    let pad = (SETTINGS_PAD * scale).round();
+    let header = (SETTINGS_HEADER_H * scale).round();
+    let h = (SETTINGS_ROW_H * scale).round();
+    LayoutRect {
+        x: card.x + pad,
+        y: card.y + header + i as f32 * h,
+        w: (card.w - 2.0 * pad).max(0.0),
+        h,
+    }
+}
+
 /// The region right of the sidebar where the split tree lives. Inset from the
 /// window's top/right/bottom edges so the tile cards float on the gradient.
 pub fn terminal_area(width: u32, height: u32, scale: f32, sidebar_w: f32) -> LayoutRect {
