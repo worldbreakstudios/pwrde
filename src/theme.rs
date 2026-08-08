@@ -29,7 +29,7 @@ pub struct Theme {
     /// Window gradient endpoints (painted under everything).
     pub gradient_from: (u8, u8, u8),
     pub gradient_to: (u8, u8, u8),
-    /// Terminal / settings card fill.
+    /// Terminal card fill.
     pub term_bg: (u8, u8, u8),
     /// Hairline under a card's tab strip.
     pub card_divider: (u8, u8, u8),
