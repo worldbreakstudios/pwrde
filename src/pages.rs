@@ -187,11 +187,12 @@ pub enum Action {
     PrevPage,
     NextPage,
     OpenSettings,
+    CommandPalette,
 }
 
 impl Action {
     /// Keyboard-page row order.
-    pub const ALL: [Action; 17] = [
+    pub const ALL: [Action; 18] = [
         Action::SplitRight,
         Action::SplitDown,
         Action::NewTab,
@@ -209,6 +210,7 @@ impl Action {
         Action::PrevPage,
         Action::NextPage,
         Action::OpenSettings,
+        Action::CommandPalette,
     ];
 
     /// Stable identifier used in the settings key (`keyboard.<name>`).
@@ -231,6 +233,7 @@ impl Action {
             Action::PrevPage => "prev_page",
             Action::NextPage => "next_page",
             Action::OpenSettings => "open_settings",
+            Action::CommandPalette => "command_palette",
         }
     }
 
@@ -253,6 +256,7 @@ impl Action {
             Action::PrevPage => "Previous page",
             Action::NextPage => "Next page",
             Action::OpenSettings => "Open settings",
+            Action::CommandPalette => "Command palette",
         }
     }
 
@@ -279,6 +283,7 @@ impl Action {
             Action::PrevPage => (true, "left"),
             Action::NextPage => (true, "right"),
             Action::OpenSettings => (false, ","),
+            Action::CommandPalette => (false, "p"),
         };
         Binding { shift, alt: false, ctrl: false, key: key.into() }
     }
@@ -447,6 +452,34 @@ mod tests {
         }
         let full = Binding { shift: true, alt: true, ctrl: true, key: "left".into() };
         assert_eq!(Binding::parse(&full.serialize()), Some(full));
+    }
+
+    /// ⌘P must reach the palette through the same lookup every hotkey uses.
+    #[test]
+    fn cmd_p_dispatches_command_palette() {
+        let ks = Keystroke {
+            modifiers: Modifiers { platform: true, ..Default::default() },
+            key: "p".into(),
+            key_char: None,
+        };
+        assert_eq!(match_action(&ks), Some(Action::CommandPalette));
+    }
+
+    /// Two actions sharing a default chord would make the second unreachable
+    /// (`match_action` returns the first hit in `ALL` order).
+    #[test]
+    fn default_bindings_do_not_collide() {
+        for (i, a) in Action::ALL.iter().enumerate() {
+            for b in &Action::ALL[i + 1..] {
+                assert_ne!(
+                    a.default_binding(),
+                    b.default_binding(),
+                    "{} and {} share a default binding",
+                    a.name(),
+                    b.name()
+                );
+            }
+        }
     }
 
     #[test]

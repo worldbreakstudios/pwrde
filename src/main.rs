@@ -20,6 +20,7 @@ mod claude_hooks;
 mod git;
 mod links;
 mod pages;
+mod palette;
 mod persist;
 mod picker;
 mod rect;
@@ -139,6 +140,8 @@ struct App {
     picker: Option<picker::Picker>,
     /// The open step-2 fork-source picker (git repos only), or `None`.
     fork: Option<picker::ForkPicker>,
+    /// The open command palette, or `None` when closed.
+    palette: Option<palette::Palette>,
     /// A centered one-line message. `bool` is `dismissable`: false while `drop`
     /// provisions (input swallowed), true for a failure note the user can close.
     message: Option<(String, bool)>,
@@ -1662,25 +1665,46 @@ impl App {
         }
 
         // Dir picker (step 1): existing behaviour.
-        let Some(picker) = &mut self.picker else { return };
-        let layout = picker::PickerLayout::compute(width, height, scale, picker.rows.len(), picker.selected);
-        if !layout.panel.contains(px, py) {
-            self.picker = None;
-            self.request_redraw();
+        if let Some(picker) = &mut self.picker {
+            let layout = picker::PickerLayout::compute(width, height, scale, picker.rows.len(), picker.selected);
+            if !layout.panel.contains(px, py) {
+                self.picker = None;
+                self.request_redraw();
+                return;
+            }
+            let Some(index) = layout.row_at(px, py) else { return };
+            let Some(rect) = layout.row_rect(index) else { return };
+            let Some(picker::PickerRow::Entry(entry)) = picker.rows.get(index).cloned() else {
+                return;
+            };
+            picker.select(index);
+            if layout.star_rect(&rect).contains(px, py) {
+                picker.toggle_pin(&entry.path);
+                self.request_redraw();
+                return;
+            }
+            self.confirm_picker();
             return;
         }
-        let Some(index) = layout.row_at(px, py) else { return };
-        let Some(rect) = layout.row_rect(index) else { return };
-        let Some(picker::PickerRow::Entry(entry)) = picker.rows.get(index).cloned() else {
-            return;
-        };
-        picker.select(index);
-        if layout.star_rect(&rect).contains(px, py) {
-            picker.toggle_pin(&entry.path);
+
+        // Command palette: click a row to run the action, click outside to close.
+        if let Some(palette) = &mut self.palette {
+            let layout = picker::PickerLayout::compute(width, height, scale, palette.rows.len(), palette.selected);
+            if !layout.panel.contains(px, py) {
+                self.palette = None;
+                self.request_redraw();
+                return;
+            }
+            if let Some(index) = layout.row_at(px, py) {
+                palette.select(index);
+                let action = palette.selected_action();
+                self.palette = None;
+                if let Some(action) = action {
+                    self.run_action(action);
+                }
+            }
             self.request_redraw();
-            return;
         }
-        self.confirm_picker();
     }
 
     fn on_mouse_down(&mut self, window: &mut Window, click_count: usize) {
@@ -1695,6 +1719,7 @@ impl App {
             || self.message.is_some()
             || self.fork.is_some()
             || self.picker.is_some()
+            || self.palette.is_some()
         {
             self.overlay_click(px, py, w, h, scale);
             return;
@@ -1959,6 +1984,7 @@ impl App {
                     || self.message.is_some()
                     || self.fork.is_some()
                     || self.picker.is_some()
+                    || self.palette.is_some()
                 {
                     None
                 } else {
@@ -2056,6 +2082,7 @@ impl App {
             || self.message.is_some()
             || self.fork.is_some()
             || self.picker.is_some()
+            || self.palette.is_some()
         {
             self.handle_picker_key(ev);
             return;
@@ -2152,37 +2179,85 @@ impl App {
             return;
         }
         // Step 1: the dir picker. Escape closes the overlay entirely.
-        match key {
-            "escape" => self.picker = None,
-            "enter" => self.confirm_picker(),
-            "up" => {
-                if let Some(p) = self.picker.as_mut() {
-                    p.move_selection(-1);
-                }
-            },
-            "down" => {
-                if let Some(p) = self.picker.as_mut() {
-                    p.move_selection(1);
-                }
-            },
-            "backspace" => {
-                if let Some(p) = self.picker.as_mut() {
-                    p.backspace();
-                }
-            },
-            _ => {
-                // A printable character extends the query. gpui hands us the
-                // already-composed text (respecting shift/dead keys) in
-                // key_char; ignore control chords and non-text keys.
-                if !ev.keystroke.modifiers.control
-                    && let Some(text) = ev.keystroke.key_char.as_deref()
-                    && let Some(p) = self.picker.as_mut()
-                {
-                    for ch in text.chars().filter(|c| !c.is_control()) {
-                        p.push_char(ch);
+        if self.picker.is_some() {
+            match key {
+                "escape" => self.picker = None,
+                "enter" => self.confirm_picker(),
+                "up" => {
+                    if let Some(p) = self.picker.as_mut() {
+                        p.move_selection(-1);
                     }
-                }
-            },
+                },
+                "down" => {
+                    if let Some(p) = self.picker.as_mut() {
+                        p.move_selection(1);
+                    }
+                },
+                "backspace" => {
+                    if let Some(p) = self.picker.as_mut() {
+                        p.backspace();
+                    }
+                },
+                _ => {
+                    // A printable character extends the query. gpui hands us the
+                    // already-composed text (respecting shift/dead keys) in
+                    // key_char; ignore control chords and non-text keys.
+                    if !ev.keystroke.modifiers.control
+                        && let Some(text) = ev.keystroke.key_char.as_deref()
+                        && let Some(p) = self.picker.as_mut()
+                    {
+                        for ch in text.chars().filter(|c| !c.is_control()) {
+                            p.push_char(ch);
+                        }
+                    }
+                },
+            }
+        } else if self.palette.is_some() {
+            // The palette's own chord closes it again — the overlay owns the
+            // keyboard, so the toggle in run_action is unreachable from here.
+            if Action::CommandPalette.binding().matches(&ev.keystroke) {
+                self.palette = None;
+                self.request_redraw();
+                return;
+            }
+            match key {
+                "escape" => self.palette = None,
+                "enter" => {
+                    let action = self
+                        .palette
+                        .as_ref()
+                        .and_then(|p| p.selected_action());
+                    self.palette = None;
+                    if let Some(action) = action {
+                        self.run_action(action);
+                    }
+                },
+                "up" => {
+                    if let Some(p) = self.palette.as_mut() {
+                        p.move_selection(-1);
+                    }
+                },
+                "down" => {
+                    if let Some(p) = self.palette.as_mut() {
+                        p.move_selection(1);
+                    }
+                },
+                "backspace" => {
+                    if let Some(p) = self.palette.as_mut() {
+                        p.backspace();
+                    }
+                },
+                _ => {
+                    if !ev.keystroke.modifiers.control
+                        && let Some(text) = ev.keystroke.key_char.as_deref()
+                        && let Some(p) = self.palette.as_mut()
+                    {
+                        for ch in text.chars().filter(|c| !c.is_control()) {
+                            p.push_char(ch);
+                        }
+                    }
+                },
+            }
         }
         self.request_redraw();
     }
@@ -2304,6 +2379,14 @@ impl App {
             Action::NextSidebarTab => return self.cycle_sidebar_tab(1),
             Action::OpenSettings => return self.set_page(Page::Settings),
             Action::Quit => std::process::exit(0),
+            Action::CommandPalette => {
+                if self.palette.is_some() {
+                    self.palette = None;
+                } else {
+                    self.palette = Some(palette::Palette::new());
+                }
+                return;
+            },
             _ => {},
         }
         if self.page != Page::Sessions {
@@ -2334,7 +2417,8 @@ impl App {
             | Action::PrevPage
             | Action::NextPage
             | Action::OpenSettings
-            | Action::Quit => {},
+            | Action::Quit
+            | Action::CommandPalette => {},
         }
     }
 
@@ -2902,7 +2986,8 @@ impl App {
         let overlay_open = self.confirm.is_some()
             || self.message.is_some()
             || self.fork.is_some()
-            || self.picker.is_some();
+            || self.picker.is_some()
+            || self.palette.is_some();
         let resize_hover = if overlay_open
             || !matches!(self.drag, Drag::None | Drag::Sidebar | Drag::Divider { .. })
         {
@@ -2960,6 +3045,7 @@ impl App {
             resize_hover,
             self.picker.as_ref(),
             self.fork.as_ref(),
+            self.palette.as_ref(),
             self.message.as_ref(),
             self.confirm.as_ref().map(|c| c.text.as_str()),
             &chrome,
@@ -3247,6 +3333,7 @@ fn main() {
                         drag: Drag::None,
                         picker: None,
                         fork: None,
+                        palette: None,
                         message: None,
                         confirm: None,
                         pending_primary_cmd: std::collections::HashMap::new(),
