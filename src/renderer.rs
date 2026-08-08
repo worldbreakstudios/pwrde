@@ -261,6 +261,15 @@ pub struct Frame {
     pub fg_quads: Vec<Quad>,
     /// Chrome labels (tab titles).
     pub labels: Vec<LabelSpec>,
+    /// Flyover panel fills (card background, tab strip, selection rects).
+    /// Painted after labels, before picker_quads so modal overlays sit above.
+    pub flyover_quads: Vec<Quad>,
+    /// Flyover terminal text runs.
+    pub flyover_panes: Vec<PaneText>,
+    /// Flyover foreground fills (cursor, selection).
+    pub flyover_fg_quads: Vec<Quad>,
+    /// Flyover tab-strip labels.
+    pub flyover_labels: Vec<LabelSpec>,
     /// Picker overlay fills painted over everything else (scrim, panel, rows).
     pub picker_quads: Vec<Quad>,
     /// Picker overlay labels, painted last.
@@ -908,7 +917,19 @@ impl Renderer {
             self.cleanup_popover(&area, chrome, &mut picker_quads, &mut picker_labels);
         }
 
-        Frame { bg_quads, panes, fg_quads, labels, picker_quads, picker_labels, carets }
+        Frame {
+            bg_quads,
+            panes,
+            fg_quads,
+            labels,
+            flyover_quads: Vec::new(),
+            flyover_panes: Vec::new(),
+            flyover_fg_quads: Vec::new(),
+            flyover_labels: Vec::new(),
+            picker_quads,
+            picker_labels,
+            carets,
+        }
     }
 
     /// Paint Sessions sidebar rows (section headers + group cards) using the
@@ -2456,6 +2477,179 @@ impl Renderer {
             clip: panel,
             size: None,
         }]
+    }
+
+    /// The terminal background the active colors want: the selected scheme's
+    /// bg, or the chrome theme's terminal background under the adaptive
+    /// default. The popout window fills with this behind the flyover card.
+    pub fn term_scheme_bg(&self) -> (u8, u8, u8) {
+        crate::term_theme::selected(crate::theme::dark_active())
+            .map_or(self.theme().term_bg, |t| t.bg)
+    }
+
+    /// Build all geometry for the flyover terminal panel (card, tab strip,
+    /// terminal text). Returns the frame fields to be set on the caller's Frame.
+    /// `tabs` is the flyover tab list, `active` is the active tab index,
+    /// `panel_rect` is where the panel sits — the slide-animated bottom strip
+    /// in the main window (`workspace::flyover_rect`), or the full window in
+    /// the popout — and `focused` indicates whether it holds keyboard focus.
+    /// An open-but-empty panel (first-open picker flow) still paints its card
+    /// so the slide-in reads; only the tab/content parts need tabs.
+    /// `show_window_buttons` draws the minimize/maximize squares at the
+    /// bar's right — the in-window panel wants them, the popout window has
+    /// real window controls instead.
+    pub fn flyover_overlay(
+        &self,
+        tabs: &[crate::workspace::Tab],
+        active: usize,
+        panel_rect: &crate::workspace::LayoutRect,
+        focused: bool,
+        draw_cursor: bool,
+        show_window_buttons: bool,
+        maximized: bool,
+    ) -> (Vec<Quad>, Vec<PaneText>, Vec<Quad>, Vec<LabelSpec>) {
+        let th = self.theme();
+        let scale = self.scale;
+        // Resolve the terminal scheme exactly as `build_frame` does for tile
+        // cards, so the flyover follows the Appearance-page terminal colors:
+        // scheme bg/fg drive the card and tab chrome when one is selected.
+        let scheme = crate::term_theme::selected(crate::theme::dark_active());
+        let term_palette = crate::term_theme::build(scheme, th.term_bg);
+        let (pane_bg, pane_ink, pane_ink_dim, pane_divider, pane_pill) = match scheme {
+            Some(t) => (t.bg, (t.fg, 1.0), (t.fg, 0.55), (t.fg, 0.15), (t.fg, 0.12)),
+            None => (
+                th.term_bg,
+                (th.text_bright, 1.0),
+                (th.text_dim, 1.0),
+                (th.card_divider, 1.0),
+                ((255u8, 255u8, 255u8), 0.09f32),
+            ),
+        };
+
+        let tab_bar = crate::workspace::flyover_tab_bar(panel_rect, scale);
+        let content = crate::workspace::flyover_content(panel_rect, scale);
+        let n = tabs.len();
+
+        let mut quads: Vec<Quad> = Vec::new();
+        let mut fg_quads: Vec<Quad> = Vec::new();
+        let mut panes: Vec<PaneText> = Vec::new();
+        let mut labels: Vec<LabelSpec> = Vec::new();
+
+        // Card background + border.
+        let card_r = (8.0 * scale).round();
+        quads.push(self.px_rect(panel_rect, pane_bg, 1.0, card_r).shadow(Shadow::Card));
+        // Subtle top border line.
+        let border = crate::workspace::LayoutRect {
+            x: panel_rect.x,
+            y: panel_rect.y,
+            w: panel_rect.w,
+            h: (1.0_f32 * scale).round().max(1.0),
+        };
+        quads.push(self.px_rect(&border, pane_divider.0, pane_divider.1 * 0.5, 0.0));
+
+        // Tab strip: highlight pill for the active tab, inset like the tile
+        // strips' pill so the bar shows around it.
+        if n > 0 {
+            let tr = crate::workspace::flyover_tab_rect(panel_rect, active, n, scale, maximized);
+            let m = (4.0 * scale).round();
+            let pill = crate::workspace::LayoutRect {
+                x: tr.x + m,
+                y: tr.y + m,
+                w: (tr.w - 2.0 * m).max(0.0),
+                h: (tr.h - 2.0 * m).max(0.0),
+            };
+            quads.push(self.px_rect(&pill, pane_pill.0, pane_pill.1, (7.0 * scale).round()));
+        }
+
+        // Tab labels + per-tab × close button (mirrors the tile tab strip).
+        let tab_text_pad = (8.0 * scale).round();
+        for (i, tab) in tabs.iter().enumerate() {
+            let tr = crate::workspace::flyover_tab_rect(panel_rect, i, n, scale, maximized);
+            let close = crate::workspace::flyover_tab_close_rect(panel_rect, i, n, scale, maximized);
+            let title = tab.session.title();
+            let text = if title.is_empty() { "shell".to_string() } else { title };
+            let mut text_left = tr.x + tab_text_pad;
+            // Unread dot.
+            if tab.unread {
+                let ds = (6.0 * scale).round();
+                let dot = crate::workspace::LayoutRect {
+                    x: text_left,
+                    y: (tr.y + (tr.h - ds) / 2.0).round(),
+                    w: ds,
+                    h: ds,
+                };
+                fg_quads.push(self.px_rect(&dot, th.accent, 1.0, ds / 2.0));
+                text_left += ds + (5.0 * scale).round();
+            }
+            labels.push(LabelSpec {
+                text,
+                color: if i == active {
+                    color(pane_ink.0, pane_ink.1)
+                } else {
+                    color(pane_ink_dim.0, pane_ink_dim.1)
+                },
+                left: text_left,
+                top: (tr.y + (tr.h - self.cell_height) / 2.0).round(),
+                clip: crate::workspace::LayoutRect {
+                    w: (close.x - tr.x - tab_text_pad).max(0.0),
+                    ..tr
+                },
+                size: None,
+            });
+            labels.push(LabelSpec {
+                text: "×".to_string(),
+                color: color(pane_ink_dim.0, pane_ink_dim.1),
+                left: close.x + ((close.w - self.cell_width) / 2.0).round(),
+                top: (tr.y + (tr.h - self.cell_height) / 2.0).round(),
+                clip: tr,
+                size: None,
+            });
+        }
+
+        // Minimize / maximize buttons at the bar's right edge.
+        if show_window_buttons {
+            let bar_h = tab_bar.h;
+            for (rect, glyph) in [
+                (crate::workspace::flyover_minimize_rect(panel_rect, scale), "–"),
+                (crate::workspace::flyover_maximize_rect(panel_rect, scale), "□"),
+            ] {
+                labels.push(LabelSpec {
+                    text: glyph.to_string(),
+                    color: color(pane_ink_dim.0, pane_ink_dim.1),
+                    left: rect.x + ((rect.w - self.cell_width) / 2.0).round(),
+                    top: (rect.y + (bar_h - self.cell_height) / 2.0).round(),
+                    clip: rect,
+                    size: None,
+                });
+            }
+        }
+
+        // Tab-bar bottom divider line.
+        let divider = crate::workspace::LayoutRect {
+            x: tab_bar.x,
+            y: tab_bar.y + tab_bar.h - (1.0_f32 * scale).round().max(1.0),
+            w: tab_bar.w,
+            h: (1.0_f32 * scale).round().max(1.0),
+        };
+        quads.push(self.px_rect(&divider, pane_divider.0, pane_divider.1, 0.0));
+
+        // Terminal content for the active tab.
+        if let Some(tab) = tabs.get(active) {
+            let origin = self.content_origin(&content);
+            let rows = self.snapshot_pane(
+                &tab.session,
+                &term_palette,
+                origin,
+                draw_cursor && focused,
+                None,
+                &mut quads,
+                &mut fg_quads,
+            );
+            panes.push(PaneText { origin, rows });
+            self.selection_rects(&tab.session, origin, &mut fg_quads);
+        }
+
+        (quads, panes, fg_quads, labels)
     }
 
     /// Snapshot one pane's grid into per-row text spans + geometry quads,
