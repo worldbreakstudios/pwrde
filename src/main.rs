@@ -30,7 +30,7 @@ use std::time::Duration;
 use gpui::{
     canvas, div, px, App as GpuiApp, AppContext, Application, Bounds, Context, CursorStyle,
     FocusHandle,
-    InteractiveElement, IntoElement, KeyDownEvent, Modifiers, MouseButton,
+    InteractiveElement, IntoElement, KeyDownEvent, Keystroke, Modifiers, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render, ShapedLine,
     Size, Styled, TextAlign, TextRun, Window, WindowBounds, WindowOptions,
 };
@@ -908,7 +908,7 @@ impl App {
             self.handle_shortcut(ev);
             return;
         }
-        if let Some(bytes) = key_to_bytes(ev) {
+        if let Some(bytes) = key_to_bytes(&ev.keystroke) {
             let ws = &self.workspaces[self.active];
             if let Some(tab) = ws.focused().and_then(|t| t.active_tab()) {
                 tab.session.write(bytes);
@@ -1232,27 +1232,56 @@ fn scroll_steps(accum: &mut f64, notches: f64) -> isize {
     steps
 }
 
-/// Map a gpui key event to the bytes a terminal expects, or `None` when the
+/// Map a gpui keystroke to the bytes a terminal expects, or `None` when the
 /// key is not something we send to the PTY.
-fn key_to_bytes(ev: &KeyDownEvent) -> Option<Vec<u8>> {
-    let m = ev.keystroke.modifiers;
-    let key = ev.keystroke.key.as_str();
+fn key_to_bytes(ks: &Keystroke) -> Option<Vec<u8>> {
+    let m = ks.modifiers;
+    let key = ks.key.as_str();
 
-    // Named keys → control sequences.
+    // xterm modifier parameter: 1 + shift(1) + alt(2) + ctrl(4). Cmd never
+    // reaches here (it's routed to app shortcuts in on_key_down).
+    let mod_param = 1 + m.shift as u8 + ((m.alt as u8) << 1) + ((m.control as u8) << 2);
+
+    // CSI-final-letter keys: plain `CSI <c>`, modified `CSI 1;<mod> <c>`.
+    let csi_letter = match key {
+        "up" => Some('A'),
+        "down" => Some('B'),
+        "right" => Some('C'),
+        "left" => Some('D'),
+        "home" => Some('H'),
+        "end" => Some('F'),
+        _ => None,
+    };
+    if let Some(c) = csi_letter {
+        return Some(if mod_param > 1 {
+            format!("\x1b[1;{mod_param}{c}").into_bytes()
+        } else {
+            format!("\x1b[{c}").into_bytes()
+        });
+    }
+
+    // Tilde keys: plain `CSI <n>~`, modified `CSI <n>;<mod>~`.
+    let tilde = match key {
+        "pageup" => Some(5),
+        "pagedown" => Some(6),
+        "delete" => Some(3),
+        _ => None,
+    };
+    if let Some(n) = tilde {
+        return Some(if mod_param > 1 {
+            format!("\x1b[{n};{mod_param}~").into_bytes()
+        } else {
+            format!("\x1b[{n}~").into_bytes()
+        });
+    }
+
+    // Remaining named keys → fixed sequences.
     let seq: Option<&[u8]> = match key {
         "enter" => Some(b"\r"),
+        "tab" if m.shift => Some(b"\x1b[Z"),
         "tab" => Some(b"\t"),
         "backspace" => Some(b"\x7f"),
         "escape" => Some(b"\x1b"),
-        "up" => Some(b"\x1b[A"),
-        "down" => Some(b"\x1b[B"),
-        "right" => Some(b"\x1b[C"),
-        "left" => Some(b"\x1b[D"),
-        "home" => Some(b"\x1b[H"),
-        "end" => Some(b"\x1b[F"),
-        "pageup" => Some(b"\x1b[5~"),
-        "pagedown" => Some(b"\x1b[6~"),
-        "delete" => Some(b"\x1b[3~"),
         _ => None,
     };
     if let Some(seq) = seq {
@@ -1261,7 +1290,7 @@ fn key_to_bytes(ev: &KeyDownEvent) -> Option<Vec<u8>> {
 
     // gpui gives the already-composed text for character keys (respecting
     // shift/dead keys) in key_char.
-    if let Some(ref text) = ev.keystroke.key_char {
+    if let Some(ref text) = ks.key_char {
         if !text.is_empty() {
             // Ctrl+letter → control byte.
             if m.control && text.len() == 1 {
@@ -1402,6 +1431,17 @@ impl App {
         // established content-mask context those sub-layers don't composite —
         // this mirrors how Zed's own TerminalElement paints.
         window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
+            // 0) the warm window gradient every card and sidebar row floats on
+            // (mockup 3a's tinted wrapper).
+            window.paint_quad(gpui::fill(
+                bounds,
+                gpui::linear_gradient(
+                    135.0,
+                    gpui::linear_color_stop(renderer::color(renderer::GRADIENT_FROM, 1.0), 0.0),
+                    gpui::linear_color_stop(renderer::color(renderer::GRADIENT_TO, 1.0), 1.0),
+                ),
+            ));
+
             // 1) background quads.
             for q in &frame.bg_quads {
                 paint_quad(window, origin, inv, q);
@@ -1551,17 +1591,40 @@ fn hide_titlebar_decoration(window: &Window) {
     }
 }
 
-/// Paint one renderer `Quad` (physical-px coords) as a gpui fill.
+/// Paint one renderer `Quad` (physical-px coords) as a gpui fill, with its
+/// optional drop shadow (under) and border.
 fn paint_quad(window: &mut Window, origin: Point<Pixels>, inv: f32, q: &renderer::Quad) {
     let b = Bounds {
         origin: Point::new(origin.x + px(q.x * inv), origin.y + px(q.y * inv)),
         size: Size::new(px(q.w * inv), px(q.h * inv)),
     };
+    let radii = gpui::Corners::all(px(q.radius * inv));
+    // (alpha, y-offset, blur) in logical px, matching mock 3a's card/row shadows.
+    let shadow = match q.shadow {
+        renderer::Shadow::None => None,
+        renderer::Shadow::Card => Some((0.22, 8.0, 28.0)),
+        renderer::Shadow::Soft => Some((0.10, 1.0, 3.0)),
+    };
+    if let Some((alpha, dy, blur)) = shadow {
+        window.paint_drop_shadows(
+            b,
+            radii,
+            &[gpui::BoxShadow {
+                color: renderer::color((32, 30, 29), alpha),
+                offset: Point::new(px(0.0), px(dy)),
+                blur_radius: px(blur),
+                spread_radius: px(0.0),
+                inset: false,
+            }],
+        );
+    }
     let mut quad = gpui::fill(b, q.color);
-    // Honor the renderer's corner radius (physical px → logical), so the custom
-    // traffic lights render as circles and the picker panel/search box round.
-    if q.radius > 0.0 {
-        quad.corner_radii = gpui::Corners::all(px(q.radius * inv));
+    // Honor the renderer's corner radius (physical px → logical), so the tile
+    // cards, sidebar rows, and picker panel/search box round.
+    quad.corner_radii = radii;
+    if q.border > 0.0 {
+        quad.border_widths = gpui::Edges::all(px(q.border * inv));
+        quad.border_color = q.border_color;
     }
     window.paint_quad(quad);
 }
@@ -1612,7 +1675,7 @@ fn main() {
                         active: 0,
                         next_session_id: 0,
                         next_tile_id: 0,
-                        sidebar_w: workspace::SIDEBAR_MIN_W,
+                        sidebar_w: workspace::SIDEBAR_DEFAULT_W,
                         modifiers: Modifiers::default(),
                         title: String::new(),
                         cursor: (0.0, 0.0),
@@ -1660,4 +1723,54 @@ fn main() {
 
         cx.activate(true);
     });
+}
+
+#[cfg(test)]
+mod key_to_bytes_tests {
+    use super::*;
+
+    fn ks(key: &str, modifiers: Modifiers) -> Keystroke {
+        Keystroke { modifiers, key: key.into(), key_char: None }
+    }
+
+    const SHIFT: Modifiers = Modifiers {
+        shift: true,
+        control: false,
+        alt: false,
+        platform: false,
+        function: false,
+    };
+    const CTRL: Modifiers = Modifiers { control: true, shift: false, ..SHIFT };
+    const ALT: Modifiers = Modifiers { alt: true, shift: false, ..SHIFT };
+
+    #[test]
+    fn unmodified_named_keys_keep_plain_sequences() {
+        let none = Modifiers::default();
+        assert_eq!(key_to_bytes(&ks("tab", none)).unwrap(), b"\t");
+        assert_eq!(key_to_bytes(&ks("up", none)).unwrap(), b"\x1b[A");
+        assert_eq!(key_to_bytes(&ks("home", none)).unwrap(), b"\x1b[H");
+        assert_eq!(key_to_bytes(&ks("pageup", none)).unwrap(), b"\x1b[5~");
+        assert_eq!(key_to_bytes(&ks("delete", none)).unwrap(), b"\x1b[3~");
+    }
+
+    #[test]
+    fn shift_tab_sends_backtab() {
+        assert_eq!(key_to_bytes(&ks("tab", SHIFT)).unwrap(), b"\x1b[Z");
+    }
+
+    #[test]
+    fn modified_csi_letter_keys_encode_xterm_params() {
+        assert_eq!(key_to_bytes(&ks("up", SHIFT)).unwrap(), b"\x1b[1;2A");
+        assert_eq!(key_to_bytes(&ks("left", ALT)).unwrap(), b"\x1b[1;3D");
+        assert_eq!(key_to_bytes(&ks("right", CTRL)).unwrap(), b"\x1b[1;5C");
+        let ctrl_shift = Modifiers { shift: true, ..CTRL };
+        assert_eq!(key_to_bytes(&ks("end", ctrl_shift)).unwrap(), b"\x1b[1;6F");
+    }
+
+    #[test]
+    fn modified_tilde_keys_encode_xterm_params() {
+        assert_eq!(key_to_bytes(&ks("delete", SHIFT)).unwrap(), b"\x1b[3;2~");
+        assert_eq!(key_to_bytes(&ks("pageup", CTRL)).unwrap(), b"\x1b[5;5~");
+        assert_eq!(key_to_bytes(&ks("pagedown", ALT)).unwrap(), b"\x1b[6;3~");
+    }
 }
