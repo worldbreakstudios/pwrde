@@ -107,6 +107,42 @@ pub fn shpool_binary() -> Option<std::path::PathBuf> {
     candidates.into_iter().map(|d| d.join("shpool")).find(|p| p.exists())
 }
 
+/// Config file to pass to `shpool attach` so the daemon it auto-starts skips
+/// the `shpool:$SHPOOL_SESSION_NAME` prompt prefix, which otherwise stamps an
+/// extra line above every prompt in persisted panes.
+///
+/// Defers to the user: if they keep their own shpool config (either the
+/// macOS `~/Library/Application Support/shpool/config.toml` or the XDG
+/// `~/.config/shpool/config.toml`), returns None so shpool loads it normally.
+/// Otherwise lazily writes `~/.pwrde/shpool.toml` with `prompt_prefix = ""`
+/// and returns its path. Any failure returns None — persistence must keep
+/// working even if the prefix can't be silenced.
+pub fn shpool_quiet_config() -> Option<std::path::PathBuf> {
+    let home = dirs::home_dir()?;
+    let user_configs = [
+        home.join("Library/Application Support/shpool/config.toml"),
+        home.join(".config/shpool/config.toml"),
+    ];
+    shpool_quiet_config_in(&user_configs, &crate::settings::config_dir())
+}
+
+/// Path logic for [`shpool_quiet_config`] over explicit paths so tests can use
+/// temp dirs.
+pub fn shpool_quiet_config_in(
+    user_configs: &[std::path::PathBuf],
+    pwrde_dir: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    if user_configs.iter().any(|p| p.exists()) {
+        return None;
+    }
+    let path = pwrde_dir.join("shpool.toml");
+    if !path.exists() {
+        std::fs::create_dir_all(pwrde_dir).ok()?;
+        std::fs::write(&path, "prompt_prefix = \"\"\n").ok()?;
+    }
+    Some(path)
+}
+
 /// Fire-and-forget `shpool kill <name>`, used when a persisted tab is closed
 /// explicitly so the daemon doesn't accumulate orphaned sessions.
 pub fn shpool_kill(name: &str) {
@@ -161,6 +197,14 @@ impl Session {
         let (cmd_opt, spawn_error) = if let Some(ref name) = shpool_name {
             if let Some(shpool_path) = shpool_binary() {
                 let mut cmd = CommandBuilder::new(shpool_path);
+                // Global flag, so it must precede the subcommand (after
+                // `attach`, `-c` means `--cmd`). Only matters when this attach
+                // auto-starts the daemon; an already-running daemon keeps the
+                // config it was launched with.
+                if let Some(cfg) = shpool_quiet_config() {
+                    cmd.arg("--config-file");
+                    cmd.arg(cfg);
+                }
                 cmd.arg("attach");
                 // The daemon spawns the session's shell, so the client's cwd
                 // doesn't reach it — pass the start dir explicitly (only used
@@ -590,6 +634,54 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "plain output must not produce Attention event"
+        );
+    }
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("pwrde-term-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// With no user shpool config, the quiet config is written under the pwrde
+    /// dir with the prefix disabled.
+    #[test]
+    fn quiet_config_written_when_user_has_none() {
+        let dir = temp_dir("quiet-fresh");
+        let missing = [dir.join("nope/config.toml")];
+        let path = shpool_quiet_config_in(&missing, &dir.join("pwrde"))
+            .expect("should produce a config path");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "prompt_prefix = \"\"\n"
+        );
+    }
+
+    /// A user-managed shpool config wins: no pwrde config is offered or written.
+    #[test]
+    fn quiet_config_defers_to_user_config() {
+        let dir = temp_dir("quiet-defer");
+        let user = dir.join("config.toml");
+        std::fs::write(&user, "prompt_prefix = \"mine\"\n").unwrap();
+        let pwrde = dir.join("pwrde");
+        assert!(shpool_quiet_config_in(&[user], &pwrde).is_none());
+        assert!(!pwrde.join("shpool.toml").exists(), "must not write a rival config");
+    }
+
+    /// An existing pwrde shpool config (possibly hand-edited) is not clobbered.
+    #[test]
+    fn quiet_config_does_not_overwrite_existing() {
+        let dir = temp_dir("quiet-keep");
+        let pwrde = dir.join("pwrde");
+        std::fs::create_dir_all(&pwrde).unwrap();
+        std::fs::write(pwrde.join("shpool.toml"), "prompt_prefix = \"custom\"\n").unwrap();
+        let missing = [dir.join("nope/config.toml")];
+        let path = shpool_quiet_config_in(&missing, &pwrde).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "prompt_prefix = \"custom\"\n"
         );
     }
 }
