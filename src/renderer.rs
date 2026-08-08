@@ -120,6 +120,19 @@ pub struct LabelSpec {
     pub left: f32,
     pub top: f32,
     pub clip: LayoutRect,
+    /// Font size override in physical px; `None` uses the standard size.
+    pub size: Option<f32>,
+}
+
+/// Button labels of the confirm dialog (shared by layout and drawing).
+const CONFIRM_CANCEL: &str = "Cancel";
+const CONFIRM_CLOSE: &str = "Close group";
+
+/// The confirm dialog's rects, in physical px.
+pub struct ConfirmLayout {
+    pub panel: LayoutRect,
+    pub cancel: LayoutRect,
+    pub close: LayoutRect,
 }
 
 /// Per-frame page/navigation state the renderer needs beyond the workspaces:
@@ -130,6 +143,9 @@ pub struct ChromeState<'a> {
     pub section: Section,
     pub dot_anim: &'a [f32],
     pub recording: Option<Action>,
+    /// In-progress edit buffer for the primary-command settings row, if the
+    /// row is being edited.
+    pub editing_command: Option<&'a str>,
 }
 
 /// Everything `main.rs`'s terminal `Element` needs to paint one frame — all
@@ -314,6 +330,7 @@ impl Renderer {
         picker: Option<&Picker>,
         fork: Option<&ForkPicker>,
         message: Option<&(String, bool)>,
+        confirm: Option<&str>,
         chrome: &ChromeState,
     ) -> Frame {
         let th = self.theme();
@@ -371,6 +388,7 @@ impl Renderer {
                     left: (new_group.x + group_pad).round(),
                     top: (new_group.y + (new_group.h - self.cell_height) / 2.0).round(),
                     clip: new_group,
+                    size: None,
                 });
                 if empty {
                     // Empty state: a centered CTA instead of group rows.
@@ -385,6 +403,7 @@ impl Renderer {
                         left: (cta.x + ((cta.w - cta_w) / 2.0).max(0.0)).round(),
                         top: (cta.y + (cta.h - self.cell_height) / 2.0).round(),
                         clip: cta,
+                        size: None,
                     });
                     let hint_text = "press ⇧⌘T";
                     let hint_w = hint_text.chars().count() as f32 * self.cell_width;
@@ -394,8 +413,13 @@ impl Renderer {
                         left: (hint.x + ((hint.w - hint_w) / 2.0).max(0.0)).round(),
                         top: (hint.y + (hint.h - self.cell_height) / 2.0).round(),
                         clip: hint,
+                        size: None,
                     });
                 } else {
+                    // Group cards are two lines: the primary pane's title on
+                    // top, the group's cwd below in smaller, dimmer text.
+                    let cwd_size = self.font_size() * 0.85;
+                    let cwd_line_h = self.cell_height * 0.85;
                     for (i, ws_item) in workspaces.iter().enumerate() {
                         let tab = workspace::tab_rect(i, self.scale, sidebar_w);
                         if i == active {
@@ -403,13 +427,22 @@ impl Renderer {
                             bg_quads
                                 .push(self.px_rect(&tab, th.card, 0.78, row_r).shadow(Shadow::Soft));
                         }
-                        // The group's name, so the sidebar tab isn't blank.
+                        let inset = ((tab.h - (self.cell_height + cwd_line_h)) / 2.0).max(0.0);
                         labels.push(LabelSpec {
                             text: ws_item.name.clone(),
                             color: color(if i == active { th.ink } else { th.ink_dim }, 1.0),
                             left: tab.x + group_pad,
-                            top: (tab.y + (tab.h - self.cell_height) / 2.0).round(),
+                            top: (tab.y + inset).round(),
                             clip: LayoutRect { w: tab.w - group_pad, ..tab },
+                            size: None,
+                        });
+                        labels.push(LabelSpec {
+                            text: workspace::display_cwd(ws_item.cwd.as_deref()),
+                            color: color(th.ink_dim, 0.8),
+                            left: tab.x + group_pad,
+                            top: (tab.y + inset + self.cell_height).round(),
+                            clip: LayoutRect { w: tab.w - group_pad, ..tab },
+                            size: Some(cwd_size),
                         });
                     }
                 }
@@ -429,6 +462,7 @@ impl Renderer {
                         left: tab.x + group_pad,
                         top: (tab.y + (tab.h - self.cell_height) / 2.0).round(),
                         clip: LayoutRect { w: tab.w - group_pad, ..tab },
+                        size: None,
                     });
                 }
             },
@@ -462,6 +496,7 @@ impl Renderer {
                     // a small clip overhang so they aren't shaved.
                     top: (slot.y + (slot.h - self.cell_height) / 2.0).round(),
                     clip: slot.inflate((4.0 * self.scale).round()),
+                    size: None,
                 });
             }
         }
@@ -505,7 +540,8 @@ impl Renderer {
                     let draw_cursor = Some(*id) == focused_tile
                         && picker.is_none()
                         && fork.is_none()
-                        && message.is_none();
+                        && message.is_none()
+                        && confirm.is_none();
                     let rows = self.snapshot_pane(
                         session,
                         &term_palette,
@@ -534,6 +570,7 @@ impl Renderer {
                         left: tr.x + tab_text_pad,
                         top: (tr.y + (tr.h - self.cell_height) / 2.0).round(),
                         clip: LayoutRect { w: tr.w - tab_text_pad, ..tr },
+                        size: None,
                     });
                 }
             }
@@ -572,13 +609,16 @@ impl Renderer {
                 left: (area.x + area.w - pad - w).round(),
                 top: (area.y + (6.0 * self.scale)).round(),
                 clip: area,
+                size: None,
             });
         }
 
         // ── Picker overlay (over everything) ───────────────────────────
         let mut picker_quads: Vec<Quad> = Vec::new();
         let mut picker_labels: Vec<LabelSpec> = Vec::new();
-        if let Some(p) = picker {
+        if let Some(text) = confirm {
+            picker_labels = self.confirm_overlay(text, &mut picker_quads);
+        } else if let Some(p) = picker {
             let layout = PickerLayout::compute(width, height, self.scale, p.rows.len(), p.selected);
             picker_labels = self.picker_overlay(p, &layout, &mut picker_quads);
         } else if let Some(f) = fork {
@@ -616,6 +656,7 @@ impl Renderer {
             left: area.x + pad,
             top: (area.y + (header_h - self.cell_height) / 2.0).round(),
             clip: *area,
+            size: None,
         });
 
         // Rows that would spill past the card bottom are dropped, not clipped
@@ -624,6 +665,63 @@ impl Renderer {
         let mid = |row: &LayoutRect| (row.y + (row.h - self.cell_height) / 2.0).round();
 
         match chrome.section {
+            Section::Sessions => {
+                let row = workspace::settings_row_rect(area, 0, scale);
+                if fits(&row) {
+                    let editing = chrome.editing_command.is_some();
+                    if editing {
+                        bg_quads.push(self.px_rect(&row, th.accent, 0.18, pill_r));
+                    }
+                    labels.push(LabelSpec {
+                        text: "Primary command".into(),
+                        color: color(th.text_bright, 1.0),
+                        left: row.x + pad,
+                        top: mid(&row),
+                        clip: row,
+                        size: None,
+                    });
+                    let value = match chrome.editing_command {
+                        Some(buf) => buf.to_string(),
+                        None => crate::settings::primary_command(),
+                    };
+                    let caret_w = (2.0 * scale).round().max(1.0);
+                    let w = value.chars().count() as f32 * self.cell_width;
+                    let right = row.x + row.w - pad - if editing { caret_w + 2.0 } else { 0.0 };
+                    labels.push(LabelSpec {
+                        text: value,
+                        color: color(if editing { th.text_bright } else { th.text_dim }, 1.0),
+                        left: (right - w).round(),
+                        top: mid(&row),
+                        clip: row,
+                        size: None,
+                    });
+                    if editing {
+                        let caret = LayoutRect {
+                            x: right.round(),
+                            y: mid(&row),
+                            w: caret_w,
+                            h: self.cell_height,
+                        };
+                        bg_quads.push(self.px_rect(&caret, th.accent, 1.0, 0.0));
+                    }
+                }
+                let hint = workspace::settings_row_rect(area, 1, scale);
+                if fits(&hint) {
+                    let text = if chrome.editing_command.is_some() {
+                        "type a command… (enter saves, esc cancels)"
+                    } else {
+                        "runs in the primary pane when a group opens"
+                    };
+                    labels.push(LabelSpec {
+                        text: text.into(),
+                        color: color(th.text_dim, 1.0),
+                        left: hint.x + pad,
+                        top: mid(&hint),
+                        clip: hint,
+                        size: None,
+                    });
+                }
+            },
             Section::Keyboard => {
                 for (i, action) in Action::ALL.iter().enumerate() {
                     let row = workspace::settings_row_rect(area, i, scale);
@@ -640,6 +738,7 @@ impl Renderer {
                         left: row.x + pad,
                         top: mid(&row),
                         clip: row,
+                        size: None,
                     });
                     let value = if recording {
                         "press keys… (esc cancels)".to_string()
@@ -653,6 +752,7 @@ impl Renderer {
                         left: (row.x + row.w - pad - w).round(),
                         top: mid(&row),
                         clip: row,
+                        size: None,
                     });
                 }
             },
@@ -673,6 +773,7 @@ impl Renderer {
                                 left: slot.x + pad,
                                 top: mid(&slot),
                                 clip: slot,
+                                size: None,
                             });
                             for (i, m) in crate::theme::Mode::ALL.iter().enumerate() {
                                 let seg = workspace::mode_segment_rect(
@@ -695,6 +796,7 @@ impl Renderer {
                                     left: (seg.x + (seg.w - lw) / 2.0).round(),
                                     top: mid(&slot),
                                     clip: seg,
+                                    size: None,
                                 });
                             }
                         },
@@ -705,6 +807,7 @@ impl Renderer {
                                 left: slot.x + pad,
                                 top: mid(&slot),
                                 clip: slot,
+                                size: None,
                             });
                         },
                         pages::AppearanceItem::Theme(t) => {
@@ -763,6 +866,7 @@ impl Renderer {
                         left: row.x + pad,
                         top: mid(&row),
                         clip: LayoutRect { w: (value_col - 2.0 * pad).max(0.0), ..row },
+                        size: None,
                     });
                     labels.push(LabelSpec {
                         text: value.clone(),
@@ -770,6 +874,7 @@ impl Renderer {
                         left: row.x + value_col,
                         top: mid(&row),
                         clip: row,
+                        size: None,
                     });
                 }
                 // The one functional toggle, separated from the diagnostics.
@@ -782,6 +887,7 @@ impl Renderer {
                         left: row.x + pad,
                         top: mid(&row),
                         clip: row,
+                        size: None,
                     });
                     let state = if on { "on" } else { "off" };
                     let w = state.chars().count() as f32 * self.cell_width;
@@ -805,6 +911,7 @@ impl Renderer {
                         left: (pill.x + pill_pad).round(),
                         top: mid(&row),
                         clip: row,
+                        size: None,
                     });
                 }
             },
@@ -850,6 +957,7 @@ impl Renderer {
                 left: (slot.x + slot.w - pad - self.cell_width).round(),
                 top: mid,
                 clip: *slot,
+                size: None,
             });
         }
         let mut right = slot.x + slot.w - pad - self.cell_width - (6.0 * scale).round();
@@ -870,6 +978,7 @@ impl Renderer {
             left: slot.x + pad,
             top: mid,
             clip: LayoutRect { w: (right - slot.x - pad).max(0.0), ..*slot },
+            size: None,
         });
     }
 
@@ -910,6 +1019,7 @@ impl Renderer {
             left: layout.search.x + pad,
             top: search_top,
             clip: layout.search,
+            size: None,
         });
         let caret_x = layout.search.x + pad + picker.query.chars().count() as f32 * self.cell_width;
         let caret = LayoutRect {
@@ -933,6 +1043,7 @@ impl Renderer {
                     left: row.x + pad,
                     top,
                     clip: row,
+                    size: None,
                 }),
                 PickerRow::Entry(entry) => {
                     if i == picker.selected {
@@ -951,6 +1062,7 @@ impl Renderer {
                         left: row.x + pad,
                         top,
                         clip: label_bounds,
+                        size: None,
                     });
                     if entry.is_git {
                         let gx = row.x + row.w - 2.0 * layout.row_h;
@@ -961,6 +1073,7 @@ impl Renderer {
                             left: gx + (layout.row_h - self.cell_width) / 2.0,
                             top,
                             clip: cell,
+                            size: None,
                         });
                     }
                     if picker.is_pinned(&entry.path) {
@@ -971,6 +1084,7 @@ impl Renderer {
                             left: star.x + (layout.row_h - self.cell_width) / 2.0,
                             top,
                             clip: star,
+                            size: None,
                         });
                     }
                 },
@@ -1014,6 +1128,7 @@ impl Renderer {
             left: panel_x + pad,
             top: (header.y + (row_h - self.cell_height) / 2.0).round(),
             clip: header,
+            size: None,
         });
 
         // Filter box + caret.
@@ -1032,6 +1147,7 @@ impl Renderer {
             left: search.x + pad,
             top: search_top,
             clip: search,
+            size: None,
         });
         let caret_x = search.x + pad + fork.query.chars().count() as f32 * self.cell_width;
         let caret = LayoutRect {
@@ -1059,6 +1175,82 @@ impl Renderer {
                 left: row.x + pad,
                 top,
                 clip: LayoutRect { w: panel_w - 2.0 * pad, ..row },
+                size: None,
+            });
+        }
+        labels
+    }
+
+    /// Geometry of the confirm dialog (panel + buttons), shared by drawing and
+    /// `main.rs` hit-testing so clicks always agree with pixels.
+    pub fn confirm_layout(&self, text: &str) -> ConfirmLayout {
+        let scale = self.scale;
+        let pad = (16.0 * scale).round();
+        let gap = (10.0 * scale).round();
+        let btn_pad = (14.0 * scale).round();
+        let btn_h = (self.cell_height + 10.0 * scale).round();
+        let text_w = text.chars().count() as f32 * self.cell_width;
+        let cancel_w =
+            (CONFIRM_CANCEL.chars().count() as f32 * self.cell_width + 2.0 * btn_pad).round();
+        let close_w =
+            (CONFIRM_CLOSE.chars().count() as f32 * self.cell_width + 2.0 * btn_pad).round();
+        let w = (text_w.max(cancel_w + gap + close_w) + 2.0 * pad)
+            .min(self.width as f32 - 2.0 * pad);
+        let h = (self.cell_height + gap + btn_h + 2.0 * pad).round();
+        let x = ((self.width as f32 - w) / 2.0).round();
+        let y = ((self.height as f32 - h) / 2.0).round();
+        let by = (y + pad + self.cell_height + gap).round();
+        let close_x = (x + w - pad - close_w).round();
+        let cancel_x = (close_x - gap - cancel_w).round();
+        ConfirmLayout {
+            panel: LayoutRect { x, y, w, h },
+            cancel: LayoutRect { x: cancel_x, y: by, w: cancel_w, h: btn_h },
+            close: LayoutRect { x: close_x, y: by, w: close_w, h: btn_h },
+        }
+    }
+
+    /// Centered confirm dialog: a message line over Cancel / Close-group
+    /// buttons. Styled like the message panel; the destructive button carries
+    /// the accent fill.
+    fn confirm_overlay(&self, text: &str, rects: &mut Vec<Quad>) -> Vec<LabelSpec> {
+        let th = self.theme();
+        let scale = self.scale;
+        let pad = (16.0 * scale).round();
+        let btn_r = (7.0 * scale).round();
+        let layout = self.confirm_layout(text);
+
+        let scrim = LayoutRect { x: 0.0, y: 0.0, w: self.width as f32, h: self.height as f32 };
+        rects.push(self.px_rect(&scrim, th.scrim, 0.30, 0.0));
+        rects.push(
+            self.px_rect(&layout.panel, th.card, 0.96, (CARD_RADIUS * scale).round())
+                .shadow(Shadow::Card),
+        );
+
+        let mut labels = vec![LabelSpec {
+            text: text.to_string(),
+            color: color(th.ink, 1.0),
+            left: layout.panel.x + pad,
+            top: (layout.panel.y + pad).round(),
+            clip: layout.panel,
+            size: None,
+        }];
+        for (rect, label, danger) in
+            [(&layout.cancel, CONFIRM_CANCEL, false), (&layout.close, CONFIRM_CLOSE, true)]
+        {
+            rects.push(self.px_rect(
+                rect,
+                if danger { th.accent } else { th.ink },
+                if danger { 0.9 } else { 0.08 },
+                btn_r,
+            ));
+            let w = label.chars().count() as f32 * self.cell_width;
+            labels.push(LabelSpec {
+                text: label.into(),
+                color: color(if danger { (255, 255, 255) } else { th.ink }, 1.0),
+                left: (rect.x + (rect.w - w) / 2.0).round(),
+                top: (rect.y + (rect.h - self.cell_height) / 2.0).round(),
+                clip: *rect,
+                size: None,
             });
         }
         labels
@@ -1088,6 +1280,7 @@ impl Renderer {
             left: x + pad,
             top: (y + (h - self.cell_height) / 2.0).round(),
             clip: panel,
+            size: None,
         }]
     }
 

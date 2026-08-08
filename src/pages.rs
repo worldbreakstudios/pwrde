@@ -3,7 +3,8 @@
 //! pwrde has Arc-style *pages*: Sessions (the terminal workspace) and
 //! Settings. The sidebar's bottom strip shows one slot per page — a subtle
 //! dot that crossfades into the page's glyph on hover, and stays a glyph on
-//! the active page. ⌘⇧←/→ cycle pages with wraparound.
+//! the active page. ⌘⇧←/→ cycle pages with wraparound; ⌘⇧↑/↓ cycle the
+//! sidebar's tabs (groups on Sessions, sections on Settings) the same way.
 //!
 //! Every ⌘ shortcut is an [`Action`] dispatched through a bindings table
 //! resolved from the settings store (`"keyboard.<action>"` keys, falling back
@@ -47,16 +48,19 @@ pub fn cycle(i: usize, n: usize, delta: isize) -> usize {
 /// Sections of the Settings page (sidebar tabs while it is active).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Section {
+    Sessions,
     Keyboard,
     Appearance,
     Debug,
 }
 
 impl Section {
-    pub const ALL: [Section; 3] = [Section::Keyboard, Section::Appearance, Section::Debug];
+    pub const ALL: [Section; 4] =
+        [Section::Sessions, Section::Keyboard, Section::Appearance, Section::Debug];
 
     pub fn label(self) -> &'static str {
         match self {
+            Section::Sessions => "Sessions",
             Section::Keyboard => "Keyboard",
             Section::Appearance => "Appearance",
             Section::Debug => "Debug",
@@ -168,13 +172,15 @@ pub enum Action {
     NextTile,
     PrevTab,
     NextTab,
+    PrevSidebarTab,
+    NextSidebarTab,
     PrevPage,
     NextPage,
 }
 
 impl Action {
     /// Keyboard-page row order.
-    pub const ALL: [Action; 14] = [
+    pub const ALL: [Action; 16] = [
         Action::SplitRight,
         Action::SplitDown,
         Action::NewTab,
@@ -187,6 +193,8 @@ impl Action {
         Action::NextTile,
         Action::PrevTab,
         Action::NextTab,
+        Action::PrevSidebarTab,
+        Action::NextSidebarTab,
         Action::PrevPage,
         Action::NextPage,
     ];
@@ -206,6 +214,8 @@ impl Action {
             Action::NextTile => "next_tile",
             Action::PrevTab => "prev_tab",
             Action::NextTab => "next_tab",
+            Action::PrevSidebarTab => "prev_sidebar_tab",
+            Action::NextSidebarTab => "next_sidebar_tab",
             Action::PrevPage => "prev_page",
             Action::NextPage => "next_page",
         }
@@ -225,6 +235,8 @@ impl Action {
             Action::NextTile => "Focus next tile",
             Action::PrevTab => "Previous tab",
             Action::NextTab => "Next tab",
+            Action::PrevSidebarTab => "Previous sidebar tab",
+            Action::NextSidebarTab => "Next sidebar tab",
             Action::PrevPage => "Previous page",
             Action::NextPage => "Next page",
         }
@@ -248,6 +260,8 @@ impl Action {
             Action::NextTile => (false, "]"),
             Action::PrevTab => (true, "["),
             Action::NextTab => (true, "]"),
+            Action::PrevSidebarTab => (true, "up"),
+            Action::NextSidebarTab => (true, "down"),
             Action::PrevPage => (true, "left"),
             Action::NextPage => (true, "right"),
         };
@@ -441,6 +455,23 @@ mod tests {
             key_char: None,
         };
         assert!(b.matches(&ks));
+    }
+
+    #[test]
+    fn sidebar_tab_bindings_resolve() {
+        let ks = |key: &str| Keystroke {
+            modifiers: Modifiers {
+                platform: true,
+                shift: true,
+                control: false,
+                alt: false,
+                function: false,
+            },
+            key: key.into(),
+            key_char: None,
+        };
+        assert_eq!(match_action(&ks("up")), Some(Action::PrevSidebarTab));
+        assert_eq!(match_action(&ks("down")), Some(Action::NextSidebarTab));
     }
 
     #[test]

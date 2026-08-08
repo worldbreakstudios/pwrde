@@ -161,14 +161,17 @@ pub struct Workspace {
     /// Directory every shell opened in this group starts in. `None` inherits
     /// the directory pwrde itself was launched from.
     pub cwd: Option<std::path::PathBuf>,
+    /// The first tile spawned with the group. Closing it closes the whole
+    /// group (after a confirmation), so it anchors the group's lifetime.
+    pub primary_tile: u64,
 }
 
 impl Workspace {
     /// Create a group holding a single tile, rooted at `cwd` (`None` = inherit
-    /// the process launch directory).
+    /// the process launch directory). The founding tile becomes the primary.
     pub fn new(name: String, tile: Tile, cwd: Option<std::path::PathBuf>) -> Self {
         let focused_tile = tile.id;
-        Self { name, root: Node::Leaf(tile), focused_tile, cwd }
+        Self { name, root: Node::Leaf(tile), focused_tile, cwd, primary_tile: focused_tile }
     }
 
     /// The tab-less workspace shown behind the empty-state CTA. Kept around
@@ -201,6 +204,33 @@ impl Workspace {
     }
 }
 
+/// Display form of a path with a leading `$HOME` shortened to `~`.
+pub fn display_path(dir: &std::path::Path, home: Option<&std::path::Path>) -> String {
+    if let Some(home) = home {
+        if dir == home {
+            return "~".into();
+        }
+        if let Ok(rest) = dir.strip_prefix(home) {
+            return format!("~/{}", rest.display());
+        }
+    }
+    dir.display().to_string()
+}
+
+/// Display form of a group's cwd for the sidebar card's second line. `None`
+/// (inherit) falls back to the process working directory.
+pub fn display_cwd(cwd: Option<&std::path::Path>) -> String {
+    let fallback;
+    let dir = match cwd {
+        Some(d) => d,
+        None => {
+            fallback = std::env::current_dir().unwrap_or_default();
+            &fallback
+        },
+    };
+    display_path(dir, dirs::home_dir().as_deref())
+}
+
 // ─── Layout ─────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug)]
@@ -229,7 +259,7 @@ pub const SIDEBAR_MAX_W: f32 = 360.0;
 /// Top strip of the sidebar: native traffic lights float here and the rest
 /// is the window drag handle.
 pub const TITLEBAR_H: f32 = 44.0;
-const TAB_H: f32 = 34.0;
+const TAB_H: f32 = 48.0;
 /// Vertical gap between the sidebar's rounded group rows.
 const TAB_GAP: f32 = 3.0;
 /// Horizontal inset of the sidebar's rows from the sidebar edges.
@@ -516,6 +546,23 @@ mod tests {
         // layout code always have something to work with.
         assert_eq!(ws.root.tiles().len(), 1);
         assert!(ws.focused().is_some());
+    }
+
+    #[test]
+    fn new_workspace_marks_founding_tile_primary() {
+        let ws = Workspace::new("g".into(), Tile::empty(7), None);
+        assert_eq!(ws.primary_tile, 7);
+        assert_eq!(ws.focused_tile, 7);
+    }
+
+    #[test]
+    fn display_path_shortens_home() {
+        use std::path::Path;
+        let home = Path::new("/Users/me");
+        assert_eq!(display_path(home, Some(home)), "~");
+        assert_eq!(display_path(Path::new("/Users/me/src/app"), Some(home)), "~/src/app");
+        assert_eq!(display_path(Path::new("/tmp/x"), Some(home)), "/tmp/x");
+        assert_eq!(display_path(Path::new("/tmp/x"), None), "/tmp/x");
     }
 
     #[test]
