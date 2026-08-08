@@ -194,6 +194,18 @@ impl Workspace {
         self.root.find_tile_mut(self.focused_tile)
     }
 
+    /// Sidebar display title: the primary pane's active-tab title, so the
+    /// group card always tracks what its founding pane is running. Falls
+    /// back to the static group `name` while that pane has no title yet.
+    pub fn title(&self) -> String {
+        self.root
+            .find_tile(self.primary_tile)
+            .and_then(|t| t.active_tab())
+            .map(|tab| tab.session.title())
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| self.name.clone())
+    }
+
     /// Ensure `focused_tile` points at an existing tile.
     pub fn fix_focus(&mut self) {
         if self.root.find_tile(self.focused_tile).is_none()
@@ -554,6 +566,18 @@ mod tests {
         let ws = Workspace::new("g".into(), Tile::empty(7), None);
         assert_eq!(ws.primary_tile, 7);
         assert_eq!(ws.focused_tile, 7);
+    }
+
+    #[test]
+    fn title_falls_back_to_name_without_a_primary_pane_title() {
+        // A tab-less primary tile has no session title to mirror.
+        let ws = Workspace::new("g".into(), Tile::empty(7), None);
+        assert_eq!(ws.title(), "g");
+
+        // A vanished primary tile must not panic — fall back to the name.
+        let mut ws = Workspace::new("g".into(), Tile::empty(7), None);
+        ws.primary_tile = 999;
+        assert_eq!(ws.title(), "g");
     }
 
     #[test]
