@@ -54,6 +54,7 @@ pub struct SavedTab {
     pub active: bool,
     pub shpool_session: Option<String>,
     pub cwd: Option<String>,
+    pub unread: bool,
 }
 
 /// Compose the DB path under `data_dir`, optionally scoped to a worktree slug.
@@ -113,6 +114,7 @@ fn open_db(path: &Path) -> SqlResult<Connection> {
     // Migrate pre-sections DBs: CREATE TABLE IF NOT EXISTS does not add columns
     // to existing tables, so ALTER and ignore the duplicate-column error.
     let _ = conn.execute("ALTER TABLE groups ADD COLUMN section_id INTEGER", []);
+    let _ = conn.execute("ALTER TABLE tabs ADD COLUMN unread INTEGER", []);
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS sections (
@@ -179,8 +181,8 @@ pub fn save_snapshot(
 
         for tab in &group.tabs {
             tx.execute(
-                "INSERT INTO tabs (group_id, tile_id, tab_index, active, shpool_session, cwd)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO tabs (group_id, tile_id, tab_index, active, shpool_session, cwd, unread)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 (
                     group_id,
                     tab.tile_id,
@@ -188,6 +190,7 @@ pub fn save_snapshot(
                     if tab.active { 1 } else { 0 },
                     &tab.shpool_session,
                     &tab.cwd,
+                    if tab.unread { 1 } else { 0 },
                 ),
             )?;
         }
@@ -301,7 +304,7 @@ fn load_groups(conn: &Connection) -> Vec<SavedGroup> {
         };
 
         let mut tab_stmt = match conn.prepare(
-            "SELECT tile_id, tab_index, active, shpool_session, cwd
+            "SELECT tile_id, tab_index, active, shpool_session, cwd, unread
              FROM tabs WHERE group_id = ?1 ORDER BY tile_id, tab_index",
         ) {
             Ok(s) => s,
@@ -318,6 +321,7 @@ fn load_groups(conn: &Connection) -> Vec<SavedGroup> {
                 active: row.get::<_, i32>(2)? != 0,
                 shpool_session: row.get(3)?,
                 cwd: row.get(4)?,
+                unread: row.get::<_, Option<i64>>(5)?.map(|v| v != 0).unwrap_or(false),
             })
         }) {
             Ok(r) => r,
@@ -414,6 +418,7 @@ fn node_to_layout_rec(node: &crate::workspace::Node, tabs: &mut Vec<SavedTab>) -
                     active: tab_index == tile.active,
                     shpool_session: tab.session.shpool_session.clone(),
                     cwd: None, // cwd is not tracked on Session; shpool will preserve it
+                    unread: tab.unread,
                 });
             }
             LayoutNode::Leaf {
@@ -484,6 +489,7 @@ mod tests {
                 active: true,
                 shpool_session: Some("pwrde-1-abc".into()),
                 cwd: Some("/home/user".into()),
+                unread: false,
             }],
             section_id,
         }
@@ -512,6 +518,7 @@ mod tests {
                         active: true,
                         shpool_session: Some("pwrde-1-abc".into()),
                         cwd: Some("/home/user".into()),
+                        unread: false,
                     },
                     SavedTab {
                         tile_id: 1,
@@ -519,6 +526,7 @@ mod tests {
                         active: false,
                         shpool_session: Some("pwrde-2-def".into()),
                         cwd: Some("/tmp".into()),
+                        unread: false,
                     },
                     SavedTab {
                         tile_id: 2,
@@ -526,6 +534,7 @@ mod tests {
                         active: true,
                         shpool_session: None,
                         cwd: None,
+                        unread: false,
                     },
                 ],
                 section_id: None,
@@ -542,6 +551,7 @@ mod tests {
                     active: true,
                     shpool_session: Some("pwrde-3-xyz".into()),
                     cwd: Some("/var/log".into()),
+                    unread: false,
                 }],
                 section_id: None,
             },
@@ -756,5 +766,108 @@ mod tests {
         let saved = workspaces_to_saved(&[a, b]);
         assert_eq!(saved[0].section_id, Some(7));
         assert_eq!(saved[1].section_id, None);
+    }
+
+    #[test]
+    fn unread_survives_roundtrip() {
+        let path = temp_db("unread-roundtrip");
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+
+        let groups = vec![SavedGroup {
+            position: 0,
+            name: "g".into(),
+            cwd: None,
+            focused_tile: 1,
+            layout: LayoutNode::Leaf { tile: 1 },
+            tabs: vec![
+                SavedTab {
+                    tile_id: 1,
+                    tab_index: 0,
+                    active: true,
+                    shpool_session: None,
+                    cwd: None,
+                    unread: true,
+                },
+                SavedTab {
+                    tile_id: 1,
+                    tab_index: 1,
+                    active: false,
+                    shpool_session: None,
+                    cwd: None,
+                    unread: false,
+                },
+            ],
+            section_id: None,
+        }];
+
+        save_snapshot(&groups, &[], &path).unwrap();
+        let (loaded, _) = load_snapshot(&path);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].tabs.len(), 2);
+        assert!(loaded[0].tabs[0].unread, "first tab should be unread");
+        assert!(!loaded[0].tabs[1].unread, "second tab should not be unread");
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn pre_unread_db_loads_false() {
+        // DB without the unread column should load tabs with unread=false.
+        let path = temp_db("pre-unread");
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute(
+                "CREATE TABLE groups (
+                    id INTEGER PRIMARY KEY,
+                    position INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    cwd TEXT,
+                    focused_tile INTEGER NOT NULL,
+                    layout TEXT NOT NULL,
+                    section_id INTEGER
+                )",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "CREATE TABLE tabs (
+                    id INTEGER PRIMARY KEY,
+                    group_id INTEGER NOT NULL,
+                    tile_id INTEGER NOT NULL,
+                    tab_index INTEGER NOT NULL,
+                    active INTEGER NOT NULL,
+                    shpool_session TEXT,
+                    cwd TEXT
+                )",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO groups (position, name, cwd, focused_tile, layout)
+                 VALUES (0, 'old', NULL, 1, ?1)",
+                [r#"{"tile":1}"#],
+            )
+            .unwrap();
+            let gid = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO tabs (group_id, tile_id, tab_index, active, shpool_session, cwd)
+                 VALUES (?1, 1, 0, 1, NULL, NULL)",
+                [gid],
+            )
+            .unwrap();
+        }
+
+        let (groups, _) = load_snapshot(&path);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].tabs.len(), 1);
+        assert!(!groups[0].tabs[0].unread, "pre-migration rows load as unread=false");
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

@@ -22,6 +22,7 @@ use termwiz::surface::CursorVisibility;
 use wezterm_term::color::ColorPalette;
 
 use crate::pages::{self, Action, Page, Section};
+use crate::palette::Palette;
 use crate::picker::{ForkPicker, Picker, PickerLayout, PickerRow};
 use crate::rect::char_rects;
 use crate::term::Session;
@@ -337,6 +338,7 @@ impl Renderer {
         resize_hover: Option<&workspace::ResizeHover>,
         picker: Option<&Picker>,
         fork: Option<&ForkPicker>,
+        palette: Option<&Palette>,
         message: Option<&(String, bool)>,
         confirm: Option<&str>,
         chrome: &ChromeState,
@@ -553,6 +555,7 @@ impl Renderer {
                     let draw_cursor = Some(*id) == focused_tile
                         && picker.is_none()
                         && fork.is_none()
+                        && palette.is_none()
                         && message.is_none()
                         && confirm.is_none();
                     let rows = self.snapshot_pane(
@@ -575,6 +578,20 @@ impl Renderer {
                         workspace::tile_tab_close_rect(rect, ti, tile.tabs.len(), self.scale);
                     let title = tab.session.title();
                     let text = if title.is_empty() { "shell".to_string() } else { title };
+                    // Unread: an accent dot before the title, which shifts
+                    // right to make room (the clip's right edge is unchanged).
+                    let mut text_left = tr.x + tab_text_pad;
+                    if tab.unread {
+                        let ds = (6.0 * self.scale).round();
+                        let dot = LayoutRect {
+                            x: text_left,
+                            y: (tr.y + (tr.h - ds) / 2.0).round(),
+                            w: ds,
+                            h: ds,
+                        };
+                        fg_quads.push(self.px_rect(&dot, th.accent, 1.0, ds / 2.0));
+                        text_left += ds + (5.0 * self.scale).round();
+                    }
                     labels.push(LabelSpec {
                         text,
                         color: if ti == tile.active {
@@ -582,7 +599,7 @@ impl Renderer {
                         } else {
                             color(pane_ink_dim.0, pane_ink_dim.1)
                         },
-                        left: tr.x + tab_text_pad,
+                        left: text_left,
                         top: (tr.y + (tr.h - self.cell_height) / 2.0).round(),
                         clip: LayoutRect {
                             w: (close.x - tr.x - tab_text_pad).max(0.0),
@@ -677,6 +694,10 @@ impl Renderer {
             picker_labels = self.picker_overlay(p, &layout, &mut picker_quads);
         } else if let Some(f) = fork {
             picker_labels = self.fork_overlay(f, &mut picker_quads);
+        } else if let Some(pal) = palette {
+            let layout =
+                PickerLayout::compute(width, height, self.scale, pal.rows.len(), pal.selected);
+            picker_labels = self.palette_overlay(pal, &layout, &mut picker_quads);
         } else if let Some((text, _)) = message {
             picker_labels = self.message_overlay(text, &mut picker_quads);
         }
@@ -784,6 +805,21 @@ impl Renderer {
                         bg_quads
                             .push(self.px_rect(&rect, th.card, 0.78, row_r).shadow(Shadow::Soft));
                     }
+                    // Unread (mirrors the title: the primary pane's active
+                    // tab): an accent dot at the card's right edge, with the
+                    // text clips shortened so titles never run under it.
+                    let mut clip_w = rect.w - group_pad;
+                    if ws_item.primary_unread() {
+                        let ds = (7.0 * self.scale).round();
+                        let dot = LayoutRect {
+                            x: rect.x + rect.w - group_pad - ds,
+                            y: (rect.y + (rect.h - ds) / 2.0).round(),
+                            w: ds,
+                            h: ds,
+                        };
+                        bg_quads.push(self.px_rect(&dot, th.accent, 1.0, ds / 2.0));
+                        clip_w -= ds + group_pad;
+                    }
                     let inset =
                         ((rect.h - (self.cell_height + cwd_line_h)) / 2.0).max(0.0);
                     labels.push(LabelSpec {
@@ -794,7 +830,7 @@ impl Renderer {
                         ),
                         left: rect.x + group_pad,
                         top: (rect.y + inset).round(),
-                        clip: LayoutRect { w: rect.w - group_pad, ..rect },
+                        clip: LayoutRect { w: clip_w, ..rect },
                         size: None,
                     });
                     labels.push(LabelSpec {
@@ -802,7 +838,7 @@ impl Renderer {
                         color: color(th.ink_dim, 0.8),
                         left: rect.x + group_pad,
                         top: (rect.y + inset + self.cell_height).round(),
-                        clip: LayoutRect { w: rect.w - group_pad, ..rect },
+                        clip: LayoutRect { w: clip_w, ..rect },
                         size: Some(cwd_size),
                     });
                 }
@@ -1307,6 +1343,89 @@ impl Renderer {
                     }
                 },
             }
+        }
+        labels
+    }
+
+    /// Command-palette overlay: a filterable list of every rebindable action,
+    /// with its current ⌘ binding right-aligned in the row. Painted from the
+    /// same [`PickerLayout`] `main.rs` hit-tests so clicks agree with pixels.
+    fn palette_overlay(
+        &self,
+        palette: &Palette,
+        layout: &PickerLayout,
+        rects: &mut Vec<Quad>,
+    ) -> Vec<LabelSpec> {
+        let th = self.theme();
+        let scale = self.scale;
+        let pad = (12.0 * scale).round();
+        let mut labels = Vec::new();
+
+        // Scrim + card + search field, matching the dir picker.
+        let scrim = LayoutRect { x: 0.0, y: 0.0, w: self.width as f32, h: self.height as f32 };
+        rects.push(self.px_rect(&scrim, th.scrim, 0.30, 0.0));
+        rects.push(
+            self.px_rect(&layout.panel, th.card, 0.96, (CARD_RADIUS * scale).round())
+                .shadow(Shadow::Card),
+        );
+        rects.push(self.px_rect(&layout.search, th.ink, 0.06, (7.0 * scale).round()));
+
+        // Search text (or placeholder) with a caret trailing the query.
+        let search_top = (layout.search.y + (layout.search.h - self.cell_height) / 2.0).round();
+        let (text, c) = if palette.query.is_empty() {
+            ("Run a command…".to_string(), th.ink_dim)
+        } else {
+            (palette.query.clone(), th.ink)
+        };
+        labels.push(LabelSpec {
+            text,
+            color: color(c, 1.0),
+            left: layout.search.x + pad,
+            top: search_top,
+            clip: layout.search,
+            size: None,
+        });
+        let caret_x = layout.search.x + pad + palette.query.chars().count() as f32 * self.cell_width;
+        let caret = LayoutRect {
+            x: caret_x,
+            y: search_top,
+            w: (2.0 * scale).round().max(1.0),
+            h: self.cell_height,
+        };
+        rects.push(self.px_rect(&caret, th.accent, 1.0, 0.0));
+
+        // Visible rows: selected-row highlight, action label, binding hint.
+        for i in layout.first_visible..(layout.first_visible + layout.visible) {
+            let (Some(row), Some(action)) = (layout.row_rect(i), palette.rows.get(i)) else {
+                continue;
+            };
+            let top = (row.y + (row.h - self.cell_height) / 2.0).round();
+            if i == palette.selected {
+                // Accent-tinted rounded pill, inset from the panel edges.
+                let m = (6.0 * scale).round();
+                let pill = LayoutRect { x: row.x + m, w: (row.w - 2.0 * m).max(0.0), ..row };
+                rects.push(self.px_rect(&pill, th.accent, 0.10, (7.0 * scale).round()));
+            }
+            // Current binding, right-aligned; the label clips short of it.
+            let binding = action.binding().display();
+            let binding_w = binding.chars().count() as f32 * self.cell_width;
+            let binding_x = row.x + row.w - pad - binding_w;
+            labels.push(LabelSpec {
+                text: binding,
+                color: color(th.ink_dim, 1.0),
+                left: binding_x,
+                top,
+                clip: row,
+                size: None,
+            });
+            labels.push(LabelSpec {
+                text: action.label().to_string(),
+                color: color(th.ink, 1.0),
+                left: row.x + pad,
+                top,
+                clip: LayoutRect { w: (binding_x - pad - row.x).max(0.0), ..row },
+                size: None,
+            });
         }
         labels
     }
