@@ -187,6 +187,13 @@ impl App {
 
     /// Re-measure every visible tile and push grid sizes to the PTYs.
     fn sync_layout(&mut self) {
+        self.sync_layout_impl(false);
+    }
+
+    /// `force` pushes a PTY resize even when cols/rows are unchanged — needed
+    /// after a display-scale change, where the cell pixel size and dpi moved
+    /// but the grid dimensions may not have.
+    fn sync_layout_impl(&mut self, force: bool) {
         let scale = self.scale();
         let (cw, ch) = self.cell_px();
         let dpi = self.dpi();
@@ -200,7 +207,7 @@ impl App {
             let (cols, rows) = self.renderer.grid_size_for(&content);
             if let Some(tile) = ws.root.find_tile_mut(*id) {
                 if let Some(tab) = tile.active_tab_mut() {
-                    if (cols, rows) != (tab.cols, tab.rows) {
+                    if force || (cols, rows) != (tab.cols, tab.rows) {
                         tab.cols = cols;
                         tab.rows = rows;
                         tab.session.resize(cols, rows, cw, ch, dpi);
@@ -1591,9 +1598,17 @@ impl App {
         let scale = window.scale_factor();
         let phys_w = (f32::from(bounds.size.width) * scale) as u32;
         let phys_h = (f32::from(bounds.size.height) * scale) as u32;
-        self.renderer.scale = scale;
+        // The window moved to a display with a different backing scale: font
+        // size, cell metrics, and dpi all derive from it, so re-measure the
+        // cell and force the PTYs to learn the new cell size even if the
+        // grid dimensions happen to be unchanged.
+        let rescaled = scale != self.renderer.scale;
+        if rescaled {
+            let cell_width = renderer::measure_cell_width(window, scale);
+            self.renderer.update_scale(scale, cell_width);
+        }
         self.renderer.resize(phys_w, phys_h);
-        self.sync_layout();
+        self.sync_layout_impl(rescaled);
         self.begin_frame();
 
         // While a tab is being dragged, resolve the current landing zone and
@@ -1750,6 +1765,57 @@ impl App {
     }
 }
 
+/// Hide AppKit's private `_NSTitlebarDecorationView`, which draws a ~1px
+/// light highlight hairline across the top edge of the window frame. With our
+/// transparent titlebar over dark content that hairline shows as a stray
+/// white line at the top of the window. The traffic-light widgets live in the
+/// sibling `NSTitlebarView`, so hiding the decoration view leaves them
+/// untouched.
+#[cfg(target_os = "macos")]
+fn hide_titlebar_decoration(window: &Window) {
+    use objc::runtime::{Object, YES};
+    use objc::{msg_send, sel, sel_impl};
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    // Explicit trait call: gpui's `Window` has an inherent `window_handle()`
+    // (returning `AnyWindowHandle`) that would otherwise shadow the trait's.
+    let Ok(handle) = HasWindowHandle::window_handle(window) else { return };
+    let RawWindowHandle::AppKit(appkit) = handle.as_raw() else { return };
+    unsafe {
+        let ns_view = appkit.ns_view.as_ptr() as *mut Object;
+        let ns_window: *mut Object = msg_send![ns_view, window];
+        if ns_window.is_null() {
+            return;
+        }
+        let content: *mut Object = msg_send![ns_window, contentView];
+        if content.is_null() {
+            return;
+        }
+        // contentView's superview is the NSThemeFrame; the decoration view
+        // lives inside its NSTitlebarContainerView child.
+        let frame: *mut Object = msg_send![content, superview];
+        if frame.is_null() {
+            return;
+        }
+        let subviews: *mut Object = msg_send![frame, subviews];
+        let count: usize = msg_send![subviews, count];
+        for i in 0..count {
+            let container: *mut Object = msg_send![subviews, objectAtIndex: i];
+            if !(*container).class().name().contains("NSTitlebarContainerView") {
+                continue;
+            }
+            let inner: *mut Object = msg_send![container, subviews];
+            let n: usize = msg_send![inner, count];
+            for j in 0..n {
+                let v: *mut Object = msg_send![inner, objectAtIndex: j];
+                if (*v).class().name().contains("TitlebarDecoration") {
+                    let _: () = msg_send![v, setHidden: YES];
+                }
+            }
+        }
+    }
+}
+
 /// Paint one renderer `Quad` (physical-px coords) as a gpui fill, with its
 /// optional drop shadow (under, in the theme's shadow ink) and border.
 fn paint_quad(
@@ -1823,6 +1889,9 @@ fn main() {
                 ..Default::default()
             },
             |window, cx| {
+                #[cfg(target_os = "macos")]
+                hide_titlebar_decoration(window);
+
                 let scale = window.scale_factor();
                 // Measure a monospace cell at the default font size.
                 let cell_width = renderer::measure_cell_width(window, scale);
