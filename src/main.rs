@@ -16,10 +16,12 @@
 //! `Application`, a window, and a terminal `Element`. Terminal wakeups arrive
 //! over an `mpsc` channel drained on gpui's foreground executor.
 
+mod claude_hooks;
 mod cleanup;
 mod git;
 mod links;
 mod pages;
+mod palette;
 mod persist;
 mod picker;
 mod rect;
@@ -156,6 +158,8 @@ struct App {
     picker: Option<picker::Picker>,
     /// The open step-2 fork-source picker (git repos only), or `None`.
     fork: Option<picker::ForkPicker>,
+    /// The open command palette, or `None` when closed.
+    palette: Option<palette::Palette>,
     /// A centered one-line message. `bool` is `dismissable`: false while `drop`
     /// provisions (input swallowed), true for a failure note the user can close.
     message: Option<(String, bool)>,
@@ -334,7 +338,9 @@ impl App {
                     let tab_cwd = st.cwd.as_ref().map(std::path::PathBuf::from);
                     let session = self
                         .spawn_session_named(tab_cwd.as_deref().or(cwd), st.shpool_session.clone());
-                    restored.tabs.push(Tab::new(session));
+                    let mut tab = Tab::new(session);
+                    tab.unread = st.unread;
+                    restored.tabs.push(tab);
                 }
                 restored.active = saved.iter().position(|st| st.active).unwrap_or(0);
                 Node::Leaf(restored)
@@ -440,6 +446,7 @@ impl App {
                 self.persist_snapshot();
             }
             self.sync_layout();
+            self.mark_visible_read();
             self.request_redraw();
         }
     }
@@ -454,6 +461,7 @@ impl App {
         let n = ids.len() as isize;
         let next = (((cur as isize + delta) % n + n) % n) as usize;
         ws.focused_tile = ids[next];
+        self.mark_visible_read();
         self.request_redraw();
     }
 
@@ -470,6 +478,7 @@ impl App {
             tile.active = (((cur + delta) % n + n) % n) as usize;
         }
         self.sync_layout();
+        self.mark_visible_read();
         self.request_redraw();
     }
 
@@ -716,6 +725,124 @@ impl App {
             .tiles()
             .iter()
             .any(|t| t.active_tab().is_some_and(|tab| tab.session.id == id))
+    }
+
+    /// Mark the tab owning session `id` unread. Returns true (and persists)
+    /// only on a false→true transition, so repeated attention signals from
+    /// one pane don't churn the snapshot.
+    fn set_unread_by_session(&mut self, id: u64) -> bool {
+        let changed = self.workspaces.iter_mut().any(|ws| {
+            ws.root.tiles_mut().into_iter().any(|t| {
+                t.tabs.iter_mut().any(|tab| {
+                    let hit = tab.session.id == id && !tab.unread;
+                    if hit {
+                        tab.unread = true;
+                    }
+                    hit
+                })
+            })
+        });
+        if changed {
+            self.persist_snapshot();
+        }
+        changed
+    }
+
+    /// The "visible = read" sweep: clear the unread dot on every on-screen
+    /// tab (each tile's active tab) of the active group. Called after actions
+    /// that change what's on screen — never per frame, or a manual
+    /// mark-as-unread on a visible tab would clear before it could be seen.
+    fn mark_visible_read(&mut self) {
+        if self.page != Page::Sessions {
+            return;
+        }
+        let mut changed = false;
+        for tile in self.workspaces[self.active].root.tiles_mut() {
+            if let Some(tab) = tile.active_tab_mut()
+                && tab.unread
+            {
+                tab.unread = false;
+                changed = true;
+            }
+        }
+        if changed {
+            self.persist_snapshot();
+            self.request_redraw();
+        }
+    }
+
+    /// Right-click marks things unread again — the "come back to this later"
+    /// gesture. A sidebar group card re-dots its primary pane's active tab
+    /// (the same tab the card's dot mirrors); a tile tab re-dots that tab.
+    /// Never changes focus.
+    fn on_right_mouse_down(&mut self) {
+        if self.page != Page::Sessions
+            || self.confirm.is_some()
+            || self.message.is_some()
+            || self.fork.is_some()
+            || self.picker.is_some()
+        {
+            return;
+        }
+        let scale = self.scale();
+        let (px, py) = (self.cursor.0 as f32, self.cursor.1 as f32);
+        let (_, h) = self.renderer.surface_size();
+
+        if workspace::sidebar(h, scale, self.sidebar_w).contains(px, py) {
+            let rows = workspace::sidebar_rows(&self.workspaces, &self.sections);
+            for (ri, row) in rows.iter().enumerate() {
+                let rect = workspace::sidebar_row_rect(
+                    &rows,
+                    ri,
+                    &self.workspaces,
+                    scale,
+                    self.sidebar_w,
+                );
+                if !rect.contains(px, py) {
+                    continue;
+                }
+                if let workspace::SidebarRow::Group { ws_idx } = *row {
+                    let ws = &mut self.workspaces[ws_idx];
+                    let primary = ws.primary_tile;
+                    if let Some(tab) =
+                        ws.root.find_tile_mut(primary).and_then(|t| t.active_tab_mut())
+                        && !tab.unread
+                    {
+                        tab.unread = true;
+                        self.persist_snapshot();
+                        self.request_redraw();
+                    }
+                }
+                return;
+            }
+            return;
+        }
+
+        // Tile tab strips of the active group.
+        let ws = &self.workspaces[self.active];
+        let (tiles, _) = workspace::layout_tiles(&ws.root, self.area(), scale);
+        for (id, rect) in &tiles {
+            let bar = workspace::tile_tab_bar(rect, scale);
+            if !bar.contains(px, py) {
+                continue;
+            }
+            if let Some(tile) = self.workspaces[self.active].root.find_tile_mut(*id) {
+                let n = tile.tabs.len();
+                if n == 0 {
+                    return;
+                }
+                let tab_w = workspace::tile_tab_rect(rect, 0, n, scale).w;
+                let ti = (((px - bar.x) / tab_w).floor() as usize).min(n - 1);
+                if let Some(tab) = tile.tabs.get_mut(ti)
+                    && !tab.unread
+                {
+                    tab.unread = true;
+                    self.persist_snapshot();
+                    self.request_redraw();
+                }
+            }
+            return;
+        }
     }
 
     // ── cwd picker ──────────────────────────────────────────────────────
@@ -1414,6 +1541,7 @@ impl App {
             _ => {},
         }
         self.sync_layout();
+        self.mark_visible_read();
         self.request_redraw();
         self.persist_snapshot();
     }
@@ -1588,25 +1716,46 @@ impl App {
         }
 
         // Dir picker (step 1): existing behaviour.
-        let Some(picker) = &mut self.picker else { return };
-        let layout = picker::PickerLayout::compute(width, height, scale, picker.rows.len(), picker.selected);
-        if !layout.panel.contains(px, py) {
-            self.picker = None;
-            self.request_redraw();
+        if let Some(picker) = &mut self.picker {
+            let layout = picker::PickerLayout::compute(width, height, scale, picker.rows.len(), picker.selected);
+            if !layout.panel.contains(px, py) {
+                self.picker = None;
+                self.request_redraw();
+                return;
+            }
+            let Some(index) = layout.row_at(px, py) else { return };
+            let Some(rect) = layout.row_rect(index) else { return };
+            let Some(picker::PickerRow::Entry(entry)) = picker.rows.get(index).cloned() else {
+                return;
+            };
+            picker.select(index);
+            if layout.star_rect(&rect).contains(px, py) {
+                picker.toggle_pin(&entry.path);
+                self.request_redraw();
+                return;
+            }
+            self.confirm_picker();
             return;
         }
-        let Some(index) = layout.row_at(px, py) else { return };
-        let Some(rect) = layout.row_rect(index) else { return };
-        let Some(picker::PickerRow::Entry(entry)) = picker.rows.get(index).cloned() else {
-            return;
-        };
-        picker.select(index);
-        if layout.star_rect(&rect).contains(px, py) {
-            picker.toggle_pin(&entry.path);
+
+        // Command palette: click a row to run the action, click outside to close.
+        if let Some(palette) = &mut self.palette {
+            let layout = picker::PickerLayout::compute(width, height, scale, palette.rows.len(), palette.selected);
+            if !layout.panel.contains(px, py) {
+                self.palette = None;
+                self.request_redraw();
+                return;
+            }
+            if let Some(index) = layout.row_at(px, py) {
+                palette.select(index);
+                let action = palette.selected_action();
+                self.palette = None;
+                if let Some(action) = action {
+                    self.run_action(action);
+                }
+            }
             self.request_redraw();
-            return;
         }
-        self.confirm_picker();
     }
 
     fn on_mouse_down(&mut self, window: &mut Window, click_count: usize) {
@@ -1621,6 +1770,7 @@ impl App {
             || self.message.is_some()
             || self.fork.is_some()
             || self.picker.is_some()
+            || self.palette.is_some()
         {
             self.overlay_click(px, py, w, h, scale);
             return;
@@ -1807,6 +1957,7 @@ impl App {
                     }
                     self.drag = Drag::TabPress { tile: *id, tab: ti, start: self.cursor };
                     self.sync_layout();
+                    self.mark_visible_read();
                     self.request_redraw();
                 }
             } else {
@@ -1820,6 +1971,7 @@ impl App {
                     }
                     self.drag = Drag::Select { tile: *id };
                 }
+                self.mark_visible_read();
                 self.request_redraw();
             }
             return;
@@ -1906,6 +2058,7 @@ impl App {
                     || self.message.is_some()
                     || self.fork.is_some()
                     || self.picker.is_some()
+                    || self.palette.is_some()
                 {
                     None
                 } else {
@@ -2003,6 +2156,7 @@ impl App {
             || self.message.is_some()
             || self.fork.is_some()
             || self.picker.is_some()
+            || self.palette.is_some()
         {
             self.handle_picker_key(ev);
             return;
@@ -2104,37 +2258,85 @@ impl App {
             return;
         }
         // Step 1: the dir picker. Escape closes the overlay entirely.
-        match key {
-            "escape" => self.picker = None,
-            "enter" => self.confirm_picker(),
-            "up" => {
-                if let Some(p) = self.picker.as_mut() {
-                    p.move_selection(-1);
-                }
-            },
-            "down" => {
-                if let Some(p) = self.picker.as_mut() {
-                    p.move_selection(1);
-                }
-            },
-            "backspace" => {
-                if let Some(p) = self.picker.as_mut() {
-                    p.backspace();
-                }
-            },
-            _ => {
-                // A printable character extends the query. gpui hands us the
-                // already-composed text (respecting shift/dead keys) in
-                // key_char; ignore control chords and non-text keys.
-                if !ev.keystroke.modifiers.control
-                    && let Some(text) = ev.keystroke.key_char.as_deref()
-                    && let Some(p) = self.picker.as_mut()
-                {
-                    for ch in text.chars().filter(|c| !c.is_control()) {
-                        p.push_char(ch);
+        if self.picker.is_some() {
+            match key {
+                "escape" => self.picker = None,
+                "enter" => self.confirm_picker(),
+                "up" => {
+                    if let Some(p) = self.picker.as_mut() {
+                        p.move_selection(-1);
                     }
-                }
-            },
+                },
+                "down" => {
+                    if let Some(p) = self.picker.as_mut() {
+                        p.move_selection(1);
+                    }
+                },
+                "backspace" => {
+                    if let Some(p) = self.picker.as_mut() {
+                        p.backspace();
+                    }
+                },
+                _ => {
+                    // A printable character extends the query. gpui hands us the
+                    // already-composed text (respecting shift/dead keys) in
+                    // key_char; ignore control chords and non-text keys.
+                    if !ev.keystroke.modifiers.control
+                        && let Some(text) = ev.keystroke.key_char.as_deref()
+                        && let Some(p) = self.picker.as_mut()
+                    {
+                        for ch in text.chars().filter(|c| !c.is_control()) {
+                            p.push_char(ch);
+                        }
+                    }
+                },
+            }
+        } else if self.palette.is_some() {
+            // The palette's own chord closes it again — the overlay owns the
+            // keyboard, so the toggle in run_action is unreachable from here.
+            if Action::CommandPalette.binding().matches(&ev.keystroke) {
+                self.palette = None;
+                self.request_redraw();
+                return;
+            }
+            match key {
+                "escape" => self.palette = None,
+                "enter" => {
+                    let action = self
+                        .palette
+                        .as_ref()
+                        .and_then(|p| p.selected_action());
+                    self.palette = None;
+                    if let Some(action) = action {
+                        self.run_action(action);
+                    }
+                },
+                "up" => {
+                    if let Some(p) = self.palette.as_mut() {
+                        p.move_selection(-1);
+                    }
+                },
+                "down" => {
+                    if let Some(p) = self.palette.as_mut() {
+                        p.move_selection(1);
+                    }
+                },
+                "backspace" => {
+                    if let Some(p) = self.palette.as_mut() {
+                        p.backspace();
+                    }
+                },
+                _ => {
+                    if !ev.keystroke.modifiers.control
+                        && let Some(text) = ev.keystroke.key_char.as_deref()
+                        && let Some(p) = self.palette.as_mut()
+                    {
+                        for ch in text.chars().filter(|c| !c.is_control()) {
+                            p.push_char(ch);
+                        }
+                    }
+                },
+            }
         }
         self.request_redraw();
     }
@@ -2256,6 +2458,14 @@ impl App {
             Action::NextSidebarTab => return self.cycle_sidebar_tab(1),
             Action::OpenSettings => return self.set_page(Page::Settings),
             Action::Quit => std::process::exit(0),
+            Action::CommandPalette => {
+                if self.palette.is_some() {
+                    self.palette = None;
+                } else {
+                    self.palette = Some(palette::Palette::new());
+                }
+                return;
+            },
             _ => {},
         }
         if self.page != Page::Sessions {
@@ -2286,7 +2496,8 @@ impl App {
             | Action::PrevPage
             | Action::NextPage
             | Action::OpenSettings
-            | Action::Quit => {},
+            | Action::Quit
+            | Action::CommandPalette => {},
         }
     }
 
@@ -2337,6 +2548,7 @@ impl App {
             // Grids may have gone stale while the Settings page was up.
             if page == Page::Sessions {
                 self.sync_layout();
+                self.mark_visible_read();
             }
             // Entering the Cleanup page triggers a fresh scan.
             if page == Page::Cleanup {
@@ -2576,7 +2788,6 @@ impl App {
                     self.message = Some((format!("drop failed: {message}"), true));
                     redraw = true;
                 },
-                // Cleanup scan completed — handled fully in task-5.
                 TermEvent::CleanupScanned(worktrees) => {
                     self.cleanup.set_ready(worktrees);
                     redraw = true;
@@ -2596,6 +2807,15 @@ impl App {
                     self.message = Some((msg, true));
                     self.spawn_cleanup_scan();
                     redraw = true;
+                },
+                // A pane signaled for attention (OSC 9, emitted by the Claude
+                // Code hooks). On-screen tabs of the active group are being
+                // watched, so only hidden tabs gain the unread dot.
+                TermEvent::Attention(id) => {
+                    let watched = self.page == Page::Sessions && self.is_visible(id);
+                    if !watched && self.set_unread_by_session(id) {
+                        redraw = true;
+                    }
                 },
             }
         }
@@ -2949,6 +3169,16 @@ impl Render for App {
                     cx.notify();
                 }),
             )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|app, ev: &MouseDownEvent, _window, cx| {
+                    let s = app.scale() as f64;
+                    app.cursor = (f64::from(ev.position.x) * s, f64::from(ev.position.y) * s);
+                    app.modifiers = ev.modifiers;
+                    app.on_right_mouse_down();
+                    cx.notify();
+                }),
+            )
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|app, _ev: &MouseUpEvent, window, cx| {
@@ -3005,7 +3235,8 @@ impl App {
         let overlay_open = self.confirm.is_some()
             || self.message.is_some()
             || self.fork.is_some()
-            || self.picker.is_some();
+            || self.picker.is_some()
+            || self.palette.is_some();
         let resize_hover = if overlay_open
             || !matches!(self.drag, Drag::None | Drag::Sidebar | Drag::Divider { .. })
         {
@@ -3064,6 +3295,7 @@ impl App {
             resize_hover,
             self.picker.as_ref(),
             self.fork.as_ref(),
+            self.palette.as_ref(),
             self.message.as_ref(),
             self.confirm.as_ref().map(|c| (c.text.as_str(), c.accept_label())),
             &chrome,
@@ -3294,6 +3526,9 @@ fn paint_quad(
 fn main() {
     // Settings must be in memory before anything reads a binding or theme.
     settings::init();
+    // Install the Claude Code attention hooks (script + settings merge);
+    // warns and continues on any failure, never blocks launch.
+    claude_hooks::install();
     // At this gpui rev the platform lives in the gpui_platform crate; zed's own
     // main builds it the same way (current_platform → Application::with_platform).
     let platform = gpui_platform::current_platform(false);
@@ -3348,6 +3583,7 @@ fn main() {
                         drag: Drag::None,
                         picker: None,
                         fork: None,
+                        palette: None,
                         message: None,
                         confirm: None,
                         pending_primary_cmd: std::collections::HashMap::new(),
