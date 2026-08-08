@@ -625,9 +625,8 @@ impl App {
             };
             let steps = scroll_steps(&mut self.scroll_accum, notches);
             if steps != 0 {
-                let visible = self.cleanup.visible();
                 let fit = cleanup::rows_that_fit(&area, scale);
-                let max_scroll = visible.len().saturating_sub(fit);
+                let max_scroll = self.cleanup.rows().len().saturating_sub(fit);
                 let offset = self.cleanup.scroll as i64 - steps as i64;
                 self.cleanup.scroll = offset.clamp(0, max_scroll as i64) as usize;
                 self.request_redraw();
@@ -1854,12 +1853,14 @@ impl App {
                 // "All" tab at index 0.
                 if workspace::tab_rect(0, scale, self.sidebar_w).contains(px, py) {
                     self.cleanup.repo_filter = None;
+                    self.cleanup.scroll = 0;
                     self.request_redraw();
                     return;
                 }
                 for (i, repo) in repos.iter().enumerate() {
                     if workspace::tab_rect(i + 1, scale, self.sidebar_w).contains(px, py) {
                         self.cleanup.repo_filter = Some(repo.root.clone());
+                        self.cleanup.scroll = 0;
                         self.request_redraw();
                         return;
                     }
@@ -2083,8 +2084,44 @@ impl App {
                     self.resize_hover = hover;
                     self.request_redraw();
                 }
+                // Dirty-cell hover on the Cleanup page drives the file popover.
+                let cleanup_hover = if self.page == Page::Cleanup
+                    && self.confirm.is_none()
+                    && self.message.is_none()
+                {
+                    self.cleanup_dirty_hover_at(px, py)
+                } else {
+                    None
+                };
+                if cleanup_hover != self.cleanup.hover {
+                    self.cleanup.hover = cleanup_hover;
+                    self.request_redraw();
+                }
             },
         }
+    }
+
+    /// The id of the dirty worktree whose dirty cell is under the cursor.
+    fn cleanup_dirty_hover_at(&self, px: f32, py: f32) -> Option<String> {
+        let area = self.area();
+        let scale = self.scale();
+        let cols = cleanup::column_offsets(&area, scale);
+        if px < cols.dirty || px >= cols.parity {
+            return None;
+        }
+        let fit = cleanup::rows_that_fit(&area, scale);
+        for vi in 0..fit {
+            let row = cleanup::row_rect(&area, vi, scale)?;
+            if !row.contains(px, py) {
+                continue;
+            }
+            let idx = self.cleanup.scroll + vi;
+            return match self.cleanup.rows().get(idx) {
+                Some(cleanup::Row::Entry(w)) if w.dirty_count > 0 => Some(w.id.clone()),
+                _ => None,
+            };
+        }
+        None
     }
 
     fn on_mouse_up(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2535,6 +2572,7 @@ impl App {
                 } else {
                     repos.get(next - 1).map(|r| r.root.clone())
                 };
+                self.cleanup.scroll = 0;
                 self.request_redraw();
             },
         }
@@ -2596,21 +2634,37 @@ impl App {
             self.request_redraw();
             return;
         }
-        // Row clicks: toggle selection (row_rect is None past the footer).
+        // Row clicks: toggle an entry's selection, or filter to a header's
+        // repo (row_rect is None past the footer).
+        enum Hit {
+            Toggle(String),
+            Filter(String),
+        }
         let fit = cleanup::rows_that_fit(&area, scale);
-        let mut hit: Option<String> = None;
+        let mut hit: Option<Hit> = None;
         for vi in 0..fit {
             let Some(row) = cleanup::row_rect(&area, vi, scale) else { break };
             if !row.contains(px, py) {
                 continue;
             }
             let idx = self.cleanup.scroll + vi;
-            hit = self.cleanup.visible().get(idx).map(|wt| wt.id.clone());
+            hit = self.cleanup.rows().get(idx).map(|r| match r {
+                cleanup::Row::Entry(w) => Hit::Toggle(w.id.clone()),
+                cleanup::Row::Header { root, .. } => Hit::Filter(root.to_string()),
+            });
             break;
         }
-        if let Some(id) = hit {
-            self.cleanup.toggle(&id);
-            self.request_redraw();
+        match hit {
+            Some(Hit::Toggle(id)) => {
+                self.cleanup.toggle(&id);
+                self.request_redraw();
+            },
+            Some(Hit::Filter(root)) => {
+                self.cleanup.repo_filter = Some(root);
+                self.cleanup.scroll = 0;
+                self.request_redraw();
+            },
+            None => {},
         }
     }
 
@@ -3014,8 +3068,40 @@ fn run_drop_status() -> Result<Vec<cleanup::WorktreeInfo>, String> {
         return Err(if reason.is_empty() { "drop -d exited with an error".into() } else { reason });
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    serde_json::from_str::<Vec<cleanup::WorktreeInfo>>(&stdout)
-        .map_err(|e| format!("could not parse drop output: {e}"))
+    let mut worktrees = serde_json::from_str::<Vec<cleanup::WorktreeInfo>>(&stdout)
+        .map_err(|e| format!("could not parse drop output: {e}"))?;
+    // Enrich dirty worktrees with per-file +/- details for the hover popover.
+    // Best-effort: a git hiccup just leaves the list empty.
+    for w in worktrees.iter_mut().filter(|w| w.dirty_count > 0) {
+        w.dirty_files = dirty_file_details(std::path::Path::new(&w.path));
+    }
+    Ok(worktrees)
+}
+
+/// `git diff HEAD --numstat` + untracked listing for one worktree.
+fn dirty_file_details(worktree: &std::path::Path) -> Vec<cleanup::DirtyFile> {
+    let run = |args: &[&str]| -> String {
+        let mut cmd = git::augmented_command("git");
+        cmd.arg("-C").arg(worktree).args(args);
+        cmd.output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default()
+    };
+    let mut files = cleanup::parse_numstat(&run(&["diff", "HEAD", "--numstat"]));
+    for line in run(&["ls-files", "--others", "--exclude-standard"]).lines() {
+        let path = line.trim();
+        if !path.is_empty() {
+            files.push(cleanup::DirtyFile {
+                path: path.to_string(),
+                added: None,
+                removed: None,
+                untracked: true,
+            });
+        }
+    }
+    files
 }
 
 /// Remove worktrees via `drop rm <ids...> --repo <root> --json`, once per

@@ -24,6 +24,8 @@ use crate::workspace::LayoutRect;
 #[serde(rename_all = "camelCase")]
 pub struct WorktreeInfo {
     pub repo_root: String,
+    /// Worktree directory — where the scan worker runs git for dirty details.
+    pub path: String,
     pub id: String,
     /// Absent for detached worktrees.
     #[serde(default)]
@@ -37,6 +39,21 @@ pub struct WorktreeInfo {
     pub last_activity_ms: f64,
     pub is_current: bool,
     pub pr: Option<PrInfo>,
+    /// Per-file change details for dirty worktrees, filled in by the scan
+    /// worker from `git diff --numstat` + untracked listing (not drop JSON).
+    #[serde(skip)]
+    pub dirty_files: Vec<DirtyFile>,
+}
+
+/// One changed file in a dirty worktree, for the hover popover.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirtyFile {
+    pub path: String,
+    /// Added/removed line counts; `None` for binary files.
+    pub added: Option<u32>,
+    pub removed: Option<u32>,
+    /// Untracked files have no diff — shown as "new".
+    pub untracked: bool,
 }
 
 /// Pull-request summary attached to a worktree.
@@ -72,8 +89,19 @@ pub struct Cleanup {
     pub selected: HashSet<String>,
     /// `None` = show all repos; `Some(repo_root)` = filter to that repo.
     pub repo_filter: Option<String>,
-    /// Vertical scroll position in visible-row units.
+    /// Vertical scroll position in table-row units (headers included).
     pub scroll: usize,
+    /// Worktree id whose dirty cell the cursor is over (drives the
+    /// dirty-files popover).
+    pub hover: Option<String>,
+}
+
+/// One table row: worktrees grouped under repo headers in the All view.
+#[derive(Debug)]
+pub enum Row<'a> {
+    /// Repo group header; clicking one filters to that repo.
+    Header { root: &'a str, display: &'a str, count: usize },
+    Entry(&'a WorktreeInfo),
 }
 
 impl Default for ScanState {
@@ -94,11 +122,12 @@ pub struct RepoEntry {
 }
 
 impl Cleanup {
-    /// Transition to Scanning state (clears selection/scroll).
+    /// Transition to Scanning state (clears selection/scroll/hover).
     pub fn set_scanning(&mut self) {
         self.scan = Some(ScanState::Scanning);
         self.selected.clear();
         self.scroll = 0;
+        self.hover = None;
     }
 
     /// Transition to Ready state with the scanned worktrees.
@@ -149,6 +178,43 @@ impl Cleanup {
                 Some(root) => &w.repo_root == root,
             })
             .collect()
+    }
+
+    /// Table rows: in the All view every repo's worktrees sit under a header
+    /// row for context; a filtered view is a single repo, so no headers.
+    pub fn rows(&self) -> Vec<Row<'_>> {
+        let visible = self.visible();
+        if self.repo_filter.is_some() {
+            return visible.into_iter().map(Row::Entry).collect();
+        }
+        // drop sorts by repoRoot, so consecutive entries share a repo.
+        let mut rows = Vec::with_capacity(visible.len() + 4);
+        let mut prev_root: Option<&str> = None;
+        for w in &visible {
+            if prev_root != Some(w.repo_root.as_str()) {
+                prev_root = Some(w.repo_root.as_str());
+                let display = w
+                    .repo_root
+                    .split('/')
+                    .filter(|s| !s.is_empty())
+                    .last()
+                    .unwrap_or(w.repo_root.as_str());
+                let count = visible.iter().filter(|v| v.repo_root == w.repo_root).count();
+                rows.push(Row::Header { root: w.repo_root.as_str(), display, count });
+            }
+            rows.push(Row::Entry(*w));
+        }
+        rows
+    }
+
+    /// The hovered worktree, if it is dirty and has file details to show.
+    pub fn hover_entry(&self) -> Option<&WorktreeInfo> {
+        let id = self.hover.as_deref()?;
+        let worktrees = match &self.scan {
+            Some(ScanState::Ready(v)) => v,
+            _ => return None,
+        };
+        worktrees.iter().find(|w| w.id == id && !w.dirty_files.is_empty())
     }
 
     /// Toggle selection for `id` (no-op if `isCurrent`).
@@ -273,6 +339,35 @@ pub fn format_branch(w: &WorktreeInfo) -> String {
         Some(b) => b.clone(),
         None => format!("@{}", &w.head[..w.head.len().min(8)]),
     }
+}
+
+/// Parse `git diff --numstat` output: `added\tremoved\tpath` per line, with
+/// `-` counts for binary files.
+pub fn parse_numstat(out: &str) -> Vec<DirtyFile> {
+    out.lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(3, '\t');
+            let added = parts.next()?.trim();
+            let removed = parts.next()?.trim();
+            let path = parts.next()?.trim();
+            if path.is_empty() {
+                return None;
+            }
+            Some(DirtyFile {
+                path: path.to_string(),
+                added: added.parse().ok(),
+                removed: removed.parse().ok(),
+                untracked: false,
+            })
+        })
+        .collect()
+}
+
+/// Total `(+added, -removed)` across a worktree's dirty files.
+pub fn dirty_totals(files: &[DirtyFile]) -> (u32, u32) {
+    files.iter().fold((0, 0), |(a, r), f| {
+        (a + f.added.unwrap_or(0), r + f.removed.unwrap_or(0))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -525,6 +620,7 @@ mod tests {
             selected: HashSet::new(),
             repo_filter: None,
             scroll: 0,
+            hover: None,
         }
     }
 
@@ -615,6 +711,63 @@ mod tests {
         assert!(!c.selected.contains("wt-2"));
         // wt-3: merged=true, dirty=0, not current => selected
         assert!(c.selected.contains("wt-3"));
+    }
+
+    #[test]
+    fn test_rows_group_by_repo_in_all_view() {
+        let c = make_cleanup(sample_worktrees());
+        let rows = c.rows();
+        // alpha header, wt-1, wt-2, beta header, wt-3
+        assert_eq!(rows.len(), 5);
+        assert!(matches!(rows[0], Row::Header { display: "alpha", count: 2, .. }));
+        assert!(matches!(&rows[1], Row::Entry(w) if w.id == "wt-1"));
+        assert!(matches!(&rows[2], Row::Entry(w) if w.id == "wt-2"));
+        assert!(matches!(rows[3], Row::Header { display: "beta", count: 1, .. }));
+        assert!(matches!(&rows[4], Row::Entry(w) if w.id == "wt-3"));
+    }
+
+    #[test]
+    fn test_rows_no_headers_when_filtered() {
+        let mut c = make_cleanup(sample_worktrees());
+        c.repo_filter = Some("/home/user/src/alpha".to_string());
+        let rows = c.rows();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| matches!(r, Row::Entry(_))));
+    }
+
+    #[test]
+    fn test_parse_numstat() {
+        let out = "12\t3\tsrc/main.rs\n-\t-\tassets/icon.png\n0\t7\tREADME.md\n";
+        let files = parse_numstat(out);
+        assert_eq!(files.len(), 3);
+        assert_eq!(files[0], DirtyFile {
+            path: "src/main.rs".into(),
+            added: Some(12),
+            removed: Some(3),
+            untracked: false,
+        });
+        // Binary files report "-" counts.
+        assert_eq!(files[1].added, None);
+        assert_eq!(files[1].removed, None);
+        assert_eq!(files[2].removed, Some(7));
+        assert_eq!(dirty_totals(&files), (12, 10));
+    }
+
+    #[test]
+    fn test_hover_entry_requires_dirty_files() {
+        let mut wts = sample_worktrees();
+        wts[1].dirty_files = vec![DirtyFile {
+            path: "a.rs".into(),
+            added: Some(1),
+            removed: Some(0),
+            untracked: false,
+        }];
+        let mut c = make_cleanup(wts);
+        // wt-1 is clean (no file details) — hover shows nothing.
+        c.hover = Some("wt-1".to_string());
+        assert!(c.hover_entry().is_none());
+        c.hover = Some("wt-2".to_string());
+        assert_eq!(c.hover_entry().map(|w| w.id.as_str()), Some("wt-2"));
     }
 
     #[test]
