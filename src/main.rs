@@ -40,7 +40,7 @@ use gpui::{
     FocusHandle,
     InteractiveElement, IntoElement, KeyDownEvent, Keystroke, Modifiers, MouseButton,
     ModifiersChangedEvent, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
-    Point, Render, ShapedLine,
+    Point, QuitMode, Render, ShapedLine,
     Size, Styled, TextAlign, TextRun, Window, WindowBounds, WindowOptions,
 };
 
@@ -3984,7 +3984,10 @@ fn main() {
     // At this gpui rev the platform lives in the gpui_platform crate; zed's own
     // main builds it the same way (current_platform → Application::with_platform).
     let platform = gpui_platform::current_platform(false);
-    Application::with_platform(platform).run(|cx: &mut GpuiApp| {
+    // macOS's default keeps the process alive after the last window closes
+    // (document-app convention); a single-window terminal should just quit.
+    let app = Application::with_platform(platform).with_quit_mode(QuitMode::LastWindowClosed);
+    app.run(|cx: &mut GpuiApp| {
         let bounds = Bounds::centered(None, gpui::size(px(1200.0), px(720.0)), cx);
         let (events_tx, events_rx) = mpsc::channel::<TermEvent>();
 
