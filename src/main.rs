@@ -1387,6 +1387,17 @@ impl App {
         // established content-mask context those sub-layers don't composite —
         // this mirrors how Zed's own TerminalElement paints.
         window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
+            // 0) the warm window gradient every card and sidebar row floats on
+            // (mockup 3a's tinted wrapper).
+            window.paint_quad(gpui::fill(
+                bounds,
+                gpui::linear_gradient(
+                    135.0,
+                    gpui::linear_color_stop(renderer::color(renderer::GRADIENT_FROM, 1.0), 0.0),
+                    gpui::linear_color_stop(renderer::color(renderer::GRADIENT_TO, 1.0), 1.0),
+                ),
+            ));
+
             // 1) background quads.
             for q in &frame.bg_quads {
                 paint_quad(window, origin, inv, q);
@@ -1485,17 +1496,40 @@ impl App {
     }
 }
 
-/// Paint one renderer `Quad` (physical-px coords) as a gpui fill.
+/// Paint one renderer `Quad` (physical-px coords) as a gpui fill, with its
+/// optional drop shadow (under) and border.
 fn paint_quad(window: &mut Window, origin: Point<Pixels>, inv: f32, q: &renderer::Quad) {
     let b = Bounds {
         origin: Point::new(origin.x + px(q.x * inv), origin.y + px(q.y * inv)),
         size: Size::new(px(q.w * inv), px(q.h * inv)),
     };
+    let radii = gpui::Corners::all(px(q.radius * inv));
+    // (alpha, y-offset, blur) in logical px, matching mock 3a's card/row shadows.
+    let shadow = match q.shadow {
+        renderer::Shadow::None => None,
+        renderer::Shadow::Card => Some((0.22, 8.0, 28.0)),
+        renderer::Shadow::Soft => Some((0.10, 1.0, 3.0)),
+    };
+    if let Some((alpha, dy, blur)) = shadow {
+        window.paint_drop_shadows(
+            b,
+            radii,
+            &[gpui::BoxShadow {
+                color: renderer::color((32, 30, 29), alpha),
+                offset: Point::new(px(0.0), px(dy)),
+                blur_radius: px(blur),
+                spread_radius: px(0.0),
+                inset: false,
+            }],
+        );
+    }
     let mut quad = gpui::fill(b, q.color);
-    // Honor the renderer's corner radius (physical px → logical), so the custom
-    // traffic lights render as circles and the picker panel/search box round.
-    if q.radius > 0.0 {
-        quad.corner_radii = gpui::Corners::all(px(q.radius * inv));
+    // Honor the renderer's corner radius (physical px → logical), so the tile
+    // cards, sidebar rows, and picker panel/search box round.
+    quad.corner_radii = radii;
+    if q.border > 0.0 {
+        quad.border_widths = gpui::Edges::all(px(q.border * inv));
+        quad.border_color = q.border_color;
     }
     window.paint_quad(quad);
 }

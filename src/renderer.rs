@@ -12,9 +12,10 @@
 //! runs, and chrome/picker labels). `main.rs`'s terminal `Element` consumes
 //! that data and does the actual painting.
 //!
-//! Frame structure (paint order): chrome quads (sidebar, tab strips, dividers)
-//! → per-pane text (terminal grids) → foreground quads (block glyph geometry,
-//! cursor, links) → labels (tab titles, picker) → picker overlay.
+//! Frame structure (paint order): window gradient (painted by `main.rs`) →
+//! chrome quads (sidebar rows, tile cards) → per-pane text (terminal grids) →
+//! foreground quads (block glyph geometry, cursor, links) → labels (tab
+//! titles, picker) → picker overlay.
 
 use gpui::Hsla;
 use termwiz::surface::CursorVisibility;
@@ -31,18 +32,33 @@ const LINE_HEIGHT_FACTOR: f32 = 1.25;
 /// `Family::Monospace`) skips per-word font-fallback resolution, and the Nerd
 /// Font glyph coverage keeps fallback from firing on powerline/icon glyphs.
 pub const FONT_FAMILY: &str = "JetBrainsMono Nerd Font Mono";
-/// Content inset inside each tile's terminal region, logical px.
-const PANE_PAD: f32 = 5.0;
-/// UI colors (sRGB u8).
-const TERM_BG: (u8, u8, u8) = (22, 23, 28);
-const SIDEBAR_BG: (u8, u8, u8) = (30, 33, 41);
-const TAB_ACTIVE_BG: (u8, u8, u8) = (48, 53, 66);
-const DIVIDER_BG: (u8, u8, u8) = (45, 49, 61);
-pub const ACCENT: (u8, u8, u8) = (122, 162, 247);
-const TEXT_BRIGHT: (u8, u8, u8) = (220, 222, 228);
-const TEXT_DIM: (u8, u8, u8) = (130, 135, 148);
+/// Content inset inside each tile's terminal region, logical px. Generous
+/// enough that the card's rounded corners never clip glyphs.
+const PANE_PAD: f32 = 8.0;
+/// UI colors (sRGB u8) — Arc-style (mockup 3a): dark terminal cards floating
+/// on a warm light gradient; the sidebar is transparent ink-on-gradient.
+const TERM_BG: (u8, u8, u8) = (32, 30, 29);
+/// Window gradient endpoints (painted by `main.rs` under everything).
+pub const GRADIENT_FROM: (u8, u8, u8) = (248, 221, 214);
+pub const GRADIENT_TO: (u8, u8, u8) = (236, 233, 230);
+/// Hairline under a card's tab strip.
+const CARD_DIVIDER: (u8, u8, u8) = (51, 48, 46);
+/// Dark ink for sidebar text on the light gradient.
+const INK: (u8, u8, u8) = (32, 30, 29);
+const INK_DIM: (u8, u8, u8) = (87, 83, 79);
+const WHITE: (u8, u8, u8) = (255, 255, 255);
+/// Popover panels (picker / fork / message) stay dark.
+const PANEL_BG: (u8, u8, u8) = (38, 36, 35);
+const ROW_ACTIVE: (u8, u8, u8) = (58, 54, 51);
+pub const ACCENT: (u8, u8, u8) = (236, 48, 19);
+const TEXT_BRIGHT: (u8, u8, u8) = (243, 242, 242);
+const TEXT_DIM: (u8, u8, u8) = (138, 133, 128);
 /// Dimming scrim painted behind the cwd-picker popover.
 const SCRIM: (u8, u8, u8) = (0, 0, 0);
+/// Corner radius of the floating tile cards, logical px.
+const CARD_RADIUS: f32 = 12.0;
+/// Corner radius of the sidebar's rounded rows, logical px.
+const ROW_RADIUS: f32 = 9.0;
 
 /// An sRGB u8 color mapped to a gpui [`Hsla`] with an explicit alpha.
 pub fn color(rgb: (u8, u8, u8), alpha: f32) -> Hsla {
@@ -55,8 +71,19 @@ pub fn color(rgb: (u8, u8, u8), alpha: f32) -> Hsla {
     .into()
 }
 
-/// A solid (optionally rounded) fill quad, in physical px. `main.rs` converts
-/// these to gpui `Bounds<Pixels>` + `paint_quad` at paint time.
+/// Drop-shadow styles a quad can carry (painted under it by `main.rs`).
+#[derive(Clone, Copy, PartialEq)]
+pub enum Shadow {
+    None,
+    /// The big soft shadow under a floating tile card.
+    Card,
+    /// The subtle shadow under the sidebar's active group row.
+    Soft,
+}
+
+/// A solid (optionally rounded / bordered / shadowed) fill quad, in physical
+/// px. `main.rs` converts these to gpui `Bounds<Pixels>` + `paint_quad` at
+/// paint time.
 #[derive(Clone, Copy)]
 pub struct Quad {
     pub x: f32,
@@ -66,6 +93,23 @@ pub struct Quad {
     pub color: Hsla,
     /// Corner radius in physical px (0 = square).
     pub radius: f32,
+    /// Border width in physical px (0 = none).
+    pub border: f32,
+    pub border_color: Hsla,
+    pub shadow: Shadow,
+}
+
+impl Quad {
+    fn shadow(mut self, shadow: Shadow) -> Self {
+        self.shadow = shadow;
+        self
+    }
+
+    fn border(mut self, width: f32, color: Hsla) -> Self {
+        self.border = width;
+        self.border_color = color;
+        self
+    }
 }
 
 /// One colored run of text within a grid row (or a label line).
@@ -97,7 +141,7 @@ pub struct LabelSpec {
 /// Everything `main.rs`'s terminal `Element` needs to paint one frame — all
 /// plain data, no GPU or shaping state.
 pub struct Frame {
-    /// Chrome fills painted under the text (sidebar, tab strips, dividers).
+    /// Chrome fills painted under the text (sidebar rows, tile cards).
     pub bg_quads: Vec<Quad>,
     /// Per-pane colored text runs.
     pub panes: Vec<PaneText>,
@@ -265,9 +309,10 @@ impl Renderer {
     ) -> Frame {
         let ws = &workspaces[active];
         let (width, height) = (self.width, self.height);
-        let sidebar = workspace::sidebar(height, self.scale, sidebar_w);
         let area = workspace::terminal_area(width, height, self.scale, sidebar_w);
-        let (tiles, dividers) = workspace::layout_tiles(&ws.root, area, self.scale);
+        // Dividers aren't painted (the gap between cards shows the gradient);
+        // they remain drag handles for hit-testing in `main.rs`.
+        let (tiles, _dividers) = workspace::layout_tiles(&ws.root, area, self.scale);
 
         let mut bg_quads: Vec<Quad> = Vec::new();
         let mut fg_quads: Vec<Quad> = Vec::new();
@@ -275,46 +320,57 @@ impl Renderer {
         let mut panes: Vec<PaneText> = Vec::new();
 
         // ── Chrome (under text) ────────────────────────────────────────
-        bg_quads.push(self.px_rect(&sidebar, SIDEBAR_BG, 1.0, 0.0));
+        // The warm window gradient is painted by `main.rs` before these quads;
+        // the sidebar itself is transparent — its rounded rows float on it.
+        let row_r = (ROW_RADIUS * self.scale).round();
+        let group_pad = (12.0 * self.scale).round();
         // Traffic lights are the native macOS buttons now (transparent titlebar),
         // so we no longer draw our own here.
-        // "+" new-group button, just below the titlebar strip.
+        // "+" new-group button: a translucent rounded field below the titlebar.
         let new_group = workspace::new_group_button(self.scale, sidebar_w);
-        bg_quads.push(self.px_rect(&new_group, TAB_ACTIVE_BG, 1.0, 0.0));
+        bg_quads.push(self.px_rect(&new_group, WHITE, 0.55, row_r));
         labels.push(LabelSpec {
-            text: "+".into(),
-            color: color(TEXT_BRIGHT, 1.0),
-            left: (new_group.x + (new_group.w - self.cell_width) / 2.0).round(),
+            text: "+ new group".into(),
+            color: color(INK_DIM, 1.0),
+            left: (new_group.x + group_pad).round(),
             top: (new_group.y + (new_group.h - self.cell_height) / 2.0).round(),
             clip: new_group,
         });
-        let group_pad = (12.0 * self.scale).round();
         for (i, ws_item) in workspaces.iter().enumerate() {
             let tab = workspace::tab_rect(i, self.scale, sidebar_w);
             if i == active {
-                bg_quads.push(self.px_rect(&tab, TAB_ACTIVE_BG, 1.0, 0.0));
-                let bar = LayoutRect { w: (3.0 * self.scale).round(), ..tab };
-                bg_quads.push(self.px_rect(&bar, ACCENT, 1.0, 0.0));
+                // Active row: a white rounded pill with a subtle shadow.
+                bg_quads.push(self.px_rect(&tab, WHITE, 0.78, row_r).shadow(Shadow::Soft));
             }
             // The group's name, so the sidebar tab isn't blank.
             labels.push(LabelSpec {
                 text: ws_item.name.clone(),
-                color: color(if i == active { TEXT_BRIGHT } else { TEXT_DIM }, 1.0),
+                color: color(if i == active { INK } else { INK_DIM }, 1.0),
                 left: tab.x + group_pad,
                 top: (tab.y + (tab.h - self.cell_height) / 2.0).round(),
                 clip: LayoutRect { w: tab.w - group_pad, ..tab },
             });
         }
-        for d in &dividers {
-            bg_quads.push(self.px_rect(&d.rect, DIVIDER_BG, 1.0, 0.0));
-        }
+        let card_r = (CARD_RADIUS * self.scale).round();
+        let hair = (1.0 * self.scale).round().max(1.0);
         for (id, rect) in &tiles {
+            // Each tile is a floating dark card: rounded, shadowed, with its
+            // tab strip inside the card above a hairline divider.
+            bg_quads.push(self.px_rect(rect, TERM_BG, 1.0, card_r).shadow(Shadow::Card));
             let bar = workspace::tile_tab_bar(rect, self.scale);
-            bg_quads.push(self.px_rect(&bar, SIDEBAR_BG, 1.0, 0.0));
+            let divider = LayoutRect { x: rect.x, y: bar.y + bar.h - hair, w: rect.w, h: hair };
+            bg_quads.push(self.px_rect(&divider, CARD_DIVIDER, 1.0, 0.0));
             if let Some(tile) = ws.root.find_tile(*id) {
-                // Active tab slot in terminal-bg so it merges with content.
+                // Active tab: a subtle rounded pill inside the strip.
                 let tr = workspace::tile_tab_rect(rect, tile.active, tile.tabs.len(), self.scale);
-                bg_quads.push(self.px_rect(&tr, TERM_BG, 1.0, 0.0));
+                let m = (4.0 * self.scale).round();
+                let pill = LayoutRect {
+                    x: tr.x + m,
+                    y: tr.y + m,
+                    w: (tr.w - 2.0 * m).max(0.0),
+                    h: (tr.h - 2.0 * m).max(0.0),
+                };
+                bg_quads.push(self.px_rect(&pill, WHITE, 0.09, (7.0 * self.scale).round()));
             }
         }
 
@@ -351,23 +407,20 @@ impl Renderer {
             }
         }
 
-        // Focused-tile border (only interesting with multiple tiles).
+        // Focused-tile border (only interesting with multiple tiles): a
+        // rounded accent outline hugging the card's corner radius.
         if tiles.len() > 1
             && let Some((_, rect)) = tiles.iter().find(|(id, _)| Some(*id) == focused_tile)
         {
             let t = (1.5 * self.scale).round();
-            let sides = [
-                LayoutRect { x: rect.x, y: rect.y, w: rect.w, h: t },
-                LayoutRect { x: rect.x, y: rect.y + rect.h - t, w: rect.w, h: t },
-                LayoutRect { x: rect.x, y: rect.y, w: t, h: rect.h },
-                LayoutRect { x: rect.x + rect.w - t, y: rect.y, w: t, h: rect.h },
-            ];
-            fg_quads.extend(sides.iter().map(|s| self.px_rect(s, ACCENT, 1.0, 0.0)));
+            fg_quads.push(
+                self.px_rect(rect, TERM_BG, 0.0, card_r).border(t, color(ACCENT, 0.9)),
+            );
         }
 
         // Drag-drop target hint (a translucent accent overlay).
         if let Some(hint) = drop_hint {
-            fg_quads.push(self.px_rect(&hint, ACCENT, 0.3, 0.0));
+            fg_quads.push(self.px_rect(&hint, ACCENT, 0.3, row_r));
         }
 
         // ── Picker overlay (over everything) ───────────────────────────
@@ -400,7 +453,7 @@ impl Renderer {
         rects.push(self.px_rect(&scrim, SCRIM, 0.55, 0.0));
 
         // The popover panel and its search box (both rounded).
-        rects.push(self.px_rect(&layout.panel, SIDEBAR_BG, 1.0, (10.0 * scale).round()));
+        rects.push(self.px_rect(&layout.panel, PANEL_BG, 1.0, (10.0 * scale).round()));
         rects.push(self.px_rect(&layout.search, TERM_BG, 1.0, (6.0 * scale).round()));
 
         // Search text (or placeholder) with a caret trailing the query.
@@ -442,7 +495,7 @@ impl Renderer {
                 }),
                 PickerRow::Entry(entry) => {
                     if i == picker.selected {
-                        rects.push(self.px_rect(&row, TAB_ACTIVE_BG, 1.0, 0.0));
+                        rects.push(self.px_rect(&row, ROW_ACTIVE, 1.0, 0.0));
                     }
                     // Label, clipped short of the glyph gutter on the right.
                     let label_bounds =
@@ -501,7 +554,7 @@ impl Renderer {
         let panel_x = ((self.width as f32 - panel_w) / 2.0).round();
         let panel_y = ((self.height as f32 - panel_h) / 3.0).round().max(pad);
         let panel = LayoutRect { x: panel_x, y: panel_y, w: panel_w, h: panel_h };
-        rects.push(self.px_rect(&panel, SIDEBAR_BG, 1.0, (10.0 * scale).round()));
+        rects.push(self.px_rect(&panel, PANEL_BG, 1.0, (10.0 * scale).round()));
 
         // Header: "fork <name> from…".
         let header = LayoutRect { x: panel_x, y: panel_y + pad, w: panel_w, h: row_h };
@@ -545,7 +598,7 @@ impl Renderer {
             let row = LayoutRect { x: panel_x, y: rows_top + row_h * i as f32, w: panel_w, h: row_h };
             let top = (row.y + (row.h - self.cell_height) / 2.0).round();
             if i == fork.selected {
-                rects.push(self.px_rect(&row, TAB_ACTIVE_BG, 1.0, 0.0));
+                rects.push(self.px_rect(&row, ROW_ACTIVE, 1.0, 0.0));
             }
             labels.push(LabelSpec {
                 text: entry.label.clone(),
@@ -571,7 +624,7 @@ impl Renderer {
         let x = ((self.width as f32 - w) / 2.0).round();
         let y = ((self.height as f32 - h) / 2.0).round();
         let panel = LayoutRect { x, y, w, h };
-        rects.push(self.px_rect(&panel, SIDEBAR_BG, 1.0, (8.0 * scale).round()));
+        rects.push(self.px_rect(&panel, PANEL_BG, 1.0, (8.0 * scale).round()));
         vec![LabelSpec {
             text: text.to_string(),
             color: color(TEXT_BRIGHT, 1.0),
@@ -706,7 +759,17 @@ impl Renderer {
 
     /// A quad straight from layout coordinates (already physical px).
     fn px_rect(&self, r: &LayoutRect, rgb: (u8, u8, u8), alpha: f32, radius: f32) -> Quad {
-        Quad { x: r.x, y: r.y, w: r.w, h: r.h, color: color(rgb, alpha), radius }
+        Quad {
+            x: r.x,
+            y: r.y,
+            w: r.w,
+            h: r.h,
+            color: color(rgb, alpha),
+            radius,
+            border: 0.0,
+            border_color: Hsla::default(),
+            shadow: Shadow::None,
+        }
     }
 
     /// Build a pixel-space quad for a sub-region of a cell, with edges snapped
@@ -731,6 +794,16 @@ impl Renderer {
         let y0 = (base_y + uy * self.cell_height).round();
         let x1 = (base_x + (ux + uw) * self.cell_width).round();
         let y1 = (base_y + (uy + uh) * self.cell_height).round();
-        Quad { x: x0, y: y0, w: x1 - x0, h: y1 - y0, color: color(rgb, alpha), radius: 0.0 }
+        Quad {
+            x: x0,
+            y: y0,
+            w: x1 - x0,
+            h: y1 - y0,
+            color: color(rgb, alpha),
+            radius: 0.0,
+            border: 0.0,
+            border_color: Hsla::default(),
+            shadow: Shadow::None,
+        }
     }
 }
