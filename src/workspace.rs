@@ -272,7 +272,8 @@ const TILE_TAB_H: f32 = 28.0;
 /// inflate it, so a slim gap still drags fine).
 const TILE_GAP: f32 = 3.0;
 /// Padding between the tile cards and the window edges (top/right/bottom).
-const AREA_PAD: f32 = 7.0;
+/// Matches TILE_GAP so the outer border reads as thin as the inner dividers.
+const AREA_PAD: f32 = TILE_GAP;
 const TILE_TAB_MAX_W: f32 = 180.0;
 
 /// `sidebar_w` is the user-adjustable sidebar width in logical px.
@@ -576,6 +577,18 @@ mod tests {
         let left_gap = cta.x - area.x;
         let right_gap = (area.x + area.w) - (cta.x + cta.w);
         assert!((left_gap - right_gap).abs() <= 1.0);
+    }
+
+    #[test]
+    fn window_edge_padding_matches_tile_gap() {
+        // The outer border around the tile area should read exactly as thin
+        // as the dividers between tiles.
+        let (w, h, scale, sidebar_w) = (1600, 1000, 2.0, SIDEBAR_DEFAULT_W);
+        let area = terminal_area(w, h, scale, sidebar_w);
+        let gap = (TILE_GAP * scale).round();
+        assert_eq!(area.y, gap);
+        assert_eq!((w as f32) - (area.x + area.w), gap);
+        assert_eq!((h as f32) - (area.y + area.h), gap);
     }
 
     #[test]
