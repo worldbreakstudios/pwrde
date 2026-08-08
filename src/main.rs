@@ -1141,6 +1141,8 @@ impl App {
         match action {
             Action::PrevPage => return self.cycle_page(-1),
             Action::NextPage => return self.cycle_page(1),
+            Action::PrevSidebarTab => return self.cycle_sidebar_tab(-1),
+            Action::NextSidebarTab => return self.cycle_sidebar_tab(1),
             Action::Quit => std::process::exit(0),
             _ => {},
         }
@@ -1167,7 +1169,11 @@ impl App {
             Action::NextTile => self.cycle_tile(1),
             Action::PrevTab => self.cycle_tab(-1),
             Action::NextTab => self.cycle_tab(1),
-            Action::PrevPage | Action::NextPage | Action::Quit => {},
+            Action::PrevSidebarTab
+            | Action::NextSidebarTab
+            | Action::PrevPage
+            | Action::NextPage
+            | Action::Quit => {},
         }
     }
 
@@ -1175,6 +1181,23 @@ impl App {
     fn cycle_page(&mut self, delta: isize) {
         let i = pages::cycle(self.page.index(), Page::ALL.len(), delta);
         self.set_page(Page::ALL[i]);
+    }
+
+    /// ⌘⇧↑/↓: step through the sidebar's tabs, wrapping at both ends —
+    /// groups on the Sessions page, sections on the Settings page.
+    fn cycle_sidebar_tab(&mut self, delta: isize) {
+        match self.page {
+            Page::Sessions => {
+                let i = pages::cycle(self.active, self.workspaces.len(), delta);
+                self.switch_workspace(i);
+            },
+            Page::Settings => {
+                let cur = Section::ALL.iter().position(|s| *s == self.section).unwrap_or(0);
+                let i = pages::cycle(cur, Section::ALL.len(), delta);
+                self.section = Section::ALL[i];
+                self.request_redraw();
+            },
+        }
     }
 
     fn set_page(&mut self, page: Page) {
