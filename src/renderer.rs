@@ -1049,6 +1049,31 @@ impl Renderer {
                                 labels,
                             );
                         },
+                        // Action rows, never "picked": import installs the
+                        // clipboard's token string, export copies the active
+                        // theme's.
+                        pages::AppearanceItem::ImportTheme => {
+                            self.appearance_slot(
+                                &slot,
+                                "Import from Clipboard",
+                                false,
+                                false,
+                                None,
+                                bg_quads,
+                                labels,
+                            );
+                        },
+                        pages::AppearanceItem::ExportTheme => {
+                            self.appearance_slot(
+                                &slot,
+                                "Copy Theme String",
+                                false,
+                                false,
+                                None,
+                                bg_quads,
+                                labels,
+                            );
+                        },
                         pages::AppearanceItem::TermDefault => {
                             let picked = crate::term_theme::selected(dark_now).is_none();
                             self.appearance_slot(

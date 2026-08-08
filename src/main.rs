@@ -2582,6 +2582,34 @@ impl App {
                         pages::AppearanceItem::Theme(t) => {
                             settings::set(theme::setting_key(t.dark), t.name.into());
                         },
+                        // The clipboard's token string becomes its polarity's
+                        // custom theme and is selected right away; anything
+                        // unparseable changes nothing.
+                        pages::AppearanceItem::ImportTheme => {
+                            if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                                if let Some(tokens) = clipboard
+                                    .get_text()
+                                    .ok()
+                                    .as_deref()
+                                    .and_then(theme::parse_tokens)
+                                {
+                                    let dark = theme::is_dark_color(tokens[0]);
+                                    settings::set(
+                                        theme::custom_key(dark),
+                                        theme::serialize_tokens(&tokens).into(),
+                                    );
+                                    settings::set(
+                                        theme::setting_key(dark),
+                                        theme::custom_name(dark).into(),
+                                    );
+                                }
+                            }
+                        },
+                        pages::AppearanceItem::ExportTheme => {
+                            if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                                let _ = clipboard.set_text(theme::export_current());
+                            }
+                        },
                         // Adaptive default applies to both polarities at once.
                         pages::AppearanceItem::TermDefault => {
                             settings::set(term_theme::setting_key(false), "default".into());
