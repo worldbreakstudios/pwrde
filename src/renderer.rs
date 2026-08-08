@@ -327,6 +327,7 @@ impl Renderer {
         active: usize,
         sidebar_w: f32,
         drop_hint: Option<LayoutRect>,
+        resize_hover: Option<&workspace::ResizeHover>,
         picker: Option<&Picker>,
         fork: Option<&ForkPicker>,
         message: Option<&(String, bool)>,
@@ -358,7 +359,7 @@ impl Renderer {
         // Dividers aren't painted (the gap between cards shows the gradient);
         // they remain drag handles for hit-testing in `main.rs`. The empty
         // state draws no tile cards at all — just the centered CTA.
-        let (tiles, _dividers) = if empty {
+        let (tiles, dividers) = if empty {
             (Vec::new(), Vec::new())
         } else {
             workspace::layout_tiles(&ws.root, area, self.scale)
@@ -589,6 +590,34 @@ impl Renderer {
             // Drag-drop target hint (a translucent accent overlay).
             if let Some(hint) = drop_hint {
                 fg_quads.push(self.px_rect(&hint, th.accent, 0.3, row_r));
+            }
+        }
+
+        // Resize-handle hover: slim ink line + centered grip pill so the drag
+        // target reads before the press. Geometry lives here; main only paints.
+        if let Some(hover) = resize_hover {
+            match hover {
+                workspace::ResizeHover::Sidebar => {
+                    let sb = (sidebar_w * self.scale).round();
+                    let line_w = (2.0 * self.scale).round().max(1.0);
+                    let top = workspace::titlebar(self.scale, sidebar_w).h;
+                    // Same bottom margin the tile area uses (AREA_PAD via terminal_area).
+                    let bottom = area.y + area.h;
+                    let line = LayoutRect {
+                        x: sb - line_w / 2.0,
+                        y: top,
+                        w: line_w,
+                        h: (bottom - top).max(0.0),
+                    };
+                    self.push_resize_grip(&mut bg_quads, &line, true, th.ink);
+                }
+                workspace::ResizeHover::Divider { path, .. } => {
+                    // Empty state has no dividers; find is a no-op then.
+                    if let Some(d) = dividers.iter().find(|d| d.path == *path) {
+                        let vertical = d.dir == workspace::Dir::Row;
+                        self.push_resize_grip(&mut bg_quads, &d.rect, vertical, th.ink);
+                    }
+                }
             }
         }
 
@@ -1445,6 +1474,39 @@ impl Renderer {
         }
 
         rows_spans
+    }
+
+    /// Slim ink line along `rect` plus a centered grip pill (~28 logical px).
+    /// `vertical` is true for a row-split divider / the sidebar edge (pill is tall).
+    fn push_resize_grip(
+        &self,
+        quads: &mut Vec<Quad>,
+        rect: &LayoutRect,
+        vertical: bool,
+        ink: (u8, u8, u8),
+    ) {
+        let thickness = if vertical { rect.w } else { rect.h };
+        let radius = thickness / 2.0;
+        quads.push(self.px_rect(rect, ink, 0.14, radius));
+        let pill_len = (28.0 * self.scale).round();
+        let pill = if vertical {
+            let h = pill_len.min(rect.h);
+            LayoutRect {
+                x: rect.x,
+                y: rect.y + ((rect.h - h) / 2.0).max(0.0),
+                w: rect.w,
+                h,
+            }
+        } else {
+            let w = pill_len.min(rect.w);
+            LayoutRect {
+                x: rect.x + ((rect.w - w) / 2.0).max(0.0),
+                y: rect.y,
+                w,
+                h: rect.h,
+            }
+        };
+        quads.push(self.px_rect(&pill, ink, 0.45, radius));
     }
 
     /// A quad straight from layout coordinates (already physical px).

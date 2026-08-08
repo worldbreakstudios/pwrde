@@ -453,6 +453,40 @@ pub struct Divider {
     pub dir: Dir,
 }
 
+/// Which resize handle the pointer is over (sidebar edge or a tile divider).
+/// Drives the cursor style and the hover highlight painted in the renderer.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ResizeHover {
+    Sidebar,
+    Divider { path: Vec<u8>, dir: Dir },
+}
+
+/// Hit-test the sidebar edge and tile dividers at `(px, py)`.
+/// Matches `on_mouse_down` grab inflation/containment so the cursor and
+/// highlight appear exactly where a drag would arm.
+pub fn resize_hover_at(
+    node: &Node,
+    area: LayoutRect,
+    scale: f32,
+    sidebar_edge_x: f32,
+    grab: f32,
+    dividers_active: bool,
+    px: f32,
+    py: f32,
+) -> Option<ResizeHover> {
+    if (px - sidebar_edge_x).abs() <= grab {
+        return Some(ResizeHover::Sidebar);
+    }
+    if !dividers_active {
+        return None;
+    }
+    let (_, dividers) = layout_tiles(node, area, scale);
+    dividers
+        .into_iter()
+        .find(|d| d.rect.inflate(grab).contains(px, py))
+        .map(|d| ResizeHover::Divider { path: d.path, dir: d.dir })
+}
+
 /// Compute every tile's rect and every divider, in tree order.
 pub fn layout_tiles(
     node: &Node,
@@ -622,5 +656,82 @@ mod tests {
         let hint = empty_state_hint(w, h, scale, sidebar_w);
         assert!(hint.y >= cta.y + cta.h);
         assert_eq!(hint.x, cta.x);
+    }
+
+    fn row_split() -> Node {
+        Node::Split {
+            dir: Dir::Row,
+            ratio: 0.5,
+            a: Box::new(Node::Leaf(Tile::empty(1))),
+            b: Box::new(Node::Leaf(Tile::empty(2))),
+        }
+    }
+
+    #[test]
+    fn resize_hover_at_divider_and_sidebar() {
+        let scale = 2.0;
+        let grab = 6.0 * scale;
+        let area = LayoutRect { x: 100.0, y: 10.0, w: 800.0, h: 600.0 };
+        let sidebar_edge_x = 100.0;
+        let node = row_split();
+        let (_, dividers) = layout_tiles(&node, area, scale);
+        assert_eq!(dividers.len(), 1);
+        let d = &dividers[0];
+        assert_eq!(d.dir, Dir::Row);
+
+        // Point on the divider (center of its rect) → Divider with Row dir.
+        let dx = d.rect.x + d.rect.w / 2.0;
+        let dy = d.rect.y + d.rect.h / 2.0;
+        assert_eq!(
+            resize_hover_at(&node, area, scale, sidebar_edge_x, grab, true, dx, dy),
+            Some(ResizeHover::Divider { path: vec![], dir: Dir::Row })
+        );
+
+        // Point at the sidebar edge → Sidebar.
+        assert_eq!(
+            resize_hover_at(&node, area, scale, sidebar_edge_x, grab, true, sidebar_edge_x, 200.0),
+            Some(ResizeHover::Sidebar)
+        );
+
+        // Point in a tile interior → None.
+        let (tiles, _) = layout_tiles(&node, area, scale);
+        let t = &tiles[0].1;
+        let ix = t.x + t.w / 2.0;
+        let iy = t.y + t.h / 2.0;
+        assert_eq!(
+            resize_hover_at(&node, area, scale, sidebar_edge_x, grab, true, ix, iy),
+            None
+        );
+
+        // dividers_active=false suppresses divider hits but not the sidebar.
+        assert_eq!(
+            resize_hover_at(&node, area, scale, sidebar_edge_x, grab, false, dx, dy),
+            None
+        );
+        assert_eq!(
+            resize_hover_at(&node, area, scale, sidebar_edge_x, grab, false, sidebar_edge_x, 200.0),
+            Some(ResizeHover::Sidebar)
+        );
+    }
+
+    #[test]
+    fn resize_hover_at_column_divider() {
+        let scale = 1.0;
+        let grab = 6.0;
+        let area = LayoutRect { x: 0.0, y: 0.0, w: 400.0, h: 400.0 };
+        let node = Node::Split {
+            dir: Dir::Column,
+            ratio: 0.5,
+            a: Box::new(Node::Leaf(Tile::empty(1))),
+            b: Box::new(Node::Leaf(Tile::empty(2))),
+        };
+        let (_, dividers) = layout_tiles(&node, area, scale);
+        let d = &dividers[0];
+        let dx = d.rect.x + d.rect.w / 2.0;
+        let dy = d.rect.y + d.rect.h / 2.0;
+        assert_eq!(
+            resize_hover_at(&node, area, scale, -100.0, grab, true, dx, dy),
+            Some(ResizeHover::Divider { path: vec![], dir: Dir::Column })
+        );
     }
 }
