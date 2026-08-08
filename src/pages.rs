@@ -48,16 +48,19 @@ pub fn cycle(i: usize, n: usize, delta: isize) -> usize {
 /// Sections of the Settings page (sidebar tabs while it is active).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Section {
+    Sessions,
     Keyboard,
     Themes,
     Debug,
 }
 
 impl Section {
-    pub const ALL: [Section; 3] = [Section::Keyboard, Section::Themes, Section::Debug];
+    pub const ALL: [Section; 4] =
+        [Section::Sessions, Section::Keyboard, Section::Themes, Section::Debug];
 
     pub fn label(self) -> &'static str {
         match self {
+            Section::Sessions => "Sessions",
             Section::Keyboard => "Keyboard",
             Section::Themes => "Themes",
             Section::Debug => "Debug",
