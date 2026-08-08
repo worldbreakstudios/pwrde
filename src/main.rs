@@ -1394,6 +1394,11 @@ impl App {
                 self.picker = None;
                 self.spawn_flyover_tab(Some(entry.path));
             }
+        } else if entry.is_git {
+            // Step 2: choose where to fork a drop worktree from.
+            let choices = build_fork_choices(&entry.path);
+            self.fork = Some(picker::ForkPicker::new(entry.path, name, choices));
+            self.picker = None;
         } else {
             self.picker = None;
             self.add_group_or_pick_profile(name, entry.path);
