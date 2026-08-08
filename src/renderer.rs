@@ -964,23 +964,23 @@ impl Renderer {
                         bg_quads
                             .push(self.px_rect(&rect, th.card, 0.78, row_r).shadow(Shadow::Soft));
                     }
+                    let clip_w = rect.w - group_pad;
+                    let inset =
+                        ((rect.h - (self.cell_height + cwd_line_h)) / 2.0).max(0.0);
                     // Unread (mirrors the title: the primary pane's active
-                    // tab): an accent dot at the card's right edge, with the
-                    // text clips shortened so titles never run under it.
-                    let mut clip_w = rect.w - group_pad;
+                    // tab): an accent dot in the left padding gutter, on the
+                    // title line; text stays put so rows keep alignment.
                     if ws_item.primary_unread() {
                         let ds = (7.0 * self.scale).round();
                         let dot = LayoutRect {
-                            x: rect.x + rect.w - group_pad - ds,
-                            y: (rect.y + (rect.h - ds) / 2.0).round(),
+                            x: (rect.x + (group_pad - ds) / 2.0).round(),
+                            y: (rect.y + inset + (self.cell_height - ds) / 2.0)
+                                .round(),
                             w: ds,
                             h: ds,
                         };
                         bg_quads.push(self.px_rect(&dot, th.accent, 1.0, ds / 2.0));
-                        clip_w -= ds + group_pad;
                     }
-                    let inset =
-                        ((rect.h - (self.cell_height + cwd_line_h)) / 2.0).max(0.0);
                     labels.push(LabelSpec {
                         text: ws_item.title(),
                         color: color(
@@ -2442,6 +2442,43 @@ mod tests {
         assert!(texts.contains(&"3±"));
         assert!(texts.contains(&"Delete 0 selected"));
         assert!(!frame.bg_quads.is_empty());
+    }
+
+    /// The sidebar unread dot sits in the row's left padding gutter, not at
+    /// the card's right edge.
+    #[test]
+    fn sidebar_unread_dot_sits_in_left_gutter() {
+        let scale = 2.0;
+        let renderer = Renderer::new(scale, 18.0, 1600, 1000);
+        let state = Cleanup::default();
+        let mut chrome = cleanup_chrome(&state);
+        chrome.page = Page::Sessions;
+
+        let mut tile = crate::workspace::Tile::new(1, crate::term::Session::placeholder());
+        if let Some(tab) = tile.active_tab_mut() {
+            tab.unread = true;
+        }
+        let wss = [crate::workspace::Workspace::new("g".into(), tile, None)];
+
+        let sidebar_w = 240.0;
+        let frame = renderer.build_frame(
+            &wss, 0, sidebar_w, None, None, None, None, None, None, None, None, &chrome,
+        );
+
+        let rows = crate::workspace::sidebar_rows(&wss, &[]);
+        let row = crate::workspace::sidebar_row_rect(&rows, 0, &wss, scale, sidebar_w);
+        let group_pad = (12.0 * scale).round();
+        let ds = (7.0 * scale).round();
+        let expected_x = (row.x + (group_pad - ds) / 2.0).round();
+        assert!(
+            frame.bg_quads.iter().any(|q| q.w == ds
+                && q.h == ds
+                && q.radius == ds / 2.0
+                && q.x == expected_x
+                && q.y >= row.y
+                && q.y + q.h <= row.y + row.h),
+            "unread dot should sit in the left gutter of the group row"
+        );
     }
 
     /// Scanning state shows the placeholder line instead of a table.
