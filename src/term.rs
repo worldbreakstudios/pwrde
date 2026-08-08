@@ -17,8 +17,8 @@ use std::sync::{Arc, Mutex};
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use wezterm_term::color::ColorPalette;
 use wezterm_term::{
-    KeyModifiers, MouseButton, MouseEvent, MouseEventKind, StableRowIndex, Terminal,
-    TerminalConfiguration, TerminalSize, VisibleRowIndex,
+    Alert, AlertHandler, KeyModifiers, MouseButton, MouseEvent, MouseEventKind, StableRowIndex,
+    Terminal, TerminalConfiguration, TerminalSize, VisibleRowIndex,
 };
 /// User events forwarded to the gpui app over an mpsc channel.
 #[derive(Debug, Clone)]
@@ -27,10 +27,27 @@ pub enum TermEvent {
     Wakeup(u64),
     /// Shell exited. Tagged with the session id.
     Exit(u64),
+    /// The program requested attention (OSC 9 toast notification). Tagged with the session id.
+    Attention(u64),
     /// A `drop` worktree finished provisioning: create its group at `cwd`.
     GroupReady { name: String, cwd: std::path::PathBuf },
     /// `drop` failed; show `message` in the picker overlay.
     GroupFailed { message: String },
+}
+
+/// Forwards `Alert::ToastNotification` from wezterm-term to the UI event channel
+/// as a `TermEvent::Attention`. All other alert variants are ignored.
+struct AttentionHandler {
+    id: u64,
+    sender: Sender<TermEvent>,
+}
+
+impl AlertHandler for AttentionHandler {
+    fn alert(&mut self, alert: Alert) {
+        if let Alert::ToastNotification { .. } = alert {
+            let _ = self.sender.send(TermEvent::Attention(self.id));
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -160,6 +177,7 @@ impl Session {
                 // Advertise 24-bit color: wezterm-term parses truecolor SGR and
                 // the renderer paints full RGB per cell, so apps should emit it.
                 cmd.env("COLORTERM", "truecolor");
+                cmd.env("PWRDE", "1");
                 (Some(cmd), None)
             } else {
                 // Fail the pane loudly rather than silently losing persistence.
@@ -169,6 +187,7 @@ impl Session {
             let mut cmd = CommandBuilder::new_default_prog(); // user's shell
             cmd.env("TERM", "xterm-256color");
             cmd.env("COLORTERM", "truecolor");
+            cmd.env("PWRDE", "1");
             // Only honor a cwd that still exists — a pinned/recent dir may have
             // been deleted since it was saved, and spawning a shell in a missing
             // directory would fail. Fall back to inheriting our own cwd.
@@ -196,13 +215,18 @@ impl Session {
             pixel_height: pty_size.pixel_height as usize,
             dpi,
         };
-        let term = Terminal::new(
+        let mut term = Terminal::new(
             term_size,
             Arc::new(TermConfig),
             "pwrde",
             env!("CARGO_PKG_VERSION"),
             Box::new(writer.clone()),
         );
+        // Register attention handler before sharing — OSC 9 toasts signal unread.
+        term.set_notification_handler(Box::new(AttentionHandler {
+            id,
+            sender: events.clone(),
+        }));
         let term = Arc::new(Mutex::new(term));
 
         let redraw_pending = Arc::new(AtomicBool::new(false));
@@ -255,6 +279,32 @@ impl Session {
             scroll_offset: AtomicUsize::new(0),
             selection: Mutex::new(None),
             shpool_session: shpool_name,
+        }
+    }
+
+    /// Minimal session for unit tests: `/bin/cat` on a fresh PTY, no reader
+    /// thread and no event channel — just enough structure to build a `Tab`.
+    #[cfg(test)]
+    pub fn placeholder() -> Self {
+        let pty_size = PtySize { rows: 24, cols: 80, pixel_width: 640, pixel_height: 384 };
+        let pair = native_pty_system().openpty(pty_size).expect("openpty");
+        let _child = pair.slave.spawn_command(CommandBuilder::new("/bin/cat")).expect("spawn cat");
+        drop(pair.slave);
+        let writer =
+            PtyWriter(Arc::new(Mutex::new(pair.master.take_writer().expect("pty writer"))));
+        let term_size =
+            TerminalSize { rows: 24, cols: 80, pixel_width: 640, pixel_height: 384, dpi: 96 };
+        let term =
+            Terminal::new(term_size, Arc::new(TermConfig), "pwrde-test", "0", Box::new(writer.clone()));
+        Self {
+            id: 0,
+            term: Arc::new(Mutex::new(term)),
+            writer,
+            master: pair.master,
+            redraw_pending: Arc::new(AtomicBool::new(false)),
+            scroll_offset: AtomicUsize::new(0),
+            selection: Mutex::new(None),
+            shpool_session: None,
         }
     }
 
@@ -513,5 +563,28 @@ mod tests {
         // Mouse tracking (DECSET 1000) claims the wheel on the primary screen.
         term.advance_bytes(b"\x1b[?1000h");
         assert!(term.is_mouse_grabbed(), "mouse-tracking apps claim the wheel");
+    }
+
+    /// OSC 9 toasts must fire `TermEvent::Attention`; plain output must not.
+    #[test]
+    fn osc9_fires_attention() {
+        use std::sync::mpsc;
+        let (tx, rx) = mpsc::channel::<TermEvent>();
+        let mut term = make_term(80, 24);
+        term.set_notification_handler(Box::new(AttentionHandler { id: 42, sender: tx }));
+
+        // OSC 9 toast notification — should signal attention.
+        term.advance_bytes(b"\x1b]9;ping\x07");
+        assert!(
+            matches!(rx.try_recv(), Ok(TermEvent::Attention(42))),
+            "OSC 9 should produce Attention event"
+        );
+
+        // Plain output — must NOT signal attention.
+        term.advance_bytes(b"hello world\r\n");
+        assert!(
+            rx.try_recv().is_err(),
+            "plain output must not produce Attention event"
+        );
     }
 }
