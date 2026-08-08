@@ -226,8 +226,9 @@ const SIDEBAR_PAD: f32 = 10.0;
 const NEW_GROUP_H: f32 = 30.0;
 /// Height of the horizontal tab strip atop each tile.
 const TILE_TAB_H: f32 = 28.0;
-/// Gap between tile cards; doubles as the divider drag handle.
-const TILE_GAP: f32 = 12.0;
+/// Gap between tile cards; doubles as the divider drag handle (hit tests
+/// inflate it, so a slim gap still drags fine).
+const TILE_GAP: f32 = 3.0;
 /// Padding between the tile cards and the window edges (top/right/bottom).
 const AREA_PAD: f32 = 7.0;
 const TILE_TAB_MAX_W: f32 = 180.0;
