@@ -15,13 +15,20 @@ wezterm-term = { git = "https://github.com/wezterm/wezterm", branch = "main" }
 termwiz = { git = "https://github.com/wezterm/wezterm", branch = "main" }
 bytemuck = { version = "1.25.2", features = ["derive"] }
 # gpui — Zed's UI framework — is the sole renderer + windowing layer. Not on
-# crates.io; pull it from the zed repo pinned to a rev for reproducibility.
-gpui = { git = "https://github.com/zed-industries/zed", rev = "027cf0def75e5c027504f402a6a6c0dcac11f178", package = "gpui" }
+# crates.io; pulled from the zed repo. NOTE: declared without a rev so cargo
+# unifies it with gpui-component's identical spec (a `rev =` dep and a branch
+# dep never unify → two gpui copies → type mismatches). The actual commit is
+# pinned in Cargo.lock (`cargo update -p gpui --precise <sha>`); keep it at the
+# same rev gpui-component's own lockfile uses.
+gpui = { git = "https://github.com/zed-industries/zed", package = "gpui" }
 # The platform layer was split into gpui_platform; current_platform() builds the
 # real macOS platform to hand to Application::with_platform (as in zed's own main).
 # `font-kit` is REQUIRED: without it gpui_macos installs gpui::NoopTextSystem and
 # NO glyphs render (quads still do). With it we get the real CoreText MacTextSystem.
-gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "027cf0def75e5c027504f402a6a6c0dcac11f178", package = "gpui_platform", features = ["font-kit"] }
+gpui_platform = { git = "https://github.com/zed-industries/zed", package = "gpui_platform", features = ["font-kit"] }
+# Longbridge's component library on top of gpui (buttons, inputs, modals, tabs,
+# sidebar, theming). Pinned to a rev whose lockfile matches the gpui rev above.
+gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "6d7847e33ef3b8e043d1fcea82eb7e1b7f919d8b" }
 arboard = "3.6.1"
 # Both already in gpui's dependency tree at these versions; used to reach the
 # NSWindow and hide AppKit's titlebar top-highlight hairline (see main.rs).
