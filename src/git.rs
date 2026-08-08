@@ -159,3 +159,141 @@ pub fn list_worktrees(repo: &Path) -> Vec<Worktree> {
     }
     worktrees
 }
+
+/// Sanitize a worktree basename into a filesystem-safe slug.
+///
+/// Keeps ASCII alphanumerics plus `.`, `_`, `-`; replaces every other character
+/// with `-`. Returns `None` when the result is empty.
+pub fn sanitize_worktree_slug(name: &str) -> Option<String> {
+    let slug: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if slug.is_empty() {
+        None
+    } else {
+        Some(slug)
+    }
+}
+
+/// Decide the per-worktree storage scope from absolute git paths.
+///
+/// Returns `None` for the primary checkout (`git_dir == git_common_dir`) or when
+/// the toplevel basename sanitizes to empty. Otherwise `Some(slug)` of the
+/// toplevel basename.
+pub fn scope_from_git_dirs(
+    toplevel: &str,
+    git_dir: &str,
+    git_common_dir: &str,
+) -> Option<String> {
+    if Path::new(git_dir) == Path::new(git_common_dir) {
+        return None;
+    }
+    let base = Path::new(toplevel)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    sanitize_worktree_slug(base)
+}
+
+/// Per-worktree storage scope for the process cwd, if any.
+///
+/// Runs `git rev-parse --path-format=absolute --show-toplevel --git-dir
+/// --git-common-dir` once (memoized). Returns `None` when cwd is not in a git
+/// repo, when it is the primary checkout, or when the slug would be empty.
+/// Linked worktrees yield `Some(slug)` derived from the toplevel basename.
+pub fn worktree_scope() -> Option<String> {
+    static SCOPE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    SCOPE
+        .get_or_init(|| {
+            let out = augmented_command("git")
+                .args([
+                    "rev-parse",
+                    "--path-format=absolute",
+                    "--show-toplevel",
+                    "--git-dir",
+                    "--git-common-dir",
+                ])
+                .output()
+                .ok()?;
+            if !out.status.success() {
+                return None;
+            }
+            let text = String::from_utf8_lossy(&out.stdout);
+            let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+            let toplevel = lines.next()?;
+            let git_dir = lines.next()?;
+            let git_common_dir = lines.next()?;
+            scope_from_git_dirs(toplevel, git_dir, git_common_dir)
+        })
+        .clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_keeps_safe_chars() {
+        assert_eq!(
+            sanitize_worktree_slug("feature.branch_1-ok"),
+            Some("feature.branch_1-ok".into())
+        );
+    }
+
+    #[test]
+    fn sanitize_replaces_unsafe_chars() {
+        assert_eq!(
+            sanitize_worktree_slug("feat/my branch"),
+            Some("feat-my-branch".into())
+        );
+        assert_eq!(sanitize_worktree_slug("a@b#c"), Some("a-b-c".into()));
+    }
+
+    #[test]
+    fn sanitize_empty_is_none() {
+        assert_eq!(sanitize_worktree_slug(""), None);
+    }
+
+    #[test]
+    fn scope_primary_checkout_is_none() {
+        assert_eq!(
+            scope_from_git_dirs(
+                "/Users/me/proj",
+                "/Users/me/proj/.git",
+                "/Users/me/proj/.git",
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn scope_linked_worktree_uses_basename_slug() {
+        assert_eq!(
+            scope_from_git_dirs(
+                "/Users/me/proj/.worktrees/7cb7f5a9",
+                "/Users/me/proj/.git/worktrees/7cb7f5a9",
+                "/Users/me/proj/.git",
+            ),
+            Some("7cb7f5a9".into())
+        );
+    }
+
+    #[test]
+    fn scope_linked_sanitizes_basename() {
+        assert_eq!(
+            scope_from_git_dirs(
+                "/repo/.worktrees/feat my-branch",
+                "/repo/.git/worktrees/feat-my-branch",
+                "/repo/.git",
+            ),
+            Some("feat-my-branch".into())
+        );
+    }
+}

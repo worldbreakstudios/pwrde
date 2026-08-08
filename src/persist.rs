@@ -1,4 +1,10 @@
 //! Session persistence — snapshots group layouts and shpool sessions to SQLite.
+//!
+//! The default DB path is `<data_dir>/pwrde/state.db`. When the process is
+//! launched from a linked git worktree (see [`crate::git::worktree_scope`]),
+//! the path becomes `<data_dir>/pwrde/worktrees/<slug>/state.db` so each
+//! worktree keeps an isolated session database. Primary checkouts and
+//! non-git launches keep the unscoped default.
 
 use rusqlite::{Connection, Result as SqlResult};
 use serde::{Deserialize, Serialize};
@@ -33,9 +39,24 @@ pub struct SavedTab {
     pub cwd: Option<String>,
 }
 
-/// Location of the persisted DB: `<data_dir>/pwrde/state.db`.
+/// Compose the DB path under `data_dir`, optionally scoped to a worktree slug.
+///
+/// - `None` scope → `<data_dir>/pwrde/state.db`
+/// - `Some(slug)` → `<data_dir>/pwrde/worktrees/<slug>/state.db`
+pub fn db_path_in(data_dir: &Path, scope: Option<&str>) -> PathBuf {
+    let mut path = data_dir.join("pwrde");
+    if let Some(slug) = scope {
+        path = path.join("worktrees").join(slug);
+    }
+    path.join("state.db")
+}
+
+/// Location of the persisted DB: `<data_dir>/pwrde/state.db`, or
+/// `<data_dir>/pwrde/worktrees/<slug>/state.db` when launched from a linked worktree.
 fn db_path() -> Option<PathBuf> {
-    Some(dirs::data_dir()?.join("pwrde").join("state.db"))
+    let data_dir = dirs::data_dir()?;
+    let scope = crate::git::worktree_scope();
+    Some(db_path_in(&data_dir, scope.as_deref()))
 }
 
 /// Open the DB at `path`, creating tables if needed. Never panics on corrupt DB.
@@ -417,5 +438,23 @@ mod tests {
     fn missing_db_loads_empty() {
         let groups = load_snapshot(Path::new("/nonexistent/pwrde/state.db"));
         assert_eq!(groups.len(), 0);
+    }
+
+    #[test]
+    fn db_path_in_unscoped() {
+        let base = Path::new("/data");
+        assert_eq!(
+            db_path_in(base, None),
+            PathBuf::from("/data/pwrde/state.db")
+        );
+    }
+
+    #[test]
+    fn db_path_in_scoped() {
+        let base = Path::new("/data");
+        assert_eq!(
+            db_path_in(base, Some("feature-branch")),
+            PathBuf::from("/data/pwrde/worktrees/feature-branch/state.db")
+        );
     }
 }
