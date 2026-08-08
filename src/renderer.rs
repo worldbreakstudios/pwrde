@@ -2775,6 +2775,8 @@ impl Renderer {
         draw_cursor: bool,
         show_window_buttons: bool,
         maximized: bool,
+        cursor: Option<(f32, f32)>,
+        hot: &mut Vec<LayoutRect>,
     ) -> (Vec<Quad>, Vec<PaneText>, Vec<Quad>, Vec<LabelSpec>) {
         let th = self.theme();
         let scale = self.scale;
@@ -2834,6 +2836,38 @@ impl Renderer {
         for (i, tab) in tabs.iter().enumerate() {
             let tr = crate::workspace::flyover_tab_rect(panel_rect, i, n, scale, maximized);
             let close = crate::workspace::flyover_tab_close_rect(panel_rect, i, n, scale, maximized);
+            let close_hov = hover(cursor, &close);
+            // Same hover language as the tile strips: dim pill on an inactive
+            // tab, rounded chip + brightened glyph on the ×.
+            if i != active && hover(cursor, &tr) && !close_hov {
+                let m = (4.0 * scale).round();
+                let pill = crate::workspace::LayoutRect {
+                    x: tr.x + m,
+                    y: tr.y + m,
+                    w: (tr.w - 2.0 * m).max(0.0),
+                    h: (tr.h - 2.0 * m).max(0.0),
+                };
+                quads.push(self.px_rect(&pill, pane_pill.0, pane_pill.1 * 0.55, (7.0 * scale).round()));
+            }
+            if close_hov {
+                let inset = (3.0 * scale).round();
+                let chip = crate::workspace::LayoutRect {
+                    x: close.x + inset,
+                    y: close.y + inset,
+                    w: (close.w - 2.0 * inset).max(0.0),
+                    h: (close.h - 2.0 * inset).max(0.0),
+                };
+                quads.push(self.px_rect(
+                    &chip,
+                    pane_pill.0,
+                    (pane_pill.1 * 2.0).min(1.0),
+                    (4.0 * scale).round(),
+                ));
+            }
+            // Close after its tab so reverse iteration (topmost wins)
+            // resolves × over the tab it sits in.
+            hot.push(tr);
+            hot.push(close);
             let title = tab.session.title();
             let text = if title.is_empty() { "shell".to_string() } else { title };
             let mut text_left = tr.x + tab_text_pad;
@@ -2866,7 +2900,11 @@ impl Renderer {
             });
             labels.push(LabelSpec {
                 text: "×".to_string(),
-                color: color(pane_ink_dim.0, pane_ink_dim.1),
+                color: if close_hov {
+                    color(pane_ink.0, pane_ink.1)
+                } else {
+                    color(pane_ink_dim.0, pane_ink_dim.1)
+                },
                 left: close.x + ((close.w - self.cell_width) / 2.0).round(),
                 top: (tr.y + (tr.h - self.cell_height) / 2.0).round(),
                 clip: tr,
@@ -2881,9 +2919,30 @@ impl Renderer {
                 (crate::workspace::flyover_minimize_rect(panel_rect, scale), "–"),
                 (crate::workspace::flyover_maximize_rect(panel_rect, scale), "□"),
             ] {
+                let hov = hover(cursor, &rect);
+                if hov {
+                    let inset = (3.0 * scale).round();
+                    let chip = crate::workspace::LayoutRect {
+                        x: rect.x + inset,
+                        y: rect.y + inset,
+                        w: (rect.w - 2.0 * inset).max(0.0),
+                        h: (rect.h - 2.0 * inset).max(0.0),
+                    };
+                    quads.push(self.px_rect(
+                        &chip,
+                        pane_pill.0,
+                        (pane_pill.1 * 2.0).min(1.0),
+                        (4.0 * scale).round(),
+                    ));
+                }
+                hot.push(rect);
                 labels.push(LabelSpec {
                     text: glyph.to_string(),
-                    color: color(pane_ink_dim.0, pane_ink_dim.1),
+                    color: if hov {
+                        color(pane_ink.0, pane_ink.1)
+                    } else {
+                        color(pane_ink_dim.0, pane_ink_dim.1)
+                    },
                     left: rect.x + ((rect.w - self.cell_width) / 2.0).round(),
                     top: (rect.y + (bar_h - self.cell_height) / 2.0).round(),
                     clip: rect,
@@ -3379,6 +3438,34 @@ mod tests {
             row_quad(&hovered),
             Some(Shadow::None),
             "hovered inactive row gains the shadowless pill"
+        );
+    }
+
+    /// Hovering a flyover tab's × registers it hot and paints the chip; with
+    /// no cursor the strip stays in its resting style.
+    #[test]
+    fn flyover_close_hover_paints_chip_and_registers_hot() {
+        let scale = 2.0;
+        let renderer = Renderer::new(scale, 18.0, 1600, 1000);
+        let panel = crate::workspace::flyover_rect(1600, 1000, scale, 1.0, 0.35, false);
+        let tabs = [crate::workspace::Tab::new(crate::term::Session::placeholder())];
+        let close = crate::workspace::flyover_tab_close_rect(&panel, 0, 1, scale, false);
+
+        let mut hot = Vec::new();
+        let (resting_quads, ..) = renderer
+            .flyover_overlay(&tabs, 0, &panel, true, false, true, false, None, &mut hot);
+        // Tab, its ×, and the two window buttons are all interactive.
+        assert_eq!(hot.len(), 4, "tab + close + minimize + maximize are hot");
+        assert!(hot.iter().any(|r| r.x == close.x && r.y == close.y));
+
+        let cursor = Some((close.x + close.w / 2.0, close.y + close.h / 2.0));
+        let mut hot2 = Vec::new();
+        let (hovered_quads, ..) = renderer
+            .flyover_overlay(&tabs, 0, &panel, true, false, true, false, cursor, &mut hot2);
+        assert_eq!(
+            hovered_quads.len(),
+            resting_quads.len() + 1,
+            "hovering the × adds exactly the chip quad"
         );
     }
 
