@@ -212,17 +212,25 @@ impl LayoutRect {
 
 /// Logical (pre-scale) dimensions.
 pub const SIDEBAR_MIN_W: f32 = 120.0;
+pub const SIDEBAR_DEFAULT_W: f32 = 240.0;
 pub const SIDEBAR_MAX_W: f32 = 360.0;
 /// Top strip of the sidebar: native traffic lights float here and the rest
 /// is the window drag handle.
 pub const TITLEBAR_H: f32 = 44.0;
-const TAB_H: f32 = 40.0;
+const TAB_H: f32 = 34.0;
+/// Vertical gap between the sidebar's rounded group rows.
+const TAB_GAP: f32 = 3.0;
+/// Horizontal inset of the sidebar's rows from the sidebar edges.
+const SIDEBAR_PAD: f32 = 10.0;
 /// Height of the "+" new-group button between the titlebar and the group tabs.
-const NEW_GROUP_H: f32 = 28.0;
+const NEW_GROUP_H: f32 = 30.0;
 /// Height of the horizontal tab strip atop each tile.
 const TILE_TAB_H: f32 = 28.0;
-/// Gap between tiles; doubles as the divider drag handle.
-const TILE_GAP: f32 = 4.0;
+/// Gap between tile cards; doubles as the divider drag handle (hit tests
+/// inflate it, so a slim gap still drags fine).
+const TILE_GAP: f32 = 3.0;
+/// Padding between the tile cards and the window edges (top/right/bottom).
+const AREA_PAD: f32 = 7.0;
 const TILE_TAB_MAX_W: f32 = 180.0;
 
 /// `sidebar_w` is the user-adjustable sidebar width in logical px.
@@ -236,27 +244,44 @@ pub fn titlebar(scale: f32, sidebar_w: f32) -> LayoutRect {
 }
 
 /// The "+" new-group button, directly below the titlebar strip and above the
-/// group tabs. Clicking it opens the cwd picker.
+/// group tabs. Clicking it opens the cwd picker. Inset like the group rows so
+/// it renders as a rounded field floating on the gradient.
 pub fn new_group_button(scale: f32, sidebar_w: f32) -> LayoutRect {
+    let pad = (SIDEBAR_PAD * scale).round();
     LayoutRect {
-        x: 0.0,
+        x: pad,
         y: (TITLEBAR_H * scale).round(),
-        w: (sidebar_w * scale).round(),
+        w: ((sidebar_w * scale).round() - 2.0 * pad).max(0.0),
         h: (NEW_GROUP_H * scale).round(),
     }
 }
 
 /// Group tab `index` in the sidebar, stacked below the new-group button.
+/// Rows are inset from the sidebar edges (rounded pills, Arc-style).
 pub fn tab_rect(index: usize, scale: f32, sidebar_w: f32) -> LayoutRect {
+    let pad = (SIDEBAR_PAD * scale).round();
     let h = (TAB_H * scale).round();
-    let top = ((TITLEBAR_H + NEW_GROUP_H) * scale).round();
-    LayoutRect { x: 0.0, y: top + index as f32 * h, w: (sidebar_w * scale).round(), h }
+    let gap = (TAB_GAP * scale).round();
+    let top = ((TITLEBAR_H + NEW_GROUP_H) * scale).round() + 2.0 * gap;
+    LayoutRect {
+        x: pad,
+        y: top + index as f32 * (h + gap),
+        w: ((sidebar_w * scale).round() - 2.0 * pad).max(0.0),
+        h,
+    }
 }
 
-/// The region right of the sidebar where the split tree lives.
+/// The region right of the sidebar where the split tree lives. Inset from the
+/// window's top/right/bottom edges so the tile cards float on the gradient.
 pub fn terminal_area(width: u32, height: u32, scale: f32, sidebar_w: f32) -> LayoutRect {
     let sb = (sidebar_w * scale).round();
-    LayoutRect { x: sb, y: 0.0, w: (width as f32 - sb).max(0.0), h: height as f32 }
+    let pad = (AREA_PAD * scale).round();
+    LayoutRect {
+        x: sb,
+        y: pad,
+        w: (width as f32 - sb - pad).max(0.0),
+        h: (height as f32 - 2.0 * pad).max(0.0),
+    }
 }
 
 pub struct Divider {
