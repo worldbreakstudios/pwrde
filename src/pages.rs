@@ -186,11 +186,12 @@ pub enum Action {
     NextSidebarTab,
     PrevPage,
     NextPage,
+    OpenSettings,
 }
 
 impl Action {
     /// Keyboard-page row order.
-    pub const ALL: [Action; 16] = [
+    pub const ALL: [Action; 17] = [
         Action::SplitRight,
         Action::SplitDown,
         Action::NewTab,
@@ -207,6 +208,7 @@ impl Action {
         Action::NextSidebarTab,
         Action::PrevPage,
         Action::NextPage,
+        Action::OpenSettings,
     ];
 
     /// Stable identifier used in the settings key (`keyboard.<name>`).
@@ -228,6 +230,7 @@ impl Action {
             Action::NextSidebarTab => "next_sidebar_tab",
             Action::PrevPage => "prev_page",
             Action::NextPage => "next_page",
+            Action::OpenSettings => "open_settings",
         }
     }
 
@@ -249,6 +252,7 @@ impl Action {
             Action::NextSidebarTab => "Next sidebar tab",
             Action::PrevPage => "Previous page",
             Action::NextPage => "Next page",
+            Action::OpenSettings => "Open settings",
         }
     }
 
@@ -274,6 +278,7 @@ impl Action {
             Action::NextSidebarTab => (true, "down"),
             Action::PrevPage => (true, "left"),
             Action::NextPage => (true, "right"),
+            Action::OpenSettings => (false, ","),
         };
         Binding { shift, alt: false, ctrl: false, key: key.into() }
     }
@@ -482,6 +487,22 @@ mod tests {
         };
         assert_eq!(match_action(&ks("up")), Some(Action::PrevSidebarTab));
         assert_eq!(match_action(&ks("down")), Some(Action::NextSidebarTab));
+    }
+
+    #[test]
+    fn open_settings_binds_cmd_comma() {
+        let ks = Keystroke {
+            modifiers: Modifiers {
+                platform: true,
+                shift: false,
+                control: false,
+                alt: false,
+                function: false,
+            },
+            key: ",".into(),
+            key_char: None,
+        };
+        assert_eq!(match_action(&ks), Some(Action::OpenSettings));
     }
 
     #[test]
