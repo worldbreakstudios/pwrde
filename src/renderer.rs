@@ -558,6 +558,8 @@ impl Renderer {
                 let tab_text_pad = (8.0 * self.scale).round();
                 for (ti, tab) in tile.tabs.iter().enumerate() {
                     let tr = workspace::tile_tab_rect(rect, ti, tile.tabs.len(), self.scale);
+                    let close =
+                        workspace::tile_tab_close_rect(rect, ti, tile.tabs.len(), self.scale);
                     let title = tab.session.title();
                     let text = if title.is_empty() { "shell".to_string() } else { title };
                     labels.push(LabelSpec {
@@ -569,7 +571,18 @@ impl Renderer {
                         },
                         left: tr.x + tab_text_pad,
                         top: (tr.y + (tr.h - self.cell_height) / 2.0).round(),
-                        clip: LayoutRect { w: tr.w - tab_text_pad, ..tr },
+                        clip: LayoutRect {
+                            w: (close.x - tr.x - tab_text_pad).max(0.0),
+                            ..tr
+                        },
+                        size: None,
+                    });
+                    labels.push(LabelSpec {
+                        text: "×".to_string(),
+                        color: color(pane_ink_dim.0, pane_ink_dim.1),
+                        left: close.x + ((close.w - self.cell_width) / 2.0).round(),
+                        top: (tr.y + (tr.h - self.cell_height) / 2.0).round(),
+                        clip: tr,
                         size: None,
                     });
                 }

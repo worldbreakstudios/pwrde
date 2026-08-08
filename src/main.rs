@@ -1083,6 +1083,12 @@ impl App {
                     let ti = (((px - bar.x) / tab_w).floor() as usize).min(n.saturating_sub(1));
                     tile.active = ti;
                     ws.focused_tile = *id;
+                    if n > 0
+                        && workspace::tile_tab_close_rect(rect, ti, n, scale).contains(px, py)
+                    {
+                        self.close_active_tab();
+                        return;
+                    }
                     self.drag = Drag::TabPress { tile: *id, tab: ti, start: self.cursor };
                     self.sync_layout();
                     self.request_redraw();

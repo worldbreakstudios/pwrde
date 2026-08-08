@@ -534,6 +534,19 @@ pub fn tile_tab_rect(rect: &LayoutRect, i: usize, n: usize, scale: f32) -> Layou
     LayoutRect { x: bar.x + i as f32 * w, y: bar.y, w, h: bar.h }
 }
 
+/// The close-button hit region at the right edge of tab `i` of `n`.
+pub fn tile_tab_close_rect(rect: &LayoutRect, i: usize, n: usize, scale: f32) -> LayoutRect {
+    let tr = tile_tab_rect(rect, i, n, scale);
+    let s = (16.0 * scale).round();
+    let pad = (6.0 * scale).round();
+    LayoutRect {
+        x: tr.x + tr.w - s - pad,
+        y: (tr.y + (tr.h - s) / 2.0).round(),
+        w: s,
+        h: s,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -554,6 +567,21 @@ mod tests {
         let ws = Workspace::new("g".into(), Tile::empty(7), None);
         assert_eq!(ws.primary_tile, 7);
         assert_eq!(ws.focused_tile, 7);
+    }
+
+    #[test]
+    fn tab_close_rect_sits_inside_its_tab() {
+        let rect = LayoutRect { x: 100.0, y: 50.0, w: 900.0, h: 600.0 };
+        for scale in [1.0, 2.0] {
+            for n in [1, 3, 8] {
+                for i in 0..n {
+                    let tr = tile_tab_rect(&rect, i, n, scale);
+                    let close = tile_tab_close_rect(&rect, i, n, scale);
+                    assert!(close.x >= tr.x && close.x + close.w <= tr.x + tr.w);
+                    assert!(close.y >= tr.y && close.y + close.h <= tr.y + tr.h);
+                }
+            }
+        }
     }
 
     #[test]
