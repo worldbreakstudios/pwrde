@@ -523,7 +523,7 @@ impl Session {
         let lines = screen.lines_in_phys_range(
             screen.scrollback_or_visible_range(&(-offset..rows as i32 - offset)),
         );
-        crate::links::links_in_lines(&lines)
+        crate::links::links_in_lines(&lines, screen.physical_cols)
             .into_iter()
             .find(|h| h.contains(row, col))
             .map(|h| h.url)

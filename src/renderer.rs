@@ -2212,7 +2212,7 @@ impl Renderer {
         // stretch keeps the shaping input small.
         // Links get the accent color + an underline quad; ⌘-click opens.
         // Detection is wrap-aware: a URL broken across rows is one link.
-        let links = crate::links::links_in_lines(&lines);
+        let links = crate::links::links_in_lines(&lines, screen.physical_cols);
         // Resolve which URL (if any) the mouse is hovering over — covers all
         // rows of a wrapped link so the entire anchor brightens together.
         let hovered_url: Option<String> = hover.and_then(|(col, row)| {
