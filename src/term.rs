@@ -469,11 +469,16 @@ impl Session {
     pub fn link_at(&self, col: usize, row: usize) -> Option<String> {
         let term = self.term.lock().unwrap();
         let screen = term.screen();
-        if row >= screen.physical_rows {
+        let rows = screen.physical_rows;
+        if row >= rows {
             return None;
         }
-        let lines =
-            screen.lines_in_phys_range(screen.phys_range(&(0..screen.physical_rows as i64)));
+        // Use the same viewport slice as renderer.rs snapshot_pane so that
+        // hit-testing agrees with what is actually visible when scrolled.
+        let offset = self.scroll_offset() as i32;
+        let lines = screen.lines_in_phys_range(
+            screen.scrollback_or_visible_range(&(-offset..rows as i32 - offset)),
+        );
         crate::links::links_in_lines(&lines)
             .into_iter()
             .find(|h| h.contains(row, col))

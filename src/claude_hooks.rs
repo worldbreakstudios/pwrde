@@ -2,12 +2,16 @@
 //!
 //! On startup pwrde writes a tiny hook script to `~/.pwrde/claude-hook.sh` and
 //! idempotently merges entries for the attention-worthy Claude Code hook events
-//! into `~/.claude/settings.json`. The script emits an OSC 9 toast to
-//! `/dev/tty`, which rides the pane's own PTY back to pwrde (through shpool
-//! too) where wezterm-term surfaces it as `Alert::ToastNotification` and the
-//! tab gains an unread dot. The script no-ops outside pwrde: directly spawned
-//! panes carry `PWRDE=1`, and shpool-backed panes carry a `pwrde-`-prefixed
-//! `SHPOOL_SESSION_NAME` set by the daemon.
+//! into `~/.claude/settings.json`. The script emits an OSC 9 toast onto the
+//! pane's own PTY, which rides back to pwrde (through shpool too) where
+//! wezterm-term surfaces it as `Alert::ToastNotification` and the tab gains an
+//! unread dot. Claude Code spawns hook processes without a controlling
+//! terminal, so `/dev/tty` usually fails (ENXIO); the script then walks its
+//! process ancestry with `ps` to the nearest ancestor holding a tty — the
+//! `claude` process sitting on the pane's PTY — and writes there instead. The
+//! script no-ops outside pwrde: directly spawned panes carry `PWRDE=1`, and
+//! shpool-backed panes carry a `pwrde-`-prefixed `SHPOOL_SESSION_NAME` set by
+//! the daemon.
 //!
 //! The settings merge is additive only — existing entries are never removed or
 //! reordered, and a settings file that fails to parse is left untouched.
@@ -23,9 +27,26 @@ const HOOK_SCRIPT: &str = "#!/bin/sh\n\
 # Installed by pwrde. Signals attention to the hosting pwrde pane via OSC 9.\n\
 # No-ops outside pwrde: PWRDE is set in panes pwrde spawns directly, and\n\
 # shpool-backed panes carry a pwrde- prefixed SHPOOL_SESSION_NAME.\n\
+# Hooks run with no controlling terminal, so /dev/tty usually fails (ENXIO);\n\
+# fall back to the tty of the nearest ancestor that has one — the claude\n\
+# process sitting on the pane's PTY.\n\
+osc9() { printf '\\033]9;pwrde:attention\\007' 2>/dev/null > \"$1\"; }\n\
 if [ -n \"${PWRDE:-}\" ] || [ \"${SHPOOL_SESSION_NAME#pwrde-}\" != \"${SHPOOL_SESSION_NAME:-}\" ]; then\n\
-  printf '\\033]9;pwrde:attention\\007' 2>/dev/null > /dev/tty || :\n\
-fi\n";
+  if ! osc9 /dev/tty; then\n\
+    pid=$$\n\
+    i=0\n\
+    while [ \"$i\" -lt 20 ] && [ -n \"$pid\" ] && [ \"$pid\" -gt 1 ] 2>/dev/null; do\n\
+      t=$(ps -o tty= -p \"$pid\" 2>/dev/null | tr -d ' ')\n\
+      case \"$t\" in\n\
+        ''|'??'|'-') ;;\n\
+        *) osc9 \"/dev/$t\" && break ;;\n\
+      esac\n\
+      pid=$(ps -o ppid= -p \"$pid\" 2>/dev/null | tr -d ' ')\n\
+      i=$((i+1))\n\
+    done\n\
+  fi\n\
+fi\n\
+exit 0\n";
 
 /// Ensure every event in [`HOOK_EVENTS`] has an entry running `script_path`.
 /// Returns the (possibly updated) root and whether anything changed. Purely
@@ -204,5 +225,21 @@ mod tests {
         assert!(HOOK_SCRIPT.contains("SHPOOL_SESSION_NAME#pwrde-"));
         assert!(HOOK_SCRIPT.contains("]9;"), "must emit OSC 9");
         assert!(HOOK_SCRIPT.contains("/dev/tty"));
+        // Hooks have no controlling terminal, so the /dev/tty write must have
+        // the ancestry-walk fallback to the pane's PTY device.
+        assert!(HOOK_SCRIPT.contains("ps -o tty="), "must walk ancestor ttys");
+        assert!(HOOK_SCRIPT.contains("ps -o ppid="), "must walk up the process tree");
+        assert!(HOOK_SCRIPT.contains("\"/dev/$t\""), "must write to the found tty");
+    }
+
+    #[test]
+    fn script_passes_sh_syntax_check() {
+        let dir = std::env::temp_dir().join(format!("pwrde-hook-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("claude-hook.sh");
+        std::fs::write(&path, HOOK_SCRIPT).unwrap();
+        let status = std::process::Command::new("sh").arg("-n").arg(&path).status().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(status.success(), "sh -n rejected HOOK_SCRIPT");
     }
 }
