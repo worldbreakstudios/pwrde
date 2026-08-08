@@ -23,7 +23,7 @@ use wezterm_term::color::ColorPalette;
 
 use crate::pages::{self, Action, Page, Section};
 use crate::palette::Palette;
-use crate::picker::{ForkPicker, Picker, PickerLayout, PickerRow};
+use crate::picker::{ForkPicker, Picker, PickerLayout, PickerRow, ProfilePicker};
 use crate::rect::char_rects;
 use crate::term::Session;
 use crate::theme::Theme;
@@ -46,6 +46,21 @@ const CARD_RADIUS: f32 = 12.0;
 const ROW_RADIUS: f32 = 9.0;
 
 /// Blend `c` 40% toward white — brightens the hovered link color.
+/// Truncate `text` to at most `max_chars` characters, ending in `…` when
+/// anything was cut. Zero (or one) available column yields an empty string
+/// rather than a lone ellipsis.
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    if max_chars <= 1 {
+        return String::new();
+    }
+    let mut out: String = text.chars().take(max_chars - 1).collect();
+    out.push('…');
+    out
+}
+
 fn brighten(c: (u8, u8, u8)) -> (u8, u8, u8) {
     let blend = |v: u8| v.saturating_add(((255 - v) as f32 * 0.4) as u8);
     (blend(c.0), blend(c.1), blend(c.2))
@@ -188,6 +203,28 @@ pub struct ConfirmLayout {
     pub panel: LayoutRect,
     pub cancel: LayoutRect,
     pub close: LayoutRect,
+}
+
+/// Geometry of the save-workspace modal (panel, both text fields, destination
+/// rows), shared by drawing and `main.rs` hit-testing.
+pub struct SaveLayout {
+    pub panel: LayoutRect,
+    pub name: LayoutRect,
+    pub desc: LayoutRect,
+    /// One rect per destination choice; empty while the fields are edited.
+    pub rows: Vec<LayoutRect>,
+}
+
+/// Snapshot of the save-workspace modal for painting: field buffers, which
+/// field holds the caret, and — once the modal reaches the destination stage —
+/// the destination row labels with the selected index.
+pub struct SaveModalView<'a> {
+    pub name: &'a str,
+    pub description: &'a str,
+    /// 0 = Name focused, 1 = Description.
+    pub field: usize,
+    /// `Some((row_labels, selected))` in the destination stage, else `None`.
+    pub dest: Option<(&'a [String], usize)>,
 }
 
 /// Per-frame page/navigation state the renderer needs beyond the workspaces:
@@ -406,6 +443,8 @@ impl Renderer {
         link_hover: Option<(u64, usize, usize)>,
         picker: Option<&Picker>,
         fork: Option<&ForkPicker>,
+        profile: Option<&ProfilePicker>,
+        save: Option<&SaveModalView>,
         palette: Option<&Palette>,
         message: Option<&(String, bool)>,
         confirm: Option<(&str, &str)>,
@@ -854,6 +893,13 @@ impl Renderer {
         let mut picker_labels: Vec<LabelSpec> = Vec::new();
         if let Some((text, accept)) = confirm {
             picker_labels = self.confirm_overlay(text, accept, &mut picker_quads);
+        } else if let Some(s) = save {
+            let layout = self.save_layout(s.dest.map_or(0, |(rows, _)| rows.len()));
+            picker_labels = self.save_overlay(s, &layout, &mut picker_quads);
+        } else if let Some(pp) = profile {
+            let layout =
+                PickerLayout::compute(width, height, self.scale, pp.rows.len(), pp.selected);
+            picker_labels = self.profile_overlay(pp, &layout, &mut picker_quads);
         } else if let Some(p) = picker {
             let layout = PickerLayout::compute(width, height, self.scale, p.rows.len(), p.selected);
             picker_labels = self.picker_overlay(p, &layout, &mut picker_quads);
@@ -2102,6 +2148,235 @@ impl Renderer {
         labels
     }
 
+    /// Step-3 workspace-profile overlay: the discovered `.pwrspace.json`
+    /// profiles for the group being created, default row first. Drawn from the
+    /// same [`PickerLayout`] `main.rs` hit-tests (like the command palette) so
+    /// clicks agree with pixels. Each row shows the profile name with its
+    /// description and source dimmed, right-aligned.
+    fn profile_overlay(
+        &self,
+        profile: &ProfilePicker,
+        layout: &PickerLayout,
+        rects: &mut Vec<Quad>,
+    ) -> Vec<LabelSpec> {
+        let th = self.theme();
+        let scale = self.scale;
+        let pad = (12.0 * scale).round();
+        let mut labels = Vec::new();
+
+        // Scrim + card + search field, matching the dir picker.
+        let scrim = LayoutRect { x: 0.0, y: 0.0, w: self.width as f32, h: self.height as f32 };
+        rects.push(self.px_rect(&scrim, th.scrim, 0.30, 0.0));
+        rects.push(
+            self.px_rect(&layout.panel, th.card, 0.96, (CARD_RADIUS * scale).round())
+                .shadow(Shadow::Card),
+        );
+        rects.push(self.px_rect(&layout.search, th.ink, 0.06, (7.0 * scale).round()));
+
+        // Search text (or a placeholder naming the group) with a caret.
+        let search_top = (layout.search.y + (layout.search.h - self.cell_height) / 2.0).round();
+        let (text, c) = if profile.query.is_empty() {
+            (format!("Launch {} with…", profile.name), th.ink_dim)
+        } else {
+            (profile.query.clone(), th.ink)
+        };
+        labels.push(LabelSpec {
+            text,
+            color: color(c, 1.0),
+            left: layout.search.x + pad,
+            top: search_top,
+            clip: layout.search,
+            size: None,
+        });
+        let caret_x =
+            layout.search.x + pad + profile.query.chars().count() as f32 * self.cell_width;
+        let caret = LayoutRect {
+            x: caret_x,
+            y: search_top,
+            w: (2.0 * scale).round().max(1.0),
+            h: self.cell_height,
+        };
+        rects.push(self.px_rect(&caret, th.accent, 1.0, 0.0));
+
+        // Visible rows: selected pill, profile name, dim detail right-aligned.
+        for i in layout.first_visible..(layout.first_visible + layout.visible) {
+            let (Some(row), Some(entry)) = (layout.row_rect(i), profile.rows.get(i)) else {
+                continue;
+            };
+            let top = (row.y + (row.h - self.cell_height) / 2.0).round();
+            if i == profile.selected {
+                let m = (6.0 * scale).round();
+                let pill = LayoutRect { x: row.x + m, w: (row.w - 2.0 * m).max(0.0), ..row };
+                rects.push(self.px_rect(&pill, th.accent, 0.10, (7.0 * scale).round()));
+            }
+            // The name has priority: the detail only gets the width left over
+            // after it (a long description truncates with an ellipsis rather
+            // than pushing the name out of the row).
+            let label_w = entry.label.chars().count() as f32 * self.cell_width;
+            let room = row.w - 2.0 * pad - label_w - 2.0 * self.cell_width;
+            let detail = truncate_chars(&entry.detail, (room / self.cell_width) as usize);
+            let detail_w = detail.chars().count() as f32 * self.cell_width;
+            let detail_x = row.x + row.w - pad - detail_w;
+            if !detail.is_empty() {
+                labels.push(LabelSpec {
+                    text: detail,
+                    color: color(th.ink_dim, 1.0),
+                    left: detail_x,
+                    top,
+                    clip: row,
+                    size: None,
+                });
+            }
+            labels.push(LabelSpec {
+                text: entry.label.clone(),
+                color: color(th.ink, 1.0),
+                left: row.x + pad,
+                top,
+                clip: LayoutRect { w: (detail_x - pad - row.x).max(0.0), ..row },
+                size: None,
+            });
+        }
+        labels
+    }
+
+    /// Geometry of the save-workspace modal, shared by drawing and `main.rs`
+    /// hit-testing. `dest_rows` is the number of destination choices shown
+    /// (0 while the name/description fields are being edited).
+    pub fn save_layout(&self, dest_rows: usize) -> SaveLayout {
+        let scale = self.scale;
+        let pad = (12.0 * scale).round();
+        let row_h = (self.cell_height + 8.0 * scale).round();
+        let caption_h = (self.cell_height + 4.0 * scale).round();
+
+        let panel_w = (self.width as f32 * 0.5).min(560.0 * scale).round();
+        let dest_h = if dest_rows > 0 { caption_h + dest_rows as f32 * row_h } else { 0.0 };
+        let panel_h = (pad * 2.0 + row_h + 2.0 * (caption_h + row_h) + dest_h).round();
+        let panel_x = ((self.width as f32 - panel_w) / 2.0).round();
+        let panel_y = ((self.height as f32 - panel_h) / 3.0).round().max(pad);
+        let panel = LayoutRect { x: panel_x, y: panel_y, w: panel_w, h: panel_h };
+
+        let field_w = panel_w - 2.0 * pad;
+        let name_y = panel_y + pad + row_h + caption_h;
+        let name = LayoutRect { x: panel_x + pad, y: name_y, w: field_w, h: row_h };
+        let desc_y = name_y + row_h + caption_h;
+        let desc = LayoutRect { x: panel_x + pad, y: desc_y, w: field_w, h: row_h };
+
+        let rows_top = desc_y + row_h + caption_h;
+        let rows = (0..dest_rows)
+            .map(|i| LayoutRect {
+                x: panel_x,
+                y: rows_top + i as f32 * row_h,
+                w: panel_w,
+                h: row_h,
+            })
+            .collect();
+        SaveLayout { panel, name, desc, rows }
+    }
+
+    /// Save-workspace modal: Name and Description fields, then (once both are
+    /// entered) the destination rows. The focused field carries the caret; the
+    /// selected destination row carries the accent pill.
+    fn save_overlay(
+        &self,
+        view: &SaveModalView,
+        layout: &SaveLayout,
+        rects: &mut Vec<Quad>,
+    ) -> Vec<LabelSpec> {
+        let th = self.theme();
+        let scale = self.scale;
+        let pad = (12.0 * scale).round();
+        let mut labels = Vec::new();
+
+        let scrim = LayoutRect { x: 0.0, y: 0.0, w: self.width as f32, h: self.height as f32 };
+        rects.push(self.px_rect(&scrim, th.scrim, 0.30, 0.0));
+        rects.push(
+            self.px_rect(&layout.panel, th.card, 0.96, (CARD_RADIUS * scale).round())
+                .shadow(Shadow::Card),
+        );
+
+        // Title.
+        labels.push(LabelSpec {
+            text: "Save as workspace".into(),
+            color: color(th.ink_dim, 1.0),
+            left: layout.panel.x + pad,
+            top: (layout.panel.y + pad).round(),
+            clip: layout.panel,
+            size: None,
+        });
+
+        // Fields: caption above each box; the focused one is brighter and
+        // carries the caret (only while still in the field-editing stage).
+        let editing_fields = view.dest.is_none();
+        for (i, (caption, value, rect)) in [
+            ("Name", view.name, &layout.name),
+            ("Description", view.description, &layout.desc),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            labels.push(LabelSpec {
+                text: caption.into(),
+                color: color(th.ink_dim, 1.0),
+                left: rect.x,
+                top: (rect.y - self.cell_height - 2.0 * scale).round(),
+                clip: layout.panel,
+                size: None,
+            });
+            let focused = editing_fields && view.field == i;
+            rects.push(self.px_rect(rect, th.ink, if focused { 0.10 } else { 0.06 }, (7.0 * scale).round()));
+            let top = (rect.y + (rect.h - self.cell_height) / 2.0).round();
+            labels.push(LabelSpec {
+                text: value.to_string(),
+                color: color(th.ink, 1.0),
+                left: rect.x + pad,
+                top,
+                clip: *rect,
+                size: None,
+            });
+            if focused {
+                let caret_x = rect.x + pad + value.chars().count() as f32 * self.cell_width;
+                let caret = LayoutRect {
+                    x: caret_x,
+                    y: top,
+                    w: (2.0 * scale).round().max(1.0),
+                    h: self.cell_height,
+                };
+                rects.push(self.px_rect(&caret, th.accent, 1.0, 0.0));
+            }
+        }
+
+        // Destination rows.
+        if let Some((dest_labels, selected)) = view.dest {
+            if let Some(first) = layout.rows.first() {
+                labels.push(LabelSpec {
+                    text: "Save to".into(),
+                    color: color(th.ink_dim, 1.0),
+                    left: layout.panel.x + pad,
+                    top: (first.y - self.cell_height - 2.0 * scale).round(),
+                    clip: layout.panel,
+                    size: None,
+                });
+            }
+            for (i, (text, row)) in dest_labels.iter().zip(layout.rows.iter()).enumerate() {
+                let top = (row.y + (row.h - self.cell_height) / 2.0).round();
+                if i == selected {
+                    let m = (6.0 * scale).round();
+                    let pill = LayoutRect { x: row.x + m, w: (row.w - 2.0 * m).max(0.0), ..*row };
+                    rects.push(self.px_rect(&pill, th.accent, 0.10, (7.0 * scale).round()));
+                }
+                labels.push(LabelSpec {
+                    text: text.clone(),
+                    color: color(th.ink, 1.0),
+                    left: row.x + pad,
+                    top,
+                    clip: LayoutRect { w: row.w - 2.0 * pad, ..*row },
+                    size: None,
+                });
+            }
+        }
+        labels
+    }
+
     /// Geometry of the confirm dialog (panel + buttons), shared by drawing and
     /// `main.rs` hit-testing so clicks always agree with pixels.
     pub fn confirm_layout(&self, text: &str, accept: &str) -> ConfirmLayout {
@@ -2603,6 +2878,18 @@ mod tests {
     use super::*;
     use crate::cleanup::{Cleanup, WorktreeInfo};
 
+    /// Long profile details truncate with an ellipsis instead of overrunning
+    /// the row; degenerate widths drop the detail entirely.
+    #[test]
+    fn truncate_chars_caps_length_with_ellipsis() {
+        assert_eq!(truncate_chars("short", 10), "short");
+        assert_eq!(truncate_chars("exactly-ten", 11), "exactly-ten");
+        assert_eq!(truncate_chars("a long description · user", 10), "a long de…");
+        assert_eq!(truncate_chars("ab", 1), "");
+        assert_eq!(truncate_chars("ab", 0), "");
+        assert_eq!(truncate_chars("", 0), "");
+    }
+
     fn cleanup_chrome(cleanup: &Cleanup) -> ChromeState<'_> {
         ChromeState {
             page: Page::Cleanup,
@@ -2649,7 +2936,7 @@ mod tests {
             None,
         );
         let frame = renderer.build_frame(
-            &[ws], 0, 240.0, None, None, None, None, None, None, None, None, &chrome,
+            &[ws], 0, 240.0, None, None, None, None, None, None, None, None, None, None, &chrome,
         );
         let texts: Vec<&str> = frame.labels.iter().map(|l| l.text.as_str()).collect();
         // Sidebar: All + one tab per repo, with counts.
@@ -2685,7 +2972,7 @@ mod tests {
 
         let sidebar_w = 240.0;
         let frame = renderer.build_frame(
-            &wss, 0, sidebar_w, None, None, None, None, None, None, None, None, &chrome,
+            &wss, 0, sidebar_w, None, None, None, None, None, None, None, None, None, None, &chrome,
         );
 
         let rows = crate::workspace::sidebar_rows(&wss, &[]);
@@ -2717,7 +3004,7 @@ mod tests {
             None,
         );
         let frame = renderer.build_frame(
-            &[ws], 0, 240.0, None, None, None, None, None, None, None, None, &chrome,
+            &[ws], 0, 240.0, None, None, None, None, None, None, None, None, None, None, &chrome,
         );
         let texts: Vec<&str> = frame.labels.iter().map(|l| l.text.as_str()).collect();
         assert!(texts.contains(&"Scanning worktrees…"));
@@ -2736,7 +3023,7 @@ mod tests {
             None,
         );
         let frame = renderer.build_frame(
-            &[ws], 0, 240.0, None, None, None, None, None, None, None, None, &chrome,
+            &[ws], 0, 240.0, None, None, None, None, None, None, None, None, None, None, &chrome,
         );
         let texts: Vec<&str> = frame.labels.iter().map(|l| l.text.as_str()).collect();
         // Header rows appear once per repo (the sidebar shows the same string,
@@ -2774,7 +3061,7 @@ mod tests {
             None,
         );
         let frame = renderer.build_frame(
-            &[ws], 0, 240.0, None, None, None, None, None, None, None, None, &chrome,
+            &[ws], 0, 240.0, None, None, None, None, None, None, None, None, None, None, &chrome,
         );
         let texts: Vec<&str> = frame.picker_labels.iter().map(|l| l.text.as_str()).collect();
         assert!(texts.contains(&"2 changes · +12 −3"), "popover summary: {texts:?}");
@@ -2799,7 +3086,7 @@ mod tests {
             None,
         );
         let frame = renderer.build_frame(
-            &[ws], 0, 240.0, None, None, None, None, None, None, None, None, &chrome,
+            &[ws], 0, 240.0, None, None, None, None, None, None, None, None, None, None, &chrome,
         );
         let texts: Vec<&str> = frame.labels.iter().map(|l| l.text.as_str()).collect();
         assert!(texts.contains(&"Delete 1 selected"));

@@ -218,11 +218,12 @@ pub enum Action {
     CommandPalette,
     ToggleFlyover,
     FlyoverPopout,
+    SaveWorkspace,
 }
 
 impl Action {
     /// Keyboard-page row order.
-    pub const ALL: [Action; 27] = [
+    pub const ALL: [Action; 28] = [
         Action::SplitRight,
         Action::SplitDown,
         Action::NewTab,
@@ -250,6 +251,7 @@ impl Action {
         Action::CommandPalette,
         Action::ToggleFlyover,
         Action::FlyoverPopout,
+        Action::SaveWorkspace,
     ];
 
     /// Stable identifier used in the settings key (`keyboard.<name>`).
@@ -282,6 +284,7 @@ impl Action {
             Action::CommandPalette => "command_palette",
             Action::ToggleFlyover => "toggle_flyover",
             Action::FlyoverPopout => "flyover_popout",
+            Action::SaveWorkspace => "save_workspace",
         }
     }
 
@@ -314,6 +317,7 @@ impl Action {
             Action::CommandPalette => "Command palette",
             Action::ToggleFlyover => "Toggle Flyover Terminal",
             Action::FlyoverPopout => "Flyover: panel ↔ window",
+            Action::SaveWorkspace => "Save as workspace",
         }
     }
 
@@ -350,6 +354,7 @@ impl Action {
             Action::CommandPalette => (false, "p"),
             Action::ToggleFlyover => (false, "`"),
             Action::FlyoverPopout => (true, "`"),
+            Action::SaveWorkspace => (true, "s"),
         };
         Binding { shift, alt: false, ctrl: false, key: key.into() }
     }

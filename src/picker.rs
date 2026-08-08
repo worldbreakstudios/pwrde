@@ -5,6 +5,11 @@
 //! that choice: the home dir, `~/src`, and each immediate subdirectory of
 //! `~/src` (the usual home for checkouts), flagging the ones that are git
 //! repos so the UI can mark them.
+//!
+//! It also holds the two follow-up picker models: the fork-source picker
+//! ([`ForkPicker`], step 2 for git repos) and the workspace-profile picker
+//! ([`ProfilePicker`], shown when `.pwrspace.json` profiles exist for the
+//! chosen directory).
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -234,6 +239,115 @@ impl ForkPicker {
             self.entries.clone()
         } else {
             self.entries.iter().filter(|e| e.label.to_lowercase().contains(&query)).cloned().collect()
+        };
+        if self.selected >= self.rows.len() {
+            self.selected = self.rows.len().saturating_sub(1);
+        }
+    }
+}
+
+/// One row of the workspace-profile picker: either a discovered profile or
+/// the "Default — single pane" row (no profile).
+#[derive(Clone, Debug)]
+pub struct ProfileEntry {
+    /// Display label: the profile name, or the default row's caption.
+    pub label: String,
+    /// Dim right-aligned annotation: `description · source`, empty for default.
+    pub detail: String,
+    /// The profile to launch, or `None` for a plain single-pane group.
+    pub profile: Option<crate::pwrspace::WorkspaceProfile>,
+}
+
+/// The workspace-profile picker: the third step of group creation, shown only
+/// when at least one profile was discovered for the target directory. The
+/// "Default — single pane" row sits first so Enter with no filter keeps
+/// today's behavior one keystroke away.
+pub struct ProfilePicker {
+    /// The name the group will get once launched.
+    pub name: String,
+    /// Every choice, default row first.
+    pub entries: Vec<ProfileEntry>,
+    pub query: String,
+    pub selected: usize,
+    /// The filtered view currently on screen.
+    pub rows: Vec<ProfileEntry>,
+}
+
+impl ProfilePicker {
+    /// Build the picker over `profiles` (discovered, already deduped), naming
+    /// the eventual group `name`. Prepends the default row.
+    pub fn new(name: String, profiles: Vec<(crate::pwrspace::WorkspaceProfile, String)>) -> Self {
+        let mut entries = vec![ProfileEntry {
+            label: "Default — single pane".into(),
+            detail: String::new(),
+            profile: None,
+        }];
+        entries.extend(profiles.into_iter().map(|(profile, source)| ProfileEntry {
+            label: profile.name.clone(),
+            detail: if profile.description.is_empty() {
+                source
+            } else {
+                format!("{} · {}", profile.description, source)
+            },
+            profile: Some(profile),
+        }));
+        let mut picker =
+            Self { name, entries, query: String::new(), selected: 0, rows: Vec::new() };
+        picker.rebuild();
+        picker
+    }
+
+    /// Appends a typed character to the query and refilters.
+    pub fn push_char(&mut self, ch: char) {
+        self.query.push(ch);
+        self.selected = 0;
+        self.rebuild();
+    }
+
+    /// Removes the last query character and refilters.
+    pub fn backspace(&mut self) {
+        self.query.pop();
+        self.selected = 0;
+        self.rebuild();
+    }
+
+    /// Moves the highlight by `delta` rows, clamped to the list.
+    pub fn move_selection(&mut self, delta: isize) {
+        if self.rows.is_empty() {
+            self.selected = 0;
+            return;
+        }
+        let max = self.rows.len() as isize - 1;
+        self.selected = (self.selected as isize + delta).clamp(0, max) as usize;
+    }
+
+    /// Selects the row at `index` when it is in range.
+    pub fn select(&mut self, index: usize) {
+        if index < self.rows.len() {
+            self.selected = index;
+        }
+    }
+
+    /// The highlighted row, if the list is not empty.
+    pub fn selected_entry(&self) -> Option<&ProfileEntry> {
+        self.rows.get(self.selected)
+    }
+
+    /// Recomputes [`ProfilePicker::rows`] from the query (case-insensitive
+    /// substring match on label or detail; empty query shows everything).
+    fn rebuild(&mut self) {
+        let query = self.query.trim().to_lowercase();
+        self.rows = if query.is_empty() {
+            self.entries.clone()
+        } else {
+            self.entries
+                .iter()
+                .filter(|e| {
+                    e.label.to_lowercase().contains(&query)
+                        || e.detail.to_lowercase().contains(&query)
+                })
+                .cloned()
+                .collect()
         };
         if self.selected >= self.rows.len() {
             self.selected = self.rows.len().saturating_sub(1);
@@ -646,5 +760,83 @@ mod tests {
         assert_eq!(picker.selected, picker.rows.len() - 1, "clamps at the last row");
         let entry = picker.selected_entry().expect("a selected entry");
         assert_eq!(entry.from.as_deref(), Some("origin/tw-term-features"));
+    }
+
+    // ── ProfilePicker ─────────────────────────────────────────────────────
+
+    fn profile(name: &str, description: &str) -> crate::pwrspace::WorkspaceProfile {
+        crate::pwrspace::WorkspaceProfile {
+            name: name.into(),
+            description: description.into(),
+            layout: crate::pwrspace::ProfileNode::Leaf(crate::pwrspace::ProfileLeaf {
+                tabs: vec![crate::pwrspace::ProfileTab::default()],
+                active: 0,
+            }),
+        }
+    }
+
+    fn sample_profile_picker() -> ProfilePicker {
+        ProfilePicker::new(
+            "repo".into(),
+            vec![
+                (profile("agent-dev", "claude + sub0 + lciw"), "repo".into()),
+                (profile("review", ""), "user".into()),
+            ],
+        )
+    }
+
+    /// The default (no-profile) row sits first and starts selected, so Enter
+    /// immediately launches a plain single-pane group.
+    #[test]
+    fn profile_picker_defaults_to_plain_group() {
+        let picker = sample_profile_picker();
+        assert_eq!(picker.rows.len(), 3);
+        assert_eq!(picker.selected, 0);
+        let entry = picker.selected_entry().expect("a selected entry");
+        assert!(entry.profile.is_none(), "default row launches without a profile");
+    }
+
+    /// Profile rows carry the name as label and `description · source` (or
+    /// just the source when the description is empty) as the dim detail.
+    #[test]
+    fn profile_picker_row_labels_and_details() {
+        let picker = sample_profile_picker();
+        assert_eq!(picker.rows[1].label, "agent-dev");
+        assert_eq!(picker.rows[1].detail, "claude + sub0 + lciw · repo");
+        assert_eq!(picker.rows[2].label, "review");
+        assert_eq!(picker.rows[2].detail, "user");
+    }
+
+    /// Typing filters on label and detail; clearing restores every row.
+    #[test]
+    fn profile_picker_filters_by_query() {
+        let mut picker = sample_profile_picker();
+        for ch in "agent".chars() {
+            picker.push_char(ch);
+        }
+        assert_eq!(picker.rows.len(), 1);
+        assert_eq!(picker.rows[0].label, "agent-dev");
+        for _ in 0.."agent".len() {
+            picker.backspace();
+        }
+        assert_eq!(picker.rows.len(), 3);
+
+        // Detail text (description/source) matches too.
+        for ch in "lciw".chars() {
+            picker.push_char(ch);
+        }
+        assert_eq!(picker.rows.len(), 1);
+        assert_eq!(picker.rows[0].label, "agent-dev");
+    }
+
+    /// Selection clamps within the filtered list.
+    #[test]
+    fn profile_picker_selection_clamps() {
+        let mut picker = sample_profile_picker();
+        picker.move_selection(-1);
+        assert_eq!(picker.selected, 0);
+        picker.move_selection(100);
+        assert_eq!(picker.selected, picker.rows.len() - 1);
+        assert_eq!(picker.selected_entry().unwrap().label, "review");
     }
 }
