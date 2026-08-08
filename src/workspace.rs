@@ -11,6 +11,20 @@
 //!
 //! Layout is pure math over the window size so the renderer (drawing) and
 //! the app (hit-testing, PTY resize, divider dragging) always agree.
+//!
+//! ## Collapse model
+//!
+//! Each `Tile` carries `collapsed: bool` (target state) and
+//! `collapse_anim: f32` (0.0 = fully expanded .. 1.0 = fully collapsed).
+//! A tile collapses *along its parent split's axis*: in a `Column` split it
+//! shrinks to the tab-bar height (`TILE_TAB_H`); in a `Row` split it shrinks
+//! to a narrow vertical strip of the same width. The split `ratio` is never
+//! modified — siblings absorb freed space and the prior arrangement is
+//! restored exactly on expand.
+//!
+//! [`tile_collapse_axis`] maps every tile id to its parent split's [`Dir`]
+//! (or `None` for a root leaf that has no parent). The renderer and app use
+//! this to decide caret visibility and collapsed appearance.
 
 use crate::term::Session;
 
@@ -34,15 +48,20 @@ pub struct Tile {
     pub id: u64,
     pub tabs: Vec<Tab>,
     pub active: usize,
+    /// Whether this tile is collapsed (target state; see `collapse_anim`).
+    pub collapsed: bool,
+    /// Animation progress: 0.0 = fully expanded, 1.0 = fully collapsed.
+    /// Advances toward `collapsed as u8 as f32` at 0.15 per tick.
+    pub collapse_anim: f32,
 }
 
 impl Tile {
     pub fn new(id: u64, session: Session) -> Self {
-        Self { id, tabs: vec![Tab::new(session)], active: 0 }
+        Self { id, tabs: vec![Tab::new(session)], active: 0, collapsed: false, collapse_anim: 0.0 }
     }
 
     pub fn empty(id: u64) -> Self {
-        Self { id, tabs: Vec::new(), active: 0 }
+        Self { id, tabs: Vec::new(), active: 0, collapsed: false, collapse_anim: 0.0 }
     }
 
     pub fn active_tab(&self) -> Option<&Tab> {
@@ -250,6 +269,13 @@ impl Workspace {
             && let Some(first) = self.root.tiles().first()
         {
             self.focused_tile = first.id;
+        }
+        // A root leaf has no parent split, so collapse is inert there — but a
+        // stale flag would spring back on the next split. Clear it when a
+        // removal promotes a lone tile to the root.
+        if let Node::Leaf(t) = &mut self.root {
+            t.collapsed = false;
+            t.collapse_anim = 0.0;
         }
     }
 }
@@ -933,8 +959,94 @@ pub fn layout_tiles(
     let mut tiles = Vec::new();
     let mut dividers = Vec::new();
     let gap = (TILE_GAP * scale).round();
-    walk(node, rect, gap, &mut Vec::new(), &mut tiles, &mut dividers);
+    walk(node, rect, gap, scale, &mut Vec::new(), &mut tiles, &mut dividers);
     (tiles, dividers)
+}
+
+// ── Collapse ────────────────────────────────────────────────────────────
+
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
+}
+
+/// How collapsed a subtree currently *renders* (animation state, not the
+/// target): a leaf's `collapse_anim`, a split the minimum of its children —
+/// a split is only as collapsed as its least-collapsed child.
+fn collapse_factor(node: &Node) -> f32 {
+    match node {
+        Node::Leaf(t) => t.collapse_anim.clamp(0.0, 1.0),
+        Node::Split { a, b, .. } => collapse_factor(a).min(collapse_factor(b)),
+    }
+}
+
+/// Whether every leaf of the subtree has `collapsed == true` (target state).
+pub fn fully_collapsed(node: &Node) -> bool {
+    match node {
+        Node::Leaf(t) => t.collapsed,
+        Node::Split { a, b, .. } => fully_collapsed(a) && fully_collapsed(b),
+    }
+}
+
+/// Extent a fully-collapsed subtree occupies along `axis`: a leaf keeps just
+/// its tab-bar height (or an equally narrow strip when collapsing sideways);
+/// splits stack extents along the axis and take the max across it.
+fn collapsed_extent(node: &Node, axis: Dir, scale: f32, gap: f32) -> f32 {
+    match node {
+        Node::Leaf(_) => (TILE_TAB_H * scale).round(),
+        Node::Split { dir, a, b, .. } => {
+            let ea = collapsed_extent(a, axis, scale, gap);
+            let eb = collapsed_extent(b, axis, scale, gap);
+            if *dir == axis { ea + gap + eb } else { ea.max(eb) }
+        },
+    }
+}
+
+/// Child rects + divider for a split, honoring collapse. With both collapse
+/// factors at 0 this is exactly [`split_rects`]. A collapsing child heads to
+/// its fixed collapsed extent while the sibling absorbs the remainder; the
+/// stored `ratio` is never touched, so expanding restores the old layout and
+/// multi-pane siblings keep their relative distribution.
+fn split_rects_collapsed(
+    rect: &LayoutRect,
+    dir: Dir,
+    ratio: f32,
+    a: &Node,
+    b: &Node,
+    gap: f32,
+    scale: f32,
+) -> (LayoutRect, LayoutRect, LayoutRect) {
+    let fa = collapse_factor(a);
+    let fb = collapse_factor(b);
+    if fa <= 0.0 && fb <= 0.0 {
+        return split_rects(rect, dir, ratio, gap);
+    }
+    let total = match dir {
+        Dir::Row => rect.w,
+        Dir::Column => rect.h,
+    };
+    let nat_a = ((total - gap) * ratio).round();
+    let nat_b = total - nat_a - gap;
+    // The more-collapsed side is sized to its target; the other side takes
+    // the remainder, so freed space always flows to the expanded panes.
+    let (ea, eb) = if fa >= fb {
+        let ea = lerp(nat_a, collapsed_extent(a, dir, scale, gap), fa).round();
+        (ea, total - ea - gap)
+    } else {
+        let eb = lerp(nat_b, collapsed_extent(b, dir, scale, gap), fb).round();
+        (total - eb - gap, eb)
+    };
+    match dir {
+        Dir::Row => (
+            LayoutRect { w: ea, ..*rect },
+            LayoutRect { x: rect.x + ea + gap, w: eb, ..*rect },
+            LayoutRect { x: rect.x + ea, y: rect.y, w: gap, h: rect.h },
+        ),
+        Dir::Column => (
+            LayoutRect { h: ea, ..*rect },
+            LayoutRect { y: rect.y + ea + gap, h: eb, ..*rect },
+            LayoutRect { x: rect.x, y: rect.y + ea, w: rect.w, h: gap },
+        ),
+    }
 }
 
 // ── Directional navigation ──────────────────────────────────────────────
@@ -1054,6 +1166,7 @@ fn walk(
     node: &Node,
     rect: LayoutRect,
     gap: f32,
+    scale: f32,
     path: &mut Vec<u8>,
     tiles: &mut Vec<(u64, LayoutRect)>,
     dividers: &mut Vec<Divider>,
@@ -1061,13 +1174,16 @@ fn walk(
     match node {
         Node::Leaf(t) => tiles.push((t.id, rect)),
         Node::Split { dir, ratio, a, b } => {
-            let (ra, rb, div) = split_rects(&rect, *dir, *ratio, gap);
-            dividers.push(Divider { path: path.clone(), rect: div, dir: *dir });
+            let (ra, rb, div) = split_rects_collapsed(&rect, *dir, *ratio, a, b, gap, scale);
+            // A collapsed edge has a fixed extent — no divider to drag.
+            if !fully_collapsed(a) && !fully_collapsed(b) {
+                dividers.push(Divider { path: path.clone(), rect: div, dir: *dir });
+            }
             path.push(0);
-            walk(a, ra, gap, path, tiles, dividers);
+            walk(a, ra, gap, scale, path, tiles, dividers);
             path.pop();
             path.push(1);
-            walk(b, rb, gap, path, tiles, dividers);
+            walk(b, rb, gap, scale, path, tiles, dividers);
             path.pop();
         },
     }
@@ -1099,7 +1215,7 @@ pub fn rect_at_path(node: &Node, rect: LayoutRect, path: &[u8], scale: f32) -> L
     let mut rect = rect;
     for step in path {
         if let Node::Split { dir, ratio, a, b } = node {
-            let (ra, rb, _) = split_rects(&rect, *dir, *ratio, gap);
+            let (ra, rb, _) = split_rects_collapsed(&rect, *dir, *ratio, a, b, gap, scale);
             if *step == 0 {
                 node = a;
                 rect = ra;
@@ -1123,16 +1239,34 @@ pub fn tile_content(rect: &LayoutRect, scale: f32) -> LayoutRect {
     LayoutRect { y: rect.y + bar, h: (rect.h - bar).max(0.0), ..*rect }
 }
 
-/// Rect of tab `i` of `n` in a tile's strip.
-pub fn tile_tab_rect(rect: &LayoutRect, i: usize, n: usize, scale: f32) -> LayoutRect {
+/// A square caret button at the RIGHT edge of a tile's tab bar.
+/// Side length = `TILE_TAB_H * scale`. Present only when the tile has a
+/// parent split (i.e. `tile_collapse_axis` returns `Some`).
+pub fn tile_caret_rect(rect: &LayoutRect, scale: f32) -> LayoutRect {
     let bar = tile_tab_bar(rect, scale);
-    let w = (bar.w / n.max(1) as f32).min((TILE_TAB_MAX_W * scale).round()).round();
+    let side = (TILE_TAB_H * scale).round();
+    LayoutRect { x: bar.x + (bar.w - side).max(0.0), y: bar.y, w: side, h: side }
+}
+
+/// Rect of tab `i` of `n` in a tile's strip.
+///
+/// When `has_caret` is `true` (the tile has a parent split and therefore
+/// shows a collapse caret button), the caret square at the right end of the
+/// strip is excluded from the available width so tabs never overlap it.
+pub fn tile_tab_rect(rect: &LayoutRect, i: usize, n: usize, scale: f32, has_caret: bool) -> LayoutRect {
+    let bar = tile_tab_bar(rect, scale);
+    let caret_w = if has_caret { (TILE_TAB_H * scale).round() } else { 0.0 };
+    let avail_w = (bar.w - caret_w).max(0.0);
+    let w = (avail_w / n.max(1) as f32).min((TILE_TAB_MAX_W * scale).round()).round();
     LayoutRect { x: bar.x + i as f32 * w, y: bar.y, w, h: bar.h }
 }
 
 /// The close-button hit region at the right edge of tab `i` of `n`.
-pub fn tile_tab_close_rect(rect: &LayoutRect, i: usize, n: usize, scale: f32) -> LayoutRect {
-    let tr = tile_tab_rect(rect, i, n, scale);
+///
+/// `has_caret` is forwarded to `tile_tab_rect` so the close button position
+/// stays consistent with the tab's actual position.
+pub fn tile_tab_close_rect(rect: &LayoutRect, i: usize, n: usize, scale: f32, has_caret: bool) -> LayoutRect {
+    let tr = tile_tab_rect(rect, i, n, scale, has_caret);
     let s = (16.0 * scale).round();
     let pad = (6.0 * scale).round();
     LayoutRect {
@@ -1140,6 +1274,26 @@ pub fn tile_tab_close_rect(rect: &LayoutRect, i: usize, n: usize, scale: f32) ->
         y: (tr.y + (tr.h - s) / 2.0).round(),
         w: s,
         h: s,
+    }
+}
+
+/// Maps each tile id to the [`Dir`] of its parent split, or `None` if the
+/// tile is a root leaf (no parent, so collapse has no effect).
+///
+/// The returned `Vec` is in tree order (same as `Node::tiles()`).
+pub fn tile_collapse_axis(node: &Node) -> Vec<(u64, Option<Dir>)> {
+    let mut out = Vec::new();
+    collect_collapse_axis(node, None, &mut out);
+    out
+}
+
+fn collect_collapse_axis(node: &Node, parent_dir: Option<Dir>, out: &mut Vec<(u64, Option<Dir>)>) {
+    match node {
+        Node::Leaf(tile) => out.push((tile.id, parent_dir)),
+        Node::Split { dir, a, b, .. } => {
+            collect_collapse_axis(a, Some(*dir), out);
+            collect_collapse_axis(b, Some(*dir), out);
+        }
     }
 }
 
@@ -1171,10 +1325,12 @@ mod tests {
         for scale in [1.0, 2.0] {
             for n in [1, 3, 8] {
                 for i in 0..n {
-                    let tr = tile_tab_rect(&rect, i, n, scale);
-                    let close = tile_tab_close_rect(&rect, i, n, scale);
-                    assert!(close.x >= tr.x && close.x + close.w <= tr.x + tr.w);
-                    assert!(close.y >= tr.y && close.y + close.h <= tr.y + tr.h);
+                    for has_caret in [false, true] {
+                        let tr = tile_tab_rect(&rect, i, n, scale, has_caret);
+                        let close = tile_tab_close_rect(&rect, i, n, scale, has_caret);
+                        assert!(close.x >= tr.x && close.x + close.w <= tr.x + tr.w);
+                        assert!(close.y >= tr.y && close.y + close.h <= tr.y + tr.h);
+                    }
                 }
             }
         }
@@ -1714,5 +1870,211 @@ mod tests {
             (3, r(100.0, 200.0, 100.0, 50.0)),// center (150, 225) — farther
         ];
         assert_eq!(directional_neighbor(&tiles, 1, NavDir::Right), Some(2));
+    }
+
+    // --- collapse ---
+
+    fn leaf(id: u64, collapsed: bool) -> Node {
+        let mut t = Tile::empty(id);
+        t.collapsed = collapsed;
+        t.collapse_anim = if collapsed { 1.0 } else { 0.0 };
+        Node::Leaf(t)
+    }
+
+    fn split(dir: Dir, ratio: f32, a: Node, b: Node) -> Node {
+        Node::Split { dir, ratio, a: Box::new(a), b: Box::new(b) }
+    }
+
+    fn rect_of(tiles: &[(u64, LayoutRect)], id: u64) -> LayoutRect {
+        tiles.iter().find(|(t, _)| *t == id).map(|(_, r)| *r).unwrap()
+    }
+
+    const AREA: LayoutRect = LayoutRect { x: 0.0, y: 0.0, w: 1200.0, h: 800.0 };
+
+    #[test]
+    fn collapsed_column_pane_shrinks_to_tab_bar() {
+        let scale = 2.0;
+        let gap = (TILE_GAP * scale).round();
+        let ce = (TILE_TAB_H * scale).round();
+        let node = split(Dir::Column, 0.5, leaf(1, false), leaf(2, true));
+        let (tiles, _) = layout_tiles(&node, AREA, scale);
+        let a = rect_of(&tiles, 1);
+        let b = rect_of(&tiles, 2);
+        assert_eq!(b.h, ce);
+        assert_eq!(a.h, AREA.h - gap - ce);
+        assert_eq!(b.y, a.h + gap);
+        // Widths untouched by a stacked collapse.
+        assert_eq!(a.w, AREA.w);
+        assert_eq!(b.w, AREA.w);
+    }
+
+    #[test]
+    fn collapsed_row_pane_shrinks_to_narrow_strip() {
+        let scale = 2.0;
+        let gap = (TILE_GAP * scale).round();
+        let ce = (TILE_TAB_H * scale).round();
+        let node = split(Dir::Row, 0.5, leaf(1, true), leaf(2, false));
+        let (tiles, _) = layout_tiles(&node, AREA, scale);
+        let a = rect_of(&tiles, 1);
+        let b = rect_of(&tiles, 2);
+        assert_eq!(a.w, ce);
+        assert_eq!(b.w, AREA.w - gap - ce);
+        assert_eq!(b.x, ce + gap);
+    }
+
+    #[test]
+    fn siblings_absorb_freed_space_proportionally() {
+        // Column(a, Column(b, c)): collapsing a hands its space to the b/c
+        // subtree, which keeps splitting by its own (untouched) ratio.
+        let scale = 1.0;
+        let gap = (TILE_GAP * scale).round();
+        let ce = (TILE_TAB_H * scale).round();
+        let node = split(
+            Dir::Column,
+            0.5,
+            leaf(1, true),
+            split(Dir::Column, 0.25, leaf(2, false), leaf(3, false)),
+        );
+        let (tiles, _) = layout_tiles(&node, AREA, scale);
+        let a = rect_of(&tiles, 1);
+        let b = rect_of(&tiles, 2);
+        let c = rect_of(&tiles, 3);
+        assert_eq!(a.h, ce);
+        let rest = AREA.h - gap - ce;
+        assert_eq!(b.h, ((rest - gap) * 0.25).round());
+        assert_eq!(c.h, rest - gap - b.h);
+    }
+
+    #[test]
+    fn expand_restores_exact_previous_layout() {
+        let scale = 2.0;
+        let mut node = split(Dir::Column, 0.37, leaf(1, false), leaf(2, false));
+        let (before, _) = layout_tiles(&node, AREA, scale);
+        for (collapsed, anim) in [(true, 1.0_f32), (false, 0.0)] {
+            if let Some(t) = node.find_tile_mut(2) {
+                t.collapsed = collapsed;
+                t.collapse_anim = anim;
+            }
+        }
+        let (after, _) = layout_tiles(&node, AREA, scale);
+        for ((ida, ra), (idb, rb)) in before.iter().zip(after.iter()) {
+            assert_eq!(ida, idb);
+            assert_eq!((ra.x, ra.y, ra.w, ra.h), (rb.x, rb.y, rb.w, rb.h));
+        }
+    }
+
+    #[test]
+    fn nested_fully_collapsed_split_stacks_extents() {
+        // Column(a, Column(b, c)) with b and c collapsed: the whole subtree
+        // is collapsed, occupying two tab bars plus the gap between them.
+        let scale = 1.0;
+        let gap = (TILE_GAP * scale).round();
+        let ce = (TILE_TAB_H * scale).round();
+        let node = split(
+            Dir::Column,
+            0.5,
+            leaf(1, false),
+            split(Dir::Column, 0.5, leaf(2, true), leaf(3, true)),
+        );
+        let (tiles, _) = layout_tiles(&node, AREA, scale);
+        let a = rect_of(&tiles, 1);
+        let b = rect_of(&tiles, 2);
+        let c = rect_of(&tiles, 3);
+        assert_eq!(b.h, ce);
+        assert_eq!(c.h, ce);
+        assert_eq!(a.h, AREA.h - gap - (ce + gap + ce));
+
+        // Perpendicular nesting: Row(a, Column(b collapsed, c collapsed))
+        // takes the max across the axis — one strip width.
+        let node = split(
+            Dir::Row,
+            0.5,
+            leaf(1, false),
+            split(Dir::Column, 0.5, leaf(2, true), leaf(3, true)),
+        );
+        let (tiles, _) = layout_tiles(&node, AREA, scale);
+        assert_eq!(rect_of(&tiles, 2).w, ce);
+        assert_eq!(rect_of(&tiles, 1).w, AREA.w - gap - ce);
+    }
+
+    #[test]
+    fn mid_animation_extent_is_between_endpoints() {
+        let scale = 1.0;
+        let gap = (TILE_GAP * scale).round();
+        let ce = (TILE_TAB_H * scale).round();
+        let mut node = split(Dir::Column, 0.5, leaf(1, false), leaf(2, true));
+        if let Some(t) = node.find_tile_mut(2) {
+            t.collapse_anim = 0.5;
+        }
+        let (tiles, _) = layout_tiles(&node, AREA, scale);
+        let b = rect_of(&tiles, 2);
+        let natural = ((AREA.h - gap) * 0.5).round();
+        assert!(b.h > ce && b.h < natural, "mid-anim height {} not between", b.h);
+    }
+
+    #[test]
+    fn no_divider_on_a_collapsed_edge() {
+        let scale = 1.0;
+        let node = split(Dir::Column, 0.5, leaf(1, false), leaf(2, true));
+        let (_, dividers) = layout_tiles(&node, AREA, scale);
+        assert!(dividers.is_empty());
+        // Expanded panes keep their divider.
+        let node = split(Dir::Column, 0.5, leaf(1, false), leaf(2, false));
+        let (_, dividers) = layout_tiles(&node, AREA, scale);
+        assert_eq!(dividers.len(), 1);
+    }
+
+    #[test]
+    fn caret_rect_right_aligned_and_tabs_avoid_it() {
+        let rect = LayoutRect { x: 100.0, y: 50.0, w: 900.0, h: 600.0 };
+        for scale in [1.0, 2.0] {
+            let bar = tile_tab_bar(&rect, scale);
+            let caret = tile_caret_rect(&rect, scale);
+            // Right-aligned square inside the bar.
+            assert_eq!(caret.x + caret.w, bar.x + bar.w);
+            assert!(caret.y >= bar.y && caret.y + caret.h <= bar.y + bar.h);
+            // Tabs start at the bar's left edge either way; with a caret the
+            // last tab must end at or before the caret square.
+            for n in [1, 2, 4] {
+                let first = tile_tab_rect(&rect, 0, n, scale, true);
+                assert_eq!(first.x, bar.x);
+                let last = tile_tab_rect(&rect, n - 1, n, scale, true);
+                assert!(last.x + last.w <= caret.x + 1.0);
+                // Close button stays inside its tab.
+                let close = tile_tab_close_rect(&rect, n - 1, n, scale, true);
+                assert!(close.x >= last.x && close.x + close.w <= last.x + last.w);
+            }
+        }
+    }
+
+    #[test]
+    fn tile_collapse_axis_maps_parent_dirs() {
+        let node = split(
+            Dir::Row,
+            0.5,
+            leaf(1, false),
+            split(Dir::Column, 0.5, leaf(2, false), leaf(3, false)),
+        );
+        let axes = tile_collapse_axis(&node);
+        assert_eq!(axes, vec![(1, Some(Dir::Row)), (2, Some(Dir::Column)), (3, Some(Dir::Column))]);
+        // A root leaf cannot collapse.
+        let axes = tile_collapse_axis(&leaf(9, false));
+        assert_eq!(axes, vec![(9, None)]);
+    }
+
+    #[test]
+    fn fix_focus_clears_stale_collapse_on_root_leaf() {
+        let mut ws = Workspace::new("g".into(), Tile::empty(1), None);
+        if let Node::Leaf(t) = &mut ws.root {
+            t.collapsed = true;
+            t.collapse_anim = 1.0;
+        }
+        ws.fix_focus();
+        if let Node::Leaf(t) = &ws.root {
+            assert!(!t.collapsed);
+            assert_eq!(t.collapse_anim, 0.0);
+        } else {
+            panic!("root should be a leaf");
+        }
     }
 }

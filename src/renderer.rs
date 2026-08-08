@@ -131,9 +131,57 @@ pub struct LabelSpec {
     pub size: Option<f32>,
 }
 
+/// A pane's collapse caret: a chevron that rotates from pointing down
+/// (expanded) to pointing right (collapsed). Quads can't rotate, so `main.rs`
+/// paints it as a small filled gpui path. Position in physical px, angle in
+/// radians.
+#[derive(Clone, Copy)]
+pub struct CaretSpec {
+    pub cx: f32,
+    pub cy: f32,
+    /// Half-width of the chevron.
+    pub size: f32,
+    /// 0.0 points down; `-FRAC_PI_2` points right.
+    pub angle: f32,
+    pub color: Hsla,
+}
+
 /// Button labels of the confirm dialog (shared by layout and drawing).
 const CONFIRM_CANCEL: &str = "Cancel";
-const CONFIRM_CLOSE: &str = "Close group";
+
+/// Cleanup-page status colors, flipped per theme polarity so they read on
+/// both white and dark cards.
+struct CleanupStatusColors {
+    /// Uncommitted-changes count.
+    dirty: (u8, u8, u8),
+    /// Merged PRs.
+    merged: (u8, u8, u8),
+    /// Open/draft PRs, and added lines / new files in the popover.
+    open: (u8, u8, u8),
+    added: (u8, u8, u8),
+    /// Closed PRs, errors, and removed lines in the popover.
+    removed: (u8, u8, u8),
+}
+
+fn cleanup_status_colors(th: &crate::theme::Theme) -> CleanupStatusColors {
+    if th.dark {
+        CleanupStatusColors {
+            dirty: (230, 160, 90),
+            merged: (200, 130, 220),
+            open: (120, 190, 140),
+            added: (120, 190, 140),
+            removed: (230, 120, 110),
+        }
+    } else {
+        CleanupStatusColors {
+            dirty: (176, 98, 20),
+            merged: (142, 68, 173),
+            open: (34, 139, 84),
+            added: (34, 139, 84),
+            removed: (192, 57, 57),
+        }
+    }
+}
 
 /// The confirm dialog's rects, in physical px.
 pub struct ConfirmLayout {
@@ -160,6 +208,8 @@ pub struct ChromeState<'a> {
     /// In-progress section rename: `(section_id, buffer)`. When set, that
     /// section header paints the buffer + caret instead of emoji/name.
     pub editing_section: Option<(u64, &'a str)>,
+    /// Cleanup page state (worktree table, selection, filter, scroll).
+    pub cleanup: &'a crate::cleanup::Cleanup,
 }
 
 /// Everything `main.rs`'s terminal `Element` needs to paint one frame — all
@@ -178,6 +228,8 @@ pub struct Frame {
     pub picker_quads: Vec<Quad>,
     /// Picker overlay labels, painted last.
     pub picker_labels: Vec<LabelSpec>,
+    /// Collapse carets, painted as rotated chevron paths over the chrome.
+    pub carets: Vec<CaretSpec>,
 }
 
 /// Stateless renderer: owns only cell metrics and scale. All measurements
@@ -347,7 +399,7 @@ impl Renderer {
         fork: Option<&ForkPicker>,
         palette: Option<&Palette>,
         message: Option<&(String, bool)>,
-        confirm: Option<&str>,
+        confirm: Option<(&str, &str)>,
         chrome: &ChromeState,
     ) -> Frame {
         let th = self.theme();
@@ -385,6 +437,11 @@ impl Renderer {
         let mut fg_quads: Vec<Quad> = Vec::new();
         let mut labels: Vec<LabelSpec> = Vec::new();
         let mut panes: Vec<PaneText> = Vec::new();
+        let mut carets: Vec<CaretSpec> = Vec::new();
+        // Which axis each tile would collapse along (its parent split's dir);
+        // `None` = root leaf, which shows no caret and cannot collapse.
+        let collapse_axis_map: std::collections::HashMap<u64, Option<workspace::Dir>> =
+            workspace::tile_collapse_axis(&ws.root).into_iter().collect();
 
         // ── Sidebar chrome (identical geometry on every page) ──────────
         // The window gradient is painted by `main.rs` before these quads;
@@ -488,6 +545,34 @@ impl Renderer {
                     });
                 }
             },
+            Page::Cleanup => {
+                // "All" plus one tab per repo with drop worktrees, in the same
+                // rows the groups occupy on Sessions so the chrome reads as one.
+                let repos = chrome.cleanup.repos();
+                let filter = chrome.cleanup.repo_filter.as_deref();
+                let mut tabs: Vec<(String, bool)> =
+                    vec![("All".to_string(), filter.is_none())];
+                for repo in &repos {
+                    tabs.push((
+                        format!("{} · {}", repo.display, repo.count),
+                        filter == Some(repo.root.as_str()),
+                    ));
+                }
+                for (i, (label, active_row)) in tabs.iter().enumerate() {
+                    let tab = workspace::tab_rect(i, self.scale, sidebar_w);
+                    if *active_row {
+                        bg_quads.push(self.px_rect(&tab, th.card, 0.78, row_r).shadow(Shadow::Soft));
+                    }
+                    labels.push(LabelSpec {
+                        text: label.clone(),
+                        color: color(if *active_row { th.ink } else { th.ink_dim }, 1.0),
+                        left: tab.x + group_pad,
+                        top: (tab.y + (tab.h - self.cell_height) / 2.0).round(),
+                        clip: LayoutRect { w: tab.w - group_pad, ..tab },
+                        size: None,
+                    });
+                }
+            },
         }
 
         // ── Page-dot strip (bottom of the sidebar, every page) ─────────
@@ -528,19 +613,37 @@ impl Renderer {
         if chrome.page == Page::Settings {
             // ── Settings page: one tile-style card in the content area ──
             self.settings_page(&area, chrome, workspaces, active, &mut bg_quads, &mut labels);
+        } else if chrome.page == Page::Cleanup {
+            // ── Cleanup page: the worktree table card ──
+            self.cleanup_page(&area, chrome, &mut bg_quads, &mut labels);
         } else {
             let hair = (1.0 * self.scale).round().max(1.0);
             for (id, rect) in &tiles {
                 // Each tile is a floating dark card: rounded, shadowed, with its
                 // tab strip inside the card above a hairline divider.
                 bg_quads.push(self.px_rect(rect, pane_bg, 1.0, card_r).shadow(Shadow::Card));
+                let axis = collapse_axis_map.get(id).copied().flatten();
+                let Some(tile) = ws.root.find_tile(*id) else { continue };
+                // Collapsed (or mid-animation) panes hide their content; a
+                // sideways-collapsed pane is a bare strip showing only the caret.
+                let collapsing = axis.is_some() && (tile.collapsed || tile.collapse_anim > 0.0);
+                let side_strip = axis == Some(workspace::Dir::Row) && collapsing;
                 let bar = workspace::tile_tab_bar(rect, self.scale);
-                let divider = LayoutRect { x: rect.x, y: bar.y + bar.h - hair, w: rect.w, h: hair };
-                bg_quads.push(self.px_rect(&divider, pane_divider.0, pane_divider.1, 0.0));
-                if let Some(tile) = ws.root.find_tile(*id) {
+                if !collapsing {
+                    let divider =
+                        LayoutRect { x: rect.x, y: bar.y + bar.h - hair, w: rect.w, h: hair };
+                    bg_quads.push(self.px_rect(&divider, pane_divider.0, pane_divider.1, 0.0));
+                }
+                if !side_strip {
                     // Active tab: a subtle rounded pill inside the strip (white
                     // works on every theme's dark card).
-                    let tr = workspace::tile_tab_rect(rect, tile.active, tile.tabs.len(), self.scale);
+                    let tr = workspace::tile_tab_rect(
+                        rect,
+                        tile.active,
+                        tile.tabs.len(),
+                        self.scale,
+                        axis.is_some(),
+                    );
                     let m = (4.0 * self.scale).round();
                     let pill = LayoutRect {
                         x: tr.x + m,
@@ -556,9 +659,44 @@ impl Renderer {
             let focused_tile = Some(ws.focused_tile);
             for (id, rect) in &tiles {
                 let Some(tile) = ws.root.find_tile(*id) else { continue };
+                let axis = collapse_axis_map.get(id).copied().flatten();
+                let has_caret = axis.is_some();
+                let collapsing = has_caret && (tile.collapsed || tile.collapse_anim > 0.0);
+                let side_strip = axis == Some(workspace::Dir::Row) && collapsing;
+                // The caret chevron, rotating down (expanded) → right
+                // (collapsed) with the pane's animation progress.
+                if has_caret {
+                    let cr = workspace::tile_caret_rect(rect, self.scale);
+                    carets.push(CaretSpec {
+                        cx: cr.x + cr.w / 2.0,
+                        cy: cr.y + cr.h / 2.0,
+                        size: (4.5 * self.scale).round(),
+                        angle: -std::f32::consts::FRAC_PI_2
+                            * tile.collapse_anim.clamp(0.0, 1.0),
+                        color: color(pane_ink_dim.0, pane_ink_dim.1),
+                    });
+                    // While collapsed, any tab's unread dot bubbles up to a
+                    // badge on the chevron so hidden panes can still call
+                    // for attention.
+                    if tile.collapsed && tile.tabs.iter().any(|t| t.unread) {
+                        let ds = (6.0 * self.scale).round();
+                        let pad = (3.0 * self.scale).round();
+                        let dot = LayoutRect {
+                            x: cr.x + cr.w - ds - pad,
+                            y: cr.y + pad,
+                            w: ds,
+                            h: ds,
+                        };
+                        fg_quads.push(self.px_rect(&dot, th.accent, 1.0, ds / 2.0));
+                    }
+                }
+                // Collapsed (or mid-animation) panes paint no terminal
+                // content — the card is just its tab strip.
                 let content = workspace::tile_content(rect, self.scale);
                 let origin = self.content_origin(&content);
-                if let Some(session) = tile.tabs.get(tile.active).map(|t| &t.session) {
+                if !collapsing
+                    && let Some(session) = tile.tabs.get(tile.active).map(|t| &t.session)
+                {
                     let draw_cursor = Some(*id) == focused_tile
                         && picker.is_none()
                         && fork.is_none()
@@ -580,13 +718,19 @@ impl Renderer {
                     panes.push(PaneText { origin, rows });
                     self.selection_rects(session, origin, &mut fg_quads);
                 }
+                // A sideways strip has no room for the strip's labels: only
+                // the caret shows. A stacked collapse keeps its tab labels
+                // (clicking one focuses + expands).
+                if side_strip {
+                    continue;
+                }
 
                 // Tab labels for this tile's tab strip.
                 let tab_text_pad = (8.0 * self.scale).round();
                 for (ti, tab) in tile.tabs.iter().enumerate() {
-                    let tr = workspace::tile_tab_rect(rect, ti, tile.tabs.len(), self.scale);
+                    let tr = workspace::tile_tab_rect(rect, ti, tile.tabs.len(), self.scale, has_caret);
                     let close =
-                        workspace::tile_tab_close_rect(rect, ti, tile.tabs.len(), self.scale);
+                        workspace::tile_tab_close_rect(rect, ti, tile.tabs.len(), self.scale, has_caret);
                     let title = tab.session.title();
                     let text = if title.is_empty() { "shell".to_string() } else { title };
                     // Unread: an accent dot before the title, which shifts
@@ -698,8 +842,8 @@ impl Renderer {
         // ── Picker overlay (over everything) ───────────────────────────
         let mut picker_quads: Vec<Quad> = Vec::new();
         let mut picker_labels: Vec<LabelSpec> = Vec::new();
-        if let Some(text) = confirm {
-            picker_labels = self.confirm_overlay(text, &mut picker_quads);
+        if let Some((text, accept)) = confirm {
+            picker_labels = self.confirm_overlay(text, accept, &mut picker_quads);
         } else if let Some(p) = picker {
             let layout = PickerLayout::compute(width, height, self.scale, p.rows.len(), p.selected);
             picker_labels = self.picker_overlay(p, &layout, &mut picker_quads);
@@ -711,9 +855,13 @@ impl Renderer {
             picker_labels = self.palette_overlay(pal, &layout, &mut picker_quads);
         } else if let Some((text, _)) = message {
             picker_labels = self.message_overlay(text, &mut picker_quads);
+        } else if chrome.page == Page::Cleanup {
+            // Dirty-files popover floats over the table while its cell is
+            // hovered (never alongside a modal overlay).
+            self.cleanup_popover(&area, chrome, &mut picker_quads, &mut picker_labels);
         }
 
-        Frame { bg_quads, panes, fg_quads, labels, picker_quads, picker_labels }
+        Frame { bg_quads, panes, fg_quads, labels, picker_quads, picker_labels, carets }
     }
 
     /// Paint Sessions sidebar rows (section headers + group cards) using the
@@ -1208,6 +1356,381 @@ impl Renderer {
         }
     }
 
+    /// The Cleanup page: one tile-style card holding the drop-worktree table.
+    /// All geometry comes from `crate::cleanup` so `main.rs` hit-tests the
+    /// same pixels.
+    fn cleanup_page(
+        &self,
+        area: &LayoutRect,
+        chrome: &ChromeState,
+        bg_quads: &mut Vec<Quad>,
+        labels: &mut Vec<LabelSpec>,
+    ) {
+        use crate::cleanup::{self, Row, ScanState};
+
+        let th = self.theme();
+        let scale = self.scale;
+        let pad = (cleanup::CLEANUP_CARD_PAD * scale).round();
+        // The card follows the chrome polarity (white in light themes, raised
+        // dark in dark ones) rather than the always-dark terminal fill, so it
+        // reads with ink like the sidebar. Status colors flip with polarity.
+        bg_quads.push(
+            self.px_rect(area, th.card, 1.0, (CARD_RADIUS * scale).round()).shadow(Shadow::Card),
+        );
+        let st = cleanup_status_colors(th);
+
+        let state = chrome.cleanup;
+        let visible = state.visible();
+        let rows = state.rows();
+        let mid = |row: &LayoutRect| (row.y + (row.h - self.cell_height) / 2.0).round();
+
+        // ── Header: title, summary, Refresh ────────────────────────────
+        let header = cleanup::header_rect(area, scale);
+        labels.push(LabelSpec {
+            text: "Cleanup".into(),
+            color: color(th.ink, 1.0),
+            left: header.x + pad,
+            top: mid(&header),
+            clip: header,
+            size: None,
+        });
+        if !visible.is_empty() || !state.selected.is_empty() {
+            let summary = format!("{} worktrees · {} selected", visible.len(), state.selected.len());
+            labels.push(LabelSpec {
+                text: summary,
+                color: color(th.ink_dim, 1.0),
+                left: (header.x + pad + 9.0 * self.cell_width).round(),
+                top: mid(&header),
+                clip: header,
+                size: None,
+            });
+        }
+        let refresh = cleanup::refresh_button_rect(area, scale, self.cell_width);
+        bg_quads.push(self.px_rect(&refresh, th.ink, 0.07, refresh.h / 2.0));
+        let refresh_text = "Refresh";
+        let rw = refresh_text.chars().count() as f32 * self.cell_width;
+        labels.push(LabelSpec {
+            text: refresh_text.into(),
+            color: color(th.ink_dim, 1.0),
+            left: (refresh.x + (refresh.w - rw) / 2.0).round(),
+            top: (refresh.y + (refresh.h - self.cell_height) / 2.0).round(),
+            clip: refresh,
+            size: None,
+        });
+
+        // ── Empty / transient states get a centered line, no table ─────
+        let centered = |text: String, c: Hsla, labels: &mut Vec<LabelSpec>| {
+            let w = text.chars().count() as f32 * self.cell_width;
+            labels.push(LabelSpec {
+                text,
+                color: c,
+                left: (area.x + (area.w - w) / 2.0).max(area.x + pad).round(),
+                top: (area.y + (area.h - self.cell_height) / 2.0).round(),
+                clip: *area,
+                size: None,
+            });
+        };
+        match &state.scan {
+            None | Some(ScanState::Scanning) => {
+                centered("Scanning worktrees…".into(), color(th.ink_dim, 1.0), labels);
+                return;
+            },
+            Some(ScanState::Failed(err)) => {
+                centered(format!("drop -d failed: {err}"), color(st.removed, 1.0), labels);
+                return;
+            },
+            Some(ScanState::Ready(_)) if visible.is_empty() => {
+                centered("No drop worktrees found.".into(), color(th.ink_dim, 1.0), labels);
+                return;
+            },
+            Some(ScanState::Ready(_)) => {},
+        }
+
+        // ── Column headers ─────────────────────────────────────────────
+        let cols = cleanup::column_offsets(area, scale, &state.col_fracs);
+        let col_header = cleanup::col_header_rect(area, scale);
+        let right_edge = area.x + area.w - pad;
+        // (x, next_x) pairs give each label its clip span.
+        let spans = [
+            (cols.branch, cols.id, "branch"),
+            (cols.id, cols.dirty, "id"),
+            (cols.dirty, cols.parity, "dirty"),
+            (cols.parity, cols.pr, "parity"),
+            (cols.pr, cols.age, "pr"),
+            (cols.age, right_edge, "age"),
+        ];
+        let col_mid = (col_header.y + (col_header.h - self.cell_height) / 2.0).round();
+        for (x, next_x, text) in spans {
+            labels.push(LabelSpec {
+                text: text.into(),
+                color: color(th.ink_dim, 0.8),
+                left: x,
+                top: col_mid,
+                clip: LayoutRect { x, y: col_header.y, w: (next_x - x).max(0.0), h: col_header.h },
+                size: None,
+            });
+        }
+
+        // ── Rows: repo headers (All view) interleaved with worktrees ───
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let fit = cleanup::rows_that_fit(area, scale);
+        for vi in 0..fit {
+            let Some(table_row) = rows.get(state.scroll + vi) else { break };
+            let Some(row) = cleanup::row_rect(area, vi, scale) else { break };
+            let w = match table_row {
+                Row::Header { display, count, .. } => {
+                    labels.push(LabelSpec {
+                        text: format!("{display} · {count}"),
+                        color: color(th.ink_dim, 1.0),
+                        left: row.x,
+                        top: mid(&row),
+                        clip: row,
+                        size: None,
+                    });
+                    continue;
+                },
+                Row::Entry(w) => w,
+            };
+            let selected = state.selected.contains(&w.id);
+            if selected {
+                bg_quads.push(self.px_rect(&row, th.accent, 0.10, (7.0 * scale).round()));
+            }
+            // Checkbox: accent-filled when selected, bordered outline when
+            // selectable, a dim dot for the current worktree.
+            let cb = cleanup::checkbox_rect(&row, scale);
+            let cb_r = (4.0 * scale).round();
+            if w.is_current {
+                let d = (5.0 * scale).round();
+                let dot = LayoutRect {
+                    x: (cb.x + (cb.w - d) / 2.0).round(),
+                    y: (cb.y + (cb.h - d) / 2.0).round(),
+                    w: d,
+                    h: d,
+                };
+                bg_quads.push(self.px_rect(&dot, th.ink_dim, 0.5, d / 2.0));
+            } else if selected {
+                bg_quads.push(self.px_rect(&cb, th.accent, 0.9, cb_r));
+            } else {
+                bg_quads.push(self.px_rect(&cb, (0, 0, 0), 0.0, cb_r).border(
+                    (1.0 * scale).round().max(1.0),
+                    color(th.ink_dim, 0.6),
+                ));
+            }
+            // Text cells. The whole row dims for the current worktree.
+            let row_mid = mid(&row);
+            let mut cell = |x: f32, next_x: f32, text: String, rgb: (u8, u8, u8), alpha: f32| {
+                labels.push(LabelSpec {
+                    text,
+                    color: color(rgb, alpha),
+                    left: x,
+                    top: row_mid,
+                    clip: LayoutRect {
+                        x,
+                        y: row.y,
+                        w: (next_x - x - 4.0 * scale).max(0.0),
+                        h: row.h,
+                    },
+                    size: None,
+                });
+            };
+            let dim = if w.is_current { 0.55 } else { 1.0 };
+            let branch = if w.is_current {
+                format!("{} (current)", cleanup::format_branch(w))
+            } else {
+                cleanup::format_branch(w)
+            };
+            cell(cols.branch, cols.id, branch, th.ink, dim);
+            cell(cols.id, cols.dirty, w.id.clone(), th.ink_dim, dim);
+            let (dirty_rgb, dirty_a) = if w.dirty_count > 0 {
+                (st.dirty, dim)
+            } else {
+                (th.ink_dim, 0.8 * dim)
+            };
+            cell(cols.dirty, cols.parity, cleanup::format_dirty(w.dirty_count), dirty_rgb, dirty_a);
+            let parity = cleanup::format_parity(w.ahead, w.behind);
+            let parity_rgb = if parity == "—" { th.ink_dim } else { th.ink };
+            cell(cols.parity, cols.pr, parity, parity_rgb, dim);
+            let pr_rgb = match w.pr.as_ref().map(|p| p.state.as_str()) {
+                Some("merged") => st.merged,
+                Some("open") | Some("draft") => st.open,
+                Some(_) => st.removed,
+                None => th.ink_dim,
+            };
+            let pr_text = cleanup::format_pr(w.pr.as_ref());
+            let pr_w = pr_text.chars().count() as f32 * self.cell_width;
+            cell(cols.pr, cols.age, pr_text, pr_rgb, dim);
+            if let Some(p) = &w.pr {
+                // Title peek after the state, in whatever room the column has.
+                cell(cols.pr + pr_w + self.cell_width, cols.age, p.title.clone(), th.ink_dim, 0.8 * dim);
+            }
+            cell(
+                cols.age,
+                right_edge,
+                cleanup::format_age(now_ms, w.last_activity_ms as u64),
+                th.ink_dim,
+                dim,
+            );
+        }
+
+        // ── Footer: hint + Delete button over a hairline divider ───────
+        let delete = cleanup::delete_button_rect(area, scale, self.cell_width);
+        let hair = (1.0 * scale).round().max(1.0);
+        let divider = LayoutRect {
+            x: area.x + pad,
+            y: (area.y + area.h - (cleanup::CLEANUP_FOOTER_H * scale).round()),
+            w: area.w - 2.0 * pad,
+            h: hair,
+        };
+        bg_quads.push(self.px_rect(&divider, th.ink, 0.12, 0.0));
+        labels.push(LabelSpec {
+            text: "click to select · a all · m merged · esc clear · r refresh".into(),
+            color: color(th.ink_dim, 0.8),
+            left: area.x + pad,
+            top: (delete.y + (delete.h - self.cell_height) / 2.0).round(),
+            clip: LayoutRect {
+                x: area.x + pad,
+                y: delete.y,
+                w: (delete.x - area.x - 2.0 * pad).max(0.0),
+                h: delete.h,
+            },
+            size: None,
+        });
+        let n = state.selected.len();
+        let enabled = n > 0;
+        bg_quads.push(self.px_rect(
+            &delete,
+            if enabled { th.accent } else { th.ink },
+            if enabled { 0.9 } else { 0.06 },
+            (7.0 * scale).round(),
+        ));
+        let btn_text = format!("Delete {n} selected");
+        let bw = btn_text.chars().count() as f32 * self.cell_width;
+        labels.push(LabelSpec {
+            text: btn_text,
+            color: color(if enabled { (255, 255, 255) } else { th.ink_dim }, 1.0),
+            left: (delete.x + (delete.w - bw) / 2.0).round(),
+            top: (delete.y + (delete.h - self.cell_height) / 2.0).round(),
+            clip: delete,
+            size: None,
+        });
+    }
+
+    /// The dirty-files popover: while a dirty cell is hovered, a floating
+    /// panel lists the worktree's changed files with +/- line counts so the
+    /// user knows what a deletion would discard.
+    fn cleanup_popover(
+        &self,
+        area: &LayoutRect,
+        chrome: &ChromeState,
+        rects: &mut Vec<Quad>,
+        labels: &mut Vec<LabelSpec>,
+    ) {
+        use crate::cleanup::{self, Row};
+
+        let Some(w) = chrome.cleanup.hover_entry() else { return };
+        let scale = self.scale;
+        // Anchor to the hovered row's dirty cell — bail if it scrolled away.
+        let rows = chrome.cleanup.rows();
+        let Some(idx) = rows.iter().position(|r| matches!(r, Row::Entry(e) if e.id == w.id))
+        else {
+            return;
+        };
+        let Some(vi) = idx.checked_sub(chrome.cleanup.scroll) else { return };
+        let Some(row) = cleanup::row_rect(area, vi, scale) else { return };
+
+        let th = self.theme();
+        let st = cleanup_status_colors(th);
+        const MAX_FILES: usize = 10;
+        let files = &w.dirty_files;
+        let shown = files.len().min(MAX_FILES);
+        let (added, removed) = cleanup::dirty_totals(files);
+        let summary = format!(
+            "{} change{} · +{added} −{removed}",
+            files.len(),
+            if files.len() == 1 { "" } else { "s" },
+        );
+
+        // Panel geometry: one line per shown file plus the summary (and a
+        // "+N more" line when clipped), sized to the longest path.
+        let pad = (10.0 * scale).round();
+        let line_h = (self.cell_height + (6.0 * scale).round()).round();
+        let counts_w = 10.0 * self.cell_width; // "+123 −456 " gutter
+        let longest = files
+            .iter()
+            .take(shown)
+            .map(|f| f.path.chars().count())
+            .max()
+            .unwrap_or(0)
+            .max(summary.chars().count());
+        let more = files.len() > shown;
+        let n_lines = 1 + shown + usize::from(more);
+        let w_px = (counts_w + longest as f32 * self.cell_width + 2.0 * pad)
+            .min(area.w - 2.0 * pad);
+        let h_px = n_lines as f32 * line_h + 2.0 * pad;
+        let cols = cleanup::column_offsets(area, scale, &chrome.cleanup.col_fracs);
+        let x = cols.dirty.min(area.x + area.w - pad - w_px).max(area.x + pad);
+        // Below the row, flipping above when there is no room.
+        let below = row.y + row.h + h_px <= area.y + area.h;
+        let y = if below { row.y + row.h } else { (row.y - h_px).max(area.y) };
+        let panel = LayoutRect { x, y, w: w_px, h: h_px };
+        rects.push(
+            self.px_rect(&panel, th.card, 1.0, (10.0 * scale).round())
+                .border((1.0 * scale).round().max(1.0), color(th.ink, 0.15))
+                .shadow(Shadow::Card),
+        );
+
+        let clip = panel;
+        let mut line_top = panel.y + pad;
+        let mut line = |text: String, c: Hsla, left: f32, top: f32| {
+            labels.push(LabelSpec { text, color: c, left, top, clip, size: None });
+        };
+        line(summary, color(th.ink, 1.0), panel.x + pad, line_top);
+        line_top += line_h;
+        for f in files.iter().take(shown) {
+            let counts = if f.untracked {
+                ("new".to_string(), color(st.added, 1.0))
+            } else if f.added.is_none() && f.removed.is_none() {
+                ("bin".to_string(), color(th.ink_dim, 1.0))
+            } else {
+                (String::new(), color(th.ink_dim, 1.0))
+            };
+            if counts.0.is_empty() {
+                line(
+                    format!("+{}", f.added.unwrap_or(0)),
+                    color(st.added, 1.0),
+                    panel.x + pad,
+                    line_top,
+                );
+                line(
+                    format!("−{}", f.removed.unwrap_or(0)),
+                    color(st.removed, 1.0),
+                    panel.x + pad + 5.0 * self.cell_width,
+                    line_top,
+                );
+            } else {
+                line(counts.0, counts.1, panel.x + pad, line_top);
+            }
+            line(
+                f.path.clone(),
+                color(th.ink_dim, 1.0),
+                panel.x + pad + counts_w,
+                line_top,
+            );
+            line_top += line_h;
+        }
+        if more {
+            line(
+                format!("… +{} more", files.len() - shown),
+                color(th.ink_dim, 0.8),
+                panel.x + pad,
+                line_top,
+            );
+        }
+    }
+
     /// One half-width Appearance slot: a pill with the entry's label, ANSI
     /// preview chips for terminal schemes, and an accent dot on the entry the
     /// resolved mode is actually applying. `picked` marks the entry its own
@@ -1556,7 +2079,7 @@ impl Renderer {
 
     /// Geometry of the confirm dialog (panel + buttons), shared by drawing and
     /// `main.rs` hit-testing so clicks always agree with pixels.
-    pub fn confirm_layout(&self, text: &str) -> ConfirmLayout {
+    pub fn confirm_layout(&self, text: &str, accept: &str) -> ConfirmLayout {
         let scale = self.scale;
         let pad = (16.0 * scale).round();
         let gap = (10.0 * scale).round();
@@ -1565,8 +2088,7 @@ impl Renderer {
         let text_w = text.chars().count() as f32 * self.cell_width;
         let cancel_w =
             (CONFIRM_CANCEL.chars().count() as f32 * self.cell_width + 2.0 * btn_pad).round();
-        let close_w =
-            (CONFIRM_CLOSE.chars().count() as f32 * self.cell_width + 2.0 * btn_pad).round();
+        let close_w = (accept.chars().count() as f32 * self.cell_width + 2.0 * btn_pad).round();
         let w = (text_w.max(cancel_w + gap + close_w) + 2.0 * pad)
             .min(self.width as f32 - 2.0 * pad);
         let h = (self.cell_height + gap + btn_h + 2.0 * pad).round();
@@ -1582,15 +2104,15 @@ impl Renderer {
         }
     }
 
-    /// Centered confirm dialog: a message line over Cancel / Close-group
-    /// buttons. Styled like the message panel; the destructive button carries
+    /// Centered confirm dialog: a message line over Cancel / accept buttons.
+    /// Styled like the message panel; the destructive accept button carries
     /// the accent fill.
-    fn confirm_overlay(&self, text: &str, rects: &mut Vec<Quad>) -> Vec<LabelSpec> {
+    fn confirm_overlay(&self, text: &str, accept: &str, rects: &mut Vec<Quad>) -> Vec<LabelSpec> {
         let th = self.theme();
         let scale = self.scale;
         let pad = (16.0 * scale).round();
         let btn_r = (7.0 * scale).round();
-        let layout = self.confirm_layout(text);
+        let layout = self.confirm_layout(text, accept);
 
         let scrim = LayoutRect { x: 0.0, y: 0.0, w: self.width as f32, h: self.height as f32 };
         rects.push(self.px_rect(&scrim, th.scrim, 0.30, 0.0));
@@ -1608,7 +2130,7 @@ impl Renderer {
             size: None,
         }];
         for (rect, label, danger) in
-            [(&layout.cancel, CONFIRM_CANCEL, false), (&layout.close, CONFIRM_CLOSE, true)]
+            [(&layout.cancel, CONFIRM_CANCEL, false), (&layout.close, accept, true)]
         {
             rects.push(self.px_rect(
                 rect,
@@ -1875,5 +2397,177 @@ impl Renderer {
             border_color: Hsla::default(),
             shadow: Shadow::None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cleanup::{Cleanup, WorktreeInfo};
+
+    fn cleanup_chrome(cleanup: &Cleanup) -> ChromeState<'_> {
+        ChromeState {
+            page: Page::Cleanup,
+            section: Section::ALL[0],
+            dot_anim: &[0.0, 0.0, 0.0],
+            recording: None,
+            editing_command: None,
+            sections: &[],
+            editing_section: None,
+            cleanup,
+        }
+    }
+
+    fn sample_state() -> Cleanup {
+        let json = r#"[
+            {"repoRoot": "/u/src/alpha", "path": "/u/src/alpha/.worktrees/a1",
+             "id": "a1", "branch": "oslo", "head": "abc123", "detached": false,
+             "dirtyCount": 0, "merged": true, "ahead": 0, "behind": 2,
+             "lastActivity": "2024-01-10T12:00:00Z", "lastActivityMs": 1704888000000.5,
+             "isCurrent": false,
+             "pr": {"number": 42, "state": "merged", "url": "u", "title": "t"}},
+            {"repoRoot": "/u/src/beta", "path": "/u/src/beta/.worktrees/b1",
+             "id": "b1", "branch": "kyoto", "head": "def456", "detached": false,
+             "dirtyCount": 3, "merged": false, "ahead": 1, "behind": 0,
+             "lastActivity": "2024-01-11T09:00:00Z", "lastActivityMs": 1704963600000,
+             "isCurrent": true}
+        ]"#;
+        let worktrees: Vec<WorktreeInfo> = serde_json::from_str(json).expect("valid");
+        let mut c = Cleanup::default();
+        c.set_ready(worktrees);
+        c
+    }
+
+    /// The Cleanup page renders headlessly: the frame gains the card, the
+    /// table rows with git/PR info, the repo sidebar tabs, and the footer.
+    #[test]
+    fn cleanup_page_builds_table_frame() {
+        let renderer = Renderer::new(2.0, 18.0, 1600, 1000);
+        let state = sample_state();
+        let chrome = cleanup_chrome(&state);
+        let ws = crate::workspace::Workspace::new(
+            "g".into(),
+            crate::workspace::Tile::empty(1),
+            None,
+        );
+        let frame = renderer.build_frame(
+            &[ws], 0, 240.0, None, None, None, None, None, None, None, None, &chrome,
+        );
+        let texts: Vec<&str> = frame.labels.iter().map(|l| l.text.as_str()).collect();
+        // Sidebar: All + one tab per repo, with counts.
+        assert!(texts.contains(&"All"), "sidebar has an All tab: {texts:?}");
+        assert!(texts.contains(&"alpha · 1"));
+        assert!(texts.contains(&"beta · 1"));
+        // Card header + table content.
+        assert!(texts.contains(&"Cleanup"));
+        assert!(texts.contains(&"oslo"));
+        assert!(texts.contains(&"kyoto (current)"));
+        assert!(texts.contains(&"#42 merged"));
+        assert!(texts.contains(&"↓2 ↑0"));
+        assert!(texts.contains(&"3±"));
+        assert!(texts.contains(&"Delete 0 selected"));
+        assert!(!frame.bg_quads.is_empty());
+    }
+
+    /// Scanning state shows the placeholder line instead of a table.
+    #[test]
+    fn cleanup_page_scanning_placeholder() {
+        let renderer = Renderer::new(2.0, 18.0, 1600, 1000);
+        let mut state = Cleanup::default();
+        state.set_scanning();
+        let chrome = cleanup_chrome(&state);
+        let ws = crate::workspace::Workspace::new(
+            "g".into(),
+            crate::workspace::Tile::empty(1),
+            None,
+        );
+        let frame = renderer.build_frame(
+            &[ws], 0, 240.0, None, None, None, None, None, None, None, None, &chrome,
+        );
+        let texts: Vec<&str> = frame.labels.iter().map(|l| l.text.as_str()).collect();
+        assert!(texts.contains(&"Scanning worktrees…"));
+        assert!(!texts.contains(&"Delete 0 selected"));
+    }
+
+    /// The All view groups worktrees under repo header rows.
+    #[test]
+    fn cleanup_page_groups_by_repo_in_all_view() {
+        let renderer = Renderer::new(2.0, 18.0, 1600, 1000);
+        let state = sample_state();
+        let chrome = cleanup_chrome(&state);
+        let ws = crate::workspace::Workspace::new(
+            "g".into(),
+            crate::workspace::Tile::empty(1),
+            None,
+        );
+        let frame = renderer.build_frame(
+            &[ws], 0, 240.0, None, None, None, None, None, None, None, None, &chrome,
+        );
+        let texts: Vec<&str> = frame.labels.iter().map(|l| l.text.as_str()).collect();
+        // Header rows appear once per repo (the sidebar shows the same string,
+        // so each repo string occurs twice in the whole frame).
+        assert_eq!(texts.iter().filter(|t| **t == "alpha · 1").count(), 2);
+        assert_eq!(texts.iter().filter(|t| **t == "beta · 1").count(), 2);
+    }
+
+    /// Hovering a dirty cell floats the dirty-files popover with +/- counts.
+    #[test]
+    fn cleanup_popover_lists_dirty_files() {
+        let renderer = Renderer::new(2.0, 18.0, 1600, 1000);
+        let mut state = sample_state();
+        if let Some(crate::cleanup::ScanState::Ready(wts)) = &mut state.scan {
+            wts[1].dirty_files = vec![
+                crate::cleanup::DirtyFile {
+                    path: "src/lib.rs".into(),
+                    added: Some(12),
+                    removed: Some(3),
+                    untracked: false,
+                },
+                crate::cleanup::DirtyFile {
+                    path: "notes.txt".into(),
+                    added: None,
+                    removed: None,
+                    untracked: true,
+                },
+            ];
+        }
+        state.hover = Some("b1".to_string());
+        let chrome = cleanup_chrome(&state);
+        let ws = crate::workspace::Workspace::new(
+            "g".into(),
+            crate::workspace::Tile::empty(1),
+            None,
+        );
+        let frame = renderer.build_frame(
+            &[ws], 0, 240.0, None, None, None, None, None, None, None, None, &chrome,
+        );
+        let texts: Vec<&str> = frame.picker_labels.iter().map(|l| l.text.as_str()).collect();
+        assert!(texts.contains(&"2 changes · +12 −3"), "popover summary: {texts:?}");
+        assert!(texts.contains(&"+12"));
+        assert!(texts.contains(&"−3"));
+        assert!(texts.contains(&"src/lib.rs"));
+        assert!(texts.contains(&"new"));
+        assert!(texts.contains(&"notes.txt"));
+        assert!(!frame.picker_quads.is_empty(), "popover panel quad present");
+    }
+
+    /// Selection is reflected in the summary, row tint, and delete button.
+    #[test]
+    fn cleanup_page_selection_updates_footer() {
+        let renderer = Renderer::new(2.0, 18.0, 1600, 1000);
+        let mut state = sample_state();
+        state.toggle("a1");
+        let chrome = cleanup_chrome(&state);
+        let ws = crate::workspace::Workspace::new(
+            "g".into(),
+            crate::workspace::Tile::empty(1),
+            None,
+        );
+        let frame = renderer.build_frame(
+            &[ws], 0, 240.0, None, None, None, None, None, None, None, None, &chrome,
+        );
+        let texts: Vec<&str> = frame.labels.iter().map(|l| l.text.as_str()).collect();
+        assert!(texts.contains(&"Delete 1 selected"));
+        assert!(texts.contains(&"2 worktrees · 1 selected"));
     }
 }

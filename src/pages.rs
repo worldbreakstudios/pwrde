@@ -1,10 +1,11 @@
 //! Top-level page navigation + rebindable keyboard actions.
 //!
-//! pwrde has Arc-style *pages*: Sessions (the terminal workspace) and
-//! Settings. The sidebar's bottom strip shows one slot per page — a subtle
-//! dot that crossfades into the page's glyph on hover, and stays a glyph on
-//! the active page. ⌘⇧←/→ cycle pages with wraparound; ⌘⇧↑/↓ cycle the
-//! sidebar's tabs (groups on Sessions, sections on Settings) the same way.
+//! pwrde has Arc-style *pages*: Sessions (the terminal workspace), Cleanup
+//! (worktree hygiene via the `drop` CLI), and Settings. The sidebar's bottom
+//! strip shows one slot per page — a subtle dot that crossfades into the
+//! page's glyph on hover, and stays a glyph on the active page. ⌘⇧←/→ cycle
+//! pages with wraparound; ⌘⇧↑/↓ cycle the sidebar's tabs (groups on Sessions,
+//! repos on Cleanup, sections on Settings) the same way.
 //!
 //! Every ⌘ shortcut is an [`Action`] dispatched through a bindings table
 //! resolved from the settings store (`"keyboard.<action>"` keys, falling back
@@ -15,22 +16,27 @@ use gpui::Keystroke;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Page {
     Sessions,
+    /// Worktree hygiene page — lists all `drop`-managed worktrees and lets the
+    /// user multi-select and delete stale ones.
+    Cleanup,
     Settings,
 }
 
 impl Page {
     /// Dot-strip order; `cycle` walks this.
-    pub const ALL: [Page; 2] = [Page::Sessions, Page::Settings];
+    pub const ALL: [Page; 3] = [Page::Sessions, Page::Cleanup, Page::Settings];
 
     pub fn index(self) -> usize {
         Self::ALL.iter().position(|p| *p == self).unwrap_or(0)
     }
 
-    /// Glyph shown in the page slot when active or hovered. The cog is a Nerd
-    /// Font codepoint — the UI font guarantees coverage.
+    /// Glyph shown in the page slot when active or hovered. The cog / broom /
+    /// brackets are Nerd Font codepoints — the UI font guarantees coverage.
     pub fn glyph(self) -> &'static str {
         match self {
             Page::Sessions => "<>",
+            // U+F00D4 = nf-md-broom (Material Design Icons via Nerd Fonts)
+            Page::Cleanup => "\u{f00d4}",
             Page::Settings => "\u{f013}",
         }
     }
@@ -201,6 +207,7 @@ pub enum Action {
     FocusDown,
     FocusUp,
     FocusRight,
+    ToggleCollapse,
     PrevSidebarTab,
     NextSidebarTab,
     PrevPage,
@@ -211,7 +218,7 @@ pub enum Action {
 
 impl Action {
     /// Keyboard-page row order.
-    pub const ALL: [Action; 22] = [
+    pub const ALL: [Action; 23] = [
         Action::SplitRight,
         Action::SplitDown,
         Action::NewTab,
@@ -228,6 +235,7 @@ impl Action {
         Action::FocusDown,
         Action::FocusUp,
         Action::FocusRight,
+        Action::ToggleCollapse,
         Action::PrevSidebarTab,
         Action::NextSidebarTab,
         Action::PrevPage,
@@ -255,6 +263,7 @@ impl Action {
             Action::FocusDown => "focus_down",
             Action::FocusUp => "focus_up",
             Action::FocusRight => "focus_right",
+            Action::ToggleCollapse => "toggle_collapse",
             Action::PrevSidebarTab => "prev_sidebar_tab",
             Action::NextSidebarTab => "next_sidebar_tab",
             Action::PrevPage => "prev_page",
@@ -282,6 +291,7 @@ impl Action {
             Action::FocusDown => "Focus pane down",
             Action::FocusUp => "Focus pane up",
             Action::FocusRight => "Focus pane right",
+            Action::ToggleCollapse => "Collapse/expand pane",
             Action::PrevSidebarTab => "Previous sidebar tab",
             Action::NextSidebarTab => "Next sidebar tab",
             Action::PrevPage => "Previous page",
@@ -313,6 +323,7 @@ impl Action {
             Action::FocusDown => (true, "j"),
             Action::FocusUp => (true, "k"),
             Action::FocusRight => (true, "l"),
+            Action::ToggleCollapse => (true, "m"),
             Action::PrevSidebarTab => (true, "up"),
             Action::NextSidebarTab => (true, "down"),
             Action::PrevPage => (true, "left"),
