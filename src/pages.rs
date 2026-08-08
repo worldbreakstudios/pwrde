@@ -92,6 +92,10 @@ pub enum AppearanceItem {
     Header(&'static str),
     /// A chrome theme slot; clicking assigns it to its polarity's slot.
     Theme(&'static crate::theme::Theme),
+    /// Reads a token string from the clipboard into a custom theme slot.
+    ImportTheme,
+    /// Copies the active theme's token string to the clipboard.
+    ExportTheme,
     /// The adaptive terminal scheme; clicking resets both polarity slots.
     TermDefault,
     /// A terminal scheme slot; clicking assigns it to its polarity's slot.
@@ -145,9 +149,20 @@ pub fn appearance_layout() -> Vec<(usize, usize, AppearanceItem)> {
     for t in crate::theme::ALL.iter().filter(|t| !t.dark) {
         p.push(AppearanceItem::Theme(t));
     }
+    // Imported custom themes join their polarity's tiles when defined.
+    if let Some(t) = crate::theme::custom(false) {
+        p.push(AppearanceItem::Theme(t));
+    }
     for t in crate::theme::ALL.iter().filter(|t| t.dark) {
         p.push(AppearanceItem::Theme(t));
     }
+    if let Some(t) = crate::theme::custom(true) {
+        p.push(AppearanceItem::Theme(t));
+    }
+    // The import/export actions share a fresh row under the tiles.
+    p.settle();
+    p.push(AppearanceItem::ImportTheme);
+    p.push(AppearanceItem::ExportTheme);
 
     // A blank row between the sections.
     p.settle();
@@ -447,6 +462,8 @@ mod tests {
         let mut themes = 0;
         let mut terms = 0;
         let mut defaults = 0;
+        let mut imports = 0;
+        let mut exports = 0;
         let mut slots: Vec<(usize, usize)> = Vec::new();
         for (row, col, item) in layout {
             assert!(col < 2, "col out of range");
@@ -457,12 +474,16 @@ mod tests {
                 AppearanceItem::Theme(_) => themes += 1,
                 AppearanceItem::Term(_) => terms += 1,
                 AppearanceItem::TermDefault => defaults += 1,
+                AppearanceItem::ImportTheme => imports += 1,
+                AppearanceItem::ExportTheme => exports += 1,
                 _ => {},
             }
         }
+        // The test store holds no custom token strings, so only presets show.
         assert_eq!(themes, crate::theme::ALL.len());
         assert_eq!(terms, crate::term_theme::ALL.len());
         assert_eq!(defaults, 1);
+        assert_eq!((imports, exports), (1, 1));
     }
 
     #[test]
