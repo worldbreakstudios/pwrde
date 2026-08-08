@@ -1381,18 +1381,37 @@ fn flyover_buttons_w(rect: &LayoutRect, scale: f32) -> f32 {
 
 /// Rect of tab `i` of `n` in the flyover tab strip (mirrors `tile_tab_rect`,
 /// no caret button so no `has_caret` parameter). Tabs share the bar minus
-/// the window-button strip at the right.
-pub fn flyover_tab_rect(rect: &LayoutRect, i: usize, n: usize, scale: f32) -> LayoutRect {
+/// the window-button strip at the right; a `maximized` panel owns the
+/// window's top-left corner, so the strip cedes its left end to the native
+/// traffic lights like a collapsed-sidebar tile does.
+pub fn flyover_tab_rect(
+    rect: &LayoutRect,
+    i: usize,
+    n: usize,
+    scale: f32,
+    maximized: bool,
+) -> LayoutRect {
     let bar = flyover_tab_bar(rect, scale);
-    let avail = (bar.w - flyover_buttons_w(rect, scale)).max(0.0);
+    let cede = if maximized {
+        (TRAFFIC_LIGHT_SAFE_W * scale).round().clamp(0.0, bar.w)
+    } else {
+        0.0
+    };
+    let avail = (bar.w - cede - flyover_buttons_w(rect, scale)).max(0.0);
     let w = (avail / n.max(1) as f32).min((TILE_TAB_MAX_W * scale).round()).round();
-    LayoutRect { x: bar.x + i as f32 * w, y: bar.y, w, h: bar.h }
+    LayoutRect { x: bar.x + cede + i as f32 * w, y: bar.y, w, h: bar.h }
 }
 
 /// Rect of the × close button inside flyover tab `i` (mirrors
 /// `tile_tab_close_rect`).
-pub fn flyover_tab_close_rect(rect: &LayoutRect, i: usize, n: usize, scale: f32) -> LayoutRect {
-    let tr = flyover_tab_rect(rect, i, n, scale);
+pub fn flyover_tab_close_rect(
+    rect: &LayoutRect,
+    i: usize,
+    n: usize,
+    scale: f32,
+    maximized: bool,
+) -> LayoutRect {
+    let tr = flyover_tab_rect(rect, i, n, scale, maximized);
     let s = (16.0 * scale).round();
     let pad = (6.0 * scale).round();
     LayoutRect {
@@ -1487,6 +1506,18 @@ mod flyover_tests {
         assert_eq!((r.x, r.y, r.w, r.h), (0.0, 0.0, 1000.0, 800.0));
     }
 
+    /// A maximized panel's first tab clears the native traffic lights.
+    #[test]
+    fn flyover_maximized_tabs_clear_traffic_lights() {
+        let panel = flyover_rect(1000, 800, 1.0, 1.0, 0.3, true);
+        let t0 = flyover_tab_rect(&panel, 0, 2, 1.0, true);
+        assert_eq!(t0.x, TRAFFIC_LIGHT_SAFE_W);
+        // Un-maximized panels keep their tabs at the bar's left edge.
+        let normal = flyover_rect(1000, 800, 1.0, 1.0, 0.3, false);
+        let n0 = flyover_tab_rect(&normal, 0, 2, 1.0, false);
+        assert_eq!(n0.x, normal.x);
+    }
+
     /// The window buttons sit inside the bar's right edge, minimize left of
     /// maximize, and tabs never overlap them.
     #[test]
@@ -1498,7 +1529,7 @@ mod flyover_tests {
         assert_eq!(max.x + max.w, bar.x + bar.w);
         assert_eq!(min.x + min.w, max.x);
         let n = 3;
-        let last = flyover_tab_rect(&panel, n - 1, n, 1.0);
+        let last = flyover_tab_rect(&panel, n - 1, n, 1.0, false);
         assert!(last.x + last.w <= min.x + 0.5);
     }
 
@@ -1508,8 +1539,8 @@ mod flyover_tests {
         let panel = flyover_rect(1000, 800, 1.0, 1.0, FLYOVER_DEFAULT_FRAC, false);
         for n in 1..=4 {
             for i in 0..n {
-                let tr = flyover_tab_rect(&panel, i, n, 1.0);
-                let close = flyover_tab_close_rect(&panel, i, n, 1.0);
+                let tr = flyover_tab_rect(&panel, i, n, 1.0, false);
+                let close = flyover_tab_close_rect(&panel, i, n, 1.0, false);
                 assert!(close.x >= tr.x && close.x + close.w <= tr.x + tr.w + 0.5);
                 assert!(close.y >= tr.y && close.y + close.h <= tr.y + tr.h + 0.5);
             }
@@ -1520,9 +1551,9 @@ mod flyover_tests {
     #[test]
     fn flyover_tab_rect_layout() {
         let panel = flyover_rect(1000, 800, 1.0, 1.0, FLYOVER_DEFAULT_FRAC, false);
-        let t0 = flyover_tab_rect(&panel, 0, 3, 1.0);
-        let t1 = flyover_tab_rect(&panel, 1, 3, 1.0);
-        let t2 = flyover_tab_rect(&panel, 2, 3, 1.0);
+        let t0 = flyover_tab_rect(&panel, 0, 3, 1.0, false);
+        let t1 = flyover_tab_rect(&panel, 1, 3, 1.0, false);
+        let t2 = flyover_tab_rect(&panel, 2, 3, 1.0, false);
         // All tabs same width.
         assert_eq!(t0.w, t1.w);
         assert_eq!(t1.w, t2.w);

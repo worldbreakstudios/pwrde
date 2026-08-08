@@ -2231,6 +2231,7 @@ impl Renderer {
         focused: bool,
         draw_cursor: bool,
         show_window_buttons: bool,
+        maximized: bool,
     ) -> (Vec<Quad>, Vec<PaneText>, Vec<Quad>, Vec<LabelSpec>) {
         let th = self.theme();
         let scale = self.scale;
@@ -2273,15 +2274,15 @@ impl Renderer {
 
         // Tab strip: highlight pill for active tab.
         if n > 0 {
-            let tr = crate::workspace::flyover_tab_rect(panel_rect, active, n, scale);
+            let tr = crate::workspace::flyover_tab_rect(panel_rect, active, n, scale, maximized);
             quads.push(self.px_rect(&tr, pane_pill.0, pane_pill.1, (5.0 * scale).round()));
         }
 
         // Tab labels + per-tab × close button (mirrors the tile tab strip).
         let tab_text_pad = (8.0 * scale).round();
         for (i, tab) in tabs.iter().enumerate() {
-            let tr = crate::workspace::flyover_tab_rect(panel_rect, i, n, scale);
-            let close = crate::workspace::flyover_tab_close_rect(panel_rect, i, n, scale);
+            let tr = crate::workspace::flyover_tab_rect(panel_rect, i, n, scale, maximized);
+            let close = crate::workspace::flyover_tab_close_rect(panel_rect, i, n, scale, maximized);
             let title = tab.session.title();
             let text = if title.is_empty() { "shell".to_string() } else { title };
             let mut text_left = tr.x + tab_text_pad;

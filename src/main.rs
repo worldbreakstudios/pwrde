@@ -2338,10 +2338,11 @@ impl App {
                         return;
                     }
                     // Determine which tab was clicked; × closes it.
-                    let tab_rect = workspace::flyover_tab_rect(&panel, 0, n.max(1), scale);
+                    let maxed = self.flyover_maximized;
+                    let tab_rect = workspace::flyover_tab_rect(&panel, 0, n.max(1), scale, maxed);
                     let ti = ((((px - tab_rect.x).max(0.0)) / tab_rect.w).floor() as usize)
                         .min(n.saturating_sub(1));
-                    if workspace::flyover_tab_close_rect(&panel, ti, n, scale).contains(px, py) {
+                    if workspace::flyover_tab_close_rect(&panel, ti, n, scale, maxed).contains(px, py) {
                         self.close_flyover_tab(ti);
                         return;
                     }
@@ -2747,6 +2748,14 @@ impl App {
                     || self.picker.is_some()
                     || self.palette.is_some()
                 {
+                    None
+                } else if self.flyover_open
+                    && !self.flyover_windowed
+                    && !self.flyover_tabs.is_empty()
+                    && self.flyover_rect_now().contains(px, py)
+                {
+                    // The flyover overlays the sidebar edge and the tile
+                    // dividers — no resize affordance underneath it.
                     None
                 } else {
                     let (_, h) = self.renderer.surface_size();
@@ -4355,6 +4364,7 @@ impl App {
                 self.flyover_focused,
                 !overlay_open,
                 true,
+                self.flyover_maximized,
             );
             frame.flyover_quads = quads;
             frame.flyover_panes = panes;
@@ -4751,9 +4761,9 @@ impl FlyoverPopout {
                 return;
             }
             if tab_bar.contains(mx, my) {
-                let tr = workspace::flyover_tab_rect(&panel, 0, n, scale);
+                let tr = workspace::flyover_tab_rect(&panel, 0, n, scale, false);
                 let ti = (((mx - tr.x).max(0.0) / tr.w).floor() as usize).min(n - 1);
-                if workspace::flyover_tab_close_rect(&panel, ti, n, scale).contains(mx, my) {
+                if workspace::flyover_tab_close_rect(&panel, ti, n, scale, false).contains(mx, my) {
                     app.close_flyover_tab(ti);
                     return;
                 }
@@ -4853,7 +4863,7 @@ impl FlyoverPopout {
                     tab.session.resize(cols, rows, cw, ch, dpi);
                 }
             }
-            renderer.flyover_overlay(&app.flyover_tabs, app.flyover_active, &panel, focused, true, false)
+            renderer.flyover_overlay(&app.flyover_tabs, app.flyover_active, &panel, focused, true, false, false)
         });
 
         let origin = bounds.origin;
