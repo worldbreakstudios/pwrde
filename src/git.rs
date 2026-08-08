@@ -202,6 +202,34 @@ pub fn scope_from_git_dirs(
     sanitize_worktree_slug(base)
 }
 
+/// The main checkout root for any directory inside a git repo.
+///
+/// Uses `git rev-parse --git-common-dir` from `dir` to find the common git dir
+/// (the `.git` of the primary checkout regardless of worktree), then returns
+/// its parent — the main checkout root — canonicalized.
+///
+/// Returns `None` when `dir` is not inside a git repo or the command fails.
+pub fn repo_root(dir: &Path) -> Option<PathBuf> {
+    let out = git(dir)
+        .args(["rev-parse", "--git-common-dir"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let common_dir_str = text.trim();
+    let common_dir = if Path::new(common_dir_str).is_absolute() {
+        PathBuf::from(common_dir_str)
+    } else {
+        // Relative path — resolve against dir
+        dir.join(common_dir_str)
+    };
+    // The common git dir's parent is the main checkout root
+    let root = common_dir.parent()?.to_path_buf();
+    root.canonicalize().ok()
+}
+
 /// Per-worktree storage scope for the process cwd, if any.
 ///
 /// Runs `git rev-parse --path-format=absolute --show-toplevel --git-dir
