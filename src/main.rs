@@ -1577,7 +1577,7 @@ fn main() {
                         active: 0,
                         next_session_id: 0,
                         next_tile_id: 0,
-                        sidebar_w: workspace::SIDEBAR_MIN_W,
+                        sidebar_w: workspace::SIDEBAR_DEFAULT_W,
                         modifiers: Modifiers::default(),
                         title: String::new(),
                         cursor: (0.0, 0.0),

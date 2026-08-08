@@ -212,6 +212,7 @@ impl LayoutRect {
 
 /// Logical (pre-scale) dimensions.
 pub const SIDEBAR_MIN_W: f32 = 120.0;
+pub const SIDEBAR_DEFAULT_W: f32 = 240.0;
 pub const SIDEBAR_MAX_W: f32 = 360.0;
 /// Top strip of the sidebar: native traffic lights float here and the rest
 /// is the window drag handle.
