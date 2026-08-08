@@ -131,6 +131,21 @@ pub struct LabelSpec {
     pub size: Option<f32>,
 }
 
+/// A pane's collapse caret: a chevron that rotates from pointing down
+/// (expanded) to pointing right (collapsed). Quads can't rotate, so `main.rs`
+/// paints it as a small filled gpui path. Position in physical px, angle in
+/// radians.
+#[derive(Clone, Copy)]
+pub struct CaretSpec {
+    pub cx: f32,
+    pub cy: f32,
+    /// Half-width of the chevron.
+    pub size: f32,
+    /// 0.0 points down; `-FRAC_PI_2` points right.
+    pub angle: f32,
+    pub color: Hsla,
+}
+
 /// Button labels of the confirm dialog (shared by layout and drawing).
 const CONFIRM_CANCEL: &str = "Cancel";
 const CONFIRM_CLOSE: &str = "Close group";
@@ -178,6 +193,8 @@ pub struct Frame {
     pub picker_quads: Vec<Quad>,
     /// Picker overlay labels, painted last.
     pub picker_labels: Vec<LabelSpec>,
+    /// Collapse carets, painted as rotated chevron paths over the chrome.
+    pub carets: Vec<CaretSpec>,
 }
 
 /// Stateless renderer: owns only cell metrics and scale. All measurements
@@ -385,6 +402,11 @@ impl Renderer {
         let mut fg_quads: Vec<Quad> = Vec::new();
         let mut labels: Vec<LabelSpec> = Vec::new();
         let mut panes: Vec<PaneText> = Vec::new();
+        let mut carets: Vec<CaretSpec> = Vec::new();
+        // Which axis each tile would collapse along (its parent split's dir);
+        // `None` = root leaf, which shows no caret and cannot collapse.
+        let collapse_axis_map: std::collections::HashMap<u64, Option<workspace::Dir>> =
+            workspace::tile_collapse_axis(&ws.root).into_iter().collect();
 
         // ── Sidebar chrome (identical geometry on every page) ──────────
         // The window gradient is painted by `main.rs` before these quads;
@@ -534,13 +556,28 @@ impl Renderer {
                 // Each tile is a floating dark card: rounded, shadowed, with its
                 // tab strip inside the card above a hairline divider.
                 bg_quads.push(self.px_rect(rect, pane_bg, 1.0, card_r).shadow(Shadow::Card));
+                let axis = collapse_axis_map.get(id).copied().flatten();
+                let Some(tile) = ws.root.find_tile(*id) else { continue };
+                // Collapsed (or mid-animation) panes hide their content; a
+                // sideways-collapsed pane is a bare strip showing only the caret.
+                let collapsing = axis.is_some() && (tile.collapsed || tile.collapse_anim > 0.0);
+                let side_strip = axis == Some(workspace::Dir::Row) && collapsing;
                 let bar = workspace::tile_tab_bar(rect, self.scale);
-                let divider = LayoutRect { x: rect.x, y: bar.y + bar.h - hair, w: rect.w, h: hair };
-                bg_quads.push(self.px_rect(&divider, pane_divider.0, pane_divider.1, 0.0));
-                if let Some(tile) = ws.root.find_tile(*id) {
+                if !collapsing {
+                    let divider =
+                        LayoutRect { x: rect.x, y: bar.y + bar.h - hair, w: rect.w, h: hair };
+                    bg_quads.push(self.px_rect(&divider, pane_divider.0, pane_divider.1, 0.0));
+                }
+                if !side_strip {
                     // Active tab: a subtle rounded pill inside the strip (white
                     // works on every theme's dark card).
-                    let tr = workspace::tile_tab_rect(rect, tile.active, tile.tabs.len(), self.scale);
+                    let tr = workspace::tile_tab_rect(
+                        rect,
+                        tile.active,
+                        tile.tabs.len(),
+                        self.scale,
+                        axis.is_some(),
+                    );
                     let m = (4.0 * self.scale).round();
                     let pill = LayoutRect {
                         x: tr.x + m,
@@ -556,9 +593,44 @@ impl Renderer {
             let focused_tile = Some(ws.focused_tile);
             for (id, rect) in &tiles {
                 let Some(tile) = ws.root.find_tile(*id) else { continue };
+                let axis = collapse_axis_map.get(id).copied().flatten();
+                let has_caret = axis.is_some();
+                let collapsing = has_caret && (tile.collapsed || tile.collapse_anim > 0.0);
+                let side_strip = axis == Some(workspace::Dir::Row) && collapsing;
+                // The caret chevron, rotating down (expanded) → right
+                // (collapsed) with the pane's animation progress.
+                if has_caret {
+                    let cr = workspace::tile_caret_rect(rect, self.scale);
+                    carets.push(CaretSpec {
+                        cx: cr.x + cr.w / 2.0,
+                        cy: cr.y + cr.h / 2.0,
+                        size: (4.5 * self.scale).round(),
+                        angle: -std::f32::consts::FRAC_PI_2
+                            * tile.collapse_anim.clamp(0.0, 1.0),
+                        color: color(pane_ink_dim.0, pane_ink_dim.1),
+                    });
+                    // While collapsed, any tab's unread dot bubbles up to a
+                    // badge on the chevron so hidden panes can still call
+                    // for attention.
+                    if tile.collapsed && tile.tabs.iter().any(|t| t.unread) {
+                        let ds = (6.0 * self.scale).round();
+                        let pad = (3.0 * self.scale).round();
+                        let dot = LayoutRect {
+                            x: cr.x + cr.w - ds - pad,
+                            y: cr.y + pad,
+                            w: ds,
+                            h: ds,
+                        };
+                        fg_quads.push(self.px_rect(&dot, th.accent, 1.0, ds / 2.0));
+                    }
+                }
+                // Collapsed (or mid-animation) panes paint no terminal
+                // content — the card is just its tab strip.
                 let content = workspace::tile_content(rect, self.scale);
                 let origin = self.content_origin(&content);
-                if let Some(session) = tile.tabs.get(tile.active).map(|t| &t.session) {
+                if !collapsing
+                    && let Some(session) = tile.tabs.get(tile.active).map(|t| &t.session)
+                {
                     let draw_cursor = Some(*id) == focused_tile
                         && picker.is_none()
                         && fork.is_none()
@@ -580,13 +652,19 @@ impl Renderer {
                     panes.push(PaneText { origin, rows });
                     self.selection_rects(session, origin, &mut fg_quads);
                 }
+                // A sideways strip has no room for the strip's labels: only
+                // the caret shows. A stacked collapse keeps its tab labels
+                // (clicking one focuses + expands).
+                if side_strip {
+                    continue;
+                }
 
                 // Tab labels for this tile's tab strip.
                 let tab_text_pad = (8.0 * self.scale).round();
                 for (ti, tab) in tile.tabs.iter().enumerate() {
-                    let tr = workspace::tile_tab_rect(rect, ti, tile.tabs.len(), self.scale);
+                    let tr = workspace::tile_tab_rect(rect, ti, tile.tabs.len(), self.scale, has_caret);
                     let close =
-                        workspace::tile_tab_close_rect(rect, ti, tile.tabs.len(), self.scale);
+                        workspace::tile_tab_close_rect(rect, ti, tile.tabs.len(), self.scale, has_caret);
                     let title = tab.session.title();
                     let text = if title.is_empty() { "shell".to_string() } else { title };
                     // Unread: an accent dot before the title, which shifts
@@ -713,7 +791,7 @@ impl Renderer {
             picker_labels = self.message_overlay(text, &mut picker_quads);
         }
 
-        Frame { bg_quads, panes, fg_quads, labels, picker_quads, picker_labels }
+        Frame { bg_quads, panes, fg_quads, labels, picker_quads, picker_labels, carets }
     }
 
     /// Paint Sessions sidebar rows (section headers + group cards) using the

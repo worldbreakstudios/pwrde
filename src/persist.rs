@@ -19,7 +19,12 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum LayoutNode {
-    Leaf { tile: usize },
+    Leaf {
+        tile: usize,
+        /// Pane collapse state; absent in pre-collapse snapshots.
+        #[serde(default)]
+        collapsed: bool,
+    },
     Split { dir: String, ratio: f32, a: Box<LayoutNode>, b: Box<LayoutNode> },
 }
 
@@ -423,6 +428,7 @@ fn node_to_layout_rec(node: &crate::workspace::Node, tabs: &mut Vec<SavedTab>) -
             }
             LayoutNode::Leaf {
                 tile: tile.id as usize,
+                collapsed: tile.collapsed,
             }
         }
         Node::Split { dir, ratio, a, b } => {
@@ -482,7 +488,7 @@ mod tests {
             name: name.into(),
             cwd: Some("/home/user".into()),
             focused_tile: 1,
-            layout: LayoutNode::Leaf { tile: 1 },
+            layout: LayoutNode::Leaf { tile: 1, collapsed: false },
             tabs: vec![SavedTab {
                 tile_id: 1,
                 tab_index: 0,
@@ -492,6 +498,31 @@ mod tests {
                 unread: false,
             }],
             section_id,
+        }
+    }
+
+    #[test]
+    fn collapsed_survives_roundtrip_and_legacy_layouts_load_expanded() {
+        // A pre-collapse snapshot has no `collapsed` key at all.
+        let legacy: LayoutNode = serde_json::from_str(r#"{"tile":5}"#).unwrap();
+        assert_eq!(legacy, LayoutNode::Leaf { tile: 5, collapsed: false });
+
+        let path = temp_db("collapsed");
+        let mut group = sample_group(0, "main", None);
+        group.layout = LayoutNode::Split {
+            dir: "column".into(),
+            ratio: 0.5,
+            a: Box::new(LayoutNode::Leaf { tile: 1, collapsed: false }),
+            b: Box::new(LayoutNode::Leaf { tile: 2, collapsed: true }),
+        };
+        save_snapshot(&[group], &[], &path).unwrap();
+        let (loaded, _) = load_snapshot(&path);
+        match &loaded[0].layout {
+            LayoutNode::Split { a, b, .. } => {
+                assert_eq!(**a, LayoutNode::Leaf { tile: 1, collapsed: false });
+                assert_eq!(**b, LayoutNode::Leaf { tile: 2, collapsed: true });
+            }
+            _ => panic!("expected split layout"),
         }
     }
 
@@ -508,8 +539,8 @@ mod tests {
                 layout: LayoutNode::Split {
                     dir: "row".into(),
                     ratio: 0.3,
-                    a: Box::new(LayoutNode::Leaf { tile: 1 }),
-                    b: Box::new(LayoutNode::Leaf { tile: 2 }),
+                    a: Box::new(LayoutNode::Leaf { tile: 1, collapsed: false }),
+                    b: Box::new(LayoutNode::Leaf { tile: 2, collapsed: false }),
                 },
                 tabs: vec![
                     SavedTab {
@@ -544,7 +575,7 @@ mod tests {
                 name: "scratch".into(),
                 cwd: None,
                 focused_tile: 3,
-                layout: LayoutNode::Leaf { tile: 3 },
+                layout: LayoutNode::Leaf { tile: 3, collapsed: false },
                 tabs: vec![SavedTab {
                     tile_id: 3,
                     tab_index: 0,
@@ -573,8 +604,8 @@ mod tests {
             LayoutNode::Split { dir, ratio, a, b } => {
                 assert_eq!(dir, "row");
                 assert!((ratio - 0.3).abs() < 0.001);
-                assert_eq!(**a, LayoutNode::Leaf { tile: 1 });
-                assert_eq!(**b, LayoutNode::Leaf { tile: 2 });
+                assert_eq!(**a, LayoutNode::Leaf { tile: 1, collapsed: false });
+                assert_eq!(**b, LayoutNode::Leaf { tile: 2, collapsed: false });
             }
             _ => panic!("expected split layout"),
         }
@@ -780,7 +811,7 @@ mod tests {
             name: "g".into(),
             cwd: None,
             focused_tile: 1,
-            layout: LayoutNode::Leaf { tile: 1 },
+            layout: LayoutNode::Leaf { tile: 1, collapsed: false },
             tabs: vec![
                 SavedTab {
                     tile_id: 1,

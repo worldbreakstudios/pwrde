@@ -186,6 +186,7 @@ pub enum Action {
     FocusDown,
     FocusUp,
     FocusRight,
+    ToggleCollapse,
     PrevSidebarTab,
     NextSidebarTab,
     PrevPage,
@@ -196,7 +197,7 @@ pub enum Action {
 
 impl Action {
     /// Keyboard-page row order.
-    pub const ALL: [Action; 22] = [
+    pub const ALL: [Action; 23] = [
         Action::SplitRight,
         Action::SplitDown,
         Action::NewTab,
@@ -213,6 +214,7 @@ impl Action {
         Action::FocusDown,
         Action::FocusUp,
         Action::FocusRight,
+        Action::ToggleCollapse,
         Action::PrevSidebarTab,
         Action::NextSidebarTab,
         Action::PrevPage,
@@ -240,6 +242,7 @@ impl Action {
             Action::FocusDown => "focus_down",
             Action::FocusUp => "focus_up",
             Action::FocusRight => "focus_right",
+            Action::ToggleCollapse => "toggle_collapse",
             Action::PrevSidebarTab => "prev_sidebar_tab",
             Action::NextSidebarTab => "next_sidebar_tab",
             Action::PrevPage => "prev_page",
@@ -267,6 +270,7 @@ impl Action {
             Action::FocusDown => "Focus pane down",
             Action::FocusUp => "Focus pane up",
             Action::FocusRight => "Focus pane right",
+            Action::ToggleCollapse => "Collapse/expand pane",
             Action::PrevSidebarTab => "Previous sidebar tab",
             Action::NextSidebarTab => "Next sidebar tab",
             Action::PrevPage => "Previous page",
@@ -298,6 +302,7 @@ impl Action {
             Action::FocusDown => (true, "j"),
             Action::FocusUp => (true, "k"),
             Action::FocusRight => (true, "l"),
+            Action::ToggleCollapse => (true, "m"),
             Action::PrevSidebarTab => (true, "up"),
             Action::NextSidebarTab => (true, "down"),
             Action::PrevPage => (true, "left"),
