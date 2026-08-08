@@ -48,16 +48,18 @@ pub fn cycle(i: usize, n: usize, delta: isize) -> usize {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Section {
     Keyboard,
+    Terminal,
     Themes,
     Debug,
 }
 
 impl Section {
-    pub const ALL: [Section; 3] = [Section::Keyboard, Section::Themes, Section::Debug];
+    pub const ALL: [Section; 4] = [Section::Keyboard, Section::Terminal, Section::Themes, Section::Debug];
 
     pub fn label(self) -> &'static str {
         match self {
             Section::Keyboard => "Keyboard",
+            Section::Terminal => "Terminal",
             Section::Themes => "Themes",
             Section::Debug => "Debug",
         }
@@ -68,6 +70,9 @@ impl Section {
 /// are read-only diagnostics; one blank row separates them from the toggle.
 /// Shared by the renderer (drawing) and main.rs (hit-testing).
 pub const DEBUG_TOGGLE_ROW: usize = 8;
+
+/// Row index of the "Persist sessions" toggle on the Terminal page.
+pub const PERSIST_TOGGLE_ROW: usize = 0;
 
 // ── Rebindable actions ──────────────────────────────────────────────────
 

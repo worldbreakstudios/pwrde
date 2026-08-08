@@ -658,6 +658,42 @@ impl Renderer {
                     }
                 }
             },
+            Section::Terminal => {
+                let row = workspace::settings_row_rect(area, pages::PERSIST_TOGGLE_ROW, scale);
+                if fits(&row) {
+                    let on = crate::settings::get_bool("terminal.persist", false);
+                    labels.push(LabelSpec {
+                        text: "Persist sessions".into(),
+                        color: color(th.text_bright, 1.0),
+                        left: row.x + pad,
+                        top: mid(&row),
+                        clip: row,
+                    });
+                    let state = if on { "on" } else { "off" };
+                    let w = state.chars().count() as f32 * self.cell_width;
+                    let pill_pad = (10.0 * scale).round();
+                    let inset = (4.0 * scale).round();
+                    let pill = LayoutRect {
+                        x: (row.x + row.w - pad - w - 2.0 * pill_pad).round(),
+                        y: row.y + inset,
+                        w: w + 2.0 * pill_pad,
+                        h: (row.h - 2.0 * inset).max(0.0),
+                    };
+                    bg_quads.push(self.px_rect(
+                        &pill,
+                        if on { th.accent } else { (255, 255, 255) },
+                        if on { 0.9 } else { 0.12 },
+                        pill.h / 2.0,
+                    ));
+                    labels.push(LabelSpec {
+                        text: state.into(),
+                        color: color(if on { (255, 255, 255) } else { th.text_dim }, 1.0),
+                        left: (pill.x + pill_pad).round(),
+                        top: mid(&row),
+                        clip: row,
+                    });
+                }
+            },
             Section::Debug => {
                 let diags: Vec<(&str, String)> = vec![
                     ("settings file", crate::settings::path().to_string_lossy().into_owned()),

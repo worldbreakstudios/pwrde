@@ -19,6 +19,7 @@
 mod git;
 mod links;
 mod pages;
+mod persist;
 mod picker;
 mod rect;
 mod renderer;
@@ -147,7 +148,34 @@ impl App {
     }
 
     /// Spawn a session whose shell starts in `cwd` (`None` inherits our own).
+    /// With persistence on, the shell runs inside a freshly named shpool
+    /// session so it survives app restarts.
     fn spawn_session_in(&mut self, cwd: Option<&std::path::Path>) -> Session {
+        let shpool_session = if settings::get_bool("terminal.persist", false) {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            Some(format!(
+                "pwrde-{}-{}{}",
+                self.next_session_id,
+                std::process::id(),
+                nanos % 1_000_000
+            ))
+        } else {
+            None
+        };
+        self.spawn_session_named(cwd, shpool_session)
+    }
+
+    /// Spawn a session bound to a specific shpool session name (the restore
+    /// path reattaches by saved name), or a plain shell when `shpool` is None.
+    fn spawn_session_named(
+        &mut self,
+        cwd: Option<&std::path::Path>,
+        shpool: Option<String>,
+    ) -> Session {
         let id = self.next_session_id;
         self.next_session_id += 1;
         let (cw, ch) = self.cell_px();
@@ -161,7 +189,76 @@ impl App {
             self.dpi(),
             cwd,
             self.events_tx.clone(),
+            shpool,
         )
+    }
+
+    fn persist_snapshot(&self) {
+        if !settings::get_bool("terminal.persist", false) {
+            return;
+        }
+        let saved = persist::workspaces_to_saved(&self.workspaces);
+        if let Err(e) = persist::save_snapshot_default(&saved) {
+            eprintln!("persist_snapshot error: {}", e);
+        }
+    }
+
+    /// Rebuild workspaces from the persisted snapshot, reattaching each tab
+    /// to its saved shpool session. Returns false when there is nothing to
+    /// restore (caller falls back to the empty state).
+    fn restore_workspaces(&mut self) -> bool {
+        let saved = persist::load_snapshot_default();
+        if saved.is_empty() {
+            return false;
+        }
+        for group in &saved {
+            let cwd = group.cwd.as_ref().map(std::path::PathBuf::from);
+            let root = self.restore_node(&group.layout, &group.tabs, cwd.as_deref());
+            let mut ws = Workspace {
+                name: group.name.clone(),
+                root,
+                focused_tile: group.focused_tile as u64,
+                cwd,
+            };
+            ws.fix_focus();
+            self.workspaces.push(ws);
+        }
+        self.active = 0;
+        true
+    }
+
+    /// Recursively rebuild a split tree from its saved layout, spawning a
+    /// reattached session for every saved tab of each leaf tile.
+    fn restore_node(
+        &mut self,
+        node: &persist::LayoutNode,
+        tabs: &[persist::SavedTab],
+        cwd: Option<&std::path::Path>,
+    ) -> Node {
+        match node {
+            persist::LayoutNode::Leaf { tile } => {
+                let tile_id = *tile as u64;
+                self.next_tile_id = self.next_tile_id.max(tile_id + 1);
+                let mut saved: Vec<&persist::SavedTab> =
+                    tabs.iter().filter(|t| t.tile_id == *tile).collect();
+                saved.sort_by_key(|t| t.tab_index);
+                let mut restored = Tile::empty(tile_id);
+                for st in &saved {
+                    let tab_cwd = st.cwd.as_ref().map(std::path::PathBuf::from);
+                    let session = self
+                        .spawn_session_named(tab_cwd.as_deref().or(cwd), st.shpool_session.clone());
+                    restored.tabs.push(Tab::new(session));
+                }
+                restored.active = saved.iter().position(|st| st.active).unwrap_or(0);
+                Node::Leaf(restored)
+            }
+            persist::LayoutNode::Split { dir, ratio, a, b } => Node::Split {
+                dir: if dir == "column" { Dir::Column } else { Dir::Row },
+                ratio: *ratio,
+                a: Box::new(self.restore_node(a, tabs, cwd)),
+                b: Box::new(self.restore_node(b, tabs, cwd)),
+            },
+        }
     }
 
     fn new_tile(&mut self) -> Tile {
@@ -227,6 +324,7 @@ impl App {
         }
         self.sync_layout();
         self.request_redraw();
+        self.persist_snapshot();
     }
 
     fn new_tab(&mut self) {
@@ -239,6 +337,7 @@ impl App {
         }
         self.sync_layout();
         self.request_redraw();
+        self.persist_snapshot();
     }
 
     fn switch_workspace(&mut self, wi: usize) {
@@ -287,6 +386,12 @@ impl App {
         }
         let tab_idx = tile.active;
         let tab = tile.tabs.remove(tab_idx);
+        // Explicit close ends the persistent session too; a shell that merely
+        // exited goes through remove_session instead, where the shpool session
+        // is already gone.
+        if let Some(name) = tab.session.shpool_session.as_deref() {
+            term::shpool_kill(name);
+        }
         if tile.active >= tile.tabs.len() {
             tile.active = tile.tabs.len().saturating_sub(1);
         }
@@ -310,6 +415,7 @@ impl App {
         self.workspaces[self.active].fix_focus();
         self.sync_layout();
         self.request_redraw();
+        self.persist_snapshot();
     }
 
     /// Mouse wheel / trackpad → scroll the pane under the cursor. On the
@@ -485,6 +591,7 @@ impl App {
     fn reset_empty_workspace(&mut self, wi: usize) {
         self.workspaces[wi] = Workspace::placeholder();
         self.active = wi;
+        self.persist_snapshot();
     }
 
     /// Open a new group named `name`, rooted at `cwd`, and make it active.
@@ -503,6 +610,7 @@ impl App {
         }
         self.sync_layout();
         self.request_redraw();
+        self.persist_snapshot();
     }
 
     // ── Tab drag / drop ───────────────────────────────────────────────────
@@ -672,6 +780,7 @@ impl App {
         }
         self.sync_layout();
         self.request_redraw();
+        self.persist_snapshot();
     }
 
     /// ⌘-click: open the link under the cursor, if any.
@@ -1226,6 +1335,16 @@ impl App {
                     }
                 }
             },
+            Section::Terminal => {
+                let row = workspace::settings_row_rect(&area, pages::PERSIST_TOGGLE_ROW, scale);
+                if row.contains(px, py) {
+                    let on = settings::get_bool("terminal.persist", false);
+                    settings::set("terminal.persist", (!on).into());
+                    // Snapshot right away so enabling then restarting (with no
+                    // further mutations) still restores the current groups.
+                    self.persist_snapshot();
+                }
+            },
             Section::Debug => {
                 let row = workspace::settings_row_rect(&area, pages::DEBUG_TOGGLE_ROW, scale);
                 if row.contains(px, py) {
@@ -1318,6 +1437,7 @@ impl App {
                 }
                 self.sync_layout();
                 self.request_redraw();
+                self.persist_snapshot();
                 return;
             }
         }
@@ -1931,9 +2051,14 @@ fn main() {
                         },
                         dot_hover: None,
                     };
-                    // Launch into the empty state: no shell is spawned until
-                    // the user starts a group (CTA click or ⇧⌘T).
-                    app.workspaces.push(Workspace::placeholder());
+                    // With persistence on, reattach to the previous session's
+                    // groups; otherwise launch into the empty state — no shell
+                    // is spawned until the user starts a group (CTA or ⇧⌘T).
+                    if !(settings::get_bool("terminal.persist", false)
+                        && app.restore_workspaces())
+                    {
+                        app.workspaces.push(Workspace::placeholder());
+                    }
                     app.sync_layout();
 
                     // Drain PTY wakeups on the foreground executor: poll the
