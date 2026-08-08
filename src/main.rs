@@ -137,6 +137,10 @@ struct App {
     title: String,
     cursor: (f64, f64),
     drag: Drag,
+    /// Tile expanded by the first click of a potential double-click. The
+    /// second click's bar double-click-to-collapse is suppressed for it, so
+    /// double-clicking a collapsed pane's tab doesn't snap it shut again.
+    just_expanded: Option<u64>,
     /// The open step-1 cwd picker popover, or `None` when closed.
     picker: Option<picker::Picker>,
     /// The open step-2 fork-source picker (git repos only), or `None`.
@@ -1764,6 +1768,11 @@ impl App {
         let (w, h) = self.renderer.surface_size();
         let grab = GRAB * scale;
 
+        // A fresh click sequence forgets which pane the previous one expanded.
+        if click_count <= 1 {
+            self.just_expanded = None;
+        }
+
         // Overlays are modal: they intercept clicks in priority order
         // (confirm → message → fork picker → dir picker) before anything else.
         if self.confirm.is_some()
@@ -1927,6 +1936,7 @@ impl App {
                 && ws.root.find_tile(*id).is_some_and(|t| t.collapsed)
             {
                 self.set_collapsed(*id, false);
+                self.just_expanded = Some(*id);
                 self.workspaces[self.active].focused_tile = *id;
                 self.request_redraw();
                 return;
@@ -1935,9 +1945,13 @@ impl App {
             if bar.contains(px, py) {
                 let has_caret = axis.is_some();
                 if has_caret && workspace::tile_caret_rect(rect, scale).contains(px, py) {
-                    let collapsed = ws.root.find_tile(*id).is_some_and(|t| t.collapsed);
-                    self.set_collapsed(*id, !collapsed);
-                    self.request_redraw();
+                    // Only the first click of a double toggles — the second
+                    // would just snap it straight back.
+                    if click_count <= 1 {
+                        let collapsed = ws.root.find_tile(*id).is_some_and(|t| t.collapsed);
+                        self.set_collapsed(*id, !collapsed);
+                        self.request_redraw();
+                    }
                     return;
                 }
                 if let Some(tile) = ws.root.find_tile_mut(*id) {
@@ -1954,9 +1968,19 @@ impl App {
                         self.close_active_tab();
                         return;
                     }
-                    // Clicking a tab name on a collapsed pane also expands it.
                     if tile.collapsed {
+                        // Clicking a tab name on a collapsed pane expands it.
                         self.set_collapsed(*id, false);
+                        self.just_expanded = Some(*id);
+                    } else if has_caret
+                        && click_count >= 2
+                        && self.just_expanded != Some(*id)
+                    {
+                        // Double-clicking the tab bar collapses the pane
+                        // (unless this same double-click just expanded it).
+                        self.set_collapsed(*id, true);
+                        self.request_redraw();
+                        return;
                     }
                     self.drag = Drag::TabPress { tile: *id, tab: ti, start: self.cursor };
                     self.sync_layout();
@@ -3504,6 +3528,7 @@ fn main() {
                         title: String::new(),
                         cursor: (0.0, 0.0),
                         drag: Drag::None,
+                        just_expanded: None,
                         picker: None,
                         fork: None,
                         palette: None,

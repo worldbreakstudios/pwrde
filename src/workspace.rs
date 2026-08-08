@@ -1239,26 +1239,26 @@ pub fn tile_content(rect: &LayoutRect, scale: f32) -> LayoutRect {
     LayoutRect { y: rect.y + bar, h: (rect.h - bar).max(0.0), ..*rect }
 }
 
-/// A square caret button at the LEFT edge of a tile's tab bar.
+/// A square caret button at the RIGHT edge of a tile's tab bar.
 /// Side length = `TILE_TAB_H * scale`. Present only when the tile has a
 /// parent split (i.e. `tile_collapse_axis` returns `Some`).
 pub fn tile_caret_rect(rect: &LayoutRect, scale: f32) -> LayoutRect {
     let bar = tile_tab_bar(rect, scale);
     let side = (TILE_TAB_H * scale).round();
-    LayoutRect { x: bar.x, y: bar.y, w: side, h: side }
+    LayoutRect { x: bar.x + (bar.w - side).max(0.0), y: bar.y, w: side, h: side }
 }
 
 /// Rect of tab `i` of `n` in a tile's strip.
 ///
 /// When `has_caret` is `true` (the tile has a parent split and therefore
-/// shows a collapse caret button), the available width starts after the
-/// caret square so tabs never overlap it.
+/// shows a collapse caret button), the caret square at the right end of the
+/// strip is excluded from the available width so tabs never overlap it.
 pub fn tile_tab_rect(rect: &LayoutRect, i: usize, n: usize, scale: f32, has_caret: bool) -> LayoutRect {
     let bar = tile_tab_bar(rect, scale);
     let caret_w = if has_caret { (TILE_TAB_H * scale).round() } else { 0.0 };
     let avail_w = (bar.w - caret_w).max(0.0);
     let w = (avail_w / n.max(1) as f32).min((TILE_TAB_MAX_W * scale).round()).round();
-    LayoutRect { x: bar.x + caret_w + i as f32 * w, y: bar.y, w, h: bar.h }
+    LayoutRect { x: bar.x + i as f32 * w, y: bar.y, w, h: bar.h }
 }
 
 /// The close-button hit region at the right edge of tab `i` of `n`.
@@ -2025,20 +2025,25 @@ mod tests {
     }
 
     #[test]
-    fn caret_rect_sits_inside_bar_and_offsets_tabs() {
+    fn caret_rect_right_aligned_and_tabs_avoid_it() {
         let rect = LayoutRect { x: 100.0, y: 50.0, w: 900.0, h: 600.0 };
         for scale in [1.0, 2.0] {
             let bar = tile_tab_bar(&rect, scale);
             let caret = tile_caret_rect(&rect, scale);
-            assert!(caret.x >= bar.x && caret.x + caret.w <= bar.x + bar.w);
+            // Right-aligned square inside the bar.
+            assert_eq!(caret.x + caret.w, bar.x + bar.w);
             assert!(caret.y >= bar.y && caret.y + caret.h <= bar.y + bar.h);
-            let with = tile_tab_rect(&rect, 0, 2, scale, true);
-            let without = tile_tab_rect(&rect, 0, 2, scale, false);
-            assert_eq!(with.x, bar.x + caret.w);
-            assert_eq!(without.x, bar.x);
-            // Close button stays inside its (shifted) tab.
-            let close = tile_tab_close_rect(&rect, 0, 2, scale, true);
-            assert!(close.x >= with.x && close.x + close.w <= with.x + with.w);
+            // Tabs start at the bar's left edge either way; with a caret the
+            // last tab must end at or before the caret square.
+            for n in [1, 2, 4] {
+                let first = tile_tab_rect(&rect, 0, n, scale, true);
+                assert_eq!(first.x, bar.x);
+                let last = tile_tab_rect(&rect, n - 1, n, scale, true);
+                assert!(last.x + last.w <= caret.x + 1.0);
+                // Close button stays inside its tab.
+                let close = tile_tab_close_rect(&rect, n - 1, n, scale, true);
+                assert!(close.x >= last.x && close.x + close.w <= last.x + last.w);
+            }
         }
     }
 
