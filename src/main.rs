@@ -24,6 +24,7 @@ mod pages;
 mod palette;
 mod persist;
 mod picker;
+mod pwrspace;
 mod rect;
 mod renderer;
 mod settings;
@@ -107,6 +108,32 @@ enum ConfirmAction {
     CleanupDelete { targets: Vec<(String, Vec<String>)> },
 }
 
+/// What confirming the workspace-profile picker continues into: the picker is
+/// interposed *before* the group exists (and, for a `drop` fork, before the
+/// worktree is even provisioned), so the pending creation is carried here.
+enum ProfileNext {
+    /// Open the group directly at `cwd`.
+    Open { name: String, cwd: std::path::PathBuf },
+    /// Provision a `drop` worktree in `repo` (off `from`), then open it.
+    Fork { repo: std::path::PathBuf, name: String, from: Option<String> },
+}
+
+/// The save-as-workspace modal: two text buffers, the focused field, and —
+/// once Enter moves past the fields — the destination choice.
+struct SaveWorkspaceModal {
+    name: String,
+    description: String,
+    /// 0 = Name focused, 1 = Description.
+    field: usize,
+    /// `Some(selected)` while the destination rows are up, `None` while the
+    /// text fields are being edited.
+    dest_selected: Option<usize>,
+    /// Row labels for the destination stage, parallel to `dest_paths`.
+    dest_labels: Vec<String>,
+    /// The `.pwrspace.json` path each destination row writes to.
+    dest_paths: Vec<std::path::PathBuf>,
+}
+
 /// The in-flight pointer drag gesture.
 #[derive(Clone, Debug)]
 enum Drag {
@@ -168,6 +195,16 @@ struct App {
     picker: Option<picker::Picker>,
     /// The open step-2 fork-source picker (git repos only), or `None`.
     fork: Option<picker::ForkPicker>,
+    /// The open workspace-profile picker (shown only when `.pwrspace.json`
+    /// profiles were discovered for the group being created), or `None`.
+    profile_picker: Option<picker::ProfilePicker>,
+    /// The creation the profile picker resolves into; set with `profile_picker`.
+    profile_next: Option<ProfileNext>,
+    /// Profile chosen for a group whose `drop` worktree is still provisioning;
+    /// applied on `GroupReady`, dropped on `GroupFailed`.
+    pending_group_profile: Option<pwrspace::WorkspaceProfile>,
+    /// The open save-as-workspace modal, or `None`.
+    save_ws: Option<SaveWorkspaceModal>,
     /// The open command palette, or `None` when closed.
     palette: Option<palette::Palette>,
     /// A centered one-line message. `bool` is `dismissable`: false while `drop`
@@ -957,7 +994,7 @@ impl App {
             self.picker = None;
         } else {
             self.picker = None;
-            self.add_group(name, Some(entry.path));
+            self.add_group_or_pick_profile(name, entry.path);
         }
     }
 
@@ -977,12 +1014,34 @@ impl App {
         // directly in that directory (the repo, or the existing worktree).
         if matches!(scope, picker::ForkScope::RepoRoot | picker::ForkScope::Worktree) {
             self.fork = None;
-            self.add_group(name, path);
+            match path {
+                Some(p) => self.add_group_or_pick_profile(name, p),
+                None => self.add_group(name, None),
+            }
             return;
         }
 
-        self.message = Some((format!("Provisioning worktree for {name}…"), false));
+        // Forking scopes: the worktree doesn't exist yet, so profiles are
+        // discovered at the repo root (plus user-level) and the choice is made
+        // *before* provisioning; it is applied when `GroupReady` arrives.
+        let found = pwrspace::discover(&pwrspace::candidate_paths(&repo));
+        if !found.is_empty() {
+            self.fork = None;
+            self.profile_picker = Some(picker::ProfilePicker::new(name.clone(), found));
+            self.profile_next = Some(ProfileNext::Fork { repo, name, from });
+            self.request_redraw();
+            return;
+        }
+
         self.fork = None;
+        self.start_fork(repo, name, from);
+    }
+
+    /// Spawn `drop` on a worker thread and show the provisioning message until
+    /// it reports back over `events_tx` (the tail of the pre-profile
+    /// `confirm_fork`, shared with the profile picker's deferred path).
+    fn start_fork(&mut self, repo: std::path::PathBuf, name: String, from: Option<String>) {
+        self.message = Some((format!("Provisioning worktree for {name}…"), false));
         self.request_redraw();
 
         let events_tx = self.events_tx.clone();
@@ -993,6 +1052,56 @@ impl App {
             };
             let _ = events_tx.send(event);
         });
+    }
+
+    /// Create the group at `cwd` immediately, or interpose the profile picker
+    /// when any `.pwrspace.json` profiles exist for it (dir → repo root → user
+    /// precedence; worktree dirs also see their main checkout's profiles).
+    fn add_group_or_pick_profile(&mut self, name: String, cwd: std::path::PathBuf) {
+        let found = pwrspace::discover(&pwrspace::candidate_paths(&cwd));
+        if found.is_empty() {
+            self.add_group(name, Some(cwd));
+        } else {
+            self.profile_picker = Some(picker::ProfilePicker::new(name.clone(), found));
+            self.profile_next = Some(ProfileNext::Open { name, cwd });
+            self.request_redraw();
+        }
+    }
+
+    /// Confirm the highlighted profile row: launch (or provision) the pending
+    /// group with the chosen profile — the default row (`profile: None`)
+    /// keeps today's single-pane behavior.
+    fn confirm_profile(&mut self) {
+        let Some(pp) = self.profile_picker.as_ref() else { return };
+        let Some(entry) = pp.selected_entry().cloned() else { return };
+        self.profile_picker = None;
+        match self.profile_next.take() {
+            Some(ProfileNext::Open { name, cwd }) => match entry.profile {
+                Some(profile) => self.add_group_with_profile(name, Some(cwd), &profile),
+                None => self.add_group(name, Some(cwd)),
+            },
+            Some(ProfileNext::Fork { repo, name, from }) => {
+                self.pending_group_profile = entry.profile;
+                self.start_fork(repo, name, from);
+            },
+            None => {},
+        }
+        self.request_redraw();
+    }
+
+    /// Escape/outside-click on the profile picker: step back to the picker it
+    /// came from — the fork picker for a pending `drop` fork, else the dir
+    /// picker (matching how the fork picker itself steps back).
+    fn cancel_profile(&mut self) {
+        self.profile_picker = None;
+        match self.profile_next.take() {
+            Some(ProfileNext::Fork { repo, name, .. }) => {
+                let choices = build_fork_choices(&repo);
+                self.fork = Some(picker::ForkPicker::new(repo, name, choices));
+            },
+            _ => self.picker = Some(picker::Picker::new()),
+        }
+        self.request_redraw();
     }
 
     fn new_tile_in(&mut self, cwd: Option<&std::path::Path>) -> Tile {
@@ -1040,6 +1149,149 @@ impl App {
         self.sync_layout();
         self.request_redraw();
         self.persist_snapshot();
+    }
+
+    /// Open a new group at `cwd` laid out per `profile`: the saved split tree
+    /// is rebuilt with fresh tiles/sessions and every tab's command is queued
+    /// for its pane's first wakeup — the same mechanism as the primary
+    /// command, so shell startup files can't eat it.
+    fn add_group_with_profile(
+        &mut self,
+        name: String,
+        cwd: Option<std::path::PathBuf>,
+        profile: &pwrspace::WorkspaceProfile,
+    ) {
+        let empty = self.is_empty_state();
+        let root = self.build_profile_node(&profile.layout, cwd.as_deref());
+        // The first leaf anchors the group's lifetime, mirroring add_group's
+        // founding tile.
+        let primary_tile = root.tiles().first().map(|t| t.id).unwrap_or(0);
+        let mut ws = Workspace {
+            name,
+            root,
+            focused_tile: primary_tile,
+            cwd,
+            primary_tile,
+            section: None,
+        };
+        ws.fix_focus();
+        if empty {
+            self.workspaces[0] = ws;
+            self.active = 0;
+        } else {
+            self.workspaces.push(ws);
+            self.active = self.workspaces.len() - 1;
+        }
+        self.sync_layout();
+        self.request_redraw();
+        self.persist_snapshot();
+    }
+
+    /// Recursively build a live split tree from a profile node, spawning a
+    /// session in `cwd` for every tab and queueing its command. A leaf with no
+    /// tabs still gets one bare shell so no tile is ever empty; ratios are
+    /// clamped so a hand-edited file can't collapse a pane to nothing.
+    fn build_profile_node(
+        &mut self,
+        node: &pwrspace::ProfileNode,
+        cwd: Option<&std::path::Path>,
+    ) -> Node {
+        match node {
+            pwrspace::ProfileNode::Leaf(leaf) => {
+                let id = self.next_tile_id;
+                self.next_tile_id += 1;
+                let mut tile = Tile::empty(id);
+                let bare = [pwrspace::ProfileTab::default()];
+                let tabs: &[pwrspace::ProfileTab] =
+                    if leaf.tabs.is_empty() { &bare } else { &leaf.tabs };
+                for profile_tab in tabs {
+                    let session = self.spawn_session_in(cwd);
+                    if let Some(cmd) = profile_tab
+                        .command
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|c| !c.is_empty())
+                    {
+                        self.pending_primary_cmd.insert(session.id, cmd.to_string());
+                    }
+                    tile.tabs.push(Tab::new(session));
+                }
+                tile.active = leaf.active.min(tile.tabs.len() - 1);
+                Node::Leaf(tile)
+            },
+            pwrspace::ProfileNode::Split(split) => Node::Split {
+                dir: match split.split {
+                    pwrspace::SplitDir::Row => Dir::Row,
+                    pwrspace::SplitDir::Column => Dir::Column,
+                },
+                ratio: split.ratio.clamp(0.05, 0.95),
+                a: Box::new(self.build_profile_node(&split.a, cwd)),
+                b: Box::new(self.build_profile_node(&split.b, cwd)),
+            },
+        }
+    }
+
+    /// Open the save-as-workspace modal over the active group, prefilled with
+    /// the group's name. The repo destination row is offered only when the
+    /// group's cwd resolves to a git repo (for a worktree that is the *main*
+    /// checkout root, so the profile is visible to every future worktree).
+    fn open_save_workspace(&mut self) {
+        if self.is_empty_state() {
+            return;
+        }
+        let ws = &self.workspaces[self.active];
+        let mut dest_labels = Vec::new();
+        let mut dest_paths = Vec::new();
+        if let Some(root) = ws.cwd.as_deref().and_then(git::repo_root) {
+            let path = root.join(".pwrspace.json");
+            dest_labels.push(format!("This repo — {}", tilde(&path)));
+            dest_paths.push(path);
+        }
+        let user = settings::config_dir().join("pwrspace.json");
+        dest_labels.push(format!("User — {}", tilde(&user)));
+        dest_paths.push(user);
+        self.save_ws = Some(SaveWorkspaceModal {
+            name: ws.name.clone(),
+            description: String::new(),
+            field: 0,
+            dest_selected: None,
+            dest_labels,
+            dest_paths,
+        });
+        self.request_redraw();
+    }
+
+    /// Write the modal's profile to the selected destination and close it,
+    /// reporting the outcome via the message overlay. A blank name refuses to
+    /// commit (focus returns to the Name field instead).
+    fn commit_save_workspace(&mut self) {
+        let Some(modal) = self.save_ws.take() else { return };
+        let name = modal.name.trim().to_string();
+        if name.is_empty() {
+            self.save_ws =
+                Some(SaveWorkspaceModal { field: 0, dest_selected: None, ..modal });
+            return;
+        }
+        let Some(path) = modal.dest_selected.and_then(|i| modal.dest_paths.get(i)) else {
+            return;
+        };
+        let profile = pwrspace::WorkspaceProfile {
+            name,
+            description: modal.description.trim().to_string(),
+            layout: capture_profile_node(&self.workspaces[self.active].root),
+        };
+        match pwrspace::save_profile(path, &profile) {
+            Ok(()) => {
+                self.message = Some((
+                    format!("Saved workspace \"{}\" to {}", profile.name, tilde(path)),
+                    true,
+                ));
+            },
+            Err(e) => {
+                self.message = Some((format!("Save failed: {e}"), true));
+            },
+        }
+        self.request_redraw();
     }
 
     // ── Tab drag / drop ───────────────────────────────────────────────────
@@ -1795,6 +2047,52 @@ impl App {
             return;
         }
 
+        // Save-as-workspace modal: a click focuses a field, picks a
+        // destination row (which saves), or cancels when outside the panel.
+        if let Some(modal) = self.save_ws.as_ref() {
+            let dest_rows =
+                if modal.dest_selected.is_some() { modal.dest_labels.len() } else { 0 };
+            let layout = self.renderer.save_layout(dest_rows);
+            if !layout.panel.contains(px, py) {
+                self.save_ws = None;
+            } else if layout.name.contains(px, py) {
+                if let Some(m) = self.save_ws.as_mut() {
+                    m.field = 0;
+                    m.dest_selected = None;
+                }
+            } else if layout.desc.contains(px, py) {
+                if let Some(m) = self.save_ws.as_mut() {
+                    m.field = 1;
+                    m.dest_selected = None;
+                }
+            } else if let Some(i) = layout.rows.iter().position(|r| r.contains(px, py)) {
+                if let Some(m) = self.save_ws.as_mut() {
+                    m.dest_selected = Some(i);
+                }
+                self.commit_save_workspace();
+            }
+            self.request_redraw();
+            return;
+        }
+
+        // Profile picker (step 3): click a row to select+confirm, click
+        // outside to step back.
+        if let Some(pp) = &mut self.profile_picker {
+            let layout =
+                picker::PickerLayout::compute(width, height, scale, pp.rows.len(), pp.selected);
+            if !layout.panel.contains(px, py) {
+                self.cancel_profile();
+                self.request_redraw();
+                return;
+            }
+            if let Some(index) = layout.row_at(px, py) {
+                pp.select(index);
+                self.confirm_profile();
+            }
+            self.request_redraw();
+            return;
+        }
+
         // Fork picker (step 2): click a row to select+confirm, click outside to
         // step back to the dir picker.
         if let Some(fork) = &mut self.fork {
@@ -1872,6 +2170,8 @@ impl App {
         // (confirm → message → fork picker → dir picker) before anything else.
         if self.confirm.is_some()
             || self.message.is_some()
+            || self.save_ws.is_some()
+            || self.profile_picker.is_some()
             || self.fork.is_some()
             || self.picker.is_some()
             || self.palette.is_some()
@@ -2415,6 +2715,8 @@ impl App {
         // the PTY so typing filters the list rather than reaching the shell.
         if self.confirm.is_some()
             || self.message.is_some()
+            || self.save_ws.is_some()
+            || self.profile_picker.is_some()
             || self.fork.is_some()
             || self.picker.is_some()
             || self.palette.is_some()
@@ -2477,6 +2779,46 @@ impl App {
         if let Some((_, dismissable)) = self.message.as_ref() {
             if *dismissable {
                 self.message = None;
+            }
+            self.request_redraw();
+            return;
+        }
+        // The save-as-workspace modal owns typing for its two fields, then the
+        // destination rows.
+        if self.save_ws.is_some() {
+            self.handle_save_key(ev);
+            return;
+        }
+        // Step 3: the workspace-profile picker. Escape steps back.
+        if self.profile_picker.is_some() {
+            match key {
+                "escape" => self.cancel_profile(),
+                "enter" => self.confirm_profile(),
+                "up" => {
+                    if let Some(pp) = self.profile_picker.as_mut() {
+                        pp.move_selection(-1);
+                    }
+                },
+                "down" => {
+                    if let Some(pp) = self.profile_picker.as_mut() {
+                        pp.move_selection(1);
+                    }
+                },
+                "backspace" => {
+                    if let Some(pp) = self.profile_picker.as_mut() {
+                        pp.backspace();
+                    }
+                },
+                _ => {
+                    if !ev.keystroke.modifiers.control
+                        && let Some(text) = ev.keystroke.key_char.as_deref()
+                        && let Some(pp) = self.profile_picker.as_mut()
+                    {
+                        for ch in text.chars().filter(|c| !c.is_control()) {
+                            pp.push_char(ch);
+                        }
+                    }
+                },
             }
             self.request_redraw();
             return;
@@ -2598,6 +2940,72 @@ impl App {
                     }
                 },
             }
+        }
+        self.request_redraw();
+    }
+
+    /// Keyboard routing for the save-as-workspace modal. Field stage: typing
+    /// edits the focused field, Tab toggles fields, Enter advances (Name →
+    /// Description → destination rows), Esc cancels. Destination stage:
+    /// arrows move, Enter saves, Esc steps back to the fields.
+    fn handle_save_key(&mut self, ev: &KeyDownEvent) {
+        let key = ev.keystroke.key.as_str();
+        let mut close = false;
+        let mut commit = false;
+        if let Some(modal) = self.save_ws.as_mut() {
+            if let Some(sel) = modal.dest_selected {
+                match key {
+                    "escape" => modal.dest_selected = None,
+                    "up" => modal.dest_selected = Some(sel.saturating_sub(1)),
+                    "down" => {
+                        let last = modal.dest_labels.len().saturating_sub(1);
+                        modal.dest_selected = Some((sel + 1).min(last));
+                    },
+                    "enter" => commit = true,
+                    _ => {},
+                }
+            } else {
+                match key {
+                    "escape" => close = true,
+                    "tab" => modal.field = (modal.field + 1) % 2,
+                    "enter" => {
+                        if modal.field == 0 {
+                            modal.field = 1;
+                        } else if modal.name.trim().is_empty() {
+                            // A profile needs a name before it can move on.
+                            modal.field = 0;
+                        } else {
+                            modal.dest_selected = Some(0);
+                        }
+                    },
+                    "backspace" => {
+                        let buf =
+                            if modal.field == 0 { &mut modal.name } else { &mut modal.description };
+                        buf.pop();
+                    },
+                    _ => {
+                        if !ev.keystroke.modifiers.control
+                            && !ev.keystroke.modifiers.platform
+                            && let Some(text) = ev.keystroke.key_char.as_deref()
+                        {
+                            let buf = if modal.field == 0 {
+                                &mut modal.name
+                            } else {
+                                &mut modal.description
+                            };
+                            for ch in text.chars().filter(|c| !c.is_control()) {
+                                buf.push(ch);
+                            }
+                        }
+                    },
+                }
+            }
+        }
+        if close {
+            self.save_ws = None;
+        }
+        if commit {
+            self.commit_save_workspace();
         }
         self.request_redraw();
     }
@@ -2758,6 +3166,7 @@ impl App {
             Action::FocusUp => self.focus_dir(workspace::NavDir::Up),
             Action::FocusRight => self.focus_dir(workspace::NavDir::Right),
             Action::ToggleCollapse => self.toggle_focused_collapse(),
+            Action::SaveWorkspace => self.open_save_workspace(),
             Action::PrevSidebarTab
             | Action::NextSidebarTab
             | Action::ToggleSidebar
@@ -3106,13 +3515,19 @@ impl App {
                     redraw = true;
                 },
                 // A backgrounded worktree drop finished: clear the provisioning
-                // message and open the new group, or surface the failure.
+                // message and open the new group — with the profile chosen
+                // before provisioning, when there was one — or surface the
+                // failure (dropping any pending profile with it).
                 TermEvent::GroupReady { name, cwd } => {
                     self.message = None;
-                    self.add_group(name, Some(cwd));
+                    match self.pending_group_profile.take() {
+                        Some(profile) => self.add_group_with_profile(name, Some(cwd), &profile),
+                        None => self.add_group(name, Some(cwd)),
+                    }
                     redraw = true;
                 },
                 TermEvent::GroupFailed { message } => {
+                    self.pending_group_profile = None;
                     self.message = Some((format!("drop failed: {message}"), true));
                     redraw = true;
                 },
@@ -3256,6 +3671,55 @@ fn group_name(dir: &std::path::Path) -> String {
     dir.file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| dir.to_string_lossy().into_owned())
+}
+
+/// Abbreviate `path` with `~` for display.
+fn tilde(path: &std::path::Path) -> String {
+    if let Some(home) = dirs::home_dir()
+        && let Ok(rest) = path.strip_prefix(&home)
+    {
+        return format!("~/{}", rest.display());
+    }
+    path.display().to_string()
+}
+
+/// Snapshot a live split tree into a profile layout: dirs and ratios verbatim,
+/// every tab captured with its best-effort running command.
+fn capture_profile_node(node: &Node) -> pwrspace::ProfileNode {
+    match node {
+        Node::Leaf(tile) => pwrspace::ProfileNode::Leaf(pwrspace::ProfileLeaf {
+            tabs: tile
+                .tabs
+                .iter()
+                .map(|tab| pwrspace::ProfileTab { command: tab_command(tab) })
+                .collect(),
+            active: tile.active,
+        }),
+        Node::Split { dir, ratio, a, b } => pwrspace::ProfileNode::Split(pwrspace::ProfileSplit {
+            split: match dir {
+                Dir::Row => pwrspace::SplitDir::Row,
+                Dir::Column => pwrspace::SplitDir::Column,
+            },
+            ratio: *ratio,
+            a: Box::new(capture_profile_node(a)),
+            b: Box::new(capture_profile_node(b)),
+        }),
+    }
+}
+
+/// Best-effort capture of the command running in a tab's pane. Plain panes
+/// walk the shell child's process tree; shpool panes walk from the daemon-side
+/// session shell instead (the pane's own child is just `shpool attach`).
+/// `None` — including every failure — saves the tab as a bare shell.
+fn tab_command(tab: &workspace::Tab) -> Option<String> {
+    let session = &tab.session;
+    let cmd = if let Some(name) = &session.shpool_session {
+        term::shpool_foreground_command(name)
+    } else {
+        session.child_pid.and_then(term::foreground_command)
+    }?;
+    let cmd = cmd.trim();
+    if cmd.is_empty() { None } else { Some(cmd.to_string()) }
 }
 
 /// Build the fork picker's rows for a git repo: a default "new branch" row and
@@ -3717,6 +4181,12 @@ impl App {
         if resize_hover.is_none() && link_hover_suppressed.is_some() && self.modifiers.platform {
             window.set_window_cursor_style(CursorStyle::PointingHand);
         }
+        let save_view = self.save_ws.as_ref().map(|m| renderer::SaveModalView {
+            name: &m.name,
+            description: &m.description,
+            field: m.field,
+            dest: m.dest_selected.map(|sel| (m.dest_labels.as_slice(), sel)),
+        });
         let frame = self.renderer.build_frame(
             &self.workspaces,
             self.active,
@@ -3726,6 +4196,8 @@ impl App {
             link_hover_suppressed,
             self.picker.as_ref(),
             self.fork.as_ref(),
+            self.profile_picker.as_ref(),
+            save_view.as_ref(),
             self.palette.as_ref(),
             self.message.as_ref(),
             self.confirm.as_ref().map(|c| (c.text.as_str(), c.accept_label())),
@@ -4037,6 +4509,10 @@ fn main() {
                         just_expanded: None,
                         picker: None,
                         fork: None,
+                        profile_picker: None,
+                        profile_next: None,
+                        pending_group_profile: None,
+                        save_ws: None,
                         palette: None,
                         message: None,
                         confirm: None,
@@ -4180,5 +4656,56 @@ mod key_to_bytes_tests {
         assert_eq!(key_to_bytes(&ks("delete", SHIFT)).unwrap(), b"\x1b[3;2~");
         assert_eq!(key_to_bytes(&ks("pageup", CTRL)).unwrap(), b"\x1b[5;5~");
         assert_eq!(key_to_bytes(&ks("pagedown", ALT)).unwrap(), b"\x1b[6;3~");
+    }
+}
+
+#[cfg(test)]
+mod capture_profile_tests {
+    use super::*;
+    use crate::term::Session;
+
+    fn tile_with_tabs(id: u64, n: usize, active: usize) -> Tile {
+        let mut tile = Tile::empty(id);
+        for _ in 0..n {
+            tile.tabs.push(Tab::new(Session::placeholder()));
+        }
+        tile.active = active;
+        tile
+    }
+
+    /// Capturing a live split tree preserves dirs, ratios, tab counts and the
+    /// active index; placeholder sessions (no child pid) capture as bare
+    /// shells, and the result serializes in the `.pwrspace.json` format.
+    #[test]
+    fn capture_preserves_tree_shape_and_roundtrips() {
+        let root = Node::Split {
+            dir: Dir::Row,
+            ratio: 0.3,
+            a: Box::new(Node::Leaf(tile_with_tabs(1, 1, 0))),
+            b: Box::new(Node::Leaf(tile_with_tabs(2, 2, 1))),
+        };
+        let captured = capture_profile_node(&root);
+
+        let pwrspace::ProfileNode::Split(split) = &captured else {
+            panic!("expected split at root");
+        };
+        assert!(matches!(split.split, pwrspace::SplitDir::Row));
+        assert!((split.ratio - 0.3).abs() < 1e-6);
+        let pwrspace::ProfileNode::Leaf(a) = split.a.as_ref() else { panic!("leaf a") };
+        assert_eq!(a.tabs.len(), 1);
+        assert_eq!(a.active, 0);
+        let pwrspace::ProfileNode::Leaf(b) = split.b.as_ref() else { panic!("leaf b") };
+        assert_eq!(b.tabs.len(), 2);
+        assert_eq!(b.active, 1);
+        assert!(
+            b.tabs.iter().all(|t| t.command.is_none()),
+            "placeholder panes capture as bare shells"
+        );
+
+        // The captured tree round-trips through the on-disk JSON format.
+        let json = serde_json::to_string(&captured).unwrap();
+        assert!(json.contains(r#""split":"row""#), "split dir serialized: {json}");
+        let back: pwrspace::ProfileNode = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, pwrspace::ProfileNode::Split(_)));
     }
 }

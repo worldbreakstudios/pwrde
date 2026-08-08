@@ -215,11 +215,12 @@ pub enum Action {
     NextPage,
     OpenSettings,
     CommandPalette,
+    SaveWorkspace,
 }
 
 impl Action {
     /// Keyboard-page row order.
-    pub const ALL: [Action; 24] = [
+    pub const ALL: [Action; 25] = [
         Action::SplitRight,
         Action::SplitDown,
         Action::NewTab,
@@ -244,6 +245,7 @@ impl Action {
         Action::NextPage,
         Action::OpenSettings,
         Action::CommandPalette,
+        Action::SaveWorkspace,
     ];
 
     /// Stable identifier used in the settings key (`keyboard.<name>`).
@@ -273,6 +275,7 @@ impl Action {
             Action::NextPage => "next_page",
             Action::OpenSettings => "open_settings",
             Action::CommandPalette => "command_palette",
+            Action::SaveWorkspace => "save_workspace",
         }
     }
 
@@ -302,6 +305,7 @@ impl Action {
             Action::NextPage => "Next page",
             Action::OpenSettings => "Open settings",
             Action::CommandPalette => "Command palette",
+            Action::SaveWorkspace => "Save as workspace",
         }
     }
 
@@ -335,6 +339,7 @@ impl Action {
             Action::NextPage => (true, "right"),
             Action::OpenSettings => (false, ","),
             Action::CommandPalette => (false, "p"),
+            Action::SaveWorkspace => (true, "s"),
         };
         Binding { shift, alt: false, ctrl: false, key: key.into() }
     }

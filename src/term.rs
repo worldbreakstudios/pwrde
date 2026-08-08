@@ -162,6 +162,101 @@ pub fn shpool_kill(name: &str) {
     }
 }
 
+/// Walk a process table (pid, ppid, command) and return the deepest first-child
+/// descendant of `root_pid`. If `root_pid` has no children in the table,
+/// returns `None`. Pure function — no shelling out — so it is unit-testable.
+///
+/// "First child" means the child with the lowest pid among the direct children
+/// of each node, chosen greedily at each level (depth-first, first-child chain).
+pub fn deepest_descendant(
+    table: &[(u32, u32, String)],
+    root_pid: u32,
+) -> Option<String> {
+    // Build parent → children map (sorted by pid for determinism).
+    let mut children: std::collections::HashMap<u32, Vec<(u32, &str)>> =
+        std::collections::HashMap::new();
+    for (pid, ppid, cmd) in table {
+        children.entry(*ppid).or_default().push((*pid, cmd.as_str()));
+    }
+    // Sort each child list by pid so the walk is deterministic.
+    for v in children.values_mut() {
+        v.sort_by_key(|(pid, _)| *pid);
+    }
+
+    let mut current = root_pid;
+    let mut result: Option<String> = None;
+    loop {
+        match children.get(&current).and_then(|v| v.first()) {
+            Some(&(child_pid, child_cmd)) => {
+                result = Some(child_cmd.to_owned());
+                current = child_pid;
+            }
+            None => break,
+        }
+    }
+    result
+}
+
+/// Run `ps` with `args` (which must select `pid=,ppid=,command=` columns) and
+/// parse each line into `(pid, ppid, command)`. `split_whitespace` tolerates
+/// ps's right-aligned column padding; the command keeps its remaining tokens
+/// joined by single spaces. Returns `None` on any `ps` failure.
+fn ps_table(args: &[&str]) -> Option<Vec<(u32, u32, String)>> {
+    let output = std::process::Command::new("ps").args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Some(
+        stdout
+            .lines()
+            .filter_map(|line| {
+                let mut parts = line.split_whitespace();
+                let pid: u32 = parts.next()?.parse().ok()?;
+                let ppid: u32 = parts.next()?.parse().ok()?;
+                let cmd = parts.collect::<Vec<_>>().join(" ");
+                if cmd.is_empty() { None } else { Some((pid, ppid, cmd)) }
+            })
+            .collect(),
+    )
+}
+
+/// Return the command line of the foreground process running inside the shell
+/// identified by `shell_pid`. Shells out to `ps -axo pid=,ppid=,command=`,
+/// builds a parent→children map, and returns the deepest first-child descendant
+/// of `shell_pid`. Returns `None` if the shell has no descendants or on any
+/// `ps` failure. Best-effort: never panics.
+pub fn foreground_command(shell_pid: u32) -> Option<String> {
+    let table = ps_table(&["-axo", "pid=,ppid=,command="])?;
+    deepest_descendant(&table, shell_pid)
+}
+
+/// The root pid of the env-tagged subtree: among rows whose command field
+/// contains `needle`, the one whose parent does *not* — i.e. the process the
+/// environment variable was first set on. Pure, for tests.
+pub fn env_subtree_root(table: &[(u32, u32, String)], needle: &str) -> Option<u32> {
+    let matching: std::collections::HashSet<u32> =
+        table.iter().filter(|(_, _, cmd)| cmd.contains(needle)).map(|(pid, _, _)| *pid).collect();
+    table
+        .iter()
+        .find(|(pid, ppid, _)| matching.contains(pid) && !matching.contains(ppid))
+        .map(|(pid, _, _)| *pid)
+}
+
+/// Best-effort foreground command for a shpool-backed pane. The pane's own
+/// child is just `shpool attach`; the real shell lives under the daemon, so
+/// find it by its `SHPOOL_SESSION_NAME=<name>` environment (`ps -E` appends
+/// the environment to the command field for same-user processes), then walk
+/// its descendants in a clean (env-free) table. Returns `None` whenever any
+/// step fails — callers save the tab as a bare shell.
+pub fn shpool_foreground_command(session_name: &str) -> Option<String> {
+    let env_table = ps_table(&["-axE", "-o", "pid=,ppid=,command="])?;
+    let needle = format!("SHPOOL_SESSION_NAME={session_name}");
+    let root = env_subtree_root(&env_table, &needle)?;
+    let clean = ps_table(&["-axo", "pid=,ppid=,command="])?;
+    deepest_descendant(&clean, root)
+}
+
 pub struct Session {
     pub id: u64,
     pub term: Arc<Mutex<Terminal>>,
@@ -174,6 +269,10 @@ pub struct Session {
     selection: Mutex<Option<Sel>>,
     /// The shpool session name if this session is backed by shpool.
     pub shpool_session: Option<String>,
+    /// PID of the direct child process (shell or shpool client). None for
+    /// placeholder sessions and when spawn fails. Used by `foreground_command`
+    /// to find the deepest foreground descendant.
+    pub child_pid: Option<u32>,
 }
 
 impl Session {
@@ -313,6 +412,9 @@ impl Session {
             let _ = events.send(TermEvent::Wakeup(id));
         }
 
+        // Capture PID before moving child into the watcher thread.
+        let child_pid = child_opt.as_ref().and_then(|c| c.process_id());
+
         // Child watcher: shell exit closes the window.
         if let Some(mut child) = child_opt {
             std::thread::spawn(move || {
@@ -330,6 +432,7 @@ impl Session {
             scroll_offset: AtomicUsize::new(0),
             selection: Mutex::new(None),
             shpool_session: shpool_name,
+            child_pid,
         }
     }
 
@@ -356,6 +459,7 @@ impl Session {
             scroll_offset: AtomicUsize::new(0),
             selection: Mutex::new(None),
             shpool_session: None,
+            child_pid: None,
         }
     }
 
@@ -690,5 +794,65 @@ mod tests {
             std::fs::read_to_string(path).unwrap(),
             "prompt_prefix = \"custom\"\n"
         );
+    }
+
+    // ── foreground_command / deepest_descendant ──────────────────────────────
+
+    fn pt(pid: u32, ppid: u32, cmd: &str) -> (u32, u32, String) {
+        (pid, ppid, cmd.to_owned())
+    }
+
+    /// Shell with no children → None.
+    #[test]
+    fn deepest_descendant_no_children() {
+        let table = vec![pt(100, 1, "bash")];
+        assert_eq!(deepest_descendant(&table, 100), None);
+    }
+
+    /// Shell → one child → grandchild → returns grandchild.
+    #[test]
+    fn deepest_descendant_chain() {
+        let table = vec![
+            pt(100, 1, "bash"),
+            pt(101, 100, "vim"),
+            pt(102, 101, "git"),
+        ];
+        assert_eq!(deepest_descendant(&table, 100), Some("git".to_owned()));
+    }
+
+    /// Among multiple children the one with the lowest pid wins (first in
+    /// sorted order), so the walk is deterministic.
+    #[test]
+    fn deepest_descendant_picks_lowest_pid_child() {
+        let table = vec![
+            pt(100, 1, "bash"),
+            pt(105, 100, "zsh"),
+            pt(102, 100, "vim"),  // lower pid → chosen
+        ];
+        // First child (pid 102 "vim") has no children — result is "vim".
+        assert_eq!(deepest_descendant(&table, 100), Some("vim".to_owned()));
+    }
+
+    /// Root pid absent from table (no children) → None.
+    #[test]
+    fn deepest_descendant_unknown_root() {
+        let table = vec![pt(200, 1, "sh")];
+        assert_eq!(deepest_descendant(&table, 999), None);
+    }
+
+    /// The env-subtree root is the matching process whose parent doesn't
+    /// match — the daemon-side session shell, not its descendants (which
+    /// inherit the variable) and not the daemon itself.
+    #[test]
+    fn env_subtree_root_finds_session_shell() {
+        let needle = "SHPOOL_SESSION_NAME=pwrde-1-abc";
+        let table = vec![
+            pt(50, 1, "shpool daemon"),
+            pt(60, 50, format!("-zsh {needle} TERM=xterm").as_str()),
+            pt(61, 60, format!("claude {needle}").as_str()),
+            pt(70, 50, "-zsh SHPOOL_SESSION_NAME=other"),
+        ];
+        assert_eq!(env_subtree_root(&table, needle), Some(60));
+        assert_eq!(env_subtree_root(&table, "SHPOOL_SESSION_NAME=missing"), None);
     }
 }
