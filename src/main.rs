@@ -173,6 +173,9 @@ struct App {
     dot_anim: Vec<f32>,
     /// Page slot currently under the pointer.
     dot_hover: Option<usize>,
+    /// Resize handle currently under the pointer (sidebar edge or tile divider).
+    /// Drives the cursor style and hover highlight; sticky for the drag duration.
+    resize_hover: Option<workspace::ResizeHover>,
 }
 
 impl App {
@@ -1589,6 +1592,7 @@ impl App {
         // Sidebar edge → resize sidebar (every page shares the width).
         if (px - sidebar.w).abs() <= grab {
             self.drag = Drag::Sidebar;
+            self.resize_hover = Some(workspace::ResizeHover::Sidebar);
             return;
         }
 
@@ -1607,6 +1611,10 @@ impl App {
             let (_, dividers) = workspace::layout_tiles(&ws.root, self.area(), scale);
             if let Some(d) = dividers.iter().find(|d| d.rect.inflate(grab).contains(px, py)) {
                 self.drag = Drag::Divider { path: d.path.clone() };
+                self.resize_hover = Some(workspace::ResizeHover::Divider {
+                    path: d.path.clone(),
+                    dir: d.dir,
+                });
                 return;
             }
         }
@@ -1811,28 +1819,37 @@ impl App {
                 // Page-dot hover: the crossfade animation is driven by the
                 // 16ms tick in drain_events; here we only track the target.
                 self.dot_hover = self.page_slot_at(px, py);
-                // Hover resize-cursor affordances. We compute which resize
-                // orientation the pointer is over (sidebar edge = horizontal,
-                // a divider = its split direction). This references Divider.dir.
-                let sidebar_w = (self.sidebar_w * scale).round();
-                let grab = GRAB * scale;
-                let ws = &self.workspaces[self.active];
-                let (_tiles, dividers) = workspace::layout_tiles(&ws.root, self.area(), scale);
-                let _hover = if (px - sidebar_w).abs() <= grab {
-                    Some(CursorStyle::ResizeLeftRight)
+                // Resize-handle hover: suppress while any overlay is open so the
+                // cursor/highlight don't fight the modal. Hit-test matches
+                // on_mouse_down exactly via workspace::resize_hover_at.
+                let hover = if self.confirm.is_some()
+                    || self.message.is_some()
+                    || self.fork.is_some()
+                    || self.picker.is_some()
+                {
+                    None
                 } else {
-                    dividers
-                        .iter()
-                        .find(|d| d.rect.inflate(grab).contains(px, py))
-                        .map(|d| match d.dir {
-                            Dir::Row => CursorStyle::ResizeLeftRight,
-                            Dir::Column => CursorStyle::ResizeUpDown,
-                        })
+                    let (_, h) = self.renderer.surface_size();
+                    let sidebar_edge_x = workspace::sidebar(h, scale, self.sidebar_w).w;
+                    let grab = GRAB * scale;
+                    let dividers_active =
+                        self.page == Page::Sessions && !self.is_empty_state();
+                    let ws = &self.workspaces[self.active];
+                    workspace::resize_hover_at(
+                        &ws.root,
+                        self.area(),
+                        scale,
+                        sidebar_edge_x,
+                        grab,
+                        dividers_active,
+                        px,
+                        py,
+                    )
                 };
-                // TODO(gpui-port): gpui's window.set_cursor_style requires a
-                // &Hitbox which is awkward to synthesize from a raw mouse-move
-                // handler; wiring the actual cursor swap is left for later.
-                let _ = _hover;
+                if hover != self.resize_hover {
+                    self.resize_hover = hover;
+                    self.request_redraw();
+                }
             },
         }
     }
@@ -2725,6 +2742,31 @@ impl App {
         self.sync_layout_impl(rescaled);
         self.begin_frame();
 
+        // Cursor style must be set during paint (gpui asserts the phase). Sticky
+        // resize_hover keeps the resize cursor for the whole drag, even when the
+        // pointer strays off the handle. An overlay opened by keyboard while
+        // hovering leaves resize_hover stale, so overlays suppress it here too.
+        let overlay_open = self.confirm.is_some()
+            || self.message.is_some()
+            || self.fork.is_some()
+            || self.picker.is_some();
+        let resize_hover = if overlay_open
+            || !matches!(self.drag, Drag::None | Drag::Sidebar | Drag::Divider { .. })
+        {
+            None
+        } else {
+            self.resize_hover.as_ref()
+        };
+        if let Some(hover) = resize_hover {
+            let style = match hover {
+                workspace::ResizeHover::Divider { dir: Dir::Column, .. } => {
+                    CursorStyle::ResizeUpDown
+                },
+                _ => CursorStyle::ResizeLeftRight,
+            };
+            window.set_window_cursor_style(style);
+        }
+
         // While a tab/group/section is being dragged, resolve the current
         // landing zone and compute its translucent preview rect.
         // `self.cursor` is already physical px (see the mouse listeners), so
@@ -2762,6 +2804,7 @@ impl App {
             self.active,
             self.sidebar_w,
             drop_hint,
+            resize_hover,
             self.picker.as_ref(),
             self.fork.as_ref(),
             self.message.as_ref(),
@@ -3067,6 +3110,7 @@ fn main() {
                             v
                         },
                         dot_hover: None,
+                        resize_hover: None,
                     };
                     // With persistence on, reattach to the previous session's
                     // groups; otherwise launch into the empty state — no shell
