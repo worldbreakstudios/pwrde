@@ -1333,7 +1333,7 @@ impl Renderer {
         }
 
         // ── Column headers ─────────────────────────────────────────────
-        let cols = cleanup::column_offsets(area, scale);
+        let cols = cleanup::column_offsets(area, scale, &state.col_fracs);
         let col_header = cleanup::col_header_rect(area, scale);
         let right_edge = area.x + area.w - pad;
         // (x, next_x) pairs give each label its clip span.
@@ -1556,7 +1556,7 @@ impl Renderer {
         let w_px = (counts_w + longest as f32 * self.cell_width + 2.0 * pad)
             .min(area.w - 2.0 * pad);
         let h_px = n_lines as f32 * line_h + 2.0 * pad;
-        let cols = cleanup::column_offsets(area, scale);
+        let cols = cleanup::column_offsets(area, scale, &chrome.cleanup.col_fracs);
         let x = cols.dirty.min(area.x + area.w - pad - w_px).max(area.x + pad);
         // Below the row, flipping above when there is no room.
         let below = row.y + row.h + h_px <= area.y + area.h;

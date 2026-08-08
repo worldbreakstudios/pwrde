@@ -112,6 +112,8 @@ enum Drag {
     None,
     /// Resizing the sidebar.
     Sidebar,
+    /// Resizing a Cleanup-table column boundary.
+    CleanupColumn { boundary: usize },
     /// Resizing a split divider at `path`.
     Divider { path: Vec<u8> },
     /// A tab was pressed; may become a drag past the threshold.
@@ -1928,8 +1930,21 @@ impl App {
             self.settings_click(px, py);
             return;
         }
-        // Cleanup page: the content area is the cleanup card.
+        // Cleanup page: the content area is the cleanup card. A press on a
+        // column boundary starts a resize drag; anything else is a click.
         if self.page == Page::Cleanup {
+            if let Some(boundary) = cleanup::boundary_at(
+                &self.area(),
+                scale,
+                &self.cleanup.col_fracs,
+                px,
+                py,
+                GRAB * scale,
+            ) {
+                self.cleanup.hover = None;
+                self.drag = Drag::CleanupColumn { boundary };
+                return;
+            }
             self.cleanup_click(px, py);
             return;
         }
@@ -1990,6 +2005,19 @@ impl App {
                     (px / scale).clamp(workspace::SIDEBAR_MIN_W, workspace::SIDEBAR_MAX_W);
                 self.sync_layout();
                 self.request_redraw();
+            },
+            Drag::CleanupColumn { boundary } => {
+                let fracs = cleanup::drag_boundary(
+                    &self.area(),
+                    scale,
+                    &self.cleanup.col_fracs,
+                    *boundary,
+                    px,
+                );
+                if fracs != self.cleanup.col_fracs {
+                    self.cleanup.col_fracs = fracs;
+                    self.request_redraw();
+                }
             },
             Drag::Divider { path } => {
                 let path = path.clone();
@@ -2105,7 +2133,7 @@ impl App {
     fn cleanup_dirty_hover_at(&self, px: f32, py: f32) -> Option<String> {
         let area = self.area();
         let scale = self.scale();
-        let cols = cleanup::column_offsets(&area, scale);
+        let cols = cleanup::column_offsets(&area, scale, &self.cleanup.col_fracs);
         if px < cols.dirty || px >= cols.parity {
             return None;
         }
@@ -2127,6 +2155,14 @@ impl App {
     fn on_mouse_up(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let _ = (window, cx);
         match std::mem::replace(&mut self.drag, Drag::None) {
+            // Column resize released: keep the layout for future sessions.
+            Drag::CleanupColumn { .. } => {
+                settings::set(
+                    "cleanup.columns",
+                    cleanup::format_col_fracs(&self.cleanup.col_fracs).into(),
+                );
+                self.request_redraw();
+            },
             Drag::Tab { tile, tab } => {
                 let (px, py) = (self.cursor.0 as f32, self.cursor.1 as f32);
                 if let Some(target) = self.resolve_drop(px, py) {
@@ -3701,7 +3737,13 @@ fn main() {
                         },
                         dot_hover: None,
                         resize_hover: None,
-                        cleanup: cleanup::Cleanup::default(),
+                        cleanup: {
+                            let mut c = cleanup::Cleanup::default();
+                            if let Some(s) = settings::get_str("cleanup.columns") {
+                                c.col_fracs = cleanup::parse_col_fracs(&s);
+                            }
+                            c
+                        },
                     };
                     // With persistence on, reattach to the previous session's
                     // groups; otherwise launch into the empty state — no shell

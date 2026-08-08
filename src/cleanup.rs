@@ -80,8 +80,16 @@ pub enum ScanState {
     Failed(String),
 }
 
+/// Resizable column widths as fractions of the table's usable width, in
+/// order: branch, id, dirty, parity, pr. Age takes the remainder.
+pub const COL_COUNT: usize = 5;
+pub const DEFAULT_COL_FRACS: [f32; COL_COUNT] = [0.28, 0.18, 0.10, 0.14, 0.18];
+/// No column may shrink below this fraction; the age remainder keeps at
+/// least one minimum too.
+pub const MIN_COL_FRAC: f32 = 0.05;
+
 /// All mutable state for the Cleanup page.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Cleanup {
     /// Lifecycle of the background scan.
     pub scan: Option<ScanState>,
@@ -94,6 +102,21 @@ pub struct Cleanup {
     /// Worktree id whose dirty cell the cursor is over (drives the
     /// dirty-files popover).
     pub hover: Option<String>,
+    /// User-resizable column fractions (persisted under `cleanup.columns`).
+    pub col_fracs: [f32; COL_COUNT],
+}
+
+impl Default for Cleanup {
+    fn default() -> Self {
+        Cleanup {
+            scan: None,
+            selected: HashSet::new(),
+            repo_filter: None,
+            scroll: 0,
+            hover: None,
+            col_fracs: DEFAULT_COL_FRACS,
+        }
+    }
 }
 
 /// One table row: worktrees grouped under repo headers in the All view.
@@ -393,27 +416,99 @@ pub struct ColumnOffsets {
     pub age: f32,
 }
 
-/// Compute column x-offsets in physical px given the card rect and scale.
-pub fn column_offsets(card: &LayoutRect, scale: f32) -> ColumnOffsets {
+/// The x where the branch column starts (after the checkbox gutter) and the
+/// width the fraction-sized columns divide up.
+fn columns_origin(card: &LayoutRect, scale: f32) -> (f32, f32) {
     let pad = (CLEANUP_CARD_PAD * scale).round();
     let checkbox_w = (20.0 * scale).round();
-    let x = card.x + pad;
-    // Proportional column widths relative to usable width.
-    let usable = (card.w - 2.0 * pad).max(0.0);
-    // branch 28%, id 18%, dirty 10%, parity 14%, pr 18%, age 12%
-    let branch_w = (usable * 0.28).round();
-    let id_w = (usable * 0.18).round();
-    let dirty_w = (usable * 0.10).round();
-    let parity_w = (usable * 0.14).round();
-    let pr_w = (usable * 0.18).round();
-    ColumnOffsets {
-        branch: x + checkbox_w + (6.0 * scale).round(),
-        id: x + checkbox_w + (6.0 * scale).round() + branch_w,
-        dirty: x + checkbox_w + (6.0 * scale).round() + branch_w + id_w,
-        parity: x + checkbox_w + (6.0 * scale).round() + branch_w + id_w + dirty_w,
-        pr: x + checkbox_w + (6.0 * scale).round() + branch_w + id_w + dirty_w + parity_w,
-        age: x + checkbox_w + (6.0 * scale).round() + branch_w + id_w + dirty_w + parity_w + pr_w,
+    let x = card.x + pad + checkbox_w + (6.0 * scale).round();
+    let usable = (card.x + card.w - pad - x).max(0.0);
+    (x, usable)
+}
+
+/// Compute column x-offsets in physical px from the user-resizable fractions
+/// (see [`DEFAULT_COL_FRACS`]); age takes whatever the five leave over.
+pub fn column_offsets(card: &LayoutRect, scale: f32, fracs: &[f32; COL_COUNT]) -> ColumnOffsets {
+    let (x, usable) = columns_origin(card, scale);
+    let mut edges = [0.0f32; COL_COUNT];
+    let mut sum = 0.0;
+    for (i, f) in fracs.iter().enumerate() {
+        sum += f;
+        edges[i] = x + (usable * sum).round();
     }
+    ColumnOffsets {
+        branch: x,
+        id: edges[0],
+        dirty: edges[1],
+        parity: edges[2],
+        pr: edges[3],
+        age: edges[4],
+    }
+}
+
+/// The x positions of the five draggable column boundaries (the left edge of
+/// id, dirty, parity, pr, and age).
+pub fn column_boundaries(card: &LayoutRect, scale: f32, fracs: &[f32; COL_COUNT]) -> [f32; COL_COUNT] {
+    let cols = column_offsets(card, scale, fracs);
+    [cols.id, cols.dirty, cols.parity, cols.pr, cols.age]
+}
+
+/// The boundary under the cursor, if any: within `grab` px horizontally and
+/// vertically inside the table band (column headers through the footer).
+pub fn boundary_at(
+    card: &LayoutRect,
+    scale: f32,
+    fracs: &[f32; COL_COUNT],
+    px: f32,
+    py: f32,
+    grab: f32,
+) -> Option<usize> {
+    let top = col_header_rect(card, scale).y;
+    let bottom = footer_origin_y(card, scale);
+    if py < top || py > bottom {
+        return None;
+    }
+    column_boundaries(card, scale, fracs)
+        .iter()
+        .position(|x| (px - x).abs() <= grab)
+}
+
+/// New fractions with boundary `b` dragged to `px`: the column left of the
+/// boundary resizes, everything to the right shifts. Each column keeps
+/// [`MIN_COL_FRAC`], including the age remainder.
+pub fn drag_boundary(
+    card: &LayoutRect,
+    scale: f32,
+    fracs: &[f32; COL_COUNT],
+    b: usize,
+    px: f32,
+) -> [f32; COL_COUNT] {
+    let (x, usable) = columns_origin(card, scale);
+    let mut out = *fracs;
+    if usable <= 0.0 || b >= COL_COUNT {
+        return out;
+    }
+    let before: f32 = fracs[..b].iter().sum();
+    let after: f32 = fracs[b + 1..].iter().sum();
+    let target = (px - x) / usable - before;
+    // Leave room for every later column plus the age remainder.
+    let max = 1.0 - before - after - MIN_COL_FRAC;
+    out[b] = target.clamp(MIN_COL_FRAC, max.max(MIN_COL_FRAC));
+    out
+}
+
+/// Serialize fractions for the settings store ("0.28,0.18,…").
+pub fn format_col_fracs(fracs: &[f32; COL_COUNT]) -> String {
+    fracs.map(|f| format!("{f:.3}")).join(",")
+}
+
+/// Parse a stored fraction list; anything malformed falls back to defaults.
+pub fn parse_col_fracs(s: &str) -> [f32; COL_COUNT] {
+    let vals: Vec<f32> = s.split(',').filter_map(|p| p.trim().parse().ok()).collect();
+    let ok = vals.len() == COL_COUNT
+        && vals.iter().all(|f| (MIN_COL_FRAC..=1.0).contains(f))
+        && vals.iter().sum::<f32>() <= 1.0 - MIN_COL_FRAC;
+    if ok { [vals[0], vals[1], vals[2], vals[3], vals[4]] } else { DEFAULT_COL_FRACS }
 }
 
 /// The header row of the cleanup card (title + refresh button).
@@ -615,13 +710,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn make_cleanup(wts: Vec<WorktreeInfo>) -> Cleanup {
-        Cleanup {
-            scan: Some(ScanState::Ready(wts)),
-            selected: HashSet::new(),
-            repo_filter: None,
-            scroll: 0,
-            hover: None,
-        }
+        Cleanup { scan: Some(ScanState::Ready(wts)), ..Default::default() }
     }
 
     #[test]
@@ -912,6 +1001,59 @@ mod tests {
         let btn = delete_button_rect(&card, 1.0, 8.0);
         assert!(btn.x >= card.x);
         assert!(btn.x + btn.w <= card.x + card.w + 0.5);
+    }
+
+    #[test]
+    fn test_column_offsets_follow_fracs() {
+        let card = test_card();
+        let a = column_offsets(&card, 1.0, &DEFAULT_COL_FRACS);
+        let mut wider_branch = DEFAULT_COL_FRACS;
+        wider_branch[0] += 0.10;
+        let b = column_offsets(&card, 1.0, &wider_branch);
+        assert!(b.id > a.id, "wider branch pushes id right");
+        assert_eq!(a.branch, b.branch, "branch origin is fixed");
+        assert!(a.age < card.x + card.w, "age stays inside the card");
+    }
+
+    #[test]
+    fn test_boundary_at_hits_and_misses() {
+        let card = test_card();
+        let bounds = column_boundaries(&card, 1.0, &DEFAULT_COL_FRACS);
+        let y = col_header_rect(&card, 1.0).y + 5.0;
+        assert_eq!(boundary_at(&card, 1.0, &DEFAULT_COL_FRACS, bounds[0], y, 4.0), Some(0));
+        assert_eq!(boundary_at(&card, 1.0, &DEFAULT_COL_FRACS, bounds[3] + 3.0, y, 4.0), Some(3));
+        // Between boundaries: no hit. Above the table band: no hit.
+        assert_eq!(boundary_at(&card, 1.0, &DEFAULT_COL_FRACS, bounds[0] + 40.0, y, 4.0), None);
+        assert_eq!(boundary_at(&card, 1.0, &DEFAULT_COL_FRACS, bounds[0], card.y + 2.0, 4.0), None);
+    }
+
+    #[test]
+    fn test_drag_boundary_resizes_and_clamps() {
+        let card = test_card();
+        let bounds = column_boundaries(&card, 1.0, &DEFAULT_COL_FRACS);
+        // Drag the branch/id boundary 50px left: branch shrinks, others keep.
+        let fracs = drag_boundary(&card, 1.0, &DEFAULT_COL_FRACS, 0, bounds[0] - 50.0);
+        assert!(fracs[0] < DEFAULT_COL_FRACS[0]);
+        assert_eq!(fracs[1..], DEFAULT_COL_FRACS[1..]);
+        // Drag far past the left edge: clamped to the minimum.
+        let fracs = drag_boundary(&card, 1.0, &DEFAULT_COL_FRACS, 0, card.x - 100.0);
+        assert_eq!(fracs[0], MIN_COL_FRAC);
+        // Drag far right: every later column and the age remainder keep room.
+        let fracs = drag_boundary(&card, 1.0, &DEFAULT_COL_FRACS, 4, card.x + card.w + 100.0);
+        assert!(fracs.iter().sum::<f32>() <= 1.0 - MIN_COL_FRAC + 1e-4);
+    }
+
+    #[test]
+    fn test_col_fracs_roundtrip_and_rejects_garbage() {
+        let mut fracs = DEFAULT_COL_FRACS;
+        fracs[0] = 0.2;
+        fracs[4] = 0.25;
+        assert_eq!(parse_col_fracs(&format_col_fracs(&fracs)), fracs);
+        assert_eq!(parse_col_fracs(""), DEFAULT_COL_FRACS);
+        assert_eq!(parse_col_fracs("0.5,0.5"), DEFAULT_COL_FRACS);
+        // Sum leaves no room for the age column.
+        assert_eq!(parse_col_fracs("0.3,0.3,0.3,0.05,0.05"), DEFAULT_COL_FRACS);
+        assert_eq!(parse_col_fracs("a,b,c,d,e"), DEFAULT_COL_FRACS);
     }
 
     #[test]
