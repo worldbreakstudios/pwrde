@@ -2272,10 +2272,18 @@ impl Renderer {
         };
         quads.push(self.px_rect(&border, pane_divider.0, pane_divider.1 * 0.5, 0.0));
 
-        // Tab strip: highlight pill for active tab.
+        // Tab strip: highlight pill for the active tab, inset like the tile
+        // strips' pill so the bar shows around it.
         if n > 0 {
             let tr = crate::workspace::flyover_tab_rect(panel_rect, active, n, scale, maximized);
-            quads.push(self.px_rect(&tr, pane_pill.0, pane_pill.1, (5.0 * scale).round()));
+            let m = (4.0 * scale).round();
+            let pill = crate::workspace::LayoutRect {
+                x: tr.x + m,
+                y: tr.y + m,
+                w: (tr.w - 2.0 * m).max(0.0),
+                h: (tr.h - 2.0 * m).max(0.0),
+            };
+            quads.push(self.px_rect(&pill, pane_pill.0, pane_pill.1, (7.0 * scale).round()));
         }
 
         // Tab labels + per-tab × close button (mirrors the tile tab strip).
