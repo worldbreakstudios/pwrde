@@ -45,6 +45,12 @@ const CARD_RADIUS: f32 = 12.0;
 /// Corner radius of the sidebar's rounded rows, logical px.
 const ROW_RADIUS: f32 = 9.0;
 
+/// Blend `c` 40% toward white — brightens the hovered link color.
+fn brighten(c: (u8, u8, u8)) -> (u8, u8, u8) {
+    let blend = |v: u8| v.saturating_add(((255 - v) as f32 * 0.4) as u8);
+    (blend(c.0), blend(c.1), blend(c.2))
+}
+
 /// An sRGB u8 color mapped to a gpui [`Hsla`] with an explicit alpha.
 pub fn color(rgb: (u8, u8, u8), alpha: f32) -> Hsla {
     gpui::Rgba {
@@ -336,6 +342,7 @@ impl Renderer {
         sidebar_w: f32,
         drop_hint: Option<LayoutRect>,
         resize_hover: Option<&workspace::ResizeHover>,
+        link_hover: Option<(u64, usize, usize)>,
         picker: Option<&Picker>,
         fork: Option<&ForkPicker>,
         palette: Option<&Palette>,
@@ -558,11 +565,15 @@ impl Renderer {
                         && palette.is_none()
                         && message.is_none()
                         && confirm.is_none();
+                    let tile_hover = link_hover
+                        .filter(|(hid, _, _)| *hid == *id)
+                        .map(|(_, col, row)| (col, row));
                     let rows = self.snapshot_pane(
                         session,
                         &term_palette,
                         origin,
                         draw_cursor,
+                        tile_hover,
                         &mut bg_quads,
                         &mut fg_quads,
                     );
@@ -1630,6 +1641,7 @@ impl Renderer {
         palette: &ColorPalette,
         origin: (f32, f32),
         draw_cursor: bool,
+        hover: Option<(usize, usize)>,
         bg_rects: &mut Vec<Quad>,
         rects: &mut Vec<Quad>,
     ) -> Vec<Vec<TextSpan>> {
@@ -1653,10 +1665,19 @@ impl Renderer {
         // Links get the accent color + an underline quad; ⌘-click opens.
         // Detection is wrap-aware: a URL broken across rows is one link.
         let links = crate::links::links_in_lines(&lines);
+        // Resolve which URL (if any) the mouse is hovering over — covers all
+        // rows of a wrapped link so the entire anchor brightens together.
+        let hovered_url: Option<String> = hover.and_then(|(col, row)| {
+            crate::links::hovered_url(&links, row, col).map(|s| s.to_owned())
+        });
         for l in &links {
+            let is_hovered = hovered_url.as_deref() == Some(l.url.as_str());
             let span = (l.end_col - l.start_col + 1) as f32;
+            // Hovered links get a slightly thicker underline, still hugging
+            // the cell bottom.
+            let (y_off, height) = if is_hovered { (0.91, 0.09) } else { (0.92, 0.06) };
             rects.push(self.cell_rect(
-                origin, l.start_col, l.row, 0.0, 0.92, span, 0.06, th.accent, 1.0,
+                origin, l.start_col, l.row, 0.0, y_off, span, height, th.accent, 1.0,
             ));
         }
 
@@ -1692,10 +1713,12 @@ impl Renderer {
                     ));
                 }
                 let (r, g, b, _) = fg.to_srgb_u8();
-                let rgb = if links.iter().any(|l| l.contains(row, col)) {
-                    th.accent
-                } else {
-                    (r, g, b)
+                let rgb = match links.iter().find(|l| l.contains(row, col)) {
+                    Some(l) if hovered_url.as_deref() == Some(l.url.as_str()) => {
+                        brighten(th.accent)
+                    },
+                    Some(_) => th.accent,
+                    None => (r, g, b),
                 };
 
                 // Block elements and box-drawing lines are drawn as exact
