@@ -905,11 +905,13 @@ impl App {
         }
 
         // Tile tab strips of the active group.
+        let area = self.area();
         let ws = &self.workspaces[self.active];
-        let (tiles, _) = workspace::layout_tiles(&ws.root, self.area(), scale);
+        let (tiles, _) = workspace::layout_tiles(&ws.root, area, scale);
         let axes = workspace::tile_collapse_axis(&ws.root);
         for (id, rect) in &tiles {
-            let bar = workspace::tile_tab_bar(rect, scale);
+            let strip = workspace::tab_strip_rect(area, rect, scale, self.sidebar_w());
+            let bar = workspace::tile_tab_bar(&strip, scale);
             if !bar.contains(px, py) {
                 continue;
             }
@@ -919,7 +921,7 @@ impl App {
                 if n == 0 {
                     return;
                 }
-                let t0 = workspace::tile_tab_rect(rect, 0, n, scale, has_caret);
+                let t0 = workspace::tile_tab_rect(&strip, 0, n, scale, has_caret);
                 let ti = ((((px - t0.x).max(0.0)) / t0.w).floor() as usize).min(n - 1);
                 if let Some(tab) = tile.tabs.get_mut(ti)
                     && !tab.unread
@@ -1062,18 +1064,20 @@ impl App {
 
     fn resolve_drop(&self, px: f32, py: f32) -> Option<DropTarget> {
         let scale = self.scale();
+        let area = self.area();
         let ws = &self.workspaces[self.active];
-        let (tiles, _) = workspace::layout_tiles(&ws.root, self.area(), scale);
+        let (tiles, _) = workspace::layout_tiles(&ws.root, area, scale);
         let axes = workspace::tile_collapse_axis(&ws.root);
         for (id, rect) in &tiles {
             if !rect.contains(px, py) {
                 continue;
             }
-            let bar = workspace::tile_tab_bar(rect, scale);
+            let strip = workspace::tab_strip_rect(area, rect, scale, self.sidebar_w());
+            let bar = workspace::tile_tab_bar(&strip, scale);
             if bar.contains(px, py) {
                 let has_caret = axes.iter().any(|(tid, a)| tid == id && a.is_some());
                 let n = ws.root.find_tile(*id).map_or(1, |t| t.tabs.len()).max(1);
-                let t0 = workspace::tile_tab_rect(rect, 0, n, scale, has_caret);
+                let t0 = workspace::tile_tab_rect(&strip, 0, n, scale, has_caret);
                 let index = ((((px - t0.x).max(0.0)) / t0.w).floor() as usize).min(n);
                 return Some(DropTarget::TabBar { tile: *id, index });
             }
@@ -1468,11 +1472,15 @@ impl App {
             DropTarget::TabBar { tile, .. }
             | DropTarget::Center { tile }
             | DropTarget::Edge { tile, .. } => {
+                let area = self.area();
                 let wsp = &self.workspaces[self.active];
-                let (tiles, _) = workspace::layout_tiles(&wsp.root, self.area(), scale);
+                let (tiles, _) = workspace::layout_tiles(&wsp.root, area, scale);
                 let (_, rect) = tiles.into_iter().find(|(id, _)| *id == tile)?;
                 Some(match target {
-                    DropTarget::TabBar { .. } => workspace::tile_tab_bar(&rect, scale),
+                    DropTarget::TabBar { .. } => workspace::tile_tab_bar(
+                        &workspace::tab_strip_rect(area, &rect, scale, self.sidebar_w()),
+                        scale,
+                    ),
                     DropTarget::Center { .. } => workspace::tile_content(&rect, scale),
                     DropTarget::Edge { dir, first, .. } => {
                         let c = workspace::tile_content(&rect, scale);
@@ -1894,12 +1902,9 @@ impl App {
             return;
         }
 
-        // Collapsed sidebar: the reserved top safe strip (where the native
-        // traffic lights float) becomes the window-drag handle, full-width
-        // since there is no sidebar to scope it to.
-        if self.sidebar_collapsed
-            && workspace::collapsed_titlebar(w, scale).contains(px, py)
-        {
+        // Collapsed sidebar: the traffic-light corner (which the top-left
+        // tile's tab strip cedes via `tab_strip_rect`) drags the window.
+        if self.sidebar_collapsed && workspace::collapsed_drag_zone(scale).contains(px, py) {
             window.start_window_move();
             return;
         }
@@ -2054,8 +2059,9 @@ impl App {
             self.cleanup_click(px, py);
             return;
         }
+        let area = self.area();
         let ws = &self.workspaces[self.active];
-        let (tiles, _) = workspace::layout_tiles(&ws.root, self.area(), scale);
+        let (tiles, _) = workspace::layout_tiles(&ws.root, area, scale);
         let axes = workspace::tile_collapse_axis(&ws.root);
 
         // Tiles: caret/collapse handling, tab strip press (activate + arm
@@ -2064,6 +2070,7 @@ impl App {
             if !rect.contains(px, py) {
                 continue;
             }
+            let strip = workspace::tab_strip_rect(area, rect, scale, self.sidebar_w());
             let axis = axes.iter().find(|(tid, _)| tid == id).and_then(|(_, a)| *a);
             let ws = &mut self.workspaces[self.active];
             // A sideways-collapsed strip has no usable tab bar: any click
@@ -2077,7 +2084,7 @@ impl App {
                 self.request_redraw();
                 return;
             }
-            let bar = workspace::tile_tab_bar(rect, scale);
+            let bar = workspace::tile_tab_bar(&strip, scale);
             if bar.contains(px, py) {
                 let has_caret = axis.is_some();
                 if has_caret && workspace::tile_caret_rect(rect, scale).contains(px, py) {
@@ -2092,13 +2099,13 @@ impl App {
                 }
                 if let Some(tile) = ws.root.find_tile_mut(*id) {
                     let n = tile.tabs.len();
-                    let t0 = workspace::tile_tab_rect(rect, 0, n.max(1), scale, has_caret);
+                    let t0 = workspace::tile_tab_rect(&strip, 0, n.max(1), scale, has_caret);
                     let ti =
                         ((((px - t0.x).max(0.0)) / t0.w).floor() as usize).min(n.saturating_sub(1));
                     tile.active = ti;
                     ws.focused_tile = *id;
                     if n > 0
-                        && workspace::tile_tab_close_rect(rect, ti, n, scale, has_caret)
+                        && workspace::tile_tab_close_rect(&strip, ti, n, scale, has_caret)
                             .contains(px, py)
                     {
                         self.close_active_tab();

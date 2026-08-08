@@ -627,7 +627,8 @@ impl Renderer {
                 // sideways-collapsed pane is a bare strip showing only the caret.
                 let collapsing = axis.is_some() && (tile.collapsed || tile.collapse_anim > 0.0);
                 let side_strip = axis == Some(workspace::Dir::Row) && collapsing;
-                let bar = workspace::tile_tab_bar(rect, self.scale);
+                let strip = workspace::tab_strip_rect(area, rect, self.scale, sidebar_w);
+                let bar = workspace::tile_tab_bar(&strip, self.scale);
                 if !collapsing {
                     let divider =
                         LayoutRect { x: rect.x, y: bar.y + bar.h - hair, w: rect.w, h: hair };
@@ -637,7 +638,7 @@ impl Renderer {
                     // Active tab: a subtle rounded pill inside the strip (white
                     // works on every theme's dark card).
                     let tr = workspace::tile_tab_rect(
-                        rect,
+                        &strip,
                         tile.active,
                         tile.tabs.len(),
                         self.scale,
@@ -725,11 +726,12 @@ impl Renderer {
                 }
 
                 // Tab labels for this tile's tab strip.
+                let strip = workspace::tab_strip_rect(area, rect, self.scale, sidebar_w);
                 let tab_text_pad = (8.0 * self.scale).round();
                 for (ti, tab) in tile.tabs.iter().enumerate() {
-                    let tr = workspace::tile_tab_rect(rect, ti, tile.tabs.len(), self.scale, has_caret);
+                    let tr = workspace::tile_tab_rect(&strip, ti, tile.tabs.len(), self.scale, has_caret);
                     let close =
-                        workspace::tile_tab_close_rect(rect, ti, tile.tabs.len(), self.scale, has_caret);
+                        workspace::tile_tab_close_rect(&strip, ti, tile.tabs.len(), self.scale, has_caret);
                     let title = tab.session.title();
                     let text = if title.is_empty() { "shell".to_string() } else { title };
                     // Unread: an accent dot before the title, which shifts
