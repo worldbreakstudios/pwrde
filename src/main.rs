@@ -311,7 +311,7 @@ impl App {
         cwd: Option<&std::path::Path>,
     ) -> Node {
         match node {
-            persist::LayoutNode::Leaf { tile } => {
+            persist::LayoutNode::Leaf { tile, collapsed } => {
                 let tile_id = *tile as u64;
                 self.next_tile_id = self.next_tile_id.max(tile_id + 1);
                 let mut saved: Vec<&persist::SavedTab> =
@@ -327,6 +327,8 @@ impl App {
                     restored.tabs.push(tab);
                 }
                 restored.active = saved.iter().position(|st| st.active).unwrap_or(0);
+                restored.collapsed = *collapsed;
+                restored.collapse_anim = if *collapsed { 1.0 } else { 0.0 };
                 Node::Leaf(restored)
             }
             persist::LayoutNode::Split { dir, ratio, a, b } => Node::Split {
@@ -374,12 +376,19 @@ impl App {
         let area = self.area();
         let ws = &mut self.workspaces[self.active];
         let (tiles, _) = workspace::layout_tiles(&ws.root, area, scale);
+        let axes = workspace::tile_collapse_axis(&ws.root);
         for (id, rect) in &tiles {
             let content = workspace::tile_content(rect, scale);
             // `grid_size_for` subtracts 2*PANE_PAD, matching the renderer's
             // content_origin inset — so the PTY size tracks the padded render area.
             let (cols, rows) = self.renderer.grid_size_for(&content);
+            let in_split = axes.iter().any(|(tid, a)| tid == id && a.is_some());
             if let Some(tile) = ws.root.find_tile_mut(*id) {
+                // Collapsed or mid-animation panes keep their last grid so the
+                // shell isn't squished into a strip-sized PTY.
+                if in_split && (tile.collapsed || tile.collapse_anim > 0.0) {
+                    continue;
+                }
                 if let Some(tab) = tile.active_tab_mut() {
                     if force || (cols, rows) != (tab.cols, tab.rows) {
                         tab.cols = cols;
@@ -526,6 +535,27 @@ impl App {
         self.workspaces[self.active].fix_focus();
         self.sync_layout();
         self.request_redraw();
+        self.persist_snapshot();
+    }
+
+    /// Collapse or expand a pane. The animation tick in `drain_events` walks
+    /// `collapse_anim` toward the new target; the split ratio is untouched so
+    /// expanding restores the previous arrangement.
+    fn set_collapsed(&mut self, id: u64, collapsed: bool) {
+        let ws = &mut self.workspaces[self.active];
+        let Some(tile) = ws.root.find_tile_mut(id) else { return };
+        if tile.collapsed == collapsed {
+            return;
+        }
+        tile.collapsed = collapsed;
+        // Collapsing the focused pane moves focus to an expanded one so
+        // keystrokes keep landing somewhere visible.
+        if collapsed
+            && ws.focused_tile == id
+            && let Some(t) = ws.root.tiles().iter().find(|t| !t.collapsed)
+        {
+            ws.focused_tile = t.id;
+        }
         self.persist_snapshot();
     }
 
@@ -786,18 +816,20 @@ impl App {
         // Tile tab strips of the active group.
         let ws = &self.workspaces[self.active];
         let (tiles, _) = workspace::layout_tiles(&ws.root, self.area(), scale);
+        let axes = workspace::tile_collapse_axis(&ws.root);
         for (id, rect) in &tiles {
             let bar = workspace::tile_tab_bar(rect, scale);
             if !bar.contains(px, py) {
                 continue;
             }
+            let has_caret = axes.iter().any(|(tid, a)| tid == id && a.is_some());
             if let Some(tile) = self.workspaces[self.active].root.find_tile_mut(*id) {
                 let n = tile.tabs.len();
                 if n == 0 {
                     return;
                 }
-                let tab_w = workspace::tile_tab_rect(rect, 0, n, scale).w;
-                let ti = (((px - bar.x) / tab_w).floor() as usize).min(n - 1);
+                let t0 = workspace::tile_tab_rect(rect, 0, n, scale, has_caret);
+                let ti = ((((px - t0.x).max(0.0)) / t0.w).floor() as usize).min(n - 1);
                 if let Some(tab) = tile.tabs.get_mut(ti)
                     && !tab.unread
                 {
@@ -941,15 +973,17 @@ impl App {
         let scale = self.scale();
         let ws = &self.workspaces[self.active];
         let (tiles, _) = workspace::layout_tiles(&ws.root, self.area(), scale);
+        let axes = workspace::tile_collapse_axis(&ws.root);
         for (id, rect) in &tiles {
             if !rect.contains(px, py) {
                 continue;
             }
             let bar = workspace::tile_tab_bar(rect, scale);
             if bar.contains(px, py) {
+                let has_caret = axes.iter().any(|(tid, a)| tid == id && a.is_some());
                 let n = ws.root.find_tile(*id).map_or(1, |t| t.tabs.len()).max(1);
-                let tab_w = workspace::tile_tab_rect(rect, 0, n, scale).w;
-                let index = (((px - bar.x) / tab_w).floor().max(0.0) as usize).min(n);
+                let t0 = workspace::tile_tab_rect(rect, 0, n, scale, has_caret);
+                let index = ((((px - t0.x).max(0.0)) / t0.w).floor() as usize).min(n);
                 return Some(DropTarget::TabBar { tile: *id, index });
             }
             let content = workspace::tile_content(rect, scale);
@@ -1489,7 +1523,8 @@ impl App {
                 let id = self.next_tile_id;
                 self.next_tile_id += 1;
                 tab.cols = 0;
-                let new_tile = Tile { id, tabs: vec![tab], active: 0 };
+                let new_tile =
+                    Tile { id, tabs: vec![tab], active: 0, collapsed: false, collapse_anim: 0.0 };
                 let ws = &mut self.workspaces[self.active];
                 if ws.root.split_tile(tile, dir, &mut Some(new_tile), first) {
                     ws.focused_tile = id;
@@ -1876,26 +1911,52 @@ impl App {
         }
         let ws = &self.workspaces[self.active];
         let (tiles, _) = workspace::layout_tiles(&ws.root, self.area(), scale);
+        let axes = workspace::tile_collapse_axis(&ws.root);
 
-        // Tiles: tab strip press (activate + arm drag) or content focus.
+        // Tiles: caret/collapse handling, tab strip press (activate + arm
+        // drag), or content focus.
         for (id, rect) in &tiles {
             if !rect.contains(px, py) {
                 continue;
             }
+            let axis = axes.iter().find(|(tid, _)| tid == id).and_then(|(_, a)| *a);
             let ws = &mut self.workspaces[self.active];
+            // A sideways-collapsed strip has no usable tab bar: any click
+            // expands and focuses it.
+            if axis == Some(Dir::Row)
+                && ws.root.find_tile(*id).is_some_and(|t| t.collapsed)
+            {
+                self.set_collapsed(*id, false);
+                self.workspaces[self.active].focused_tile = *id;
+                self.request_redraw();
+                return;
+            }
             let bar = workspace::tile_tab_bar(rect, scale);
             if bar.contains(px, py) {
+                let has_caret = axis.is_some();
+                if has_caret && workspace::tile_caret_rect(rect, scale).contains(px, py) {
+                    let collapsed = ws.root.find_tile(*id).is_some_and(|t| t.collapsed);
+                    self.set_collapsed(*id, !collapsed);
+                    self.request_redraw();
+                    return;
+                }
                 if let Some(tile) = ws.root.find_tile_mut(*id) {
                     let n = tile.tabs.len();
-                    let tab_w = workspace::tile_tab_rect(rect, 0, n.max(1), scale).w;
-                    let ti = (((px - bar.x) / tab_w).floor() as usize).min(n.saturating_sub(1));
+                    let t0 = workspace::tile_tab_rect(rect, 0, n.max(1), scale, has_caret);
+                    let ti =
+                        ((((px - t0.x).max(0.0)) / t0.w).floor() as usize).min(n.saturating_sub(1));
                     tile.active = ti;
                     ws.focused_tile = *id;
                     if n > 0
-                        && workspace::tile_tab_close_rect(rect, ti, n, scale).contains(px, py)
+                        && workspace::tile_tab_close_rect(rect, ti, n, scale, has_caret)
+                            .contains(px, py)
                     {
                         self.close_active_tab();
                         return;
+                    }
+                    // Clicking a tab name on a collapsed pane also expands it.
+                    if tile.collapsed {
+                        self.set_collapsed(*id, false);
                     }
                     self.drag = Drag::TabPress { tile: *id, tab: ti, start: self.cursor };
                     self.sync_layout();
@@ -2681,6 +2742,27 @@ impl App {
                 redraw = true;
             }
         }
+        // Advance pane collapse/expand animations the same way. PTY grids are
+        // synced only when a pane settles so shells aren't resized mid-flight.
+        let mut collapse_settled = false;
+        for ws in &mut self.workspaces {
+            for tile in ws.root.tiles_mut() {
+                let target = if tile.collapsed { 1.0 } else { 0.0 };
+                let p = tile.collapse_anim;
+                let next =
+                    if p < target { (p + 0.15).min(target) } else { (p - 0.15).max(target) };
+                if next != p {
+                    tile.collapse_anim = next;
+                    redraw = true;
+                    if next == target {
+                        collapse_settled = true;
+                    }
+                }
+            }
+        }
+        if collapse_settled {
+            self.sync_layout();
+        }
         redraw || self.dirty
     }
 
@@ -3186,6 +3268,27 @@ impl App {
             // 3) foreground quads (box-drawing / block glyphs from rect.rs).
             for q in &frame.fg_quads {
                 paint_quad(window, origin, inv, q, shadow_rgb);
+            }
+
+            // 3.5) collapse carets. Quads can't rotate, so each chevron is a
+            // small filled gpui path: a V polyline thickened vertically, its
+            // points rotated around the caret center by the animated angle.
+            for c in &frame.carets {
+                let (sin, cos) = c.angle.sin_cos();
+                let pt = |x: f32, y: f32| Point::new(
+                    origin.x + px((c.cx + x * cos - y * sin) * inv),
+                    origin.y + px((c.cy + x * sin + y * cos) * inv),
+                );
+                let w = c.size;
+                let d = w * 0.55;
+                let t = w * 0.75;
+                let mut path = gpui::Path::new(pt(-w, -d));
+                path.line_to(pt(0.0, d));
+                path.line_to(pt(w, -d));
+                path.line_to(pt(w, -d + t));
+                path.line_to(pt(0.0, d + t));
+                path.line_to(pt(-w, -d + t));
+                window.paint_path(path, c.color);
             }
 
             // 4) labels (tab titles, sidebar text, etc.).
