@@ -3090,7 +3090,18 @@ fn dirty_file_details(worktree: &std::path::Path) -> Vec<cleanup::DirtyFile> {
             .unwrap_or_default()
     };
     let mut files = cleanup::parse_numstat(&run(&["diff", "HEAD", "--numstat"]));
-    for line in run(&["ls-files", "--others", "--exclude-standard"]).lines() {
+    // `--directory` collapses whole untracked directories to one `dir/` entry
+    // (like `git status` does) — an unignored build dir reads as one line, not
+    // thousands of files. Gitignored files are excluded outright.
+    for line in run(&[
+        "ls-files",
+        "--others",
+        "--exclude-standard",
+        "--directory",
+        "--no-empty-directory",
+    ])
+    .lines()
+    {
         let path = line.trim();
         if !path.is_empty() {
             files.push(cleanup::DirtyFile {

@@ -1534,7 +1534,7 @@ impl Renderer {
         let shown = files.len().min(MAX_FILES);
         let (added, removed) = cleanup::dirty_totals(files);
         let summary = format!(
-            "{} file{} · +{added} −{removed}",
+            "{} change{} · +{added} −{removed}",
             files.len(),
             if files.len() == 1 { "" } else { "s" },
         );
@@ -2416,7 +2416,7 @@ mod tests {
             &[ws], 0, 240.0, None, None, None, None, None, None, None, &chrome,
         );
         let texts: Vec<&str> = frame.picker_labels.iter().map(|l| l.text.as_str()).collect();
-        assert!(texts.contains(&"2 files · +12 −3"), "popover summary: {texts:?}");
+        assert!(texts.contains(&"2 changes · +12 −3"), "popover summary: {texts:?}");
         assert!(texts.contains(&"+12"));
         assert!(texts.contains(&"−3"));
         assert!(texts.contains(&"src/lib.rs"));
