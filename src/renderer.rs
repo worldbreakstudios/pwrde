@@ -609,6 +609,20 @@ impl Renderer {
                             * tile.collapse_anim.clamp(0.0, 1.0),
                         color: color(pane_ink_dim.0, pane_ink_dim.1),
                     });
+                    // While collapsed, any tab's unread dot bubbles up to a
+                    // badge on the chevron so hidden panes can still call
+                    // for attention.
+                    if tile.collapsed && tile.tabs.iter().any(|t| t.unread) {
+                        let ds = (6.0 * self.scale).round();
+                        let pad = (3.0 * self.scale).round();
+                        let dot = LayoutRect {
+                            x: cr.x + cr.w - ds - pad,
+                            y: cr.y + pad,
+                            w: ds,
+                            h: ds,
+                        };
+                        fg_quads.push(self.px_rect(&dot, th.accent, 1.0, ds / 2.0));
+                    }
                 }
                 // Collapsed (or mid-animation) panes paint no terminal
                 // content — the card is just its tab strip.

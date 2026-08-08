@@ -542,6 +542,22 @@ impl App {
         self.persist_snapshot();
     }
 
+    /// Toggle collapse on the focused pane (the ⌘⇧M action). A root leaf has
+    /// no split to collapse into, so it is left alone.
+    fn toggle_focused_collapse(&mut self) {
+        let ws = &self.workspaces[self.active];
+        let id = ws.focused_tile;
+        let in_split = workspace::tile_collapse_axis(&ws.root)
+            .iter()
+            .any(|(tid, a)| *tid == id && a.is_some());
+        if !in_split {
+            return;
+        }
+        let collapsed = ws.root.find_tile(id).is_some_and(|t| t.collapsed);
+        self.set_collapsed(id, !collapsed);
+        self.request_redraw();
+    }
+
     /// Collapse or expand a pane. The animation tick in `drain_events` walks
     /// `collapse_anim` toward the new target; the split ratio is untouched so
     /// expanding restores the previous arrangement.
@@ -561,6 +577,10 @@ impl App {
             ws.focused_tile = t.id;
         }
         self.persist_snapshot();
+        if !collapsed {
+            // Expanding puts the pane's content back on screen — mark it read.
+            self.mark_visible_read();
+        }
     }
 
     /// Close workspace `wi` entirely (all tiles and their sessions). The last
@@ -719,11 +739,13 @@ impl App {
     /// True when the session is the *visible* tab of a tile in the active
     /// workspace.
     fn is_visible(&self, id: u64) -> bool {
+        // A collapsed pane's content is hidden, so its tabs are not watched
+        // even though they sit in the active workspace.
         self.workspaces[self.active]
             .root
             .tiles()
             .iter()
-            .any(|t| t.active_tab().is_some_and(|tab| tab.session.id == id))
+            .any(|t| !t.collapsed && t.active_tab().is_some_and(|tab| tab.session.id == id))
     }
 
     /// Mark the tab owning session `id` unread. Returns true (and persists)
@@ -757,6 +779,10 @@ impl App {
         }
         let mut changed = false;
         for tile in self.workspaces[self.active].root.tiles_mut() {
+            // Collapsed panes stay unread — their content isn't on screen.
+            if tile.collapsed {
+                continue;
+            }
             if let Some(tab) = tile.active_tab_mut()
                 && tab.unread
             {
@@ -2551,6 +2577,7 @@ impl App {
             Action::FocusDown => self.focus_dir(workspace::NavDir::Down),
             Action::FocusUp => self.focus_dir(workspace::NavDir::Up),
             Action::FocusRight => self.focus_dir(workspace::NavDir::Right),
+            Action::ToggleCollapse => self.toggle_focused_collapse(),
             Action::PrevSidebarTab
             | Action::NextSidebarTab
             | Action::PrevPage
