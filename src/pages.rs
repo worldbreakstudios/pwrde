@@ -208,6 +208,7 @@ pub enum Action {
     FocusUp,
     FocusRight,
     ToggleCollapse,
+    ToggleFocusOthers,
     PrevSidebarTab,
     NextSidebarTab,
     ToggleSidebar,
@@ -219,7 +220,7 @@ pub enum Action {
 
 impl Action {
     /// Keyboard-page row order.
-    pub const ALL: [Action; 24] = [
+    pub const ALL: [Action; 25] = [
         Action::SplitRight,
         Action::SplitDown,
         Action::NewTab,
@@ -237,6 +238,7 @@ impl Action {
         Action::FocusUp,
         Action::FocusRight,
         Action::ToggleCollapse,
+        Action::ToggleFocusOthers,
         Action::PrevSidebarTab,
         Action::NextSidebarTab,
         Action::ToggleSidebar,
@@ -266,6 +268,7 @@ impl Action {
             Action::FocusUp => "focus_up",
             Action::FocusRight => "focus_right",
             Action::ToggleCollapse => "toggle_collapse",
+            Action::ToggleFocusOthers => "toggle_focus_others",
             Action::PrevSidebarTab => "prev_sidebar_tab",
             Action::NextSidebarTab => "next_sidebar_tab",
             Action::ToggleSidebar => "toggle_sidebar",
@@ -295,6 +298,7 @@ impl Action {
             Action::FocusUp => "Focus pane up",
             Action::FocusRight => "Focus pane right",
             Action::ToggleCollapse => "Collapse/expand pane",
+            Action::ToggleFocusOthers => "Collapse/expand other panes",
             Action::PrevSidebarTab => "Previous sidebar tab",
             Action::NextSidebarTab => "Next sidebar tab",
             Action::ToggleSidebar => "Toggle sidebar",
@@ -328,6 +332,7 @@ impl Action {
             Action::FocusUp => (true, "k"),
             Action::FocusRight => (true, "l"),
             Action::ToggleCollapse => (true, "m"),
+            Action::ToggleFocusOthers => (true, "f"),
             Action::PrevSidebarTab => (true, "up"),
             Action::NextSidebarTab => (true, "down"),
             Action::ToggleSidebar => (false, "s"),
@@ -643,5 +648,27 @@ mod tests {
         assert!(Binding::from_keystroke(&ks("shift", cmd)).is_none());
         let got = Binding::from_keystroke(&ks("D", cmd)).unwrap();
         assert_eq!(got.key, "d");
+    }
+
+    #[test]
+    fn toggle_focus_others_binding() {
+        let b = Action::ToggleFocusOthers.default_binding();
+        assert!(b.shift, "ToggleFocusOthers should require shift");
+        assert_eq!(b.key, "f", "ToggleFocusOthers key should be 'f'");
+    }
+
+    #[test]
+    fn all_actions_have_unique_default_bindings() {
+        let mut seen = std::collections::HashSet::new();
+        for action in &Action::ALL {
+            let b = action.default_binding();
+            let key = (b.shift, b.alt, b.ctrl, b.key.clone());
+            assert!(
+                seen.insert(key.clone()),
+                "duplicate default binding {:?} on {:?}",
+                key,
+                action,
+            );
+        }
     }
 }

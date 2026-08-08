@@ -573,6 +573,34 @@ impl App {
         self.persist_snapshot();
     }
 
+    /// Toggle collapse/expand all panes *other than* the focused one (the ⌘⇧F
+    /// action). If any other tile is expanded, collapse them all; otherwise
+    /// expand them all. A single-tile workspace is left alone.
+    fn toggle_focus_others(&mut self) {
+        let ws = &self.workspaces[self.active];
+        let focused = ws.focused_tile;
+        let mut others = Vec::new();
+        let mut any_expanded = false;
+        for t in ws.root.tiles() {
+            if t.id != focused {
+                others.push(t.id);
+                any_expanded |= !t.collapsed;
+            }
+        }
+        if others.is_empty() {
+            return;
+        }
+        for id in others {
+            self.set_collapsed(id, any_expanded);
+        }
+        // Focus mode means the focused pane is the one on screen — make sure
+        // it isn't itself collapsed when everything else folds away.
+        if any_expanded {
+            self.set_collapsed(focused, false);
+        }
+        self.request_redraw();
+    }
+
     /// Toggle collapse on the focused pane (the ⌘⇧M action). A root leaf has
     /// no split to collapse into, so it is left alone.
     fn toggle_focused_collapse(&mut self) {
@@ -2758,6 +2786,7 @@ impl App {
             Action::FocusUp => self.focus_dir(workspace::NavDir::Up),
             Action::FocusRight => self.focus_dir(workspace::NavDir::Right),
             Action::ToggleCollapse => self.toggle_focused_collapse(),
+            Action::ToggleFocusOthers => self.toggle_focus_others(),
             Action::PrevSidebarTab
             | Action::NextSidebarTab
             | Action::ToggleSidebar
