@@ -1410,6 +1410,7 @@ impl App {
             Action::NextPage => return self.cycle_page(1),
             Action::PrevSidebarTab => return self.cycle_sidebar_tab(-1),
             Action::NextSidebarTab => return self.cycle_sidebar_tab(1),
+            Action::OpenSettings => return self.set_page(Page::Settings),
             Action::Quit => std::process::exit(0),
             _ => {},
         }
@@ -1440,6 +1441,7 @@ impl App {
             | Action::NextSidebarTab
             | Action::PrevPage
             | Action::NextPage
+            | Action::OpenSettings
             | Action::Quit => {},
         }
     }
