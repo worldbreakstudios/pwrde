@@ -278,6 +278,10 @@ struct App {
     /// Link currently under the pointer: (tile id, col, row).
     /// Used to brighten the hovered link and show a pointing-hand cursor.
     link_hover: Option<(u64, usize, usize)>,
+    /// Interactive chrome rects from the most recent frame, for hover testing.
+    hot_rects: Vec<workspace::LayoutRect>,
+    /// Index into hot_rects of the currently hovered element (topmost wins).
+    ui_hover: Option<usize>,
     // ── Flyover terminal panel ─────────────────────────────────────────────
     /// Tabs held by the flyover panel (independent of the workspace tree).
     flyover_tabs: Vec<workspace::Tab>,
@@ -1396,6 +1400,11 @@ impl App {
                 self.picker = None;
                 self.spawn_flyover_tab(Some(entry.path));
             }
+        } else if entry.is_git {
+            // Step 2: choose where to fork a drop worktree from.
+            let choices = build_fork_choices(&entry.path);
+            self.fork = Some(picker::ForkPicker::new(entry.path, name, choices));
+            self.picker = None;
         } else {
             self.picker = None;
             self.add_group_or_pick_profile(name, entry.path);
@@ -3134,6 +3143,14 @@ impl App {
                     self.link_hover = link_hover;
                     self.request_redraw();
                 }
+                // UI-element hover: iterate hot rects in reverse (topmost wins).
+                let ui_hover = self.hot_rects.iter().enumerate().rev()
+                    .find(|(_, r)| r.contains(px, py))
+                    .map(|(i, _)| i);
+                if ui_hover != self.ui_hover {
+                    self.ui_hover = ui_hover;
+                    self.request_redraw();
+                }
             },
         }
     }
@@ -4712,6 +4729,24 @@ impl App {
                 .as_ref()
                 .map(|(id, buf)| (*id, buf.as_str())),
             cleanup: &self.cleanup,
+            // Overlay scoping happens in the renderer (only overlay elements
+            // hover while one is up). Here we suppress hover mid-drag, and
+            // for the chrome under an open flyover panel — clicks inside the
+            // panel never fall through, so hover mustn't either. Modal
+            // overlays sit above the flyover, so they keep the live cursor.
+            cursor: {
+                let (cx, cy) = (self.cursor.0 as f32, self.cursor.1 as f32);
+                let flyover_covers = !overlay_open
+                    && self.flyover_open
+                    && !self.flyover_windowed
+                    && !self.flyover_tabs.is_empty()
+                    && self.flyover_rect_now().contains(cx, cy);
+                if matches!(self.drag, Drag::None) && !flyover_covers {
+                    Some((cx, cy))
+                } else {
+                    None
+                }
+            },
         };
         let link_hover_suppressed = if overlay_open
             || !matches!(self.drag, Drag::None)
@@ -4755,6 +4790,12 @@ impl App {
         // In windowed mode the popout window renders it instead.
         if self.flyover_anim > 0.0 && !self.flyover_windowed {
             let panel = self.flyover_rect_now();
+            let flyover_cursor = if overlay_open || !matches!(self.drag, Drag::None) {
+                None
+            } else {
+                Some((self.cursor.0 as f32, self.cursor.1 as f32))
+            };
+            let mut flyover_hot = Vec::new();
             let (quads, panes, fg_quads, labels) = self.renderer.flyover_overlay(
                 &self.flyover_tabs,
                 self.flyover_active,
@@ -4763,11 +4804,40 @@ impl App {
                 !overlay_open,
                 true,
                 self.flyover_maximized,
+                flyover_cursor,
+                &mut flyover_hot,
             );
             frame.flyover_quads = quads;
             frame.flyover_panes = panes;
             frame.flyover_fg_quads = fg_quads;
             frame.flyover_labels = labels;
+            // The panel paints above the chrome, so its controls append last
+            // (topmost) — but never over a modal overlay, which owns the frame.
+            if !overlay_open {
+                frame.hot.extend(flyover_hot);
+            }
+        }
+        // The frame's hot list is the authority on what's clickable this
+        // paint. Recompute the hover index from it right away (rather than
+        // trusting the value on_mouse_move derived from the previous frame)
+        // so a keyboard-opened overlay or layout change can't leave a stale
+        // pointing hand; on_mouse_move only change-detects to trigger redraws.
+        self.hot_rects = frame.hot.clone();
+        self.ui_hover = if matches!(self.drag, Drag::None) {
+            let (cx, cy) = (self.cursor.0 as f32, self.cursor.1 as f32);
+            self.hot_rects
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, r)| r.contains(cx, cy))
+                .map(|(i, _)| i)
+        } else {
+            None
+        };
+        // Show pointing-hand cursor when hovering any interactive chrome
+        // element (links and resize handles keep priority).
+        if resize_hover.is_none() && link_hover_suppressed.is_none() && self.ui_hover.is_some() {
+            window.set_window_cursor_style(CursorStyle::PointingHand);
         }
 
         let origin = bounds.origin;
@@ -5136,6 +5206,11 @@ struct FlyoverPopout {
     selecting: bool,
     /// Sub-notch wheel travel, as in `App::scroll_accum`.
     scroll_accum: f64,
+    /// Interactive rects from the last paint (tab strip controls), mirroring
+    /// `App::hot_rects` so hover repaints and the pointing hand work here too.
+    hot_rects: Vec<workspace::LayoutRect>,
+    /// Index into `hot_rects` of the hovered control (topmost wins).
+    ui_hover: Option<usize>,
 }
 
 impl FlyoverPopout {
@@ -5181,11 +5256,24 @@ impl FlyoverPopout {
     }
 
     fn on_mouse_move(&mut self, cx: &mut Context<Self>) {
-        if !self.selecting {
-            return;
-        }
         let scale = self.renderer.scale;
         let (mx, my) = (self.cursor.0 as f32, self.cursor.1 as f32);
+        if !self.selecting {
+            // Control hover: repaint only when the hovered control changes
+            // (mirrors `App::on_mouse_move`'s change detection).
+            let ui_hover = self
+                .hot_rects
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, r)| r.contains(mx, my))
+                .map(|(i, _)| i);
+            if ui_hover != self.ui_hover {
+                self.ui_hover = ui_hover;
+                cx.notify();
+            }
+            return;
+        }
         let panel = self.panel_rect();
         let content = workspace::flyover_content(&panel, scale);
         if let Some((col, row)) = self.renderer.cell_at(&content, mx, my) {
@@ -5251,6 +5339,12 @@ impl FlyoverPopout {
         let focused = window.is_window_active();
 
         let renderer = &self.renderer;
+        let popout_cursor = if self.selecting {
+            None
+        } else {
+            Some((self.cursor.0 as f32, self.cursor.1 as f32))
+        };
+        let mut hot = Vec::new();
         let (quads, panes, fg_quads, labels) = self.app.update(cx, |app, _| {
             // The popout owns these grids while windowed: keep the PTYs sized
             // to this window, not the main panel.
@@ -5261,8 +5355,30 @@ impl FlyoverPopout {
                     tab.session.resize(cols, rows, cw, ch, dpi);
                 }
             }
-            renderer.flyover_overlay(&app.flyover_tabs, app.flyover_active, &panel, focused, true, false, false)
+            renderer.flyover_overlay(
+                &app.flyover_tabs,
+                app.flyover_active,
+                &panel,
+                focused,
+                true,
+                false,
+                false,
+                popout_cursor,
+                &mut hot,
+            )
         });
+        self.hot_rects = hot;
+        self.ui_hover = popout_cursor.and_then(|(mx, my)| {
+            self.hot_rects
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, r)| r.contains(mx, my))
+                .map(|(i, _)| i)
+        });
+        if self.ui_hover.is_some() {
+            window.set_window_cursor_style(CursorStyle::PointingHand);
+        }
 
         let origin = bounds.origin;
         let inv = 1.0 / scale;
@@ -5472,6 +5588,8 @@ fn open_flyover_window(app: gpui::Entity<App>, cx: &mut GpuiApp) {
                 focus_handle: cx.focus_handle(),
                 cursor: (0.0, 0.0),
                 selecting: false,
+                hot_rects: Vec::new(),
+                ui_hover: None,
                 scroll_accum: 0.0,
             })
         },
@@ -5599,6 +5717,8 @@ fn main() {
                             c
                         },
                         link_hover: None,
+                        hot_rects: Vec::new(),
+                        ui_hover: None,
                         flyover_tabs: Vec::new(),
                         flyover_active: 0,
                         flyover_open: false,

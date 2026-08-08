@@ -66,6 +66,13 @@ fn brighten(c: (u8, u8, u8)) -> (u8, u8, u8) {
     (blend(c.0), blend(c.1), blend(c.2))
 }
 
+/// True when the frame's cursor (if any) sits inside `r` — the single gate
+/// every hover treatment shares, so a rect only highlights when `main.rs`
+/// would route a click to it (both sides use the same layout math).
+fn hover(cursor: Option<(f32, f32)>, r: &LayoutRect) -> bool {
+    cursor.is_some_and(|(x, y)| r.contains(x, y))
+}
+
 /// An sRGB u8 color mapped to a gpui [`Hsla`] with an explicit alpha.
 pub fn color(rgb: (u8, u8, u8), alpha: f32) -> Hsla {
     gpui::Rgba {
@@ -78,7 +85,7 @@ pub fn color(rgb: (u8, u8, u8), alpha: f32) -> Hsla {
 }
 
 /// Drop-shadow styles a quad can carry (painted under it by `main.rs`).
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Shadow {
     None,
     /// The big soft shadow under a floating tile card.
@@ -243,6 +250,9 @@ pub struct ChromeState<'a> {
     pub editing_section: Option<(u64, &'a str)>,
     /// Cleanup page state (worktree table, selection, filter, scroll).
     pub cleanup: &'a crate::cleanup::Cleanup,
+    /// Physical-pixel cursor position for hover painting. `None` while any
+    /// drag is active so hover highlights are suppressed mid-drag.
+    pub cursor: Option<(f32, f32)>,
 }
 
 /// Everything `main.rs`'s terminal `Element` needs to paint one frame — all
@@ -272,6 +282,11 @@ pub struct Frame {
     pub picker_labels: Vec<LabelSpec>,
     /// Collapse carets, painted as rotated chevron paths over the chrome.
     pub carets: Vec<CaretSpec>,
+    /// Every interactive rect drawn this frame, in draw order (topmost last).
+    /// Used by main.rs to compute ui_hover by reverse-iterating. Resize handles
+    /// are excluded — they have their own hover/cursor logic. When a modal
+    /// overlay is open, only overlay rects appear here.
+    pub hot: Vec<LayoutRect>,
 }
 
 /// Stateless renderer: owns only cell metrics and scale. All measurements
@@ -482,6 +497,18 @@ impl Renderer {
         let mut labels: Vec<LabelSpec> = Vec::new();
         let mut panes: Vec<PaneText> = Vec::new();
         let mut carets: Vec<CaretSpec> = Vec::new();
+        let mut hot: Vec<LayoutRect> = Vec::new();
+        // Overlays are modal: while one is up only its elements hover or
+        // register as hot; the chrome underneath goes inert (mirroring the
+        // click routing in `main.rs`, which sends every click to the overlay).
+        let overlay_open = confirm.is_some()
+            || message.is_some()
+            || save.is_some()
+            || profile.is_some()
+            || fork.is_some()
+            || picker.is_some()
+            || palette.is_some();
+        let cur = if overlay_open { None } else { chrome.cursor };
         // Which axis each tile would collapse along (its parent split's dir);
         // `None` = root leaf, which shows no caret and cannot collapse.
         let collapse_axis_map: std::collections::HashMap<u64, Option<workspace::Dir>> =
@@ -502,7 +529,12 @@ impl Renderer {
                 if !collapsed {
                     // Side-by-side "+ group" / "+ section" buttons below the titlebar.
                     let new_group = workspace::new_group_button(self.scale, sidebar_w);
-                    bg_quads.push(self.px_rect(&new_group, th.card, 0.55, row_r));
+                    let hov = hover(cur, &new_group);
+                    bg_quads.push(
+                        self.px_rect(&new_group, th.card, if hov { 0.85 } else { 0.55 }, row_r)
+                            .shadow(if hov { Shadow::Soft } else { Shadow::None }),
+                    );
+                    hot.push(new_group);
                     labels.push(LabelSpec {
                         text: "+ group".into(),
                         color: color(th.ink_dim, 1.0),
@@ -512,7 +544,12 @@ impl Renderer {
                         size: None,
                     });
                     let new_section = workspace::new_section_button(self.scale, sidebar_w);
-                    bg_quads.push(self.px_rect(&new_section, th.card, 0.55, row_r));
+                    let hov = hover(cur, &new_section);
+                    bg_quads.push(
+                        self.px_rect(&new_section, th.card, if hov { 0.85 } else { 0.55 }, row_r)
+                            .shadow(if hov { Shadow::Soft } else { Shadow::None }),
+                    );
+                    hot.push(new_section);
                     labels.push(LabelSpec {
                         text: "+ section".into(),
                         color: color(th.ink_dim, 1.0),
@@ -527,7 +564,12 @@ impl Renderer {
                     // Empty sections (if any) still render below the buttons.
                     let cta = workspace::empty_state_cta(width, height, self.scale, sidebar_w);
                     let hint = workspace::empty_state_hint(width, height, self.scale, sidebar_w);
-                    bg_quads.push(self.px_rect(&cta, th.card, 0.62, row_r).shadow(Shadow::Soft));
+                    let hov = hover(cur, &cta);
+                    bg_quads.push(
+                        self.px_rect(&cta, th.card, if hov { 0.85 } else { 0.62 }, row_r)
+                            .shadow(Shadow::Soft),
+                    );
+                    hot.push(cta);
                     let cta_text = "New group";
                     let cta_w = cta_text.chars().count() as f32 * self.cell_width;
                     labels.push(LabelSpec {
@@ -560,8 +602,10 @@ impl Renderer {
                         th,
                         row_r,
                         group_pad,
+                        cur,
                         &mut bg_quads,
                         &mut labels,
+                        &mut hot,
                     );
                 }
             },
@@ -574,7 +618,13 @@ impl Renderer {
                     let active_row = *section == chrome.section;
                     if active_row {
                         bg_quads.push(self.px_rect(&tab, th.card, 0.78, row_r).shadow(Shadow::Soft));
+                    } else if hover(cur, &tab) {
+                        // Hovered inactive tab: the active pill at a fraction
+                        // of its strength, shadowless so it reads as "would
+                        // select", not "selected".
+                        bg_quads.push(self.px_rect(&tab, th.card, 0.40, row_r));
                     }
+                    hot.push(tab);
                     labels.push(LabelSpec {
                         text: section.label().into(),
                         color: color(if active_row { th.ink } else { th.ink_dim }, 1.0),
@@ -603,7 +653,10 @@ impl Renderer {
                     let tab = workspace::tab_rect(i, self.scale, sidebar_w);
                     if *active_row {
                         bg_quads.push(self.px_rect(&tab, th.card, 0.78, row_r).shadow(Shadow::Soft));
+                    } else if hover(cur, &tab) {
+                        bg_quads.push(self.px_rect(&tab, th.card, 0.40, row_r));
                     }
+                    hot.push(tab);
                     labels.push(LabelSpec {
                         text: label.clone(),
                         color: color(if *active_row { th.ink } else { th.ink_dim }, 1.0),
@@ -623,6 +676,9 @@ impl Renderer {
             let n_pages = Page::ALL.len();
             for (i, page) in Page::ALL.iter().enumerate() {
                 let slot = workspace::page_slot_rect(i, n_pages, height, self.scale, sidebar_w);
+                // The dot→glyph crossfade is the hover treatment here; hot
+                // registration just adds the pointing hand.
+                hot.push(slot);
                 let p = chrome.dot_anim.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
                 if p < 1.0 {
                     let d = (5.0 * self.scale).round().max(2.0);
@@ -658,7 +714,7 @@ impl Renderer {
             // Settings overlay (settings_ui.rs); nothing painted here. ──
         } else if chrome.page == Page::Cleanup {
             // ── Cleanup page: the worktree table card ──
-            self.cleanup_page(&area, chrome, &mut bg_quads, &mut labels);
+            self.cleanup_page(&area, chrome, cur, &mut bg_quads, &mut labels, &mut hot);
         } else {
             let hair = (1.0 * self.scale).round().max(1.0);
             for (id, rect) in &tiles {
@@ -696,6 +752,13 @@ impl Renderer {
                         h: (tr.h - 2.0 * m).max(0.0),
                     };
                     bg_quads.push(self.px_rect(&pill, pane_pill.0, pane_pill.1, (7.0 * self.scale).round()));
+                } else {
+                    // A sideways-collapsed strip is one big "expand" target:
+                    // any click reopens it, so the whole bare card hovers.
+                    if hover(cur, rect) {
+                        bg_quads.push(self.px_rect(rect, pane_pill.0, pane_pill.1 * 0.6, card_r));
+                    }
+                    hot.push(*rect);
                 }
             }
 
@@ -711,14 +774,24 @@ impl Renderer {
                 // (collapsed) with the pane's animation progress.
                 if has_caret {
                     let cr = workspace::tile_caret_rect(rect, self.scale);
+                    // Hovered caret brightens to full ink; a side strip is one
+                    // whole-card target, so the caret isn't hot on its own.
+                    let caret_hov = !side_strip && hover(cur, &cr);
                     carets.push(CaretSpec {
                         cx: cr.x + cr.w / 2.0,
                         cy: cr.y + cr.h / 2.0,
                         size: (4.5 * self.scale).round(),
                         angle: -std::f32::consts::FRAC_PI_2
                             * tile.collapse_anim.clamp(0.0, 1.0),
-                        color: color(pane_ink_dim.0, pane_ink_dim.1),
+                        color: if caret_hov {
+                            color(pane_ink.0, pane_ink.1)
+                        } else {
+                            color(pane_ink_dim.0, pane_ink_dim.1)
+                        },
                     });
+                    if !side_strip {
+                        hot.push(cr);
+                    }
                     // While collapsed, any tab's unread dot bubbles up to a
                     // badge on the chevron so hidden panes can still call
                     // for attention.
@@ -776,6 +849,45 @@ impl Renderer {
                     let tr = workspace::tile_tab_rect(&strip, ti, tile.tabs.len(), self.scale, has_caret);
                     let close =
                         workspace::tile_tab_close_rect(&strip, ti, tile.tabs.len(), self.scale, has_caret);
+                    let close_hov = hover(cur, &close);
+                    if ti != tile.active && hover(cur, &tr) && !close_hov {
+                        // Hovered inactive tab: the active pill's geometry at
+                        // about half strength, so it previews without claiming
+                        // to be selected.
+                        let m = (4.0 * self.scale).round();
+                        let pill = LayoutRect {
+                            x: tr.x + m,
+                            y: tr.y + m,
+                            w: (tr.w - 2.0 * m).max(0.0),
+                            h: (tr.h - 2.0 * m).max(0.0),
+                        };
+                        bg_quads.push(self.px_rect(
+                            &pill,
+                            pane_pill.0,
+                            pane_pill.1 * 0.55,
+                            (7.0 * self.scale).round(),
+                        ));
+                    }
+                    if close_hov {
+                        // Browser-tab style: a small rounded chip behind the ×.
+                        let inset = (3.0 * self.scale).round();
+                        let chip = LayoutRect {
+                            x: close.x + inset,
+                            y: close.y + inset,
+                            w: (close.w - 2.0 * inset).max(0.0),
+                            h: (close.h - 2.0 * inset).max(0.0),
+                        };
+                        bg_quads.push(self.px_rect(
+                            &chip,
+                            pane_pill.0,
+                            (pane_pill.1 * 2.0).min(1.0),
+                            (4.0 * self.scale).round(),
+                        ));
+                    }
+                    // The close rect is hot after its tab so reverse iteration
+                    // (topmost wins) resolves × over the tab it sits in.
+                    hot.push(tr);
+                    hot.push(close);
                     let title = tab.session.title();
                     let text = if title.is_empty() { "shell".to_string() } else { title };
                     // Unread: an accent dot before the title, which shifts
@@ -809,7 +921,11 @@ impl Renderer {
                     });
                     labels.push(LabelSpec {
                         text: "×".to_string(),
-                        color: color(pane_ink_dim.0, pane_ink_dim.1),
+                        color: if close_hov {
+                            color(pane_ink.0, pane_ink.1)
+                        } else {
+                            color(pane_ink_dim.0, pane_ink_dim.1)
+                        },
                         left: close.x + ((close.w - self.cell_width) / 2.0).round(),
                         top: (tr.y + (tr.h - self.cell_height) / 2.0).round(),
                         clip: tr,
@@ -885,26 +1001,36 @@ impl Renderer {
         }
 
         // ── Picker overlay (over everything) ───────────────────────────
+        // A modal overlay owns the frame's interactivity: the chrome hot
+        // rects collected above go inert, and only overlay elements register.
+        if overlay_open {
+            hot.clear();
+        }
         let mut picker_quads: Vec<Quad> = Vec::new();
         let mut picker_labels: Vec<LabelSpec> = Vec::new();
         if let Some((text, accept)) = confirm {
-            picker_labels = self.confirm_overlay(text, accept, &mut picker_quads);
+            picker_labels =
+                self.confirm_overlay(text, accept, chrome.cursor, &mut picker_quads, &mut hot);
         } else if let Some(s) = save {
             let layout = self.save_layout(s.dest.map_or(0, |(rows, _)| rows.len()));
-            picker_labels = self.save_overlay(s, &layout, &mut picker_quads);
+            picker_labels =
+                self.save_overlay(s, &layout, chrome.cursor, &mut picker_quads, &mut hot);
         } else if let Some(pp) = profile {
             let layout =
                 PickerLayout::compute(width, height, self.scale, pp.rows.len(), pp.selected);
-            picker_labels = self.profile_overlay(pp, &layout, &mut picker_quads);
+            picker_labels =
+                self.profile_overlay(pp, &layout, chrome.cursor, &mut picker_quads, &mut hot);
         } else if let Some(p) = picker {
             let layout = PickerLayout::compute(width, height, self.scale, p.rows.len(), p.selected);
-            picker_labels = self.picker_overlay(p, &layout, &mut picker_quads);
+            picker_labels =
+                self.picker_overlay(p, &layout, chrome.cursor, &mut picker_quads, &mut hot);
         } else if let Some(f) = fork {
-            picker_labels = self.fork_overlay(f, &mut picker_quads);
+            picker_labels = self.fork_overlay(f, chrome.cursor, &mut picker_quads, &mut hot);
         } else if let Some(pal) = palette {
             let layout =
                 PickerLayout::compute(width, height, self.scale, pal.rows.len(), pal.selected);
-            picker_labels = self.palette_overlay(pal, &layout, &mut picker_quads);
+            picker_labels =
+                self.palette_overlay(pal, &layout, chrome.cursor, &mut picker_quads, &mut hot);
         } else if let Some((text, _)) = message {
             picker_labels = self.message_overlay(text, &mut picker_quads);
         } else if chrome.page == Page::Cleanup {
@@ -925,6 +1051,7 @@ impl Renderer {
             picker_quads,
             picker_labels,
             carets,
+            hot,
         }
     }
 
@@ -940,8 +1067,10 @@ impl Renderer {
         th: &Theme,
         row_r: f32,
         group_pad: f32,
+        cur: Option<(f32, f32)>,
         bg_quads: &mut Vec<Quad>,
         labels: &mut Vec<LabelSpec>,
+        hot: &mut Vec<LayoutRect>,
     ) {
         let rows = workspace::sidebar_rows(workspaces, chrome.sections);
         let active_row = workspace::active_row_index(&rows, workspaces, chrome.sections, active);
@@ -957,14 +1086,17 @@ impl Renderer {
                     let Some(sec) = chrome.sections.get(section_idx) else {
                         continue;
                     };
-                    if is_active_row {
-                        bg_quads
-                            .push(self.px_rect(&rect, th.card, 0.78, row_r).shadow(Shadow::Soft));
-                    }
                     let editing = chrome
                         .editing_section
                         .filter(|(id, _)| *id == sec.id)
                         .map(|(_, buf)| buf);
+                    if is_active_row {
+                        bg_quads
+                            .push(self.px_rect(&rect, th.card, 0.78, row_r).shadow(Shadow::Soft));
+                    } else if editing.is_none() && hover(cur, &rect) {
+                        bg_quads.push(self.px_rect(&rect, th.card, 0.40, row_r));
+                    }
+                    hot.push(rect);
                     if let Some(buf) = editing {
                         bg_quads.push(self.px_rect(&rect, th.accent, 0.18, row_r));
                         let caret_w = (2.0 * self.scale).round().max(1.0);
@@ -1027,7 +1159,10 @@ impl Renderer {
                     if is_active_row {
                         bg_quads
                             .push(self.px_rect(&rect, th.card, 0.78, row_r).shadow(Shadow::Soft));
+                    } else if hover(cur, &rect) {
+                        bg_quads.push(self.px_rect(&rect, th.card, 0.40, row_r));
                     }
+                    hot.push(rect);
                     let clip_w = rect.w - group_pad;
                     let inset =
                         ((rect.h - (self.cell_height + cwd_line_h)) / 2.0).max(0.0);
@@ -1076,8 +1211,10 @@ impl Renderer {
         &self,
         area: &LayoutRect,
         chrome: &ChromeState,
+        cur: Option<(f32, f32)>,
         bg_quads: &mut Vec<Quad>,
         labels: &mut Vec<LabelSpec>,
+        hot: &mut Vec<LayoutRect>,
     ) {
         use crate::cleanup::{self, Row, ScanState};
 
@@ -1119,7 +1256,12 @@ impl Renderer {
             });
         }
         let refresh = cleanup::refresh_button_rect(area, scale, self.cell_width);
-        bg_quads.push(self.px_rect(&refresh, th.ink, 0.07, refresh.h / 2.0));
+        let refresh_hov = hover(cur, &refresh);
+        bg_quads.push(
+            self.px_rect(&refresh, th.ink, if refresh_hov { 0.13 } else { 0.07 }, refresh.h / 2.0)
+                .shadow(if refresh_hov { Shadow::Soft } else { Shadow::None }),
+        );
+        hot.push(refresh);
         let refresh_text = "Refresh";
         let rw = refresh_text.chars().count() as f32 * self.cell_width;
         labels.push(LabelSpec {
@@ -1193,6 +1335,19 @@ impl Renderer {
         for vi in 0..fit {
             let Some(table_row) = rows.get(state.scroll + vi) else { break };
             let Some(row) = cleanup::row_rect(area, vi, scale) else { break };
+            // Both row kinds are click targets — entries toggle selection,
+            // repo headers filter to their repo — except the current
+            // worktree, which `toggle` refuses to select.
+            let clickable = match table_row {
+                Row::Header { .. } => true,
+                Row::Entry(w) => !w.is_current,
+            };
+            if clickable {
+                if hover(cur, &row) {
+                    bg_quads.push(self.px_rect(&row, th.ink, 0.05, (7.0 * scale).round()));
+                }
+                hot.push(row);
+            }
             let w = match table_row {
                 Row::Header { display, count, .. } => {
                     labels.push(LabelSpec {
@@ -1313,12 +1468,27 @@ impl Renderer {
         });
         let n = state.selected.len();
         let enabled = n > 0;
-        bg_quads.push(self.px_rect(
-            &delete,
-            if enabled { th.accent } else { th.ink },
-            if enabled { 0.9 } else { 0.06 },
-            (7.0 * scale).round(),
-        ));
+        // A disabled Delete neither hovers nor registers hot — clicking it
+        // does nothing, so the cursor shouldn't promise otherwise.
+        let delete_hov = enabled && hover(cur, &delete);
+        bg_quads.push(
+            self.px_rect(
+                &delete,
+                if enabled { th.accent } else { th.ink },
+                if delete_hov {
+                    1.0
+                } else if enabled {
+                    0.9
+                } else {
+                    0.06
+                },
+                (7.0 * scale).round(),
+            )
+            .shadow(if delete_hov { Shadow::Soft } else { Shadow::None }),
+        );
+        if enabled {
+            hot.push(delete);
+        }
         let btn_text = format!("Delete {n} selected");
         let bw = btn_text.chars().count() as f32 * self.cell_width;
         labels.push(LabelSpec {
@@ -1448,7 +1618,9 @@ impl Renderer {
         &self,
         picker: &Picker,
         layout: &PickerLayout,
+        cursor: Option<(f32, f32)>,
         rects: &mut Vec<Quad>,
+        hot: &mut Vec<LayoutRect>,
     ) -> Vec<LabelSpec> {
         let th = self.theme();
         let scale = self.scale;
@@ -1508,13 +1680,17 @@ impl Renderer {
                     size: None,
                 }),
                 PickerRow::Entry(entry) => {
+                    let m = (6.0 * scale).round();
+                    let pill = LayoutRect { x: row.x + m, w: (row.w - 2.0 * m).max(0.0), ..row };
                     if i == picker.selected {
                         // Accent-tinted rounded pill, inset from the panel edges.
-                        let m = (6.0 * scale).round();
-                        let pill =
-                            LayoutRect { x: row.x + m, w: (row.w - 2.0 * m).max(0.0), ..row };
                         rects.push(self.px_rect(&pill, th.accent, 0.10, (7.0 * scale).round()));
+                    } else if hover(cursor, &row) {
+                        // Hovered row: the selection pill's shape in plain ink,
+                        // dimmer, so it never reads as the keyboard selection.
+                        rects.push(self.px_rect(&pill, th.ink, 0.06, (7.0 * scale).round()));
                     }
+                    hot.push(row);
                     // Label, clipped short of the glyph gutter on the right.
                     let label_bounds =
                         LayoutRect { w: (row.w - 2.0 * layout.row_h).max(0.0), ..row };
@@ -1562,7 +1738,9 @@ impl Renderer {
         &self,
         palette: &Palette,
         layout: &PickerLayout,
+        cursor: Option<(f32, f32)>,
         rects: &mut Vec<Quad>,
+        hot: &mut Vec<LayoutRect>,
     ) -> Vec<LabelSpec> {
         let th = self.theme();
         let scale = self.scale;
@@ -1608,12 +1786,15 @@ impl Renderer {
                 continue;
             };
             let top = (row.y + (row.h - self.cell_height) / 2.0).round();
+            let m = (6.0 * scale).round();
+            let pill = LayoutRect { x: row.x + m, w: (row.w - 2.0 * m).max(0.0), ..row };
             if i == palette.selected {
                 // Accent-tinted rounded pill, inset from the panel edges.
-                let m = (6.0 * scale).round();
-                let pill = LayoutRect { x: row.x + m, w: (row.w - 2.0 * m).max(0.0), ..row };
                 rects.push(self.px_rect(&pill, th.accent, 0.10, (7.0 * scale).round()));
+            } else if hover(cursor, &row) {
+                rects.push(self.px_rect(&pill, th.ink, 0.06, (7.0 * scale).round()));
             }
+            hot.push(row);
             // Current binding, right-aligned; the label clips short of it.
             let binding = action.binding().display();
             let binding_w = binding.chars().count() as f32 * self.cell_width;
@@ -1641,7 +1822,13 @@ impl Renderer {
     /// Step-2 fork-source overlay: a centered, filterable list of the branch /
     /// worktree choices for the group being forked. Styled like the dir picker.
     /// TODO(gpui-port): per-scope tag colors and scroll-to-selection.
-    fn fork_overlay(&self, fork: &ForkPicker, rects: &mut Vec<Quad>) -> Vec<LabelSpec> {
+    fn fork_overlay(
+        &self,
+        fork: &ForkPicker,
+        cursor: Option<(f32, f32)>,
+        rects: &mut Vec<Quad>,
+        hot: &mut Vec<LayoutRect>,
+    ) -> Vec<LabelSpec> {
         let th = self.theme();
         let scale = self.scale;
         let pad = (12.0 * scale).round();
@@ -1708,12 +1895,15 @@ impl Renderer {
         for (i, entry) in fork.rows.iter().take(visible).enumerate() {
             let row = LayoutRect { x: panel_x, y: rows_top + row_h * i as f32, w: panel_w, h: row_h };
             let top = (row.y + (row.h - self.cell_height) / 2.0).round();
+            let m = (6.0 * scale).round();
+            let pill = LayoutRect { x: row.x + m, w: (row.w - 2.0 * m).max(0.0), ..row };
             if i == fork.selected {
                 // Accent-tinted rounded pill, inset from the panel edges.
-                let m = (6.0 * scale).round();
-                let pill = LayoutRect { x: row.x + m, w: (row.w - 2.0 * m).max(0.0), ..row };
                 rects.push(self.px_rect(&pill, th.accent, 0.10, (7.0 * scale).round()));
+            } else if hover(cursor, &row) {
+                rects.push(self.px_rect(&pill, th.ink, 0.06, (7.0 * scale).round()));
             }
+            hot.push(row);
             labels.push(LabelSpec {
                 text: entry.label.clone(),
                 color: color(th.ink, 1.0),
@@ -1735,7 +1925,9 @@ impl Renderer {
         &self,
         profile: &ProfilePicker,
         layout: &PickerLayout,
+        cursor: Option<(f32, f32)>,
         rects: &mut Vec<Quad>,
+        hot: &mut Vec<LayoutRect>,
     ) -> Vec<LabelSpec> {
         let th = self.theme();
         let scale = self.scale;
@@ -1782,11 +1974,14 @@ impl Renderer {
                 continue;
             };
             let top = (row.y + (row.h - self.cell_height) / 2.0).round();
+            let m = (6.0 * scale).round();
+            let pill = LayoutRect { x: row.x + m, w: (row.w - 2.0 * m).max(0.0), ..row };
             if i == profile.selected {
-                let m = (6.0 * scale).round();
-                let pill = LayoutRect { x: row.x + m, w: (row.w - 2.0 * m).max(0.0), ..row };
                 rects.push(self.px_rect(&pill, th.accent, 0.10, (7.0 * scale).round()));
+            } else if hover(cursor, &row) {
+                rects.push(self.px_rect(&pill, th.ink, 0.06, (7.0 * scale).round()));
             }
+            hot.push(row);
             // The name has priority: the detail only gets the width left over
             // after it (a long description truncates with an ellipsis rather
             // than pushing the name out of the row).
@@ -1858,7 +2053,9 @@ impl Renderer {
         &self,
         view: &SaveModalView,
         layout: &SaveLayout,
+        cursor: Option<(f32, f32)>,
         rects: &mut Vec<Quad>,
+        hot: &mut Vec<LayoutRect>,
     ) -> Vec<LabelSpec> {
         let th = self.theme();
         let scale = self.scale;
@@ -1901,7 +2098,15 @@ impl Renderer {
                 size: None,
             });
             let focused = editing_fields && view.field == i;
-            rects.push(self.px_rect(rect, th.ink, if focused { 0.10 } else { 0.06 }, (7.0 * scale).round()));
+            // Hover matches the focused tint — clicking would focus the field.
+            let hov = hover(cursor, rect);
+            rects.push(self.px_rect(
+                rect,
+                th.ink,
+                if focused || hov { 0.10 } else { 0.06 },
+                (7.0 * scale).round(),
+            ));
+            hot.push(*rect);
             let top = (rect.y + (rect.h - self.cell_height) / 2.0).round();
             labels.push(LabelSpec {
                 text: value.to_string(),
@@ -1937,11 +2142,14 @@ impl Renderer {
             }
             for (i, (text, row)) in dest_labels.iter().zip(layout.rows.iter()).enumerate() {
                 let top = (row.y + (row.h - self.cell_height) / 2.0).round();
+                let m = (6.0 * scale).round();
+                let pill = LayoutRect { x: row.x + m, w: (row.w - 2.0 * m).max(0.0), ..*row };
                 if i == selected {
-                    let m = (6.0 * scale).round();
-                    let pill = LayoutRect { x: row.x + m, w: (row.w - 2.0 * m).max(0.0), ..*row };
                     rects.push(self.px_rect(&pill, th.accent, 0.10, (7.0 * scale).round()));
+                } else if hover(cursor, row) {
+                    rects.push(self.px_rect(&pill, th.ink, 0.06, (7.0 * scale).round()));
                 }
+                hot.push(*row);
                 labels.push(LabelSpec {
                     text: text.clone(),
                     color: color(th.ink, 1.0),
@@ -1985,7 +2193,14 @@ impl Renderer {
     /// Centered confirm dialog: a message line over Cancel / accept buttons.
     /// Styled like the message panel; the destructive accept button carries
     /// the accent fill.
-    fn confirm_overlay(&self, text: &str, accept: &str, rects: &mut Vec<Quad>) -> Vec<LabelSpec> {
+    fn confirm_overlay(
+        &self,
+        text: &str,
+        accept: &str,
+        cursor: Option<(f32, f32)>,
+        rects: &mut Vec<Quad>,
+        hot: &mut Vec<LayoutRect>,
+    ) -> Vec<LabelSpec> {
         let th = self.theme();
         let scale = self.scale;
         let pad = (16.0 * scale).round();
@@ -2010,12 +2225,23 @@ impl Renderer {
         for (rect, label, danger) in
             [(&layout.cancel, CONFIRM_CANCEL, false), (&layout.close, accept, true)]
         {
-            rects.push(self.px_rect(
-                rect,
-                if danger { th.accent } else { th.ink },
-                if danger { 0.9 } else { 0.08 },
-                btn_r,
-            ));
+            let hov = hover(cursor, rect);
+            rects.push(
+                self.px_rect(
+                    rect,
+                    if danger { th.accent } else { th.ink },
+                    if danger {
+                        if hov { 1.0 } else { 0.9 }
+                    } else if hov {
+                        0.14
+                    } else {
+                        0.08
+                    },
+                    btn_r,
+                )
+                .shadow(if hov { Shadow::Soft } else { Shadow::None }),
+            );
+            hot.push(*rect);
             let w = label.chars().count() as f32 * self.cell_width;
             labels.push(LabelSpec {
                 text: label.into(),
@@ -2085,6 +2311,8 @@ impl Renderer {
         draw_cursor: bool,
         show_window_buttons: bool,
         maximized: bool,
+        cursor: Option<(f32, f32)>,
+        hot: &mut Vec<LayoutRect>,
     ) -> (Vec<Quad>, Vec<PaneText>, Vec<Quad>, Vec<LabelSpec>) {
         let th = self.theme();
         let scale = self.scale;
@@ -2144,6 +2372,38 @@ impl Renderer {
         for (i, tab) in tabs.iter().enumerate() {
             let tr = crate::workspace::flyover_tab_rect(panel_rect, i, n, scale, maximized);
             let close = crate::workspace::flyover_tab_close_rect(panel_rect, i, n, scale, maximized);
+            let close_hov = hover(cursor, &close);
+            // Same hover language as the tile strips: dim pill on an inactive
+            // tab, rounded chip + brightened glyph on the ×.
+            if i != active && hover(cursor, &tr) && !close_hov {
+                let m = (4.0 * scale).round();
+                let pill = crate::workspace::LayoutRect {
+                    x: tr.x + m,
+                    y: tr.y + m,
+                    w: (tr.w - 2.0 * m).max(0.0),
+                    h: (tr.h - 2.0 * m).max(0.0),
+                };
+                quads.push(self.px_rect(&pill, pane_pill.0, pane_pill.1 * 0.55, (7.0 * scale).round()));
+            }
+            if close_hov {
+                let inset = (3.0 * scale).round();
+                let chip = crate::workspace::LayoutRect {
+                    x: close.x + inset,
+                    y: close.y + inset,
+                    w: (close.w - 2.0 * inset).max(0.0),
+                    h: (close.h - 2.0 * inset).max(0.0),
+                };
+                quads.push(self.px_rect(
+                    &chip,
+                    pane_pill.0,
+                    (pane_pill.1 * 2.0).min(1.0),
+                    (4.0 * scale).round(),
+                ));
+            }
+            // Close after its tab so reverse iteration (topmost wins)
+            // resolves × over the tab it sits in.
+            hot.push(tr);
+            hot.push(close);
             let title = tab.session.title();
             let text = if title.is_empty() { "shell".to_string() } else { title };
             let mut text_left = tr.x + tab_text_pad;
@@ -2176,7 +2436,11 @@ impl Renderer {
             });
             labels.push(LabelSpec {
                 text: "×".to_string(),
-                color: color(pane_ink_dim.0, pane_ink_dim.1),
+                color: if close_hov {
+                    color(pane_ink.0, pane_ink.1)
+                } else {
+                    color(pane_ink_dim.0, pane_ink_dim.1)
+                },
                 left: close.x + ((close.w - self.cell_width) / 2.0).round(),
                 top: (tr.y + (tr.h - self.cell_height) / 2.0).round(),
                 clip: tr,
@@ -2191,9 +2455,30 @@ impl Renderer {
                 (crate::workspace::flyover_minimize_rect(panel_rect, scale), "–"),
                 (crate::workspace::flyover_maximize_rect(panel_rect, scale), "□"),
             ] {
+                let hov = hover(cursor, &rect);
+                if hov {
+                    let inset = (3.0 * scale).round();
+                    let chip = crate::workspace::LayoutRect {
+                        x: rect.x + inset,
+                        y: rect.y + inset,
+                        w: (rect.w - 2.0 * inset).max(0.0),
+                        h: (rect.h - 2.0 * inset).max(0.0),
+                    };
+                    quads.push(self.px_rect(
+                        &chip,
+                        pane_pill.0,
+                        (pane_pill.1 * 2.0).min(1.0),
+                        (4.0 * scale).round(),
+                    ));
+                }
+                hot.push(rect);
                 labels.push(LabelSpec {
                     text: glyph.to_string(),
-                    color: color(pane_ink_dim.0, pane_ink_dim.1),
+                    color: if hov {
+                        color(pane_ink.0, pane_ink.1)
+                    } else {
+                        color(pane_ink_dim.0, pane_ink_dim.1)
+                    },
                     left: rect.x + ((rect.w - self.cell_width) / 2.0).round(),
                     top: (rect.y + (bar_h - self.cell_height) / 2.0).round(),
                     clip: rect,
@@ -2476,6 +2761,7 @@ mod tests {
             sections: &[],
             editing_section: None,
             cleanup,
+            cursor: None,
         }
     }
 
@@ -2564,6 +2850,156 @@ mod tests {
                 && q.y >= row.y
                 && q.y + q.h <= row.y + row.h),
             "unread dot should sit in the left gutter of the group row"
+        );
+    }
+
+    /// Hovering the "+ group" button brightens it and adds the soft shadow;
+    /// without a cursor the button stays in its resting style.
+    #[test]
+    fn new_group_button_hover_brightens_and_soft_shadows() {
+        let scale = 2.0;
+        let renderer = Renderer::new(scale, 18.0, 1600, 1000);
+        let state = Cleanup::default();
+        let mut chrome = cleanup_chrome(&state);
+        chrome.page = Page::Sessions;
+        let sidebar_w = 240.0;
+        let btn = crate::workspace::new_group_button(scale, sidebar_w);
+        let wss = [crate::workspace::Workspace::new(
+            "g".into(),
+            crate::workspace::Tile::empty(1),
+            None,
+        )];
+
+        let quad_at_btn = |frame: &Frame| {
+            frame
+                .bg_quads
+                .iter()
+                .find(|q| q.x == btn.x && q.y == btn.y && q.w == btn.w && q.h == btn.h)
+                .map(|q| q.shadow == Shadow::Soft)
+        };
+
+        let resting = renderer.build_frame(
+            &wss, 0, sidebar_w, None, None, None, None, None, None, None, None, None, None, &chrome,
+        );
+        assert_eq!(quad_at_btn(&resting), Some(false), "resting button has no soft shadow");
+        assert!(resting.hot.iter().any(|r| r.x == btn.x && r.y == btn.y), "button is hot");
+
+        chrome.cursor = Some((btn.x + btn.w / 2.0, btn.y + btn.h / 2.0));
+        let hovered = renderer.build_frame(
+            &wss, 0, sidebar_w, None, None, None, None, None, None, None, None, None, None, &chrome,
+        );
+        assert_eq!(quad_at_btn(&hovered), Some(true), "hovered button gains the soft shadow");
+    }
+
+    /// A modal overlay owns the frame's hot list: only its elements register,
+    /// never the chrome underneath.
+    #[test]
+    fn frame_hot_scopes_to_overlay_when_modal() {
+        let scale = 2.0;
+        let renderer = Renderer::new(scale, 18.0, 1600, 1000);
+        let state = Cleanup::default();
+        let mut chrome = cleanup_chrome(&state);
+        chrome.page = Page::Sessions;
+        let sidebar_w = 240.0;
+        let btn = crate::workspace::new_group_button(scale, sidebar_w);
+        let wss = [crate::workspace::Workspace::new(
+            "g".into(),
+            crate::workspace::Tile::empty(1),
+            None,
+        )];
+
+        let plain = renderer.build_frame(
+            &wss, 0, sidebar_w, None, None, None, None, None, None, None, None, None, None, &chrome,
+        );
+        assert!(!plain.hot.is_empty());
+        assert!(plain.hot.iter().any(|r| r.x == btn.x && r.y == btn.y));
+
+        let confirm = renderer.build_frame(
+            &wss,
+            0,
+            sidebar_w,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(("Close tab?", "Close")),
+            &chrome,
+        );
+        // Exactly the dialog's Cancel and accept buttons are interactive.
+        assert_eq!(confirm.hot.len(), 2, "confirm dialog exposes only its two buttons");
+        assert!(!confirm.hot.iter().any(|r| r.x == btn.x && r.y == btn.y));
+    }
+
+    /// A hovered inactive sidebar group row gains the shadowless hover pill;
+    /// without a cursor no quad is painted for it at all.
+    #[test]
+    fn hovered_inactive_sidebar_row_gains_pill() {
+        let scale = 2.0;
+        let renderer = Renderer::new(scale, 18.0, 1600, 1000);
+        let state = Cleanup::default();
+        let mut chrome = cleanup_chrome(&state);
+        chrome.page = Page::Sessions;
+        let sidebar_w = 240.0;
+        let wss = [
+            crate::workspace::Workspace::new("a".into(), crate::workspace::Tile::empty(1), None),
+            crate::workspace::Workspace::new("b".into(), crate::workspace::Tile::empty(2), None),
+        ];
+        let rows = crate::workspace::sidebar_rows(&wss, &[]);
+        let row = crate::workspace::sidebar_row_rect(&rows, 1, &wss, scale, sidebar_w);
+        let row_quad = |frame: &Frame| {
+            frame
+                .bg_quads
+                .iter()
+                .find(|q| q.x == row.x && q.y == row.y && q.w == row.w && q.h == row.h)
+                .map(|q| q.shadow)
+        };
+
+        let resting = renderer.build_frame(
+            &wss, 0, sidebar_w, None, None, None, None, None, None, None, None, None, None, &chrome,
+        );
+        assert_eq!(row_quad(&resting), None, "inactive row paints no pill at rest");
+
+        chrome.cursor = Some((row.x + row.w / 2.0, row.y + row.h / 2.0));
+        let hovered = renderer.build_frame(
+            &wss, 0, sidebar_w, None, None, None, None, None, None, None, None, None, None, &chrome,
+        );
+        assert_eq!(
+            row_quad(&hovered),
+            Some(Shadow::None),
+            "hovered inactive row gains the shadowless pill"
+        );
+    }
+
+    /// Hovering a flyover tab's × registers it hot and paints the chip; with
+    /// no cursor the strip stays in its resting style.
+    #[test]
+    fn flyover_close_hover_paints_chip_and_registers_hot() {
+        let scale = 2.0;
+        let renderer = Renderer::new(scale, 18.0, 1600, 1000);
+        let panel = crate::workspace::flyover_rect(1600, 1000, scale, 1.0, 0.35, false);
+        let tabs = [crate::workspace::Tab::new(crate::term::Session::placeholder())];
+        let close = crate::workspace::flyover_tab_close_rect(&panel, 0, 1, scale, false);
+
+        let mut hot = Vec::new();
+        let (resting_quads, ..) = renderer
+            .flyover_overlay(&tabs, 0, &panel, true, false, true, false, None, &mut hot);
+        // Tab, its ×, and the two window buttons are all interactive.
+        assert_eq!(hot.len(), 4, "tab + close + minimize + maximize are hot");
+        assert!(hot.iter().any(|r| r.x == close.x && r.y == close.y));
+
+        let cursor = Some((close.x + close.w / 2.0, close.y + close.h / 2.0));
+        let mut hot2 = Vec::new();
+        let (hovered_quads, ..) = renderer
+            .flyover_overlay(&tabs, 0, &panel, true, false, true, false, cursor, &mut hot2);
+        assert_eq!(
+            hovered_quads.len(),
+            resting_quads.len() + 1,
+            "hovering the × adds exactly the chip quad"
         );
     }
 
