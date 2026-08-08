@@ -107,6 +107,24 @@ enum ConfirmAction {
     CleanupDelete { targets: Vec<(String, Vec<String>)> },
 }
 
+/// Discriminates who the directory/fork picker is being opened for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PickerTarget {
+    /// Opening a new group in the workspace tree (default).
+    Group,
+    /// Opening a new tab in the flyover panel.
+    Flyover,
+}
+
+/// A side effect [`App::popout_key`] needs applied to a window other than
+/// the popout itself (entity code can't touch foreign windows directly).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PopoutEffect {
+    /// Bring the main window forward (the picker and the docked panel
+    /// render there).
+    ActivateMain,
+}
+
 /// The in-flight pointer drag gesture.
 #[derive(Clone, Debug)]
 enum Drag {
@@ -123,6 +141,8 @@ enum Drag {
     Tab { tile: u64, tab: usize },
     /// A text selection is being dragged inside a tile's content area.
     Select { tile: u64 },
+    /// A text selection is being dragged inside the flyover panel.
+    FlyoverSelect,
     /// Sidebar group row pressed; may become a group drag past threshold.
     GroupPress { ws: usize, start: (f64, f64) },
     /// Dragging a sidebar workspace group tab.
@@ -210,6 +230,30 @@ struct App {
     /// Link currently under the pointer: (tile id, col, row).
     /// Used to brighten the hovered link and show a pointing-hand cursor.
     link_hover: Option<(u64, usize, usize)>,
+    // ── Flyover terminal panel ─────────────────────────────────────────────
+    /// Tabs held by the flyover panel (independent of the workspace tree).
+    flyover_tabs: Vec<workspace::Tab>,
+    /// Index of the active flyover tab.
+    flyover_active: usize,
+    /// Whether the flyover panel is currently visible.
+    flyover_open: bool,
+    /// Slide animation progress: 0.0 = fully hidden (below screen), 1.0 = fully open.
+    flyover_anim: f32,
+    /// Whether keyboard focus is currently inside the flyover panel.
+    flyover_focused: bool,
+    /// Whether the flyover lives in its own popout window instead of the
+    /// in-window panel.
+    flyover_windowed: bool,
+    /// Desired visibility of the popout window; the frame pump reconciles
+    /// the actual window against this (⌘` flips it in windowed mode).
+    flyover_window_visible: bool,
+    /// The open popout window, when the pump has one up.
+    flyover_window: Option<gpui::WindowHandle<FlyoverPopout>>,
+    /// The main window, so popout-initiated flows (new-tab picker, docking)
+    /// can bring it forward.
+    main_window: Option<gpui::AnyWindowHandle>,
+    /// Who the picker/fork picker is currently targeting.
+    picker_target: PickerTarget,
 }
 
 impl App {
@@ -390,6 +434,7 @@ impl App {
     /// Re-measure every visible tile and push grid sizes to the PTYs.
     fn sync_layout(&mut self) {
         self.sync_layout_impl(false);
+        self.sync_flyover_layout(false);
     }
 
     /// `force` pushes a PTY resize even when cols/rows are unchanged — needed
@@ -422,6 +467,30 @@ impl App {
                         tab.session.resize(cols, rows, cw, ch, dpi);
                     }
                 }
+            }
+        }
+    }
+
+    /// Resize flyover PTY sessions to match the current flyover content rect.
+    /// Only acts when the panel is open AND the animation is settled (anim == 1.0).
+    /// `force` pushes a PTY resize even when cols/rows are unchanged — needed
+    /// after a display-scale change.
+    fn sync_flyover_layout(&mut self, force: bool) {
+        if !self.flyover_open || self.flyover_anim < 1.0 {
+            return;
+        }
+        let scale = self.scale();
+        let (w, h) = self.renderer.surface_size();
+        let panel = workspace::flyover_rect(w, h, scale, self.flyover_anim);
+        let content = workspace::flyover_content(&panel, scale);
+        let (cols, rows) = self.renderer.grid_size_for(&content);
+        let (cw, ch) = self.cell_px();
+        let dpi = self.dpi();
+        for tab in &mut self.flyover_tabs {
+            if force || (cols, rows) != (tab.cols, tab.rows) {
+                tab.cols = cols;
+                tab.rows = rows;
+                tab.session.resize(cols, rows, cw, ch, dpi);
             }
         }
     }
@@ -682,6 +751,39 @@ impl App {
         {
             return;
         }
+        // Flyover panel scroll: intercept first when panel is open and cursor is inside.
+        if self.flyover_open && !self.flyover_tabs.is_empty() {
+            let scale = self.scale();
+            let (w, h) = self.renderer.surface_size();
+            let (px, py) = (self.cursor.0 as f32, self.cursor.1 as f32);
+            let panel = workspace::flyover_rect(w, h, scale, self.flyover_anim);
+            let content = workspace::flyover_content(&panel, scale);
+            if panel.contains(px, py) {
+                let cell_h = cell_height as f64;
+                let notches = match delta {
+                    gpui::ScrollDelta::Lines(p) => p.y as f64,
+                    gpui::ScrollDelta::Pixels(p) => f32::from(p.y) as f64 / (cell_h * 3.0),
+                };
+                let steps = scroll_steps(&mut self.scroll_accum, notches);
+                if steps != 0 {
+                    if let Some(tab) = self.flyover_tabs.get(self.flyover_active) {
+                        let session = &tab.session;
+                        let up = steps > 0;
+                        if session.app_consumes_wheel() {
+                            let (col, row) =
+                                self.renderer.cell_at(&content, px, py).unwrap_or((0, 0));
+                            for _ in 0..steps.unsigned_abs() {
+                                session.forward_wheel(up, col, row);
+                            }
+                        } else {
+                            session.scroll_by(steps * 3);
+                        }
+                        self.request_redraw();
+                    }
+                }
+                return;
+            }
+        }
         // Only the Sessions page has terminals to scroll; Cleanup has its own
         // scroll handling below.
         if self.page != Page::Sessions && self.page != Page::Cleanup {
@@ -777,19 +879,69 @@ impl App {
         self.request_redraw();
     }
 
-    /// The session with `id`, wherever it lives (any workspace, tile, tab).
+    /// Clear the unread dot on the flyover tab that just came on screen
+    /// (panel opened or active tab switched).
+    fn flyover_mark_read(&mut self) {
+        if !self.flyover_open && !(self.flyover_windowed && self.flyover_window_visible) {
+            return;
+        }
+        if let Some(tab) = self.flyover_tabs.get_mut(self.flyover_active) {
+            tab.unread = false;
+        }
+    }
+
+    /// Move the flyover between the in-window panel and its own popout
+    /// window. The sessions never move — only which surface renders them.
+    fn flyover_toggle_windowed(&mut self) {
+        if self.flyover_windowed {
+            // Dock back: the pump closes the window; the panel takes over.
+            self.flyover_windowed = false;
+            self.flyover_window_visible = false;
+            self.flyover_open = true;
+            self.flyover_focused = true;
+            self.flyover_mark_read();
+        } else {
+            // Pop out: the panel slides away; the pump opens the window.
+            self.flyover_windowed = true;
+            self.flyover_window_visible = true;
+            self.flyover_open = false;
+            self.flyover_focused = false;
+            if self.flyover_tabs.is_empty() {
+                self.open_flyover_picker();
+            }
+        }
+        self.request_redraw();
+    }
+
+    /// The session with `id`, wherever it lives (any workspace, tile, tab, or
+    /// the flyover panel).
     fn find_session(&self, id: u64) -> Option<&Session> {
-        self.workspaces.iter().find_map(|ws| {
-            ws.root
-                .tiles()
-                .into_iter()
-                .find_map(|t| t.tabs.iter().find(|tab| tab.session.id == id))
-                .map(|tab| &tab.session)
-        })
+        self.workspaces
+            .iter()
+            .find_map(|ws| {
+                ws.root
+                    .tiles()
+                    .into_iter()
+                    .find_map(|t| t.tabs.iter().find(|tab| tab.session.id == id))
+                    .map(|tab| &tab.session)
+            })
+            .or_else(|| {
+                self.flyover_tabs.iter().find(|tab| tab.session.id == id).map(|tab| &tab.session)
+            })
+    }
+
+    /// True when the session is the active tab of the flyover and the flyover
+    /// is on screen — panel open, or popout window showing. On screen
+    /// regardless of which page is showing, since both surfaces overlay them.
+    fn flyover_visible(&self, id: u64) -> bool {
+        let showing =
+            if self.flyover_windowed { self.flyover_window_visible } else { self.flyover_open };
+        showing
+            && self.flyover_tabs.get(self.flyover_active).is_some_and(|tab| tab.session.id == id)
     }
 
     /// True when the session is the *visible* tab of a tile in the active
-    /// workspace.
+    /// workspace, or the active tab of the open flyover panel.
     fn is_visible(&self, id: u64) -> bool {
         // A collapsed pane's content is hidden, so its tabs are not watched
         // even though they sit in the active workspace.
@@ -798,12 +950,19 @@ impl App {
             .tiles()
             .iter()
             .any(|t| !t.collapsed && t.active_tab().is_some_and(|tab| tab.session.id == id))
+            || self.flyover_visible(id)
     }
 
     /// Mark the tab owning session `id` unread. Returns true (and persists)
     /// only on a false→true transition, so repeated attention signals from
     /// one pane don't churn the snapshot.
     fn set_unread_by_session(&mut self, id: u64) -> bool {
+        // Flyover tabs aren't persisted, so their dots skip the snapshot.
+        if let Some(tab) = self.flyover_tabs.iter_mut().find(|tab| tab.session.id == id) {
+            let hit = !tab.unread;
+            tab.unread = true;
+            return hit;
+        }
         let changed = self.workspaces.iter_mut().any(|ws| {
             ws.root.tiles_mut().into_iter().any(|t| {
                 t.tabs.iter_mut().any(|tab| {
@@ -927,26 +1086,208 @@ impl App {
     // ── cwd picker ──────────────────────────────────────────────────────
 
     fn open_picker(&mut self) {
+        self.picker_target = PickerTarget::Group;
         self.picker = Some(picker::Picker::new());
         self.request_redraw();
+    }
+
+    fn open_flyover_picker(&mut self) {
+        self.picker_target = PickerTarget::Flyover;
+        self.picker = Some(picker::Picker::new());
+        self.request_redraw();
+    }
+
+    /// Spawn a new flyover tab with a plain (non-persisted) session at `cwd`.
+    fn spawn_flyover_tab(&mut self, cwd: Option<std::path::PathBuf>) {
+        let session = self.spawn_session_named(cwd.as_deref(), None);
+        self.flyover_tabs.push(workspace::Tab::new(session));
+        self.flyover_active = self.flyover_tabs.len() - 1;
+        self.flyover_focused = true;
+        self.sync_layout();
+        self.request_redraw();
+    }
+
+    /// Toggle the flyover panel open/closed. In windowed mode this shows or
+    /// hides the popout window instead (the pump reconciles the actual
+    /// window); sessions keep running either way.
+    fn toggle_flyover(&mut self) {
+        if self.flyover_windowed {
+            self.flyover_window_visible = !self.flyover_window_visible;
+            if self.flyover_window_visible {
+                self.flyover_mark_read();
+                if self.flyover_tabs.is_empty() {
+                    self.open_flyover_picker();
+                }
+            }
+            self.request_redraw();
+            return;
+        }
+        if self.flyover_open {
+            // Close: hide but keep sessions running.
+            self.flyover_open = false;
+            self.flyover_focused = false;
+            self.request_redraw();
+        } else {
+            // Open: show the panel.
+            self.flyover_open = true;
+            self.flyover_focused = true;
+            self.flyover_mark_read();
+            if self.flyover_tabs.is_empty() {
+                // First-ever open: open directory picker to create the first tab.
+                self.open_flyover_picker();
+            }
+            self.request_redraw();
+        }
+    }
+
+    /// Apply a ⌘ action to the flyover's tabs — the subset of shortcuts the
+    /// flyover captures while it has focus. Returns false when the action
+    /// isn't flyover-scoped so the caller can fall through to global routing.
+    fn flyover_shortcut(&mut self, action: Action) -> bool {
+        match action {
+            Action::NewTab => {
+                self.open_flyover_picker();
+            },
+            Action::CloseTab => {
+                if !self.flyover_tabs.is_empty() {
+                    self.flyover_tabs.remove(self.flyover_active);
+                    if self.flyover_tabs.is_empty() {
+                        self.flyover_open = false;
+                        self.flyover_focused = false;
+                        self.flyover_window_visible = false;
+                    } else {
+                        self.flyover_active =
+                            self.flyover_active.min(self.flyover_tabs.len() - 1);
+                    }
+                }
+            },
+            Action::PrevTab => {
+                if !self.flyover_tabs.is_empty() {
+                    self.flyover_active =
+                        pages::cycle(self.flyover_active, self.flyover_tabs.len(), -1);
+                    self.flyover_mark_read();
+                }
+            },
+            Action::NextTab => {
+                if !self.flyover_tabs.is_empty() {
+                    self.flyover_active =
+                        pages::cycle(self.flyover_active, self.flyover_tabs.len(), 1);
+                    self.flyover_mark_read();
+                }
+            },
+            Action::Copy => {
+                if let Some(tab) = self.flyover_tabs.get(self.flyover_active)
+                    && let Some(text) = tab.session.selected_text()
+                    && let Ok(mut clipboard) = arboard::Clipboard::new()
+                {
+                    let _ = clipboard.set_text(text);
+                }
+            },
+            Action::Paste => {
+                if let Some(tab) = self.flyover_tabs.get(self.flyover_active)
+                    && let Ok(mut clipboard) = arboard::Clipboard::new()
+                {
+                    match clipboard.get_text() {
+                        Ok(text) if !text.is_empty() => {
+                            tab.session.paste(&text);
+                            tab.session.scroll_to_bottom();
+                            tab.session.clear_selection();
+                        },
+                        _ if clipboard.get_image().is_ok() => {
+                            tab.session.write([0x16u8]);
+                        },
+                        _ => {},
+                    }
+                }
+            },
+            _ => return false,
+        }
+        true
+    }
+
+    /// Write a plain (non-⌘) keystroke's bytes to the active flyover session.
+    fn flyover_write_key(&mut self, keystroke: &Keystroke) {
+        if let Some(bytes) = key_to_bytes(keystroke)
+            && let Some(tab) = self.flyover_tabs.get(self.flyover_active)
+        {
+            tab.session.write(bytes);
+            tab.session.scroll_to_bottom();
+            tab.session.clear_selection();
+        }
+    }
+
+    /// Keyboard routing for the popout window. Global actions that concern
+    /// the main window (group switching, settings, …) are ignored here rather
+    /// than fired against a window that isn't showing. Returns an effect the
+    /// popout view must apply outside this entity.
+    fn popout_key(&mut self, ev: &KeyDownEvent) -> Option<PopoutEffect> {
+        self.modifiers = ev.keystroke.modifiers;
+        if ev.keystroke.modifiers.platform {
+            if pages::Action::ToggleFlyover.binding().matches(&ev.keystroke) {
+                // Hide: the pump closes the window; sessions keep running.
+                self.flyover_window_visible = false;
+                self.request_redraw();
+                return None;
+            }
+            if let Some(action) = pages::match_action(&ev.keystroke) {
+                if action == Action::FlyoverPopout {
+                    self.flyover_toggle_windowed();
+                    return Some(PopoutEffect::ActivateMain);
+                }
+                if self.flyover_shortcut(action) {
+                    self.request_redraw();
+                    // The new-tab picker renders in the main window.
+                    if action == Action::NewTab {
+                        return Some(PopoutEffect::ActivateMain);
+                    }
+                }
+            }
+            return None;
+        }
+        self.flyover_write_key(&ev.keystroke);
+        self.request_redraw();
+        None
     }
 
     fn confirm_picker(&mut self) {
         let Some(picker) = self.picker.as_mut() else { return };
         let Some(entry) = picker.selected_entry().cloned() else {
             self.picker = None;
+            // If this was the first-ever flyover open and user escaped, close
+            // whichever surface was waiting on the first tab.
+            if self.picker_target == PickerTarget::Flyover && self.flyover_tabs.is_empty() {
+                self.flyover_open = false;
+                self.flyover_focused = false;
+                self.flyover_window_visible = false;
+            }
             return;
         };
         picker.record_recent(&entry.path);
         let name = group_name(&entry.path);
-        if entry.is_git {
-            // Step 2: choose where to fork a drop worktree from.
-            let choices = build_fork_choices(&entry.path);
-            self.fork = Some(picker::ForkPicker::new(entry.path, name, choices));
-            self.picker = None;
+        if self.picker_target == PickerTarget::Flyover {
+            if entry.is_git {
+                // Flyover git dirs: only RepoRoot and Worktree (no drop/create).
+                let all_choices = build_fork_choices(&entry.path);
+                let choices = all_choices
+                    .into_iter()
+                    .filter(|c| matches!(c.scope, picker::ForkScope::RepoRoot | picker::ForkScope::Worktree))
+                    .collect::<Vec<_>>();
+                self.fork = Some(picker::ForkPicker::new(entry.path, name, choices));
+                self.picker = None;
+            } else {
+                self.picker = None;
+                self.spawn_flyover_tab(Some(entry.path));
+            }
         } else {
-            self.picker = None;
-            self.add_group(name, Some(entry.path));
+            if entry.is_git {
+                // Step 2: choose where to fork a drop worktree from.
+                let choices = build_fork_choices(&entry.path);
+                self.fork = Some(picker::ForkPicker::new(entry.path, name, choices));
+                self.picker = None;
+            } else {
+                self.picker = None;
+                self.add_group(name, Some(entry.path));
+            }
         }
     }
 
@@ -961,6 +1302,21 @@ impl App {
         let scope = entry.scope;
         let from = entry.from.clone();
         let path = entry.path.clone();
+
+        if self.picker_target == PickerTarget::Flyover {
+            // Flyover only supports RepoRoot and Worktree (no drop/create).
+            if matches!(scope, picker::ForkScope::RepoRoot | picker::ForkScope::Worktree) {
+                self.fork = None;
+                self.spawn_flyover_tab(path);
+            } else {
+                // Should not happen (filtered above), but be safe.
+                self.fork = None;
+                if self.flyover_tabs.is_empty() {
+                    self.flyover_open = false;
+                }
+            }
+            return;
+        }
 
         // "repo root" and "attach worktree" skip drop entirely: open the group
         // directly in that directory (the repo, or the existing worktree).
@@ -1802,6 +2158,13 @@ impl App {
             let layout = picker::PickerLayout::compute(width, height, scale, picker.rows.len(), picker.selected);
             if !layout.panel.contains(px, py) {
                 self.picker = None;
+                // Same as Escape: cancelling the flyover's first-open picker
+                // closes the waiting surface.
+                if self.picker_target == PickerTarget::Flyover && self.flyover_tabs.is_empty() {
+                    self.flyover_open = false;
+                    self.flyover_focused = false;
+                    self.flyover_window_visible = false;
+                }
                 self.request_redraw();
                 return;
             }
@@ -1867,6 +2230,40 @@ impl App {
         // editor never lingers and silently swallows terminal keystrokes.
         if self.editing_section.is_some() {
             self.commit_section_rename();
+        }
+
+        // Flyover panel hit-testing: after modal-overlay check, before sidebar/tiles.
+        if self.flyover_open && !self.flyover_tabs.is_empty() {
+            let panel = workspace::flyover_rect(w, h, scale, self.flyover_anim);
+            if panel.contains(px, py) {
+                let tab_bar = workspace::flyover_tab_bar(&panel, scale);
+                let n = self.flyover_tabs.len();
+                if tab_bar.contains(px, py) && n > 0 {
+                    // Determine which tab was clicked.
+                    let tab_rect = workspace::flyover_tab_rect(&panel, 0, n.max(1), scale);
+                    let ti = ((((px - tab_rect.x).max(0.0)) / tab_rect.w).floor() as usize)
+                        .min(n.saturating_sub(1));
+                    self.flyover_active = ti;
+                    self.flyover_focused = true;
+                    self.flyover_mark_read();
+                } else {
+                    // Click in content area: focus the panel and start selection.
+                    self.flyover_focused = true;
+                    let content = workspace::flyover_content(&panel, scale);
+                    if let Some((col, row)) = self.renderer.cell_at(&content, px, py) {
+                        if let Some(tab) = self.flyover_tabs.get(self.flyover_active) {
+                            tab.session.begin_selection(col, row);
+                        }
+                        self.drag = Drag::FlyoverSelect;
+                    }
+                }
+                self.request_redraw();
+                return;
+            } else {
+                // Clicked outside panel: move focus to tile without closing panel.
+                self.flyover_focused = false;
+                // Don't return — let tile hit-testing proceed below.
+            }
         }
 
         let sidebar = workspace::sidebar(h, scale, self.sidebar_w);
@@ -2185,6 +2582,19 @@ impl App {
                 }
             },
             Drag::Section { .. } => self.request_redraw(),
+            Drag::FlyoverSelect => {
+                let scale = self.renderer.scale;
+                let (px, py) = (self.cursor.0 as f32, self.cursor.1 as f32);
+                let (w, h) = self.renderer.surface_size();
+                let panel = workspace::flyover_rect(w, h, scale, self.flyover_anim);
+                let content = workspace::flyover_content(&panel, scale);
+                if let Some((col, row)) = self.renderer.cell_at(&content, px, py) {
+                    if let Some(tab) = self.flyover_tabs.get(self.flyover_active) {
+                        tab.session.update_selection(col, row);
+                        self.request_redraw();
+                    }
+                }
+            },
             Drag::Select { tile } => {
                 let tile = *tile;
                 let area = self.area();
@@ -2384,6 +2794,13 @@ impl App {
 
     fn on_key_down(&mut self, ev: &KeyDownEvent) {
         self.modifiers = ev.keystroke.modifiers;
+        // cmd+` toggles the flyover panel from ANY state (overlays, pages, etc.).
+        if ev.keystroke.modifiers.platform
+            && pages::Action::ToggleFlyover.binding().matches(&ev.keystroke)
+        {
+            self.toggle_flyover();
+            return;
+        }
         // An open overlay owns the keyboard: route to it before ⌘ shortcuts or
         // the PTY so typing filters the list rather than reaching the shell.
         if self.confirm.is_some()
@@ -2395,6 +2812,27 @@ impl App {
             self.handle_picker_key(ev);
             return;
         }
+        // Flyover panel: when open AND focused it owns the keyboard (except
+        // the cmd+` toggle above and overlay keys above that).
+        if self.flyover_open && self.flyover_focused {
+            if ev.keystroke.modifiers.platform {
+                // Flyover-scoped cmd shortcuts; the rest keep global meaning.
+                if let Some(action) = pages::match_action(&ev.keystroke)
+                    && self.flyover_shortcut(action)
+                {
+                    self.request_redraw();
+                    return;
+                }
+                self.handle_shortcut(ev);
+                self.request_redraw();
+                return;
+            }
+            // Plain key: write bytes to the active flyover session.
+            self.flyover_write_key(&ev.keystroke);
+            self.request_redraw();
+            return;
+        }
+
         // Sidebar section rename captures typing; shortcuts stay muted.
         if self.editing_section.is_some() {
             self.handle_section_key(ev);
@@ -2494,7 +2932,18 @@ impl App {
         // Step 1: the dir picker. Escape closes the overlay entirely.
         if self.picker.is_some() {
             match key {
-                "escape" => self.picker = None,
+                "escape" => {
+                    self.picker = None;
+                    // Cancelling the flyover's first-open picker closes the
+                    // waiting surface too — there's nothing to show yet.
+                    if self.picker_target == PickerTarget::Flyover
+                        && self.flyover_tabs.is_empty()
+                    {
+                        self.flyover_open = false;
+                        self.flyover_focused = false;
+                        self.flyover_window_visible = false;
+                    }
+                },
                 "enter" => self.confirm_picker(),
                 "up" => {
                     if let Some(p) = self.picker.as_mut() {
@@ -2737,6 +3186,8 @@ impl App {
             | Action::OpenSettings
             | Action::Quit
             | Action::CommandPalette => {},
+            Action::ToggleFlyover => self.toggle_flyover(),
+            Action::FlyoverPopout => self.flyover_toggle_windowed(),
         }
     }
 
@@ -3077,7 +3528,8 @@ impl App {
                 // Code hooks). On-screen tabs of the active group are being
                 // watched, so only hidden tabs gain the unread dot.
                 TermEvent::Attention(id) => {
-                    let watched = self.page == Page::Sessions && self.is_visible(id);
+                    let watched = (self.page == Page::Sessions && self.is_visible(id))
+                        || self.flyover_visible(id);
                     if !watched && self.set_unread_by_session(id) {
                         redraw = true;
                     }
@@ -3117,10 +3569,41 @@ impl App {
         if collapse_settled {
             self.sync_layout();
         }
+        // Advance flyover slide animation (±0.15 per tick, same cadence as
+        // collapse_anim). PTY grids are only resized when the anim settles.
+        let flyover_target = if self.flyover_open { 1.0_f32 } else { 0.0_f32 };
+        let fa = self.flyover_anim;
+        let fa_next = if fa < flyover_target {
+            (fa + 0.15).min(flyover_target)
+        } else {
+            (fa - 0.15).max(flyover_target)
+        };
+        if fa_next != fa {
+            self.flyover_anim = fa_next;
+            redraw = true;
+            if fa_next == flyover_target && self.flyover_open {
+                // Anim settled at the open position — resize flyover PTYs now.
+                // Forced, so cell-metric changes made while hidden still land.
+                self.sync_flyover_layout(true);
+            }
+        }
         redraw || self.dirty
     }
 
     fn remove_session(&mut self, id: u64) {
+        // Flyover shells live outside the workspace tree: drop the tab and
+        // close the panel when the last one goes.
+        if let Some(ti) = self.flyover_tabs.iter().position(|tab| tab.session.id == id) {
+            self.flyover_tabs.remove(ti);
+            if self.flyover_tabs.is_empty() {
+                self.flyover_open = false;
+                self.flyover_focused = false;
+                self.flyover_window_visible = false;
+            } else {
+                self.flyover_active = self.flyover_active.min(self.flyover_tabs.len() - 1);
+            }
+            return;
+        }
         // Find and remove the tab whose session matches, cascading empties.
         for wi in 0..self.workspaces.len() {
             let tile_tab = {
@@ -3178,6 +3661,10 @@ impl App {
                     tab.session.begin_frame();
                 }
             }
+        }
+        // Also call begin_frame on all flyover sessions every frame.
+        for tab in &self.flyover_tabs {
+            tab.session.begin_frame();
         }
     }
 }
@@ -3580,6 +4067,9 @@ impl App {
         }
         self.renderer.resize(phys_w, phys_h);
         self.sync_layout_impl(rescaled);
+        if rescaled {
+            self.sync_flyover_layout(true);
+        }
         self.begin_frame();
 
         // Cursor style must be set during paint (gpui asserts the phase). Sticky
@@ -3652,7 +4142,7 @@ impl App {
         if resize_hover.is_none() && link_hover_suppressed.is_some() && self.modifiers.platform {
             window.set_window_cursor_style(CursorStyle::PointingHand);
         }
-        let frame = self.renderer.build_frame(
+        let mut frame = self.renderer.build_frame(
             &self.workspaces,
             self.active,
             self.sidebar_w,
@@ -3666,6 +4156,25 @@ impl App {
             self.confirm.as_ref().map(|c| (c.text.as_str(), c.accept_label())),
             &chrome,
         );
+        // The flyover panel lives outside the workspace tree, so its layer is
+        // built here from App state and slotted into the frame's flyover
+        // fields (painted above tiles/labels, below the modal overlays).
+        // In windowed mode the popout window renders it instead.
+        if self.flyover_anim > 0.0 && !self.flyover_windowed {
+            let (w, h) = self.renderer.surface_size();
+            let panel = workspace::flyover_rect(w, h, scale, self.flyover_anim);
+            let (quads, panes, fg_quads, labels) = self.renderer.flyover_overlay(
+                &self.flyover_tabs,
+                self.flyover_active,
+                &panel,
+                self.flyover_focused,
+                !overlay_open,
+            );
+            frame.flyover_quads = quads;
+            frame.flyover_panes = panes;
+            frame.flyover_fg_quads = fg_quads;
+            frame.flyover_labels = labels;
+        }
 
         let origin = bounds.origin;
         let inv = 1.0 / scale; // physical px → logical px for gpui coords.
@@ -3780,6 +4289,27 @@ impl App {
                     let _ = shaped.paint(p, line_height, TextAlign::Left, None, window, cx);
                 });
             }
+
+            // 4.5) flyover terminal panel — above the workspace chrome,
+            // below the modal overlays and their scrim.
+            let metrics = FlyoverPaintMetrics {
+                origin,
+                inv,
+                font: font.clone(),
+                font_size,
+                line_height,
+                cell_height,
+                shadow_rgb,
+            };
+            paint_flyover_layer(
+                window,
+                cx,
+                &metrics,
+                &frame.flyover_quads,
+                &frame.flyover_panes,
+                &frame.flyover_fg_quads,
+                &frame.flyover_labels,
+            );
 
             // 5) picker / fork / message overlay.
             for q in &frame.picker_quads {
@@ -3910,6 +4440,357 @@ fn paint_quad(
     window.paint_quad(quad);
 }
 
+/// Per-frame constants the flyover layer painter needs — one bundle so the
+/// main window's paint and the popout window's paint stay in lockstep.
+struct FlyoverPaintMetrics {
+    origin: Point<Pixels>,
+    /// Physical px → logical px (1.0 / scale).
+    inv: f32,
+    font: gpui::Font,
+    font_size: Pixels,
+    line_height: Pixels,
+    cell_height: f32,
+    shadow_rgb: (u8, u8, u8),
+}
+
+/// Paint one flyover layer (card + tab-strip quads, terminal text, geometry
+/// quads, clipped labels). Shared by `paint_terminal`'s 4.5 step and the
+/// popout window's paint.
+fn paint_flyover_layer(
+    window: &mut Window,
+    cx: &mut GpuiApp,
+    m: &FlyoverPaintMetrics,
+    quads: &[renderer::Quad],
+    panes: &[renderer::PaneText],
+    fg_quads: &[renderer::Quad],
+    labels: &[renderer::LabelSpec],
+) {
+    for q in quads {
+        paint_quad(window, m.origin, m.inv, q, m.shadow_rgb);
+    }
+    for pane in panes {
+        let (ox, oy) = pane.origin;
+        for (ri, row) in pane.rows.iter().enumerate() {
+            if row.is_empty() {
+                continue;
+            }
+            let mut text = String::new();
+            let mut runs: Vec<TextRun> = Vec::new();
+            for span in row {
+                text.push_str(&span.text);
+                runs.push(TextRun {
+                    len: span.text.len(),
+                    font: m.font.clone(),
+                    color: span.color,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                });
+            }
+            let shaped: ShapedLine =
+                window.text_system().shape_line(text.into(), m.font_size, &runs, None);
+            let p = Point::new(
+                m.origin.x + px(ox * m.inv),
+                m.origin.y + px((oy + ri as f32 * m.cell_height) * m.inv),
+            );
+            let _ = shaped.paint(p, m.line_height, TextAlign::Left, None, window, cx);
+        }
+    }
+    for q in fg_quads {
+        paint_quad(window, m.origin, m.inv, q, m.shadow_rgb);
+    }
+    for label in labels {
+        let runs = [TextRun {
+            len: label.text.len(),
+            font: m.font.clone(),
+            color: label.color,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        }];
+        let size = label.size.map_or(m.font_size, |s| px(s * m.inv));
+        let shaped = window.text_system().shape_line(label.text.clone().into(), size, &runs, None);
+        let p = Point::new(
+            m.origin.x + px(label.left * m.inv),
+            m.origin.y + px(label.top * m.inv),
+        );
+        let clip_bounds = Bounds {
+            origin: Point::new(
+                m.origin.x + px(label.clip.x * m.inv),
+                m.origin.y + px(label.clip.y * m.inv),
+            ),
+            size: Size::new(px(label.clip.w * m.inv), px(label.clip.h * m.inv)),
+        };
+        window.with_content_mask(Some(gpui::ContentMask { bounds: clip_bounds }), |window| {
+            let _ = shaped.paint(p, m.line_height, TextAlign::Left, None, window, cx);
+        });
+    }
+}
+
+/// Root view of the flyover's popout window: a thin shell that renders the
+/// flyover tabs straight out of the shared [`App`] entity with its own
+/// [`Renderer`]. The sessions never move — only which surface paints them.
+/// The frame pump opens/closes this window to match
+/// `App::flyover_window_visible`.
+struct FlyoverPopout {
+    app: gpui::Entity<App>,
+    renderer: Renderer,
+    focus_handle: FocusHandle,
+    /// Pointer position in this window's physical px.
+    cursor: (f64, f64),
+    /// True while a selection drag is in flight.
+    selecting: bool,
+    /// Sub-notch wheel travel, as in `App::scroll_accum`.
+    scroll_accum: f64,
+}
+
+impl FlyoverPopout {
+    /// The flyover fills the whole popout window.
+    fn panel_rect(&self) -> workspace::LayoutRect {
+        let (w, h) = self.renderer.surface_size();
+        workspace::LayoutRect { x: 0.0, y: 0.0, w: w as f32, h: h as f32 }
+    }
+
+    fn on_mouse_down(&mut self, cx: &mut Context<Self>) {
+        let scale = self.renderer.scale;
+        let (mx, my) = (self.cursor.0 as f32, self.cursor.1 as f32);
+        let panel = self.panel_rect();
+        let tab_bar = workspace::flyover_tab_bar(&panel, scale);
+        let content = workspace::flyover_content(&panel, scale);
+        let cell = self.renderer.cell_at(&content, mx, my);
+        let mut selecting = false;
+        self.app.update(cx, |app, _| {
+            let n = app.flyover_tabs.len();
+            if n == 0 {
+                return;
+            }
+            if tab_bar.contains(mx, my) {
+                let tr = workspace::flyover_tab_rect(&panel, 0, n, scale);
+                let ti = (((mx - tr.x).max(0.0) / tr.w).floor() as usize).min(n - 1);
+                app.flyover_active = ti;
+                app.flyover_mark_read();
+                app.request_redraw();
+            } else if let Some((col, row)) = cell {
+                if let Some(tab) = app.flyover_tabs.get(app.flyover_active) {
+                    tab.session.begin_selection(col, row);
+                    selecting = true;
+                }
+                app.request_redraw();
+            }
+        });
+        self.selecting = selecting;
+        cx.notify();
+    }
+
+    fn on_mouse_move(&mut self, cx: &mut Context<Self>) {
+        if !self.selecting {
+            return;
+        }
+        let scale = self.renderer.scale;
+        let (mx, my) = (self.cursor.0 as f32, self.cursor.1 as f32);
+        let panel = self.panel_rect();
+        let content = workspace::flyover_content(&panel, scale);
+        if let Some((col, row)) = self.renderer.cell_at(&content, mx, my) {
+            self.app.update(cx, |app, _| {
+                if let Some(tab) = app.flyover_tabs.get(app.flyover_active) {
+                    tab.session.update_selection(col, row);
+                    app.request_redraw();
+                }
+            });
+            cx.notify();
+        }
+    }
+
+    fn on_scroll(&mut self, delta: gpui::ScrollDelta, cx: &mut Context<Self>) {
+        let scale = self.renderer.scale;
+        let panel = self.panel_rect();
+        let content = workspace::flyover_content(&panel, scale);
+        let (mx, my) = (self.cursor.0 as f32, self.cursor.1 as f32);
+        let cell_h = f64::from(self.renderer.cell_height);
+        let notches = match delta {
+            gpui::ScrollDelta::Lines(p) => f64::from(p.y),
+            gpui::ScrollDelta::Pixels(p) => f64::from(f32::from(p.y)) / (cell_h * 3.0),
+        };
+        let steps = scroll_steps(&mut self.scroll_accum, notches);
+        if steps == 0 {
+            return;
+        }
+        let cell = self.renderer.cell_at(&content, mx, my);
+        self.app.update(cx, |app, _| {
+            if let Some(tab) = app.flyover_tabs.get(app.flyover_active) {
+                let up = steps > 0;
+                if tab.session.app_consumes_wheel() {
+                    let (col, row) = cell.unwrap_or((0, 0));
+                    for _ in 0..steps.unsigned_abs() {
+                        tab.session.forward_wheel(up, col, row);
+                    }
+                } else {
+                    tab.session.scroll_by(steps * 3);
+                }
+                app.request_redraw();
+            }
+        });
+        cx.notify();
+    }
+
+    /// Paint the flyover into the popout window. Mirrors `paint_terminal`'s
+    /// scale/resize discipline, then reuses the shared layer painter.
+    fn paint(&mut self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        let scale = window.scale_factor();
+        let phys_w = (f32::from(bounds.size.width) * scale) as u32;
+        let phys_h = (f32::from(bounds.size.height) * scale) as u32;
+        if scale != self.renderer.scale {
+            let cell_width = renderer::measure_cell_width(window, scale);
+            self.renderer.update_scale(scale, cell_width);
+        }
+        self.renderer.resize(phys_w, phys_h);
+
+        let panel = self.panel_rect();
+        let content = workspace::flyover_content(&panel, scale);
+        let (cols, rows) = self.renderer.grid_size_for(&content);
+        let (cw, ch) = (self.renderer.cell_width as u16, self.renderer.cell_height as u16);
+        let dpi = (96.0 * scale) as u32;
+        let focused = window.is_window_active();
+
+        let renderer = &self.renderer;
+        let (quads, panes, fg_quads, labels) = self.app.update(cx, |app, _| {
+            // The popout owns these grids while windowed: keep the PTYs sized
+            // to this window, not the main panel.
+            for tab in &mut app.flyover_tabs {
+                if (cols, rows) != (tab.cols, tab.rows) {
+                    tab.cols = cols;
+                    tab.rows = rows;
+                    tab.session.resize(cols, rows, cw, ch, dpi);
+                }
+            }
+            renderer.flyover_overlay(
+                &app.flyover_tabs,
+                app.flyover_active,
+                &panel,
+                focused,
+                true,
+            )
+        });
+
+        let origin = bounds.origin;
+        let inv = 1.0 / scale;
+        let th = self.renderer.theme();
+        let metrics = FlyoverPaintMetrics {
+            origin,
+            inv,
+            font: gpui::font(renderer::FONT_FAMILY),
+            font_size: px(self.renderer.font_size() * inv),
+            line_height: px(self.renderer.cell_height * inv),
+            cell_height: self.renderer.cell_height,
+            shadow_rgb: th.shadow,
+        };
+        window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
+            window.paint_quad(gpui::fill(bounds, renderer::color(th.term_bg, 1.0)));
+            paint_flyover_layer(window, cx, &metrics, &quads, &panes, &fg_quads, &labels);
+        });
+    }
+}
+
+impl Render for FlyoverPopout {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = cx.entity();
+        div()
+            .size_full()
+            .track_focus(&self.focus_handle)
+            .key_context("Terminal")
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _win, cx| {
+                let effect = this.app.update(cx, |app, _| app.popout_key(ev));
+                if effect == Some(PopoutEffect::ActivateMain)
+                    && let Some(main) = this.app.read(cx).main_window
+                {
+                    let _ = main.update(cx, |_, window, _| window.activate_window());
+                }
+                cx.notify();
+            }))
+            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _window, cx| {
+                let s = f64::from(this.renderer.scale);
+                this.cursor = (f64::from(ev.position.x) * s, f64::from(ev.position.y) * s);
+                this.on_mouse_move(cx);
+            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, ev: &MouseDownEvent, _window, cx| {
+                    let s = f64::from(this.renderer.scale);
+                    this.cursor = (f64::from(ev.position.x) * s, f64::from(ev.position.y) * s);
+                    this.on_mouse_down(cx);
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _ev: &MouseUpEvent, _window, cx| {
+                    this.selecting = false;
+                    cx.notify();
+                }),
+            )
+            .on_scroll_wheel(cx.listener(|this, ev: &gpui::ScrollWheelEvent, _win, cx| {
+                this.on_scroll(ev.delta, cx);
+            }))
+            .child(
+                canvas(
+                    move |_bounds, _window, _cx| {},
+                    move |bounds, _prepaint, window, cx| {
+                        view.update(cx, |this, cx| {
+                            this.paint(bounds, window, cx);
+                        });
+                    },
+                )
+                .size_full(),
+            )
+    }
+}
+
+/// Open the flyover popout window and store its handle on the [`App`].
+/// Called by the frame pump when windowed mode wants a window up.
+fn open_flyover_window(app: gpui::Entity<App>, cx: &mut GpuiApp) {
+    let bounds = Bounds::centered(None, gpui::size(px(880.0), px(480.0)), cx);
+    let app_for_view = app.clone();
+    let app_for_close = app.clone();
+    let handle = cx.open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            titlebar: Some(gpui::TitlebarOptions {
+                title: Some("pwrde — flyover".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        move |window, cx| {
+            // The close button hides the window (sessions keep running);
+            // ⌘` or the dock action bring it back.
+            window.on_window_should_close(cx, move |_, cx| {
+                let _ = app_for_close.update(cx, |app, _| {
+                    app.flyover_window_visible = false;
+                    app.flyover_window = None;
+                });
+                true
+            });
+            let scale = window.scale_factor();
+            let cell_width = renderer::measure_cell_width(window, scale);
+            cx.new(|cx| FlyoverPopout {
+                app: app_for_view.clone(),
+                renderer: Renderer::new(scale, cell_width, 0, 0),
+                focus_handle: cx.focus_handle(),
+                cursor: (0.0, 0.0),
+                selecting: false,
+                scroll_accum: 0.0,
+            })
+        },
+    );
+    if let Ok(w) = handle {
+        let _ = w.update(cx, |view, window, cx| {
+            window.activate_window();
+            let fh = view.focus_handle.clone();
+            window.focus(&fh, cx);
+        });
+        let _ = app.update(cx, |app, _| app.flyover_window = Some(w));
+    }
+}
+
 fn main() {
     // Settings must be in memory before anything reads a binding or theme.
     settings::init();
@@ -3923,7 +4804,7 @@ fn main() {
         let bounds = Bounds::centered(None, gpui::size(px(1200.0), px(720.0)), cx);
         let (events_tx, events_rx) = mpsc::channel::<TermEvent>();
 
-        cx.open_window(
+        let main_window = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 // A transparent native titlebar keeps OS edge-resize and the
@@ -4000,6 +4881,16 @@ fn main() {
                             c
                         },
                         link_hover: None,
+                        flyover_tabs: Vec::new(),
+                        flyover_active: 0,
+                        flyover_open: false,
+                        flyover_anim: 0.0,
+                        flyover_focused: false,
+                        flyover_windowed: false,
+                        flyover_window_visible: false,
+                        flyover_window: None,
+                        main_window: None,
+                        picker_target: PickerTarget::Group,
                     };
                     // With persistence on, reattach to the previous session's
                     // groups; otherwise launch into the empty state — no shell
@@ -4021,11 +4912,45 @@ fn main() {
                                 .timer(Duration::from_millis(16))
                                 .await;
                             let Some(app) = handle.upgrade() else { break };
-                            let _ = app.update(cx, |app: &mut App, cx| {
-                                if app.drain_events() {
-                                    cx.notify();
-                                }
-                            });
+                            let (redraw, want_popout, popout) =
+                                app.update(cx, |app: &mut App, cx| {
+                                    let redraw = app.drain_events();
+                                    if redraw {
+                                        cx.notify();
+                                    }
+                                    (
+                                        redraw,
+                                        app.flyover_windowed && app.flyover_window_visible,
+                                        app.flyover_window,
+                                    )
+                                });
+                            // Reconcile the popout window with the desired
+                            // state — window lifecycle stays here, on the
+                            // foreground executor, so entity code never has
+                            // to touch a window it doesn't own.
+                            match (want_popout, popout) {
+                                // Desired but not open: spawn it.
+                                (true, None) => {
+                                    let app_entity = app.clone();
+                                    let _ =
+                                        cx.update(|cx| open_flyover_window(app_entity, cx));
+                                },
+                                // Open but no longer desired: close it.
+                                (false, Some(w)) => {
+                                    let _ =
+                                        w.update(cx, |_, window, _| window.remove_window());
+                                    let _ = app.update(cx, |app: &mut App, _| {
+                                        app.flyover_window = None;
+                                    });
+                                },
+                                // Steady state: forward redraws to the popout.
+                                (_, Some(w)) => {
+                                    if redraw {
+                                        let _ = w.update(cx, |_, _, cx| cx.notify());
+                                    }
+                                },
+                                (false, None) => {},
+                            }
                         }
                     })
                     .detach();
@@ -4062,6 +4987,8 @@ fn main() {
             },
         )
         .expect("open window");
+        // Remember the main window so popout flows can bring it forward.
+        let _ = main_window.update(cx, |app, _, _| app.main_window = Some(main_window.into()));
 
         cx.activate(true);
     });

@@ -199,11 +199,13 @@ pub enum Action {
     NextPage,
     OpenSettings,
     CommandPalette,
+    ToggleFlyover,
+    FlyoverPopout,
 }
 
 impl Action {
     /// Keyboard-page row order.
-    pub const ALL: [Action; 23] = [
+    pub const ALL: [Action; 25] = [
         Action::SplitRight,
         Action::SplitDown,
         Action::NewTab,
@@ -227,6 +229,8 @@ impl Action {
         Action::NextPage,
         Action::OpenSettings,
         Action::CommandPalette,
+        Action::ToggleFlyover,
+        Action::FlyoverPopout,
     ];
 
     /// Stable identifier used in the settings key (`keyboard.<name>`).
@@ -255,6 +259,8 @@ impl Action {
             Action::NextPage => "next_page",
             Action::OpenSettings => "open_settings",
             Action::CommandPalette => "command_palette",
+            Action::ToggleFlyover => "toggle_flyover",
+            Action::FlyoverPopout => "flyover_popout",
         }
     }
 
@@ -283,6 +289,8 @@ impl Action {
             Action::NextPage => "Next page",
             Action::OpenSettings => "Open settings",
             Action::CommandPalette => "Command palette",
+            Action::ToggleFlyover => "Toggle Flyover Terminal",
+            Action::FlyoverPopout => "Flyover: panel ↔ window",
         }
     }
 
@@ -315,6 +323,8 @@ impl Action {
             Action::NextPage => (true, "right"),
             Action::OpenSettings => (false, ","),
             Action::CommandPalette => (false, "p"),
+            Action::ToggleFlyover => (false, "`"),
+            Action::FlyoverPopout => (true, "`"),
         };
         Binding { shift, alt: false, ctrl: false, key: key.into() }
     }

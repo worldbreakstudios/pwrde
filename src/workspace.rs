@@ -1277,6 +1277,124 @@ pub fn tile_tab_close_rect(rect: &LayoutRect, i: usize, n: usize, scale: f32, ha
     }
 }
 
+// ── Flyover panel layout ─────────────────────────────────────────────────────
+
+/// Horizontal inset (logical px) applied to each side of the flyover panel.
+const FLYOVER_INSET: f32 = 6.0;
+
+/// Height of the flyover panel as a fraction of the window height.
+const FLYOVER_HEIGHT_FRAC: f32 = 0.40;
+
+/// Resting rect of the flyover panel in physical pixels, interpolated by
+/// `anim` (0.0 = fully off-screen below, 1.0 = fully visible).
+///
+/// The panel spans the window width minus a small horizontal inset and sits
+/// above the bottom edge, occupying ~40 % of the window height.
+pub fn flyover_rect(width: u32, height: u32, scale: f32, anim: f32) -> LayoutRect {
+    let inset = (FLYOVER_INSET * scale).round();
+    let panel_h = ((height as f32) * FLYOVER_HEIGHT_FRAC).round();
+    let resting_y = (height as f32) - panel_h;
+    // Off-screen bottom: panel sits just below the window.
+    let offscreen_y = height as f32;
+    let y = lerp(offscreen_y, resting_y, anim.clamp(0.0, 1.0));
+    LayoutRect {
+        x: inset,
+        y,
+        w: ((width as f32) - 2.0 * inset).max(0.0),
+        h: panel_h,
+    }
+}
+
+/// Tab-bar strip at the top of the flyover panel (mirrors `tile_tab_bar`).
+pub fn flyover_tab_bar(rect: &LayoutRect, scale: f32) -> LayoutRect {
+    LayoutRect { h: (TILE_TAB_H * scale).round(), ..*rect }
+}
+
+/// Terminal content region of the flyover panel (below the tab strip).
+pub fn flyover_content(rect: &LayoutRect, scale: f32) -> LayoutRect {
+    let bar = (TILE_TAB_H * scale).round();
+    LayoutRect { y: rect.y + bar, h: (rect.h - bar).max(0.0), ..*rect }
+}
+
+/// Rect of tab `i` of `n` in the flyover tab strip (mirrors `tile_tab_rect`,
+/// no caret button so no `has_caret` parameter).
+pub fn flyover_tab_rect(rect: &LayoutRect, i: usize, n: usize, scale: f32) -> LayoutRect {
+    let bar = flyover_tab_bar(rect, scale);
+    let w = (bar.w / n.max(1) as f32).min((TILE_TAB_MAX_W * scale).round()).round();
+    LayoutRect { x: bar.x + i as f32 * w, y: bar.y, w, h: bar.h }
+}
+
+#[cfg(test)]
+mod flyover_tests {
+    use super::*;
+
+    /// At anim=1.0, the panel should be fully on-screen (resting_y = height - panel_h).
+    #[test]
+    fn flyover_rect_fully_visible() {
+        let r = flyover_rect(1000, 800, 1.0, 1.0);
+        let expected_h = (800.0 * FLYOVER_HEIGHT_FRAC).round();
+        let expected_y = 800.0 - expected_h;
+        assert_eq!(r.h, expected_h);
+        assert!((r.y - expected_y).abs() < 1.0, "y={} expected={}", r.y, expected_y);
+        // Inset applied to both sides.
+        assert_eq!(r.x, FLYOVER_INSET);
+        assert_eq!(r.w, 1000.0 - 2.0 * FLYOVER_INSET);
+    }
+
+    /// At anim=0.0, the panel top should be at the bottom of the window (off-screen).
+    #[test]
+    fn flyover_rect_hidden() {
+        let r = flyover_rect(1000, 800, 1.0, 0.0);
+        assert!((r.y - 800.0).abs() < 1.0, "y={} should equal height={}", r.y, 800.0);
+    }
+
+    /// At anim=0.5, the panel should be halfway between off-screen and resting.
+    #[test]
+    fn flyover_rect_mid_anim() {
+        let r = flyover_rect(1000, 800, 1.0, 0.5);
+        let panel_h = (800.0 * FLYOVER_HEIGHT_FRAC).round();
+        let resting_y = 800.0 - panel_h;
+        let expected_y = lerp(800.0, resting_y, 0.5);
+        assert!((r.y - expected_y).abs() < 1.0, "y={} expected={}", r.y, expected_y);
+    }
+
+    /// Tab-bar height matches TILE_TAB_H * scale.
+    #[test]
+    fn flyover_tab_bar_height() {
+        let panel = flyover_rect(1000, 800, 2.0, 1.0);
+        let bar = flyover_tab_bar(&panel, 2.0);
+        assert_eq!(bar.h, (TILE_TAB_H * 2.0).round());
+        assert_eq!(bar.y, panel.y);
+    }
+
+    /// Content rect starts just below the tab bar.
+    #[test]
+    fn flyover_content_below_tab_bar() {
+        let panel = flyover_rect(1000, 800, 2.0, 1.0);
+        let bar = flyover_tab_bar(&panel, 2.0);
+        let content = flyover_content(&panel, 2.0);
+        assert_eq!(content.y, panel.y + bar.h);
+        assert_eq!(content.h, (panel.h - bar.h).max(0.0));
+    }
+
+    /// Tab rects are evenly divided and don't exceed TILE_TAB_MAX_W.
+    #[test]
+    fn flyover_tab_rect_layout() {
+        let panel = flyover_rect(1000, 800, 1.0, 1.0);
+        let t0 = flyover_tab_rect(&panel, 0, 3, 1.0);
+        let t1 = flyover_tab_rect(&panel, 1, 3, 1.0);
+        let t2 = flyover_tab_rect(&panel, 2, 3, 1.0);
+        // All tabs same width.
+        assert_eq!(t0.w, t1.w);
+        assert_eq!(t1.w, t2.w);
+        // Tabs are laid out left-to-right.
+        assert!(t1.x > t0.x);
+        assert!(t2.x > t1.x);
+        // Width doesn't exceed cap.
+        assert!(t0.w <= TILE_TAB_MAX_W);
+    }
+}
+
 /// Maps each tile id to the [`Dir`] of its parent split, or `None` if the
 /// tile is a root leaf (no parent, so collapse has no effect).
 ///
