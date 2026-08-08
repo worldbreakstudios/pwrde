@@ -342,6 +342,13 @@ pub fn titlebar(scale: f32, sidebar_w: f32) -> LayoutRect {
     LayoutRect { x: 0.0, y: 0.0, w: (sidebar_w * scale).round(), h: (TITLEBAR_H * scale).round() }
 }
 
+/// The window-drag strip while the sidebar is collapsed: with no sidebar to
+/// scope it, the reserved top safe strip spans the full window width. The
+/// native traffic lights float over its left end and handle their own clicks.
+pub fn collapsed_titlebar(width: u32, scale: f32) -> LayoutRect {
+    LayoutRect { x: 0.0, y: 0.0, w: width as f32, h: (TITLEBAR_H * scale).round() }
+}
+
 /// Shared geometry for the side-by-side "+ group" / "+ section" button row.
 fn new_btn_row(scale: f32, sidebar_w: f32) -> (f32, f32, f32, f32) {
     let pad = (SIDEBAR_PAD * scale).round();
@@ -873,14 +880,25 @@ pub fn mode_segment_rect(row: &LayoutRect, i: usize, cell_width: f32, scale: f32
 
 /// The region right of the sidebar where the split tree lives. Inset from the
 /// window's top/right/bottom edges so the tile cards float on the gradient.
+///
+/// `sidebar_w == 0.0` means the sidebar is collapsed (the resize clamp keeps
+/// a visible sidebar at [`SIDEBAR_MIN_W`] or wider). Collapsed, the area is
+/// inset from the left edge like the other sides and pushed below the
+/// titlebar strip, keeping tile tab strips clear of the native traffic
+/// lights that float at the window's top-left.
 pub fn terminal_area(width: u32, height: u32, scale: f32, sidebar_w: f32) -> LayoutRect {
     let sb = (sidebar_w * scale).round();
     let pad = (AREA_PAD * scale).round();
+    let (x, top) = if sidebar_w == 0.0 {
+        (pad, (TITLEBAR_H * scale).round() + pad)
+    } else {
+        (sb, pad)
+    };
     LayoutRect {
-        x: sb,
-        y: pad,
-        w: (width as f32 - sb - pad).max(0.0),
-        h: (height as f32 - 2.0 * pad).max(0.0),
+        x,
+        y: top,
+        w: (width as f32 - x - pad).max(0.0),
+        h: (height as f32 - top - pad).max(0.0),
     }
 }
 
@@ -911,7 +929,8 @@ pub fn resize_hover_at(
     px: f32,
     py: f32,
 ) -> Option<ResizeHover> {
-    if (px - sidebar_edge_x).abs() <= grab {
+    // `sidebar_edge_x == 0.0` means collapsed: there is no edge to grab.
+    if sidebar_edge_x > 0.0 && (px - sidebar_edge_x).abs() <= grab {
         return Some(ResizeHover::Sidebar);
     }
     if !dividers_active {
@@ -1239,6 +1258,43 @@ mod tests {
         let left_gap = cta.x - area.x;
         let right_gap = (area.x + area.w) - (cta.x + cta.w);
         assert!((left_gap - right_gap).abs() <= 1.0);
+    }
+
+    #[test]
+    fn collapsed_terminal_area_clears_the_traffic_lights() {
+        // sidebar_w == 0 (collapsed): content drops below the titlebar strip
+        // where the native traffic lights float, and gains a left inset.
+        let (w, h, scale) = (1600, 1000, 2.0);
+        let area = terminal_area(w, h, scale, 0.0);
+        let pad = (AREA_PAD * scale).round();
+        let bar = (TITLEBAR_H * scale).round();
+        assert_eq!(area.x, pad);
+        assert_eq!(area.y, bar + pad);
+        assert_eq!(area.w, w as f32 - 2.0 * pad);
+        assert_eq!(area.h, h as f32 - bar - 2.0 * pad);
+    }
+
+    #[test]
+    fn expanded_terminal_area_keeps_thin_top_inset() {
+        // Any visible sidebar width keeps the original geometry: flush to the
+        // sidebar edge, inset only by the thin pad on top.
+        let (w, h, scale) = (1600, 1000, 2.0);
+        for sidebar_w in [SIDEBAR_MIN_W, SIDEBAR_DEFAULT_W, SIDEBAR_MAX_W] {
+            let area = terminal_area(w, h, scale, sidebar_w);
+            let pad = (AREA_PAD * scale).round();
+            assert_eq!(area.x, (sidebar_w * scale).round());
+            assert_eq!(area.y, pad);
+            assert_eq!(area.h, h as f32 - 2.0 * pad);
+        }
+    }
+
+    #[test]
+    fn collapsed_sidebar_edge_never_hovers() {
+        // With the sidebar collapsed the edge sits at x=0; a pointer near the
+        // window's left edge must not read as a sidebar-resize grab.
+        let node = Node::Leaf(Tile::empty(1));
+        let area = terminal_area(1600, 1000, 2.0, 0.0);
+        assert_eq!(resize_hover_at(&node, area, 2.0, 0.0, 12.0, false, 4.0, 500.0), None);
     }
 
     #[test]

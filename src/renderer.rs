@@ -389,33 +389,38 @@ impl Renderer {
         // ── Sidebar chrome (identical geometry on every page) ──────────
         // The window gradient is painted by `main.rs` before these quads;
         // the sidebar itself is transparent — its rounded rows float on it.
+        // `sidebar_w == 0.0` means collapsed: skip all of it (the empty-state
+        // CTA still paints — it is positioned off `terminal_area`).
+        let collapsed = sidebar_w == 0.0;
         let row_r = (ROW_RADIUS * self.scale).round();
         let group_pad = (12.0 * self.scale).round();
         // Traffic lights are the native macOS buttons now (transparent titlebar),
         // so we no longer draw our own here.
         match chrome.page {
             Page::Sessions => {
-                // Side-by-side "+ group" / "+ section" buttons below the titlebar.
-                let new_group = workspace::new_group_button(self.scale, sidebar_w);
-                bg_quads.push(self.px_rect(&new_group, th.card, 0.55, row_r));
-                labels.push(LabelSpec {
-                    text: "+ group".into(),
-                    color: color(th.ink_dim, 1.0),
-                    left: (new_group.x + group_pad).round(),
-                    top: (new_group.y + (new_group.h - self.cell_height) / 2.0).round(),
-                    clip: new_group,
-                    size: None,
-                });
-                let new_section = workspace::new_section_button(self.scale, sidebar_w);
-                bg_quads.push(self.px_rect(&new_section, th.card, 0.55, row_r));
-                labels.push(LabelSpec {
-                    text: "+ section".into(),
-                    color: color(th.ink_dim, 1.0),
-                    left: (new_section.x + group_pad).round(),
-                    top: (new_section.y + (new_section.h - self.cell_height) / 2.0).round(),
-                    clip: new_section,
-                    size: None,
-                });
+                if !collapsed {
+                    // Side-by-side "+ group" / "+ section" buttons below the titlebar.
+                    let new_group = workspace::new_group_button(self.scale, sidebar_w);
+                    bg_quads.push(self.px_rect(&new_group, th.card, 0.55, row_r));
+                    labels.push(LabelSpec {
+                        text: "+ group".into(),
+                        color: color(th.ink_dim, 1.0),
+                        left: (new_group.x + group_pad).round(),
+                        top: (new_group.y + (new_group.h - self.cell_height) / 2.0).round(),
+                        clip: new_group,
+                        size: None,
+                    });
+                    let new_section = workspace::new_section_button(self.scale, sidebar_w);
+                    bg_quads.push(self.px_rect(&new_section, th.card, 0.55, row_r));
+                    labels.push(LabelSpec {
+                        text: "+ section".into(),
+                        color: color(th.ink_dim, 1.0),
+                        left: (new_section.x + group_pad).round(),
+                        top: (new_section.y + (new_section.h - self.cell_height) / 2.0).round(),
+                        clip: new_section,
+                        size: None,
+                    });
+                }
                 if empty {
                     // Empty state: a centered CTA instead of group rows.
                     // Empty sections (if any) still render below the buttons.
@@ -442,20 +447,10 @@ impl Renderer {
                         clip: hint,
                         size: None,
                     });
-                    // Still paint empty-section headers under the CTA so a just-
-                    // created section is visible before it gains members.
-                    self.paint_sidebar_rows(
-                        workspaces,
-                        active,
-                        sidebar_w,
-                        chrome,
-                        th,
-                        row_r,
-                        group_pad,
-                        &mut bg_quads,
-                        &mut labels,
-                    );
-                } else {
+                }
+                // Painted even in the empty state (under the CTA) so a just-
+                // created section is visible before it gains members.
+                if !collapsed {
                     self.paint_sidebar_rows(
                         workspaces,
                         active,
@@ -469,6 +464,7 @@ impl Renderer {
                     );
                 }
             },
+            Page::Settings if collapsed => {},
             Page::Settings => {
                 // Settings sections as sidebar tabs, in the same rows the
                 // groups occupy on Sessions so the chrome reads as one.
@@ -493,33 +489,35 @@ impl Renderer {
         // ── Page-dot strip (bottom of the sidebar, every page) ─────────
         // Each slot crossfades between a subtle dot and the page's glyph as
         // its animation progress moves 0 → 1 (hovered or active page).
-        let n_pages = Page::ALL.len();
-        for (i, page) in Page::ALL.iter().enumerate() {
-            let slot = workspace::page_slot_rect(i, n_pages, height, self.scale, sidebar_w);
-            let p = chrome.dot_anim.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-            if p < 1.0 {
-                let d = (5.0 * self.scale).round().max(2.0);
-                let dot = LayoutRect {
-                    x: (slot.x + (slot.w - d) / 2.0).round(),
-                    y: (slot.y + (slot.h - d) / 2.0).round(),
-                    w: d,
-                    h: d,
-                };
-                bg_quads.push(self.px_rect(&dot, th.ink_dim, 0.45 * (1.0 - p), d / 2.0));
-            }
-            if p > 0.0 {
-                let glyph = page.glyph();
-                let gw = glyph.chars().count() as f32 * self.cell_width;
-                labels.push(LabelSpec {
-                    text: glyph.into(),
-                    color: color(th.ink, p),
-                    left: (slot.x + (slot.w - gw) / 2.0).round(),
-                    // Glyphs may be a hair wider than the slot ("<>"): allow
-                    // a small clip overhang so they aren't shaved.
-                    top: (slot.y + (slot.h - self.cell_height) / 2.0).round(),
-                    clip: slot.inflate((4.0 * self.scale).round()),
-                    size: None,
-                });
+        if !collapsed {
+            let n_pages = Page::ALL.len();
+            for (i, page) in Page::ALL.iter().enumerate() {
+                let slot = workspace::page_slot_rect(i, n_pages, height, self.scale, sidebar_w);
+                let p = chrome.dot_anim.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                if p < 1.0 {
+                    let d = (5.0 * self.scale).round().max(2.0);
+                    let dot = LayoutRect {
+                        x: (slot.x + (slot.w - d) / 2.0).round(),
+                        y: (slot.y + (slot.h - d) / 2.0).round(),
+                        w: d,
+                        h: d,
+                    };
+                    bg_quads.push(self.px_rect(&dot, th.ink_dim, 0.45 * (1.0 - p), d / 2.0));
+                }
+                if p > 0.0 {
+                    let glyph = page.glyph();
+                    let gw = glyph.chars().count() as f32 * self.cell_width;
+                    labels.push(LabelSpec {
+                        text: glyph.into(),
+                        color: color(th.ink, p),
+                        left: (slot.x + (slot.w - gw) / 2.0).round(),
+                        // Glyphs may be a hair wider than the slot ("<>"): allow
+                        // a small clip overhang so they aren't shaved.
+                        top: (slot.y + (slot.h - self.cell_height) / 2.0).round(),
+                        clip: slot.inflate((4.0 * self.scale).round()),
+                        size: None,
+                    });
+                }
             }
         }
 

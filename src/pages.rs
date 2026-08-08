@@ -188,6 +188,7 @@ pub enum Action {
     FocusRight,
     PrevSidebarTab,
     NextSidebarTab,
+    ToggleSidebar,
     PrevPage,
     NextPage,
     OpenSettings,
@@ -196,7 +197,7 @@ pub enum Action {
 
 impl Action {
     /// Keyboard-page row order.
-    pub const ALL: [Action; 22] = [
+    pub const ALL: [Action; 23] = [
         Action::SplitRight,
         Action::SplitDown,
         Action::NewTab,
@@ -215,6 +216,7 @@ impl Action {
         Action::FocusRight,
         Action::PrevSidebarTab,
         Action::NextSidebarTab,
+        Action::ToggleSidebar,
         Action::PrevPage,
         Action::NextPage,
         Action::OpenSettings,
@@ -242,6 +244,7 @@ impl Action {
             Action::FocusRight => "focus_right",
             Action::PrevSidebarTab => "prev_sidebar_tab",
             Action::NextSidebarTab => "next_sidebar_tab",
+            Action::ToggleSidebar => "toggle_sidebar",
             Action::PrevPage => "prev_page",
             Action::NextPage => "next_page",
             Action::OpenSettings => "open_settings",
@@ -269,6 +272,7 @@ impl Action {
             Action::FocusRight => "Focus pane right",
             Action::PrevSidebarTab => "Previous sidebar tab",
             Action::NextSidebarTab => "Next sidebar tab",
+            Action::ToggleSidebar => "Toggle sidebar",
             Action::PrevPage => "Previous page",
             Action::NextPage => "Next page",
             Action::OpenSettings => "Open settings",
@@ -300,6 +304,7 @@ impl Action {
             Action::FocusRight => (true, "l"),
             Action::PrevSidebarTab => (true, "up"),
             Action::NextSidebarTab => (true, "down"),
+            Action::ToggleSidebar => (false, "s"),
             Action::PrevPage => (true, "left"),
             Action::NextPage => (true, "right"),
             Action::OpenSettings => (false, ","),
@@ -540,6 +545,20 @@ mod tests {
         };
         assert_eq!(match_action(&ks("up")), Some(Action::PrevSidebarTab));
         assert_eq!(match_action(&ks("down")), Some(Action::NextSidebarTab));
+    }
+
+    /// ⌘S must reach the sidebar toggle through the same lookup every hotkey
+    /// uses, and its default must round-trip as a plain (shiftless) chord.
+    #[test]
+    fn toggle_sidebar_binds_cmd_s() {
+        let b = Action::ToggleSidebar.default_binding();
+        assert_eq!(b, Binding { shift: false, alt: false, ctrl: false, key: "s".into() });
+        let ks = Keystroke {
+            modifiers: Modifiers { platform: true, ..Default::default() },
+            key: "s".into(),
+            key_char: None,
+        };
+        assert_eq!(match_action(&ks), Some(Action::ToggleSidebar));
     }
 
     #[test]

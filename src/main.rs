@@ -131,8 +131,11 @@ struct App {
     next_section_id: u64,
     next_session_id: u64,
     next_tile_id: u64,
-    /// Sidebar width, logical px (user-resizable).
-    sidebar_w: f32,
+    /// Sidebar width when expanded, logical px (user-resizable).
+    sidebar_expanded_w: f32,
+    /// Whether the sidebar is collapsed (⌘S toggle). Session-only, like the
+    /// width; layout treats the effective width 0 as the collapsed state.
+    sidebar_collapsed: bool,
     modifiers: Modifiers,
     title: String,
     cursor: (f64, f64),
@@ -189,6 +192,12 @@ struct App {
 impl App {
     fn scale(&self) -> f32 {
         self.renderer.scale
+    }
+
+    /// Effective sidebar width for layout/hit-testing: 0 while collapsed
+    /// (`workspace` geometry treats 0 as collapsed), else the user's width.
+    fn sidebar_w(&self) -> f32 {
+        if self.sidebar_collapsed { 0.0 } else { self.sidebar_expanded_w }
     }
 
     fn dpi(&self) -> u32 {
@@ -348,7 +357,7 @@ impl App {
     /// Physical-pixel terminal area (excludes the sidebar).
     fn area(&self) -> workspace::LayoutRect {
         let (w, h) = self.renderer.surface_size();
-        workspace::terminal_area(w, h, self.scale(), self.sidebar_w)
+        workspace::terminal_area(w, h, self.scale(), self.sidebar_w())
     }
 
     /// The screen-space rect of a tile in the active workspace, if present.
@@ -753,7 +762,7 @@ impl App {
         let (px, py) = (self.cursor.0 as f32, self.cursor.1 as f32);
         let (_, h) = self.renderer.surface_size();
 
-        if workspace::sidebar(h, scale, self.sidebar_w).contains(px, py) {
+        if workspace::sidebar(h, scale, self.sidebar_w()).contains(px, py) {
             let rows = workspace::sidebar_rows(&self.workspaces, &self.sections);
             for (ri, row) in rows.iter().enumerate() {
                 let rect = workspace::sidebar_row_rect(
@@ -761,7 +770,7 @@ impl App {
                     ri,
                     &self.workspaces,
                     scale,
-                    self.sidebar_w,
+                    self.sidebar_w(),
                 );
                 if !rect.contains(px, py) {
                     continue;
@@ -974,7 +983,7 @@ impl App {
         // Section headers of collapsed sections target the section's first
         // member when one exists; empty headers are ignored.
         let (_, h) = self.renderer.surface_size();
-        if workspace::sidebar(h, scale, self.sidebar_w).contains(px, py) {
+        if workspace::sidebar(h, scale, self.sidebar_w()).contains(px, py) {
             let rows = workspace::sidebar_rows(&self.workspaces, &self.sections);
             for (ri, row) in rows.iter().enumerate() {
                 let rect = workspace::sidebar_row_rect(
@@ -982,7 +991,7 @@ impl App {
                     ri,
                     &self.workspaces,
                     scale,
-                    self.sidebar_w,
+                    self.sidebar_w(),
                 );
                 if !rect.contains(px, py) {
                     continue;
@@ -1010,7 +1019,7 @@ impl App {
     fn resolve_sidebar_group_drop(&self, px: f32, py: f32) -> Option<DropTarget> {
         let scale = self.scale();
         let (_, h) = self.renderer.surface_size();
-        if !workspace::sidebar(h, scale, self.sidebar_w).contains(px, py) {
+        if !workspace::sidebar(h, scale, self.sidebar_w()).contains(px, py) {
             return None;
         }
         let rows = workspace::sidebar_rows(&self.workspaces, &self.sections);
@@ -1024,10 +1033,10 @@ impl App {
                 ri,
                 &self.workspaces,
                 scale,
-                self.sidebar_w,
+                self.sidebar_w(),
             );
             // Full sidebar x-span for the row's y band (indented members still hit).
-            let side = workspace::sidebar(h, scale, self.sidebar_w);
+            let side = workspace::sidebar(h, scale, self.sidebar_w());
             let hit = workspace::LayoutRect {
                 x: side.x,
                 y: rect.y,
@@ -1082,7 +1091,7 @@ impl App {
                 last,
                 &self.workspaces,
                 scale,
-                self.sidebar_w,
+                self.sidebar_w(),
             );
             if py >= rect.y + rect.h {
                 return Some(DropTarget::SidebarInsert {
@@ -1116,7 +1125,7 @@ impl App {
     fn resolve_section_drop(&self, px: f32, py: f32, section_id: u64) -> Option<DropTarget> {
         let scale = self.scale();
         let (_, h) = self.renderer.surface_size();
-        if !workspace::sidebar(h, scale, self.sidebar_w).contains(px, py) {
+        if !workspace::sidebar(h, scale, self.sidebar_w()).contains(px, py) {
             return None;
         }
         let rows = workspace::sidebar_rows(&self.workspaces, &self.sections);
@@ -1146,9 +1155,9 @@ impl App {
                     ri,
                     &self.workspaces,
                     scale,
-                    self.sidebar_w,
+                    self.sidebar_w(),
                 );
-                let side = workspace::sidebar(h, scale, self.sidebar_w);
+                let side = workspace::sidebar(h, scale, self.sidebar_w());
                 if py < rect.y || py >= rect.y + rect.h {
                     continue;
                 }
@@ -1177,9 +1186,9 @@ impl App {
                 ri,
                 &self.workspaces,
                 scale,
-                self.sidebar_w,
+                self.sidebar_w(),
             );
-            let side = workspace::sidebar(h, scale, self.sidebar_w);
+            let side = workspace::sidebar(h, scale, self.sidebar_w());
             if py < rect.y || py >= rect.y + rect.h {
                 if ri == 0 && py < rect.y {
                     return Some(DropTarget::SectionMove { dest_start: 0 });
@@ -1239,7 +1248,7 @@ impl App {
                 last,
                 &self.workspaces,
                 scale,
-                self.sidebar_w,
+                self.sidebar_w(),
             );
             if py >= rect.y + rect.h {
                 return Some(DropTarget::SectionMove {
@@ -1267,12 +1276,12 @@ impl App {
                                 ri,
                                 &self.workspaces,
                                 scale,
-                                self.sidebar_w,
+                                self.sidebar_w(),
                             ));
                         }
                     }
                 }
-                Some(workspace::tab_rect(ws, scale, self.sidebar_w))
+                Some(workspace::tab_rect(ws, scale, self.sidebar_w()))
             },
             DropTarget::SidebarJoin { target } => {
                 for (ri, row) in rows.iter().enumerate() {
@@ -1283,7 +1292,7 @@ impl App {
                                 ri,
                                 &self.workspaces,
                                 scale,
-                                self.sidebar_w,
+                                self.sidebar_w(),
                             ));
                         }
                     }
@@ -1300,7 +1309,7 @@ impl App {
                                 ri,
                                 &self.workspaces,
                                 scale,
-                                self.sidebar_w,
+                                self.sidebar_w(),
                             ));
                         }
                     }
@@ -1327,7 +1336,7 @@ impl App {
                                 ri,
                                 &self.workspaces,
                                 scale,
-                                self.sidebar_w,
+                                self.sidebar_w(),
                             );
                             return Some(workspace::LayoutRect {
                                 x: r.x,
@@ -1386,7 +1395,7 @@ impl App {
                 ri,
                 &self.workspaces,
                 scale,
-                self.sidebar_w,
+                self.sidebar_w(),
             );
             match *row {
                 workspace::SidebarRow::Group { ws_idx } if ws_idx >= before => {
@@ -1413,12 +1422,12 @@ impl App {
                 last,
                 &self.workspaces,
                 scale,
-                self.sidebar_w,
+                self.sidebar_w(),
             );
             return rect.y + rect.h;
         }
         // Empty sidebar: below the button row.
-        let btn = workspace::new_group_button(scale, self.sidebar_w);
+        let btn = workspace::new_group_button(scale, self.sidebar_w());
         btn.y + btn.h + (6.0 * scale).round()
     }
 
@@ -1432,10 +1441,10 @@ impl App {
         line_h: f32,
     ) -> workspace::LayoutRect {
         let (_, h) = self.renderer.surface_size();
-        let side = workspace::sidebar(h, scale, self.sidebar_w);
+        let side = workspace::sidebar(h, scale, self.sidebar_w());
         let mut x = side.x + (8.0 * scale).round();
         for ri in 0..rows.len() {
-            let r = workspace::sidebar_row_rect(rows, ri, &self.workspaces, scale, self.sidebar_w);
+            let r = workspace::sidebar_row_rect(rows, ri, &self.workspaces, scale, self.sidebar_w());
             x = if ri == 0 { r.x } else { x.min(r.x) };
         }
         let w = side.w - (x - side.x) * 2.0;
@@ -1747,7 +1756,7 @@ impl App {
             self.commit_section_rename();
         }
 
-        let sidebar = workspace::sidebar(h, scale, self.sidebar_w);
+        let sidebar = workspace::sidebar(h, scale, self.sidebar_w());
 
         // ⌘-click opens links instead of focusing (Sessions only — the
         // terminal grids aren't visible on other pages).
@@ -1756,9 +1765,20 @@ impl App {
         }
 
         // Sidebar edge → resize sidebar (every page shares the width).
-        if (px - sidebar.w).abs() <= grab {
+        // Collapsed there is no edge to grab (sidebar.w is 0).
+        if sidebar.w > 0.0 && (px - sidebar.w).abs() <= grab {
             self.drag = Drag::Sidebar;
             self.resize_hover = Some(workspace::ResizeHover::Sidebar);
+            return;
+        }
+
+        // Collapsed sidebar: the reserved top safe strip (where the native
+        // traffic lights float) becomes the window-drag handle, full-width
+        // since there is no sidebar to scope it to.
+        if self.sidebar_collapsed
+            && workspace::collapsed_titlebar(w, scale).contains(px, py)
+        {
+            window.start_window_move();
             return;
         }
 
@@ -1766,7 +1786,7 @@ impl App {
         // interactive element in the content area (the placeholder tile must
         // not arm tab drags). The Settings page keeps its own hit-testing.
         if self.page == Page::Sessions && self.is_empty_state() && !sidebar.contains(px, py) {
-            if workspace::empty_state_cta(w, h, scale, self.sidebar_w).contains(px, py) {
+            if workspace::empty_state_cta(w, h, scale, self.sidebar_w()).contains(px, py) {
                 self.open_picker();
             }
             return;
@@ -1789,7 +1809,7 @@ impl App {
         if sidebar.contains(px, py) {
             // Window-drag is scoped to the titlebar strip ONLY so that clicks on
             // tile tab strips are never treated as a window move.
-            if workspace::titlebar(scale, self.sidebar_w).contains(px, py) {
+            if workspace::titlebar(scale, self.sidebar_w()).contains(px, py) {
                 // Native traffic-light buttons handle their own clicks; a press
                 // anywhere else in the strip drags the window (we own the drag).
                 window.start_window_move();
@@ -1803,7 +1823,7 @@ impl App {
             if self.page == Page::Settings {
                 // Settings sections sit in the group rows' slots.
                 for (i, section) in Section::ALL.iter().enumerate() {
-                    if workspace::tab_rect(i, scale, self.sidebar_w).contains(px, py) {
+                    if workspace::tab_rect(i, scale, self.sidebar_w()).contains(px, py) {
                         self.section = *section;
                         self.recording = None;
                         self.editing_command = None;
@@ -1813,11 +1833,11 @@ impl App {
                 }
                 return;
             }
-            if workspace::new_group_button(scale, self.sidebar_w).contains(px, py) {
+            if workspace::new_group_button(scale, self.sidebar_w()).contains(px, py) {
                 self.open_picker();
                 return;
             }
-            if workspace::new_section_button(scale, self.sidebar_w).contains(px, py) {
+            if workspace::new_section_button(scale, self.sidebar_w()).contains(px, py) {
                 // Append an empty expanded section and open the rename editor.
                 let id = self.next_section_id;
                 self.next_section_id = self.next_section_id.saturating_add(1);
@@ -1842,7 +1862,7 @@ impl App {
                     ri,
                     &self.workspaces,
                     scale,
-                    self.sidebar_w,
+                    self.sidebar_w(),
                 );
                 if !rect.contains(px, py) {
                     continue;
@@ -1927,7 +1947,7 @@ impl App {
 
         match &self.drag {
             Drag::Sidebar => {
-                self.sidebar_w =
+                self.sidebar_expanded_w =
                     (px / scale).clamp(workspace::SIDEBAR_MIN_W, workspace::SIDEBAR_MAX_W);
                 self.sync_layout();
                 self.request_redraw();
@@ -2005,7 +2025,7 @@ impl App {
                     None
                 } else {
                     let (_, h) = self.renderer.surface_size();
-                    let sidebar_edge_x = workspace::sidebar(h, scale, self.sidebar_w).w;
+                    let sidebar_edge_x = workspace::sidebar(h, scale, self.sidebar_w()).w;
                     let grab = GRAB * scale;
                     let dividers_active =
                         self.page == Page::Sessions && !self.is_empty_state();
@@ -2427,6 +2447,7 @@ impl App {
             Action::NextPage => return self.cycle_page(1),
             Action::PrevSidebarTab => return self.cycle_sidebar_tab(-1),
             Action::NextSidebarTab => return self.cycle_sidebar_tab(1),
+            Action::ToggleSidebar => return self.toggle_sidebar(),
             Action::OpenSettings => return self.set_page(Page::Settings),
             Action::Quit => std::process::exit(0),
             Action::CommandPalette => {
@@ -2468,12 +2489,21 @@ impl App {
             Action::FocusRight => self.focus_dir(workspace::NavDir::Right),
             Action::PrevSidebarTab
             | Action::NextSidebarTab
+            | Action::ToggleSidebar
             | Action::PrevPage
             | Action::NextPage
             | Action::OpenSettings
             | Action::Quit
             | Action::CommandPalette => {},
         }
+    }
+
+    /// ⌘S: collapse/expand the sidebar. Layout re-syncs so the PTYs pick up
+    /// the reclaimed (or surrendered) width immediately.
+    fn toggle_sidebar(&mut self) {
+        self.sidebar_collapsed = !self.sidebar_collapsed;
+        self.sync_layout();
+        self.request_redraw();
     }
 
     /// ⌘⇧←/→: step through `Page::ALL`, wrapping at both ends.
@@ -2520,7 +2550,7 @@ impl App {
         let scale = self.scale();
         let n = Page::ALL.len();
         (0..n).find(|&i| {
-            workspace::page_slot_rect(i, n, h, scale, self.sidebar_w)
+            workspace::page_slot_rect(i, n, h, scale, self.sidebar_w())
                 .inflate((3.0 * scale).round())
                 .contains(px, py)
         })
@@ -3109,7 +3139,7 @@ impl App {
         let frame = self.renderer.build_frame(
             &self.workspaces,
             self.active,
-            self.sidebar_w,
+            self.sidebar_w(),
             drop_hint,
             resize_hover,
             link_hover_suppressed,
@@ -3396,7 +3426,8 @@ fn main() {
                         next_section_id: 0,
                         next_session_id: 0,
                         next_tile_id: 0,
-                        sidebar_w: workspace::SIDEBAR_DEFAULT_W,
+                        sidebar_expanded_w: workspace::SIDEBAR_DEFAULT_W,
+                        sidebar_collapsed: false,
                         modifiers: Modifiers::default(),
                         title: String::new(),
                         cursor: (0.0, 0.0),
