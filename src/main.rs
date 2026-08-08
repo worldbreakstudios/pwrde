@@ -41,7 +41,7 @@ use gpui::{
     FocusHandle,
     InteractiveElement, IntoElement, KeyDownEvent, Keystroke, Modifiers, MouseButton,
     ModifiersChangedEvent, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
-    Point, Render, ShapedLine,
+    Point, QuitMode, Render, ShapedLine,
     Size, Styled, TextAlign, TextRun, Window, WindowBounds, WindowOptions,
 };
 
@@ -608,6 +608,34 @@ impl App {
         self.sync_layout();
         self.request_redraw();
         self.persist_snapshot();
+    }
+
+    /// Toggle collapse/expand all panes *other than* the focused one (the ⌘⇧F
+    /// action). If any other tile is expanded, collapse them all; otherwise
+    /// expand them all. A single-tile workspace is left alone.
+    fn toggle_focus_others(&mut self) {
+        let ws = &self.workspaces[self.active];
+        let focused = ws.focused_tile;
+        let mut others = Vec::new();
+        let mut any_expanded = false;
+        for t in ws.root.tiles() {
+            if t.id != focused {
+                others.push(t.id);
+                any_expanded |= !t.collapsed;
+            }
+        }
+        if others.is_empty() {
+            return;
+        }
+        for id in others {
+            self.set_collapsed(id, any_expanded);
+        }
+        // Focus mode means the focused pane is the one on screen — make sure
+        // it isn't itself collapsed when everything else folds away.
+        if any_expanded {
+            self.set_collapsed(focused, false);
+        }
+        self.request_redraw();
     }
 
     /// Toggle collapse on the focused pane (the ⌘⇧M action). A root leaf has
@@ -3167,6 +3195,7 @@ impl App {
             Action::FocusRight => self.focus_dir(workspace::NavDir::Right),
             Action::ToggleCollapse => self.toggle_focused_collapse(),
             Action::SaveWorkspace => self.open_save_workspace(),
+            Action::ToggleFocusOthers => self.toggle_focus_others(),
             Action::PrevSidebarTab
             | Action::NextSidebarTab
             | Action::ToggleSidebar
@@ -4456,7 +4485,10 @@ fn main() {
     // At this gpui rev the platform lives in the gpui_platform crate; zed's own
     // main builds it the same way (current_platform → Application::with_platform).
     let platform = gpui_platform::current_platform(false);
-    Application::with_platform(platform).run(|cx: &mut GpuiApp| {
+    // macOS's default keeps the process alive after the last window closes
+    // (document-app convention); a single-window terminal should just quit.
+    let app = Application::with_platform(platform).with_quit_mode(QuitMode::LastWindowClosed);
+    app.run(|cx: &mut GpuiApp| {
         let bounds = Bounds::centered(None, gpui::size(px(1200.0), px(720.0)), cx);
         let (events_tx, events_rx) = mpsc::channel::<TermEvent>();
 

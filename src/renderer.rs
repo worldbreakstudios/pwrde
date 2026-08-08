@@ -1037,9 +1037,9 @@ impl Renderer {
         }
     }
 
-    /// The Settings page: a single card styled exactly like a terminal tile
-    /// (same fill, radius, shadow) filling the content area, holding the
-    /// active section's rows. Row geometry comes from
+    /// The Settings page: a single chrome-polarity card (same radius and
+    /// shadow as a terminal tile, but `card`-filled like Cleanup) filling the
+    /// content area, holding the active section's rows. Row geometry comes from
     /// `workspace::settings_row_rect` so `main.rs` hit-tests the same pixels.
     fn settings_page(
         &self,
@@ -1054,12 +1054,15 @@ impl Renderer {
         let scale = self.scale;
         let pad = (14.0 * scale).round();
         let pill_r = (7.0 * scale).round();
-        bg_quads.push(self.px_rect(area, th.term_bg, 1.0, (CARD_RADIUS * scale).round()).shadow(Shadow::Card));
+        // Like the Cleanup page, the card follows the chrome polarity (white
+        // in light themes, raised dark in dark ones) rather than the
+        // always-dark terminal fill, so it reads with ink like the sidebar.
+        bg_quads.push(self.px_rect(area, th.card, 1.0, (CARD_RADIUS * scale).round()).shadow(Shadow::Card));
 
         let header_h = (workspace::SETTINGS_HEADER_H * scale).round();
         labels.push(LabelSpec {
             text: chrome.section.label().into(),
-            color: color(th.text_bright, 1.0),
+            color: color(th.ink, 1.0),
             left: area.x + pad,
             top: (area.y + (header_h - self.cell_height) / 2.0).round(),
             clip: *area,
@@ -1081,7 +1084,7 @@ impl Renderer {
                     }
                     labels.push(LabelSpec {
                         text: "Primary command".into(),
-                        color: color(th.text_bright, 1.0),
+                        color: color(th.ink, 1.0),
                         left: row.x + pad,
                         top: mid(&row),
                         clip: row,
@@ -1096,7 +1099,7 @@ impl Renderer {
                     let right = row.x + row.w - pad - if editing { caret_w + 2.0 } else { 0.0 };
                     labels.push(LabelSpec {
                         text: value,
-                        color: color(if editing { th.text_bright } else { th.text_dim }, 1.0),
+                        color: color(if editing { th.ink } else { th.ink_dim }, 1.0),
                         left: (right - w).round(),
                         top: mid(&row),
                         clip: row,
@@ -1121,7 +1124,7 @@ impl Renderer {
                     };
                     labels.push(LabelSpec {
                         text: text.into(),
-                        color: color(th.text_dim, 1.0),
+                        color: color(th.ink_dim, 1.0),
                         left: hint.x + pad,
                         top: mid(&hint),
                         clip: hint,
@@ -1141,7 +1144,7 @@ impl Renderer {
                     }
                     labels.push(LabelSpec {
                         text: action.label().into(),
-                        color: color(th.text_bright, 1.0),
+                        color: color(th.ink, 1.0),
                         left: row.x + pad,
                         top: mid(&row),
                         clip: row,
@@ -1155,7 +1158,7 @@ impl Renderer {
                     let w = value.chars().count() as f32 * self.cell_width;
                     labels.push(LabelSpec {
                         text: value,
-                        color: color(if recording { th.text_bright } else { th.text_dim }, 1.0),
+                        color: color(if recording { th.ink } else { th.ink_dim }, 1.0),
                         left: (row.x + row.w - pad - w).round(),
                         top: mid(&row),
                         clip: row,
@@ -1176,7 +1179,7 @@ impl Renderer {
                         pages::AppearanceItem::Mode => {
                             labels.push(LabelSpec {
                                 text: "Mode".into(),
-                                color: color(th.text_bright, 1.0),
+                                color: color(th.ink, 1.0),
                                 left: slot.x + pad,
                                 top: mid(&slot),
                                 clip: slot,
@@ -1192,14 +1195,14 @@ impl Renderer {
                                 let on = *m == mode;
                                 bg_quads.push(self.px_rect(
                                     &seg,
-                                    if on { th.accent } else { (255, 255, 255) },
-                                    if on { 0.9 } else { 0.12 },
+                                    if on { th.accent } else { th.ink },
+                                    if on { 0.9 } else { 0.06 },
                                     seg.h / 2.0,
                                 ));
                                 let lw = m.label().chars().count() as f32 * self.cell_width;
                                 labels.push(LabelSpec {
                                     text: m.label().into(),
-                                    color: color(if on { (255, 255, 255) } else { th.text_dim }, 1.0),
+                                    color: color(if on { (255, 255, 255) } else { th.ink_dim }, 1.0),
                                     left: (seg.x + (seg.w - lw) / 2.0).round(),
                                     top: mid(&slot),
                                     clip: seg,
@@ -1210,7 +1213,7 @@ impl Renderer {
                         pages::AppearanceItem::Header(text) => {
                             labels.push(LabelSpec {
                                 text: text.into(),
-                                color: color(th.text_dim, 1.0),
+                                color: color(th.ink_dim, 1.0),
                                 left: slot.x + pad,
                                 top: mid(&slot),
                                 clip: slot,
@@ -1282,7 +1285,7 @@ impl Renderer {
                     let on = crate::settings::get_bool("terminal.persist", false);
                     labels.push(LabelSpec {
                         text: "Persist sessions".into(),
-                        color: color(th.text_bright, 1.0),
+                        color: color(th.ink, 1.0),
                         left: row.x + pad,
                         top: mid(&row),
                         clip: row,
@@ -1300,13 +1303,13 @@ impl Renderer {
                     };
                     bg_quads.push(self.px_rect(
                         &pill,
-                        if on { th.accent } else { (255, 255, 255) },
-                        if on { 0.9 } else { 0.12 },
+                        if on { th.accent } else { th.ink },
+                        if on { 0.9 } else { 0.06 },
                         pill.h / 2.0,
                     ));
                     labels.push(LabelSpec {
                         text: state.into(),
-                        color: color(if on { (255, 255, 255) } else { th.text_dim }, 1.0),
+                        color: color(if on { (255, 255, 255) } else { th.ink_dim }, 1.0),
                         left: (pill.x + pill_pad).round(),
                         top: mid(&row),
                         clip: row,
@@ -1332,7 +1335,7 @@ impl Renderer {
                     }
                     labels.push(LabelSpec {
                         text: (*key).into(),
-                        color: color(th.text_dim, 1.0),
+                        color: color(th.ink_dim, 1.0),
                         left: row.x + pad,
                         top: mid(&row),
                         clip: LayoutRect { w: (value_col - 2.0 * pad).max(0.0), ..row },
@@ -1340,7 +1343,7 @@ impl Renderer {
                     });
                     labels.push(LabelSpec {
                         text: value.clone(),
-                        color: color(th.text_bright, 1.0),
+                        color: color(th.ink, 1.0),
                         left: row.x + value_col,
                         top: mid(&row),
                         clip: row,
@@ -1353,7 +1356,7 @@ impl Renderer {
                     let on = crate::settings::get_bool("debug.overlay", false);
                     labels.push(LabelSpec {
                         text: "Show frame stats".into(),
-                        color: color(th.text_bright, 1.0),
+                        color: color(th.ink, 1.0),
                         left: row.x + pad,
                         top: mid(&row),
                         clip: row,
@@ -1371,13 +1374,13 @@ impl Renderer {
                     };
                     bg_quads.push(self.px_rect(
                         &pill,
-                        if on { th.accent } else { (255, 255, 255) },
-                        if on { 0.9 } else { 0.12 },
+                        if on { th.accent } else { th.ink },
+                        if on { 0.9 } else { 0.06 },
                         pill.h / 2.0,
                     ));
                     labels.push(LabelSpec {
                         text: state.into(),
-                        color: color(if on { (255, 255, 255) } else { th.text_dim }, 1.0),
+                        color: color(if on { (255, 255, 255) } else { th.ink_dim }, 1.0),
                         left: (pill.x + pill_pad).round(),
                         top: mid(&row),
                         clip: row,
@@ -1790,7 +1793,7 @@ impl Renderer {
         };
         bg_quads.push(self.px_rect(
             &pill,
-            if picked { th.accent } else { (255, 255, 255) },
+            if picked { th.accent } else { th.ink },
             if picked { 0.14 } else { 0.06 },
             (7.0 * scale).round(),
         ));
@@ -1819,7 +1822,7 @@ impl Renderer {
         }
         labels.push(LabelSpec {
             text: label.into(),
-            color: color(if picked { th.text_bright } else { th.text_dim }, 1.0),
+            color: color(if picked { th.ink } else { th.ink_dim }, 1.0),
             left: slot.x + pad,
             top: mid,
             clip: LayoutRect { w: (right - slot.x - pad).max(0.0), ..*slot },
@@ -2466,7 +2469,7 @@ impl Renderer {
         // stretch keeps the shaping input small.
         // Links get the accent color + an underline quad; ⌘-click opens.
         // Detection is wrap-aware: a URL broken across rows is one link.
-        let links = crate::links::links_in_lines(&lines);
+        let links = crate::links::links_in_lines(&lines, screen.physical_cols);
         // Resolve which URL (if any) the mouse is hovering over — covers all
         // rows of a wrapped link so the entire anchor brightens together.
         let hovered_url: Option<String> = hover.and_then(|(col, row)| {
