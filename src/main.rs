@@ -2019,6 +2019,7 @@ impl App {
                     || self.message.is_some()
                     || self.fork.is_some()
                     || self.picker.is_some()
+                    || self.palette.is_some()
                 {
                     None
                 } else {
