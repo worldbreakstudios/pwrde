@@ -250,6 +250,10 @@ struct App {
     /// Link currently under the pointer: (tile id, col, row).
     /// Used to brighten the hovered link and show a pointing-hand cursor.
     link_hover: Option<(u64, usize, usize)>,
+    /// Interactive chrome rects from the most recent frame, for hover testing.
+    hot_rects: Vec<workspace::LayoutRect>,
+    /// Index into hot_rects of the currently hovered element (topmost wins).
+    ui_hover: Option<usize>,
 }
 
 impl App {
@@ -2641,6 +2645,14 @@ impl App {
                     self.link_hover = link_hover;
                     self.request_redraw();
                 }
+                // UI-element hover: iterate hot rects in reverse (topmost wins).
+                let ui_hover = self.hot_rects.iter().enumerate().rev()
+                    .find(|(_, r)| r.contains(px, py))
+                    .map(|(i, _)| i);
+                if ui_hover != self.ui_hover {
+                    self.ui_hover = ui_hover;
+                    self.request_redraw();
+                }
             },
         }
     }
@@ -4198,6 +4210,13 @@ impl App {
                 .as_ref()
                 .map(|(id, buf)| (*id, buf.as_str())),
             cleanup: &self.cleanup,
+            // Overlay scoping happens in the renderer (only overlay elements
+            // hover while one is up); here we only suppress hover mid-drag.
+            cursor: if matches!(self.drag, Drag::None) {
+                Some((self.cursor.0 as f32, self.cursor.1 as f32))
+            } else {
+                None
+            },
         };
         let link_hover_suppressed = if overlay_open
             || !matches!(self.drag, Drag::None)
@@ -4232,6 +4251,28 @@ impl App {
             self.confirm.as_ref().map(|c| (c.text.as_str(), c.accept_label())),
             &chrome,
         );
+        // The frame's hot list is the authority on what's clickable this
+        // paint. Recompute the hover index from it right away (rather than
+        // trusting the value on_mouse_move derived from the previous frame)
+        // so a keyboard-opened overlay or layout change can't leave a stale
+        // pointing hand; on_mouse_move only change-detects to trigger redraws.
+        self.hot_rects = frame.hot.clone();
+        self.ui_hover = if matches!(self.drag, Drag::None) {
+            let (cx, cy) = (self.cursor.0 as f32, self.cursor.1 as f32);
+            self.hot_rects
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, r)| r.contains(cx, cy))
+                .map(|(i, _)| i)
+        } else {
+            None
+        };
+        // Show pointing-hand cursor when hovering any interactive chrome
+        // element (links and resize handles keep priority).
+        if resize_hover.is_none() && link_hover_suppressed.is_none() && self.ui_hover.is_some() {
+            window.set_window_cursor_style(CursorStyle::PointingHand);
+        }
 
         let origin = bounds.origin;
         let inv = 1.0 / scale; // physical px → logical px for gpui coords.
@@ -4574,6 +4615,8 @@ fn main() {
                             c
                         },
                         link_hover: None,
+                        hot_rects: Vec::new(),
+                        ui_hover: None,
                     };
                     // With persistence on, reattach to the previous session's
                     // groups; otherwise launch into the empty state — no shell
