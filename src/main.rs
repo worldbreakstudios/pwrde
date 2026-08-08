@@ -63,6 +63,16 @@ enum DropTarget {
     Group { ws: usize },
 }
 
+/// A pending close-the-group confirmation: closing a group's primary pane
+/// closes the whole group, so the close waits behind this modal dialog.
+struct ConfirmClose {
+    text: String,
+    /// The primary tile whose close was requested; resolves the workspace at
+    /// confirm time so group reordering while the dialog is up can't
+    /// misdirect the close.
+    primary_tile: u64,
+}
+
 /// The in-flight pointer drag gesture.
 #[derive(Clone, Debug)]
 enum Drag {
@@ -105,6 +115,15 @@ struct App {
     /// A centered one-line message. `bool` is `dismissable`: false while `drop`
     /// provisions (input swallowed), true for a failure note the user can close.
     message: Option<(String, bool)>,
+    /// The open close-primary-pane confirmation dialog, or `None`.
+    confirm: Option<ConfirmClose>,
+    /// Primary-pane sessions awaiting their auto-run command, keyed by session
+    /// id. The command is written on the session's first wakeup (the shell has
+    /// printed its prompt by then, so startup files can't eat the input).
+    pending_primary_cmd: std::collections::HashMap<u64, String>,
+    /// In-progress edit buffer for the Settings → Sessions primary-command
+    /// row, or `None` when not editing.
+    editing_command: Option<String>,
     /// The single focus handle for the terminal element. Minted once in the
     /// constructor and focused when the window opens; keyboard events only
     /// reach us while it holds focus.
@@ -281,8 +300,18 @@ impl App {
     fn close_active_tab(&mut self) {
         let ws = &mut self.workspaces[self.active];
         let focused = ws.focused_tile;
+        let primary = ws.primary_tile;
         let Some(tile) = ws.root.find_tile_mut(focused) else { return };
         if tile.tabs.is_empty() {
+            return;
+        }
+        // Closing the primary pane closes the whole group — confirm first.
+        if focused == primary && tile.tabs.len() == 1 {
+            self.confirm = Some(ConfirmClose {
+                text: "Closing the primary pane closes this group.".into(),
+                primary_tile: primary,
+            });
+            self.request_redraw();
             return;
         }
         let tab_idx = tile.active;
@@ -312,6 +341,35 @@ impl App {
         self.request_redraw();
     }
 
+    /// Close workspace `wi` entirely (all tiles and their sessions). The last
+    /// group resets to the empty state instead of leaving a dead window.
+    fn close_group(&mut self, wi: usize) {
+        if self.workspaces.len() > 1 {
+            self.workspaces.remove(wi);
+            if self.active >= self.workspaces.len() {
+                self.active = self.workspaces.len() - 1;
+            }
+        } else {
+            self.reset_empty_workspace(0);
+        }
+        self.workspaces[self.active].fix_focus();
+        self.sync_layout();
+        self.request_redraw();
+    }
+
+    /// Confirm-dialog accept: close the group whose primary pane the user
+    /// asked to close. The group is found by its primary tile id — it may
+    /// have shifted (or vanished) while the dialog was up.
+    fn confirm_close_group(&mut self) {
+        let Some(confirm) = self.confirm.take() else { return };
+        if let Some(wi) =
+            self.workspaces.iter().position(|ws| ws.primary_tile == confirm.primary_tile)
+        {
+            self.close_group(wi);
+        }
+        self.request_redraw();
+    }
+
     /// Mouse wheel / trackpad → scroll the pane under the cursor. On the
     /// primary screen this scrolls our own scrollback (positive = back into
     /// history, matching macOS natural scrolling). But a full-screen TUI or a
@@ -319,7 +377,11 @@ impl App {
     /// (which scrolls its own content), since the alternate screen has no
     /// scrollback of ours to move.
     fn on_scroll(&mut self, delta: gpui::ScrollDelta, cell_height: f32) {
-        if self.message.is_some() || self.fork.is_some() || self.picker.is_some() {
+        if self.confirm.is_some()
+            || self.message.is_some()
+            || self.fork.is_some()
+            || self.picker.is_some()
+        {
             return;
         }
         // Only the Sessions page has terminals to scroll.
@@ -396,6 +458,17 @@ impl App {
         tab.session.scroll_to_bottom();
         tab.session.clear_selection();
         self.request_redraw();
+    }
+
+    /// The session with `id`, wherever it lives (any workspace, tile, tab).
+    fn find_session(&self, id: u64) -> Option<&Session> {
+        self.workspaces.iter().find_map(|ws| {
+            ws.root
+                .tiles()
+                .into_iter()
+                .find_map(|t| t.tabs.iter().find(|tab| tab.session.id == id))
+                .map(|tab| &tab.session)
+        })
     }
 
     /// True when the session is the *visible* tab of a tile in the active
@@ -493,6 +566,14 @@ impl App {
     fn add_group(&mut self, name: String, cwd: Option<std::path::PathBuf>) {
         let empty = self.is_empty_state();
         let tile = self.new_tile_in(cwd.as_deref());
+        // Queue the primary command for the founding pane; it is written on
+        // the session's first wakeup so the shell's startup files can't eat it.
+        let cmd = settings::primary_command();
+        if !cmd.trim().is_empty()
+            && let Some(tab) = tile.tabs.first()
+        {
+            self.pending_primary_cmd.insert(tab.session.id, cmd);
+        }
         let ws = Workspace::new(name, tile, cwd);
         if empty {
             self.workspaces[0] = ws;
@@ -701,7 +782,20 @@ impl App {
     /// (message → fork picker → dir picker). Ports origin/main's overlay_click
     /// into the gpui three-field model.
     fn overlay_click(&mut self, px: f32, py: f32, width: u32, height: u32, scale: f32) {
-        // Message overlay is topmost: a dismissable one clears on any click,
+        // Confirm dialog is topmost: the buttons decide; a click outside the
+        // panel cancels (the safe default for a destructive action).
+        if let Some(confirm) = self.confirm.as_ref() {
+            let layout = self.renderer.confirm_layout(&confirm.text);
+            if layout.close.contains(px, py) {
+                self.confirm_close_group();
+            } else if layout.cancel.contains(px, py) || !layout.panel.contains(px, py) {
+                self.confirm = None;
+            }
+            self.request_redraw();
+            return;
+        }
+
+        // Message overlay: a dismissable one clears on any click,
         // a modal (provisioning) one swallows the click.
         if let Some((_, dismissable)) = self.message.as_ref() {
             if *dismissable {
@@ -759,8 +853,12 @@ impl App {
         let grab = GRAB * scale;
 
         // Overlays are modal: they intercept clicks in priority order
-        // (message → fork picker → dir picker) before anything else.
-        if self.message.is_some() || self.fork.is_some() || self.picker.is_some() {
+        // (confirm → message → fork picker → dir picker) before anything else.
+        if self.confirm.is_some()
+            || self.message.is_some()
+            || self.fork.is_some()
+            || self.picker.is_some()
+        {
             self.overlay_click(px, py, w, h, scale);
             return;
         }
@@ -819,6 +917,7 @@ impl App {
                     if workspace::tab_rect(i, scale, self.sidebar_w).contains(px, py) {
                         self.section = *section;
                         self.recording = None;
+                        self.editing_command = None;
                         self.request_redraw();
                         return;
                     }
@@ -984,7 +1083,11 @@ impl App {
         self.modifiers = ev.keystroke.modifiers;
         // An open overlay owns the keyboard: route to it before ⌘ shortcuts or
         // the PTY so typing filters the list rather than reaching the shell.
-        if self.message.is_some() || self.fork.is_some() || self.picker.is_some() {
+        if self.confirm.is_some()
+            || self.message.is_some()
+            || self.fork.is_some()
+            || self.picker.is_some()
+        {
             self.handle_picker_key(ev);
             return;
         }
@@ -1016,6 +1119,17 @@ impl App {
     /// open, so it always consumes the key.
     fn handle_picker_key(&mut self, ev: &KeyDownEvent) {
         let key = ev.keystroke.key.as_str();
+        // The close-primary confirm dialog is topmost: Enter confirms the
+        // group close, Escape cancels, everything else is swallowed.
+        if self.confirm.is_some() {
+            match key {
+                "enter" => self.confirm_close_group(),
+                "escape" => self.confirm = None,
+                _ => {},
+            }
+            self.request_redraw();
+            return;
+        }
         // A provisioning/error message overlay is topmost. A dismissable one
         // clears on any key; a non-dismissable one swallows the key while work
         // is in flight. Either way the key is consumed here.
@@ -1103,6 +1217,35 @@ impl App {
     /// row captures the next ⌘ chord as its new binding; otherwise ⌘
     /// shortcuts still dispatch and plain typing is swallowed.
     fn handle_settings_key(&mut self, ev: &KeyDownEvent) {
+        // An editing primary-command row captures typing: chars append, Enter
+        // saves, Escape cancels.
+        if self.editing_command.is_some() {
+            match ev.keystroke.key.as_str() {
+                "escape" => self.editing_command = None,
+                "enter" => {
+                    let value = self.editing_command.take().unwrap_or_default();
+                    settings::set("session.primary_command", value.trim().into());
+                },
+                "backspace" => {
+                    if let Some(buf) = self.editing_command.as_mut() {
+                        buf.pop();
+                    }
+                },
+                _ => {
+                    if !ev.keystroke.modifiers.control
+                        && !ev.keystroke.modifiers.platform
+                        && let Some(text) = ev.keystroke.key_char.as_deref()
+                        && let Some(buf) = self.editing_command.as_mut()
+                    {
+                        for ch in text.chars().filter(|c| !c.is_control()) {
+                            buf.push(ch);
+                        }
+                    }
+                },
+            }
+            self.request_redraw();
+            return;
+        }
         if let Some(action) = self.recording {
             if ev.keystroke.key == "escape" {
                 self.recording = None;
@@ -1181,6 +1324,7 @@ impl App {
         if self.page != page {
             self.page = page;
             self.recording = None;
+            self.editing_command = None;
             // Grids may have gone stale while the Settings page was up.
             if page == Page::Sessions {
                 self.sync_layout();
@@ -1207,6 +1351,15 @@ impl App {
         let area = self.area();
         let scale = self.scale();
         match self.section {
+            Section::Sessions => {
+                if workspace::settings_row_rect(&area, 0, scale).contains(px, py) {
+                    // Edit in place, starting from the current value.
+                    self.editing_command = Some(settings::primary_command());
+                } else {
+                    // A click anywhere else cancels an in-progress edit.
+                    self.editing_command = None;
+                }
+            },
             Section::Keyboard => {
                 for (i, action) in Action::ALL.iter().enumerate() {
                     if workspace::settings_row_rect(&area, i, scale).contains(px, py) {
@@ -1244,6 +1397,13 @@ impl App {
         while let Ok(event) = self.events_rx.try_recv() {
             match event {
                 TermEvent::Wakeup(id) => {
+                    // First output from a fresh primary pane: the prompt is
+                    // up, so the queued primary command can be typed now.
+                    if let Some(cmd) = self.pending_primary_cmd.remove(&id)
+                        && let Some(session) = self.find_session(id)
+                    {
+                        session.write(format!("{cmd}\r"));
+                    }
                     if self.is_visible(id) {
                         let ws = &self.workspaces[self.active];
                         if let Some(tab) = ws.focused().and_then(|t| t.active_tab())
@@ -1258,6 +1418,7 @@ impl App {
                     }
                 },
                 TermEvent::Exit(id) => {
+                    self.pending_primary_cmd.remove(&id);
                     self.remove_session(id);
                     redraw = true;
                 },
@@ -1302,6 +1463,22 @@ impl App {
                 })
             };
             if let Some((tile_id, tab_idx)) = tile_tab {
+                // The primary pane's shell exited: the whole group goes with
+                // it. No confirmation — the process is already gone.
+                let ws = &self.workspaces[wi];
+                if ws.primary_tile == tile_id
+                    && ws.root.find_tile(tile_id).is_some_and(|t| t.tabs.len() == 1)
+                {
+                    if self
+                        .confirm
+                        .as_ref()
+                        .is_some_and(|c| c.primary_tile == tile_id)
+                    {
+                        self.confirm = None;
+                    }
+                    self.close_group(wi);
+                    return;
+                }
                 let _ = self.take_tab(wi, tile_id, tab_idx);
                 // A sole emptied tile stays present but tab-less, so
                 // `tiles().is_empty()` never fires — test for zero tabs.
@@ -1628,6 +1805,7 @@ impl App {
             section: self.section,
             dot_anim: &self.dot_anim,
             recording: self.recording,
+            editing_command: self.editing_command.as_deref(),
         };
         let frame = self.renderer.build_frame(
             &self.workspaces,
@@ -1637,6 +1815,7 @@ impl App {
             self.picker.as_ref(),
             self.fork.as_ref(),
             self.message.as_ref(),
+            self.confirm.as_ref().map(|c| c.text.as_str()),
             &chrome,
         );
 
@@ -1717,8 +1896,9 @@ impl App {
                     underline: None,
                     strikethrough: None,
                 }];
+                let size = label.size.map_or(font_size, |s| px(s * inv));
                 let shaped =
-                    window.text_system().shape_line(label.text.clone().into(), font_size, &runs, None);
+                    window.text_system().shape_line(label.text.clone().into(), size, &runs, None);
                 let p = Point::new(origin.x + px(label.left * inv), origin.y + px(label.top * inv));
                 let clip_bounds = Bounds {
                     origin: Point::new(
@@ -1745,8 +1925,9 @@ impl App {
                     underline: None,
                     strikethrough: None,
                 }];
+                let size = label.size.map_or(font_size, |s| px(s * inv));
                 let shaped =
-                    window.text_system().shape_line(label.text.clone().into(), font_size, &runs, None);
+                    window.text_system().shape_line(label.text.clone().into(), size, &runs, None);
                 let p = Point::new(origin.x + px(label.left * inv), origin.y + px(label.top * inv));
                 let clip_bounds = Bounds {
                     origin: Point::new(
@@ -1916,6 +2097,9 @@ fn main() {
                         picker: None,
                         fork: None,
                         message: None,
+                        confirm: None,
+                        pending_primary_cmd: std::collections::HashMap::new(),
+                        editing_command: None,
                         // Single focus handle, minted once; focused below.
                         focus_handle: cx.focus_handle(),
                         dirty: true,

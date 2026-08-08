@@ -45,6 +45,12 @@ pub fn get_str(key: &str) -> Option<String> {
     store().read().ok()?.get(key)?.as_str().map(str::to_owned)
 }
 
+/// The command auto-run in a group's primary pane when the group is created.
+/// Defaults to `claude`; an explicitly empty value disables the auto-run.
+pub fn primary_command() -> String {
+    get_str("session.primary_command").unwrap_or_else(|| "claude".into())
+}
+
 pub fn get_bool(key: &str, default: bool) -> bool {
     store()
         .read()
@@ -105,6 +111,13 @@ mod tests {
         save(&path, &map).unwrap();
         assert_eq!(load(&path), map);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn primary_command_defaults_to_claude() {
+        // The global store is empty in tests (no init/set), so the unset key
+        // must fall back to the default.
+        assert_eq!(primary_command(), "claude");
     }
 
     #[test]
