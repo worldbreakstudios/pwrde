@@ -79,6 +79,29 @@ impl Sel {
     }
 }
 
+/// Locate the shpool binary in the usual install locations. GUI apps don't
+/// inherit a login-shell PATH, so probe the well-known dirs directly.
+pub fn shpool_binary() -> Option<std::path::PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        candidates.push(home.join(".cargo/bin"));
+    }
+    candidates.extend(["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"].map(Into::into));
+    candidates.into_iter().map(|d| d.join("shpool")).find(|p| p.exists())
+}
+
+/// Fire-and-forget `shpool kill <name>`, used when a persisted tab is closed
+/// explicitly so the daemon doesn't accumulate orphaned sessions.
+pub fn shpool_kill(name: &str) {
+    if let Some(bin) = shpool_binary() {
+        let _ = std::process::Command::new(bin)
+            .args(["kill", name])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+}
+
 pub struct Session {
     pub id: u64,
     pub term: Arc<Mutex<Terminal>>,
@@ -89,6 +112,8 @@ pub struct Session {
     scroll_offset: AtomicUsize,
     /// Active mouse selection, if any (in stable-row coordinates).
     selection: Mutex<Option<Sel>>,
+    /// The shpool session name if this session is backed by shpool.
+    pub shpool_session: Option<String>,
 }
 
 impl Session {
@@ -104,6 +129,7 @@ impl Session {
         dpi: u32,
         cwd: Option<&std::path::Path>,
         events: Sender<TermEvent>,
+        shpool_session: Option<String>,
     ) -> Self {
         let pty_size = PtySize {
             rows: rows as u16,
@@ -113,18 +139,50 @@ impl Session {
         };
         let pair = native_pty_system().openpty(pty_size).expect("openpty");
 
-        let mut cmd = CommandBuilder::new_default_prog(); // user's shell
-        cmd.env("TERM", "xterm-256color");
-        // Advertise 24-bit color: wezterm-term parses truecolor SGR and the
-        // renderer paints full RGB per cell, so apps should emit it.
-        cmd.env("COLORTERM", "truecolor");
-        // Only honor a cwd that still exists — a pinned/recent dir may have
-        // been deleted since it was saved, and spawning a shell in a missing
-        // directory would fail. Fall back to inheriting our own cwd.
-        if let Some(dir) = cwd.filter(|d| d.is_dir()) {
-            cmd.cwd(dir);
-        }
-        let mut child = pair.slave.spawn_command(cmd).expect("spawn shell");
+        let shpool_name = shpool_session.clone();
+
+        let (cmd_opt, spawn_error) = if let Some(ref name) = shpool_name {
+            if let Some(shpool_path) = shpool_binary() {
+                let mut cmd = CommandBuilder::new(shpool_path);
+                cmd.arg("attach");
+                // The daemon spawns the session's shell, so the client's cwd
+                // doesn't reach it — pass the start dir explicitly (only used
+                // when the session is first created; ignored on reattach).
+                // Only honor a cwd that still exists — a pinned/recent dir may
+                // have been deleted since it was saved.
+                if let Some(dir) = cwd.filter(|d| d.is_dir()) {
+                    cmd.arg("--dir");
+                    cmd.arg(dir);
+                    cmd.cwd(dir);
+                }
+                cmd.arg(name);
+                cmd.env("TERM", "xterm-256color");
+                // Advertise 24-bit color: wezterm-term parses truecolor SGR and
+                // the renderer paints full RGB per cell, so apps should emit it.
+                cmd.env("COLORTERM", "truecolor");
+                (Some(cmd), None)
+            } else {
+                // Fail the pane loudly rather than silently losing persistence.
+                (None, Some("shpool not found — install it (brew install shell-pool/shpool/shpool) or disable Persist sessions\r\n"))
+            }
+        } else {
+            let mut cmd = CommandBuilder::new_default_prog(); // user's shell
+            cmd.env("TERM", "xterm-256color");
+            cmd.env("COLORTERM", "truecolor");
+            // Only honor a cwd that still exists — a pinned/recent dir may have
+            // been deleted since it was saved, and spawning a shell in a missing
+            // directory would fail. Fall back to inheriting our own cwd.
+            if let Some(dir) = cwd.filter(|d| d.is_dir()) {
+                cmd.cwd(dir);
+            }
+            (Some(cmd), None)
+        };
+
+        let child_opt = if let Some(cmd) = cmd_opt {
+            Some(pair.slave.spawn_command(cmd).expect("spawn shell"))
+        } else {
+            None
+        };
         drop(pair.slave);
 
         let reader = pair.master.try_clone_reader().expect("pty reader");
@@ -173,11 +231,20 @@ impl Session {
             });
         }
 
+        // If there's an error message, feed it to the terminal
+        if let Some(err_msg) = spawn_error {
+            term.lock().unwrap().advance_bytes(err_msg.as_bytes());
+            redraw_pending.store(true, Ordering::Release);
+            let _ = events.send(TermEvent::Wakeup(id));
+        }
+
         // Child watcher: shell exit closes the window.
-        std::thread::spawn(move || {
-            let _ = child.wait();
-            let _ = events.send(TermEvent::Exit(id));
-        });
+        if let Some(mut child) = child_opt {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+                let _ = events.send(TermEvent::Exit(id));
+            });
+        }
 
         Self {
             id,
@@ -187,6 +254,7 @@ impl Session {
             redraw_pending,
             scroll_offset: AtomicUsize::new(0),
             selection: Mutex::new(None),
+            shpool_session: shpool_name,
         }
     }
 

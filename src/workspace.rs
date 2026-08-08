@@ -35,7 +35,7 @@ impl Tile {
         Self { id, tabs: vec![Tab::new(session)], active: 0 }
     }
 
-    fn empty(id: u64) -> Self {
+    pub fn empty(id: u64) -> Self {
         Self { id, tabs: Vec::new(), active: 0 }
     }
 

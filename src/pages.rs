@@ -50,18 +50,25 @@ pub fn cycle(i: usize, n: usize, delta: isize) -> usize {
 pub enum Section {
     Sessions,
     Keyboard,
+    Terminal,
     Appearance,
     Debug,
 }
 
 impl Section {
-    pub const ALL: [Section; 4] =
-        [Section::Sessions, Section::Keyboard, Section::Appearance, Section::Debug];
+    pub const ALL: [Section; 5] = [
+        Section::Sessions,
+        Section::Keyboard,
+        Section::Terminal,
+        Section::Appearance,
+        Section::Debug,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Section::Sessions => "Sessions",
             Section::Keyboard => "Keyboard",
+            Section::Terminal => "Terminal",
             Section::Appearance => "Appearance",
             Section::Debug => "Debug",
         }
@@ -155,6 +162,9 @@ pub fn appearance_layout() -> Vec<(usize, usize, AppearanceItem)> {
 /// are read-only diagnostics; one blank row separates them from the toggle.
 /// Shared by the renderer (drawing) and main.rs (hit-testing).
 pub const DEBUG_TOGGLE_ROW: usize = 8;
+
+/// Row index of the "Persist sessions" toggle on the Terminal page.
+pub const PERSIST_TOGGLE_ROW: usize = 0;
 
 // ── Rebindable actions ──────────────────────────────────────────────────
 
