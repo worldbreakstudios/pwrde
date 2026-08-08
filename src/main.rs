@@ -17,6 +17,7 @@
 //! over an `mpsc` channel drained on gpui's foreground executor.
 
 mod claude_hooks;
+mod cleanup;
 mod git;
 mod links;
 mod pages;
@@ -79,14 +80,31 @@ enum DropTarget {
     EmptySectionMove { to_idx: usize },
 }
 
-/// A pending close-the-group confirmation: closing a group's primary pane
-/// closes the whole group, so the close waits behind this modal dialog.
+/// A pending destructive action waiting behind the modal confirm dialog.
 struct ConfirmClose {
     text: String,
-    /// The primary tile whose close was requested; resolves the workspace at
-    /// confirm time so group reordering while the dialog is up can't
-    /// misdirect the close.
-    primary_tile: u64,
+    action: ConfirmAction,
+}
+
+impl ConfirmClose {
+    /// The accept button's label — named for the action it performs.
+    fn accept_label(&self) -> &'static str {
+        match self.action {
+            ConfirmAction::CloseGroup { .. } => "Close group",
+            ConfirmAction::CleanupDelete { .. } => "Delete",
+        }
+    }
+}
+
+/// What the confirm dialog's accept button performs.
+enum ConfirmAction {
+    /// Close the group whose primary pane the user asked to close. Resolved
+    /// by primary tile id at confirm time so group reordering while the
+    /// dialog is up can't misdirect the close.
+    CloseGroup { primary_tile: u64 },
+    /// Delete the selected drop worktrees, grouped `(repo_root, ids)` the way
+    /// `drop rm` wants them.
+    CleanupDelete { targets: Vec<(String, Vec<String>)> },
 }
 
 /// The in-flight pointer drag gesture.
@@ -95,6 +113,8 @@ enum Drag {
     None,
     /// Resizing the sidebar.
     Sidebar,
+    /// Resizing a Cleanup-table column boundary.
+    CleanupColumn { boundary: usize },
     /// Resizing a split divider at `path`.
     Divider { path: Vec<u8> },
     /// A tab was pressed; may become a drag past the threshold.
@@ -171,6 +191,8 @@ struct App {
     /// Sub-notch wheel travel carried between scroll events so tiny deltas
     /// accumulate into whole scroll steps instead of being lost.
     scroll_accum: f64,
+    /// Cleanup page state (worktree listing, selection, filter, scroll).
+    cleanup: cleanup::Cleanup,
     /// The active top-level page (Sessions / Settings).
     page: Page,
     /// The active section while the Settings page is up.
@@ -503,7 +525,7 @@ impl App {
         if focused == primary && tile.tabs.len() == 1 {
             self.confirm = Some(ConfirmClose {
                 text: "Closing the primary pane closes this group.".into(),
-                primary_tile: primary,
+                action: ConfirmAction::CloseGroup { primary_tile: primary },
             });
             self.request_redraw();
             return;
@@ -622,15 +644,26 @@ impl App {
         self.persist_snapshot();
     }
 
-    /// Confirm-dialog accept: close the group whose primary pane the user
-    /// asked to close. The group is found by its primary tile id — it may
-    /// have shifted (or vanished) while the dialog was up.
-    fn confirm_close_group(&mut self) {
+    /// Confirm-dialog accept: perform whatever action the dialog was guarding.
+    fn confirm_accept(&mut self) {
         let Some(confirm) = self.confirm.take() else { return };
-        if let Some(wi) =
-            self.workspaces.iter().position(|ws| ws.primary_tile == confirm.primary_tile)
-        {
-            self.close_group(wi);
+        match confirm.action {
+            ConfirmAction::CloseGroup { primary_tile } => {
+                if let Some(wi) =
+                    self.workspaces.iter().position(|ws| ws.primary_tile == primary_tile)
+                {
+                    self.close_group(wi);
+                }
+            },
+            ConfirmAction::CleanupDelete { targets } => {
+                let count: usize = targets.iter().map(|(_, ids)| ids.len()).sum();
+                self.message = Some((format!("Deleting {count} worktree(s)…"), false));
+                let tx = self.events_tx.clone();
+                std::thread::spawn(move || {
+                    let (removed, failed, error) = run_drop_rm(targets);
+                    let _ = tx.send(TermEvent::CleanupRemoved { removed, failed, error });
+                });
+            },
         }
         self.request_redraw();
     }
@@ -649,8 +682,27 @@ impl App {
         {
             return;
         }
-        // Only the Sessions page has terminals to scroll.
-        if self.page != Page::Sessions {
+        // Only the Sessions page has terminals to scroll; Cleanup has its own
+        // scroll handling below.
+        if self.page != Page::Sessions && self.page != Page::Cleanup {
+            return;
+        }
+        // Cleanup page: scroll the worktree table.
+        if self.page == Page::Cleanup {
+            let scale = self.scale();
+            let area = self.area();
+            let notches = match delta {
+                gpui::ScrollDelta::Lines(p) => p.y as f64,
+                gpui::ScrollDelta::Pixels(p) => f32::from(p.y) as f64 / (cell_height as f64 * 3.0),
+            };
+            let steps = scroll_steps(&mut self.scroll_accum, notches);
+            if steps != 0 {
+                let fit = cleanup::rows_that_fit(&area, scale);
+                let max_scroll = self.cleanup.rows().len().saturating_sub(fit);
+                let offset = self.cleanup.scroll as i64 - steps as i64;
+                self.cleanup.scroll = offset.clamp(0, max_scroll as i64) as usize;
+                self.request_redraw();
+            }
             return;
         }
         let scale = self.scale();
@@ -1706,9 +1758,9 @@ impl App {
         // Confirm dialog is topmost: the buttons decide; a click outside the
         // panel cancels (the safe default for a destructive action).
         if let Some(confirm) = self.confirm.as_ref() {
-            let layout = self.renderer.confirm_layout(&confirm.text);
+            let layout = self.renderer.confirm_layout(&confirm.text, confirm.accept_label());
             if layout.close.contains(px, py) {
-                self.confirm_close_group();
+                self.confirm_accept();
             } else if layout.cancel.contains(px, py) || !layout.panel.contains(px, py) {
                 self.confirm = None;
             }
@@ -1883,6 +1935,26 @@ impl App {
                 }
                 return;
             }
+            if self.page == Page::Cleanup {
+                // Tab 0 = "All", then one per repo.
+                let repos = self.cleanup.repos();
+                // "All" tab at index 0.
+                if workspace::tab_rect(0, scale, self.sidebar_w).contains(px, py) {
+                    self.cleanup.repo_filter = None;
+                    self.cleanup.scroll = 0;
+                    self.request_redraw();
+                    return;
+                }
+                for (i, repo) in repos.iter().enumerate() {
+                    if workspace::tab_rect(i + 1, scale, self.sidebar_w).contains(px, py) {
+                        self.cleanup.repo_filter = Some(repo.root.clone());
+                        self.cleanup.scroll = 0;
+                        self.request_redraw();
+                        return;
+                    }
+                }
+                return;
+            }
             if workspace::new_group_button(scale, self.sidebar_w).contains(px, py) {
                 self.open_picker();
                 return;
@@ -1942,6 +2014,24 @@ impl App {
         // Settings page: the content area is the settings card.
         if self.page == Page::Settings {
             self.settings_click(px, py);
+            return;
+        }
+        // Cleanup page: the content area is the cleanup card. A press on a
+        // column boundary starts a resize drag; anything else is a click.
+        if self.page == Page::Cleanup {
+            if let Some(boundary) = cleanup::boundary_at(
+                &self.area(),
+                scale,
+                &self.cleanup.col_fracs,
+                px,
+                py,
+                GRAB * scale,
+            ) {
+                self.cleanup.hover = None;
+                self.drag = Drag::CleanupColumn { boundary };
+                return;
+            }
+            self.cleanup_click(px, py);
             return;
         }
         let ws = &self.workspaces[self.active];
@@ -2043,6 +2133,19 @@ impl App {
                 self.sync_layout();
                 self.request_redraw();
             },
+            Drag::CleanupColumn { boundary } => {
+                let fracs = cleanup::drag_boundary(
+                    &self.area(),
+                    scale,
+                    &self.cleanup.col_fracs,
+                    *boundary,
+                    px,
+                );
+                if fracs != self.cleanup.col_fracs {
+                    self.cleanup.col_fracs = fracs;
+                    self.request_redraw();
+                }
+            },
             Drag::Divider { path } => {
                 let path = path.clone();
                 let area = self.area();
@@ -2136,6 +2239,19 @@ impl App {
                     self.resize_hover = hover;
                     self.request_redraw();
                 }
+                // Dirty-cell hover on the Cleanup page drives the file popover.
+                let cleanup_hover = if self.page == Page::Cleanup
+                    && self.confirm.is_none()
+                    && self.message.is_none()
+                {
+                    self.cleanup_dirty_hover_at(px, py)
+                } else {
+                    None
+                };
+                if cleanup_hover != self.cleanup.hover {
+                    self.cleanup.hover = cleanup_hover;
+                    self.request_redraw();
+                }
                 // Link hover: suppress when any overlay is open or not in Sessions page.
                 let link_hover = if self.page != Page::Sessions
                     || self.confirm.is_some()
@@ -2174,9 +2290,40 @@ impl App {
         }
     }
 
+    /// The id of the dirty worktree whose dirty cell is under the cursor.
+    fn cleanup_dirty_hover_at(&self, px: f32, py: f32) -> Option<String> {
+        let area = self.area();
+        let scale = self.scale();
+        let cols = cleanup::column_offsets(&area, scale, &self.cleanup.col_fracs);
+        if px < cols.dirty || px >= cols.parity {
+            return None;
+        }
+        let fit = cleanup::rows_that_fit(&area, scale);
+        for vi in 0..fit {
+            let row = cleanup::row_rect(&area, vi, scale)?;
+            if !row.contains(px, py) {
+                continue;
+            }
+            let idx = self.cleanup.scroll + vi;
+            return match self.cleanup.rows().get(idx) {
+                Some(cleanup::Row::Entry(w)) if w.dirty_count > 0 => Some(w.id.clone()),
+                _ => None,
+            };
+        }
+        None
+    }
+
     fn on_mouse_up(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let _ = (window, cx);
         match std::mem::replace(&mut self.drag, Drag::None) {
+            // Column resize released: keep the layout for future sessions.
+            Drag::CleanupColumn { .. } => {
+                settings::set(
+                    "cleanup.columns",
+                    cleanup::format_col_fracs(&self.cleanup.col_fracs).into(),
+                );
+                self.request_redraw();
+            },
             Drag::Tab { tile, tab } => {
                 let (px, py) = (self.cursor.0 as f32, self.cursor.1 as f32);
                 if let Some(target) = self.resolve_drop(px, py) {
@@ -2258,6 +2405,11 @@ impl App {
             self.handle_settings_key(ev);
             return;
         }
+        // The Cleanup page owns the keyboard too (no terminal underneath).
+        if self.page == Page::Cleanup {
+            self.handle_cleanup_key(ev);
+            return;
+        }
         // ⌘ shortcuts take priority over passing bytes to the shell.
         if ev.keystroke.modifiers.platform {
             self.handle_shortcut(ev);
@@ -2281,11 +2433,11 @@ impl App {
     /// open, so it always consumes the key.
     fn handle_picker_key(&mut self, ev: &KeyDownEvent) {
         let key = ev.keystroke.key.as_str();
-        // The close-primary confirm dialog is topmost: Enter confirms the
-        // group close, Escape cancels, everything else is swallowed.
+        // The confirm dialog is topmost: Enter accepts its pending action,
+        // Escape cancels, everything else is swallowed.
         if self.confirm.is_some() {
             match key {
-                "enter" => self.confirm_close_group(),
+                "enter" => self.confirm_accept(),
                 "escape" => self.confirm = None,
                 _ => {},
             }
@@ -2608,6 +2760,23 @@ impl App {
                 self.section = Section::ALL[i];
                 self.request_redraw();
             },
+            Page::Cleanup => {
+                let repos = self.cleanup.repos();
+                // Tabs: 0 = All, 1..=n = per-repo
+                let n_tabs = repos.len() + 1;
+                let cur = match &self.cleanup.repo_filter {
+                    None => 0,
+                    Some(root) => repos.iter().position(|r| &r.root == root).map(|i| i + 1).unwrap_or(0),
+                };
+                let next = pages::cycle(cur, n_tabs, delta);
+                self.cleanup.repo_filter = if next == 0 {
+                    None
+                } else {
+                    repos.get(next - 1).map(|r| r.root.clone())
+                };
+                self.cleanup.scroll = 0;
+                self.request_redraw();
+            },
         }
     }
 
@@ -2620,6 +2789,10 @@ impl App {
             if page == Page::Sessions {
                 self.sync_layout();
                 self.mark_visible_read();
+            }
+            // Entering the Cleanup page triggers a fresh scan.
+            if page == Page::Cleanup {
+                self.spawn_cleanup_scan();
             }
         }
         self.request_redraw();
@@ -2636,6 +2809,114 @@ impl App {
                 .inflate((3.0 * scale).round())
                 .contains(px, py)
         })
+    }
+
+    /// Route a click inside the cleanup card to the row or button it hit.
+    fn cleanup_click(&mut self, px: f32, py: f32) {
+        let area = self.area();
+        let scale = self.scale();
+        let cell_w = self.renderer.cell_width;
+        // Refresh button.
+        if cleanup::refresh_button_rect(&area, scale, cell_w).contains(px, py) {
+            self.spawn_cleanup_scan();
+            return;
+        }
+        // Delete button — only active when selection is non-empty.
+        let delete = cleanup::delete_button_rect(&area, scale, cell_w);
+        if delete.contains(px, py) && !self.cleanup.selected.is_empty() {
+            let targets = self.cleanup.selected_by_repo();
+            let count: usize = targets.iter().map(|(_, ids)| ids.len()).sum();
+            let dirty = self.cleanup.selected_dirty_count();
+            let plural = if count == 1 { "" } else { "s" };
+            let text = if dirty > 0 {
+                format!(
+                    "Delete {count} worktree{plural}? {dirty} ha{} uncommitted changes — those are discarded.",
+                    if dirty == 1 { "s" } else { "ve" }
+                )
+            } else {
+                format!("Delete {count} worktree{plural}? Unmerged branches are kept.")
+            };
+            self.confirm = Some(ConfirmClose {
+                text,
+                action: ConfirmAction::CleanupDelete { targets },
+            });
+            self.request_redraw();
+            return;
+        }
+        // Row clicks: toggle an entry's selection, or filter to a header's
+        // repo (row_rect is None past the footer).
+        enum Hit {
+            Toggle(String),
+            Filter(String),
+        }
+        let fit = cleanup::rows_that_fit(&area, scale);
+        let mut hit: Option<Hit> = None;
+        for vi in 0..fit {
+            let Some(row) = cleanup::row_rect(&area, vi, scale) else { break };
+            if !row.contains(px, py) {
+                continue;
+            }
+            let idx = self.cleanup.scroll + vi;
+            hit = self.cleanup.rows().get(idx).map(|r| match r {
+                cleanup::Row::Entry(w) => Hit::Toggle(w.id.clone()),
+                cleanup::Row::Header { root, .. } => Hit::Filter(root.to_string()),
+            });
+            break;
+        }
+        match hit {
+            Some(Hit::Toggle(id)) => {
+                self.cleanup.toggle(&id);
+                self.request_redraw();
+            },
+            Some(Hit::Filter(root)) => {
+                self.cleanup.repo_filter = Some(root);
+                self.cleanup.scroll = 0;
+                self.request_redraw();
+            },
+            None => {},
+        }
+    }
+
+    /// Kick off a background `drop -d --json` sweep and show the scanning
+    /// state until its `TermEvent` lands.
+    fn spawn_cleanup_scan(&mut self) {
+        self.cleanup.set_scanning();
+        let tx = self.events_tx.clone();
+        std::thread::spawn(move || {
+            let event = match run_drop_status() {
+                Ok(worktrees) => TermEvent::CleanupScanned(worktrees),
+                Err(e) => TermEvent::CleanupScanFailed(e),
+            };
+            let _ = tx.send(event);
+        });
+        self.request_redraw();
+    }
+
+    /// Handle keyboard input on the Cleanup page (mirrors handle_settings_key).
+    fn handle_cleanup_key(&mut self, ev: &KeyDownEvent) {
+        if ev.keystroke.modifiers.platform {
+            self.handle_shortcut(ev);
+            return;
+        }
+        match ev.keystroke.key.as_str() {
+            "a" => {
+                self.cleanup.select_all_visible();
+                self.request_redraw();
+            },
+            "m" => {
+                self.cleanup.select_merged_visible();
+                self.request_redraw();
+            },
+            "r" => {
+                self.spawn_cleanup_scan();
+                self.request_redraw();
+            },
+            "escape" => {
+                self.cleanup.clear_selection();
+                self.request_redraw();
+            },
+            _ => {},
+        }
     }
 
     /// Route a click inside the settings card to the row it hit.
@@ -2770,6 +3051,28 @@ impl App {
                     self.message = Some((format!("drop failed: {message}"), true));
                     redraw = true;
                 },
+                TermEvent::CleanupScanned(worktrees) => {
+                    self.cleanup.set_ready(worktrees);
+                    redraw = true;
+                },
+                TermEvent::CleanupScanFailed(msg) => {
+                    self.cleanup.set_failed(msg);
+                    redraw = true;
+                },
+                TermEvent::CleanupRemoved { removed, failed, error } => {
+                    // Replace the modal "Deleting…" message with the outcome
+                    // (dismissable), and refresh the table to match disk.
+                    let msg = if failed == 0 {
+                        format!("Removed {removed} worktree{}.", if removed == 1 { "" } else { "s" })
+                    } else {
+                        let reason =
+                            error.map(|e| format!(" — {e}")).unwrap_or_default();
+                        format!("Removed {removed}, failed {failed}{reason}")
+                    };
+                    self.message = Some((msg, true));
+                    self.spawn_cleanup_scan();
+                    redraw = true;
+                },
                 // A pane signaled for attention (OSC 9, emitted by the Claude
                 // Code hooks). On-screen tabs of the active group are being
                 // watched, so only hidden tabs gain the unread dot.
@@ -2836,11 +3139,10 @@ impl App {
                 if ws.primary_tile == tile_id
                     && ws.root.find_tile(tile_id).is_some_and(|t| t.tabs.len() == 1)
                 {
-                    if self
-                        .confirm
-                        .as_ref()
-                        .is_some_and(|c| c.primary_tile == tile_id)
-                    {
+                    if self.confirm.as_ref().is_some_and(|c| {
+                        matches!(c.action,
+                            ConfirmAction::CloseGroup { primary_tile } if primary_tile == tile_id)
+                    }) {
                         self.confirm = None;
                     }
                     self.close_group(wi);
@@ -2980,6 +3282,116 @@ fn run_drop(repo: &std::path::Path, from: Option<&str>) -> Result<std::path::Pat
         return Err("drop produced no worktree path".into());
     }
     Ok(std::path::PathBuf::from(path))
+}
+
+/// Scan all drop-managed worktrees via `drop -d --json`. Run from the home
+/// directory (outside any repo) so drop sweeps favorites, recents, and its
+/// reposDir instead of just one repo. Runs synchronously — callers spawn it
+/// on a background thread.
+fn run_drop_status() -> Result<Vec<cleanup::WorktreeInfo>, String> {
+    let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"));
+    let mut cmd = git::augmented_command("drop");
+    cmd.args(["-d", "--json"]).current_dir(home);
+    let output = cmd.output().map_err(|e| format!("could not run drop: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let reason =
+            stderr.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").trim().to_string();
+        return Err(if reason.is_empty() { "drop -d exited with an error".into() } else { reason });
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut worktrees = serde_json::from_str::<Vec<cleanup::WorktreeInfo>>(&stdout)
+        .map_err(|e| format!("could not parse drop output: {e}"))?;
+    // Enrich dirty worktrees with per-file +/- details for the hover popover.
+    // Best-effort: a git hiccup just leaves the list empty.
+    for w in worktrees.iter_mut().filter(|w| w.dirty_count > 0) {
+        w.dirty_files = dirty_file_details(std::path::Path::new(&w.path));
+    }
+    Ok(worktrees)
+}
+
+/// `git diff HEAD --numstat` + untracked listing for one worktree.
+fn dirty_file_details(worktree: &std::path::Path) -> Vec<cleanup::DirtyFile> {
+    let run = |args: &[&str]| -> String {
+        let mut cmd = git::augmented_command("git");
+        cmd.arg("-C").arg(worktree).args(args);
+        cmd.output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default()
+    };
+    let mut files = cleanup::parse_numstat(&run(&["diff", "HEAD", "--numstat"]));
+    // `--directory` collapses whole untracked directories to one `dir/` entry
+    // (like `git status` does) — an unignored build dir reads as one line, not
+    // thousands of files. Gitignored files are excluded outright.
+    for line in run(&[
+        "ls-files",
+        "--others",
+        "--exclude-standard",
+        "--directory",
+        "--no-empty-directory",
+    ])
+    .lines()
+    {
+        let path = line.trim();
+        if !path.is_empty() {
+            files.push(cleanup::DirtyFile {
+                path: path.to_string(),
+                added: None,
+                removed: None,
+                untracked: true,
+            });
+        }
+    }
+    files
+}
+
+/// Remove worktrees via `drop rm <ids...> --repo <root> --force --json`, once
+/// per repo — drop resolves ids only within a single repo. `--force` mirrors
+/// drop's own TUI: the user explicitly selected and confirmed these rows, so
+/// dirty worktrees are removed too (branch deletion stays safe-only either
+/// way — unmerged branches survive). Returns `(removed, failed)` totals plus
+/// the first failure's reason. Runs synchronously — callers spawn it on a
+/// background thread.
+fn run_drop_rm(targets: Vec<(String, Vec<String>)>) -> (usize, usize, Option<String>) {
+    #[derive(serde::Deserialize)]
+    struct RmResult {
+        removed: bool,
+        error: Option<String>,
+    }
+    let mut removed = 0;
+    let mut failed = 0;
+    let mut first_error: Option<String> = None;
+    for (repo, ids) in targets {
+        let count = ids.len();
+        let mut cmd = git::augmented_command("drop");
+        cmd.arg("rm").args(&ids).arg("--repo").arg(&repo).arg("--force").arg("--json");
+        let results: Vec<RmResult> = match cmd.output() {
+            Ok(o) => {
+                let parsed: Vec<RmResult> =
+                    serde_json::from_slice(&o.stdout).unwrap_or_default();
+                if parsed.is_empty() && first_error.is_none() {
+                    // drop itself failed to run — its last stderr line says why.
+                    let stderr = String::from_utf8_lossy(&o.stderr).into_owned();
+                    first_error =
+                        stderr.lines().rev().find(|l| !l.trim().is_empty()).map(str::to_string);
+                }
+                parsed
+            },
+            Err(e) => {
+                first_error.get_or_insert(format!("could not run drop: {e}"));
+                Vec::new()
+            },
+        };
+        let ok = results.iter().filter(|r| r.removed).count();
+        if first_error.is_none() {
+            first_error = results.iter().filter_map(|r| r.error.clone()).next();
+        }
+        removed += ok;
+        failed += count.saturating_sub(ok);
+    }
+    (removed, failed, first_error)
 }
 
 /// Convert accumulated fractional wheel travel into whole scroll steps,
@@ -3227,6 +3639,7 @@ impl App {
                 .editing_section
                 .as_ref()
                 .map(|(id, buf)| (*id, buf.as_str())),
+            cleanup: &self.cleanup,
         };
         let link_hover_suppressed = if overlay_open
             || !matches!(self.drag, Drag::None)
@@ -3250,7 +3663,7 @@ impl App {
             self.fork.as_ref(),
             self.palette.as_ref(),
             self.message.as_ref(),
-            self.confirm.as_ref().map(|c| c.text.as_str()),
+            self.confirm.as_ref().map(|c| (c.text.as_str(), c.accept_label())),
             &chrome,
         );
 
@@ -3579,6 +3992,13 @@ fn main() {
                         },
                         dot_hover: None,
                         resize_hover: None,
+                        cleanup: {
+                            let mut c = cleanup::Cleanup::default();
+                            if let Some(s) = settings::get_str("cleanup.columns") {
+                                c.col_fracs = cleanup::parse_col_fracs(&s);
+                            }
+                            c
+                        },
                         link_hover: None,
                     };
                     // With persistence on, reattach to the previous session's

@@ -1,10 +1,11 @@
 //! Top-level page navigation + rebindable keyboard actions.
 //!
-//! pwrde has Arc-style *pages*: Sessions (the terminal workspace) and
-//! Settings. The sidebar's bottom strip shows one slot per page — a subtle
-//! dot that crossfades into the page's glyph on hover, and stays a glyph on
-//! the active page. ⌘⇧←/→ cycle pages with wraparound; ⌘⇧↑/↓ cycle the
-//! sidebar's tabs (groups on Sessions, sections on Settings) the same way.
+//! pwrde has Arc-style *pages*: Sessions (the terminal workspace), Cleanup
+//! (worktree hygiene via the `drop` CLI), and Settings. The sidebar's bottom
+//! strip shows one slot per page — a subtle dot that crossfades into the
+//! page's glyph on hover, and stays a glyph on the active page. ⌘⇧←/→ cycle
+//! pages with wraparound; ⌘⇧↑/↓ cycle the sidebar's tabs (groups on Sessions,
+//! repos on Cleanup, sections on Settings) the same way.
 //!
 //! Every ⌘ shortcut is an [`Action`] dispatched through a bindings table
 //! resolved from the settings store (`"keyboard.<action>"` keys, falling back
@@ -15,22 +16,27 @@ use gpui::Keystroke;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Page {
     Sessions,
+    /// Worktree hygiene page — lists all `drop`-managed worktrees and lets the
+    /// user multi-select and delete stale ones.
+    Cleanup,
     Settings,
 }
 
 impl Page {
     /// Dot-strip order; `cycle` walks this.
-    pub const ALL: [Page; 2] = [Page::Sessions, Page::Settings];
+    pub const ALL: [Page; 3] = [Page::Sessions, Page::Cleanup, Page::Settings];
 
     pub fn index(self) -> usize {
         Self::ALL.iter().position(|p| *p == self).unwrap_or(0)
     }
 
-    /// Glyph shown in the page slot when active or hovered. The cog is a Nerd
-    /// Font codepoint — the UI font guarantees coverage.
+    /// Glyph shown in the page slot when active or hovered. The cog / broom /
+    /// brackets are Nerd Font codepoints — the UI font guarantees coverage.
     pub fn glyph(self) -> &'static str {
         match self {
             Page::Sessions => "<>",
+            // U+F00D4 = nf-md-broom (Material Design Icons via Nerd Fonts)
+            Page::Cleanup => "\u{f00d4}",
             Page::Settings => "\u{f013}",
         }
     }

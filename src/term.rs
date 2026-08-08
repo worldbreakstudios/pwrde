@@ -33,6 +33,13 @@ pub enum TermEvent {
     GroupReady { name: String, cwd: std::path::PathBuf },
     /// `drop` failed; show `message` in the picker overlay.
     GroupFailed { message: String },
+    /// `drop -d --json` completed: full list of managed worktrees.
+    CleanupScanned(Vec<crate::cleanup::WorktreeInfo>),
+    /// `drop -d --json` failed with an error message.
+    CleanupScanFailed(String),
+    /// `drop rm … --json` completed: counts of removed and failed worktrees,
+    /// plus the first failure's reason when there is one.
+    CleanupRemoved { removed: usize, failed: usize, error: Option<String> },
 }
 
 /// Forwards `Alert::ToastNotification` from wezterm-term to the UI event channel
