@@ -4778,8 +4778,9 @@ impl FlyoverPopout {
             cell_height: self.renderer.cell_height,
             shadow_rgb: th.shadow,
         };
+        let term_bg = self.renderer.term_scheme_bg();
         window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
-            window.paint_quad(gpui::fill(bounds, renderer::color(th.term_bg, 1.0)));
+            window.paint_quad(gpui::fill(bounds, renderer::color(term_bg, 1.0)));
             paint_flyover_layer(window, cx, &metrics, &quads, &panes, &fg_quads, &labels);
         });
     }

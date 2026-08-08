@@ -2204,6 +2204,14 @@ impl Renderer {
         }]
     }
 
+    /// The terminal background the active colors want: the selected scheme's
+    /// bg, or the chrome theme's terminal background under the adaptive
+    /// default. The popout window fills with this behind the flyover card.
+    pub fn term_scheme_bg(&self) -> (u8, u8, u8) {
+        crate::term_theme::selected(crate::theme::dark_active())
+            .map_or(self.theme().term_bg, |t| t.bg)
+    }
+
     /// Build all geometry for the flyover terminal panel (card, tab strip,
     /// terminal text). Returns the frame fields to be set on the caller's Frame.
     /// `tabs` is the flyover tab list, `active` is the active tab index,
@@ -2222,13 +2230,18 @@ impl Renderer {
     ) -> (Vec<Quad>, Vec<PaneText>, Vec<Quad>, Vec<LabelSpec>) {
         let th = self.theme();
         let scale = self.scale;
+        // Resolve the terminal scheme exactly as `build_frame` does for tile
+        // cards, so the flyover follows the Appearance-page terminal colors:
+        // scheme bg/fg drive the card and tab chrome when one is selected.
         let scheme = crate::term_theme::selected(crate::theme::dark_active());
         let term_palette = crate::term_theme::build(scheme, th.term_bg);
-        let (pane_ink, pane_ink_dim, pane_pill) = match scheme {
-            Some(t) => ((t.fg, 1.0), (t.fg, 0.55), (t.fg, 0.12)),
+        let (pane_bg, pane_ink, pane_ink_dim, pane_divider, pane_pill) = match scheme {
+            Some(t) => (t.bg, (t.fg, 1.0), (t.fg, 0.55), (t.fg, 0.15), (t.fg, 0.12)),
             None => (
+                th.term_bg,
                 (th.text_bright, 1.0),
                 (th.text_dim, 1.0),
+                (th.card_divider, 1.0),
                 ((255u8, 255u8, 255u8), 0.09f32),
             ),
         };
@@ -2244,7 +2257,7 @@ impl Renderer {
 
         // Card background + border.
         let card_r = (8.0 * scale).round();
-        quads.push(self.px_rect(panel_rect, th.term_bg, 1.0, card_r).shadow(Shadow::Card));
+        quads.push(self.px_rect(panel_rect, pane_bg, 1.0, card_r).shadow(Shadow::Card));
         // Subtle top border line.
         let border = crate::workspace::LayoutRect {
             x: panel_rect.x,
@@ -2252,7 +2265,7 @@ impl Renderer {
             w: panel_rect.w,
             h: (1.0_f32 * scale).round().max(1.0),
         };
-        quads.push(self.px_rect(&border, th.card_divider, 0.5, 0.0));
+        quads.push(self.px_rect(&border, pane_divider.0, pane_divider.1 * 0.5, 0.0));
 
         // Tab strip: highlight pill for active tab.
         if n > 0 {
@@ -2300,7 +2313,7 @@ impl Renderer {
             w: tab_bar.w,
             h: (1.0_f32 * scale).round().max(1.0),
         };
-        quads.push(self.px_rect(&divider, th.card_divider, 0.35, 0.0));
+        quads.push(self.px_rect(&divider, pane_divider.0, pane_divider.1, 0.0));
 
         // Terminal content for the active tab.
         if let Some(tab) = tabs.get(active) {
