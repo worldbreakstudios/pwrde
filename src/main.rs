@@ -28,6 +28,7 @@ mod pwrspace;
 mod rect;
 mod renderer;
 mod settings;
+mod settings_ui;
 mod term;
 mod term_theme;
 mod theme;
@@ -234,6 +235,16 @@ struct App {
     message: Option<(String, bool)>,
     /// The open close-primary-pane confirmation dialog, or `None`.
     confirm: Option<ConfirmClose>,
+    /// The component-based Settings page, created lazily the first time the
+    /// Settings page opens and overlaid over the content area while active.
+    settings_ui: Option<gpui::Entity<settings_ui::SettingsUi>>,
+    /// True while a gpui-component AlertDialog is presenting `confirm`.
+    /// Bridged each drain tick by `sync_component_overlays`; the painted
+    /// confirm chrome is disabled at the `build_frame` call site.
+    ui_confirm_open: bool,
+    /// Text of the blocking progress notification currently shown through
+    /// gpui-component, if any (bridged from the non-dismissable `message`).
+    ui_message_shown: Option<String>,
     /// Primary-pane sessions awaiting their auto-run command, keyed by session
     /// id. The command is written on the session's first wakeup (the shell has
     /// printed its prompt by then, so startup files can't eat the input).
@@ -2578,6 +2589,13 @@ impl App {
     fn on_mouse_down(&mut self, window: &mut Window, click_count: usize) {
         let scale = self.renderer.scale;
         let (px, py) = (self.cursor.0 as f32, self.cursor.1 as f32);
+        // While the component Settings page owns the content area its widgets
+        // handle their own clicks; the painted page's hit rects no longer
+        // match what's on screen, so don't run them. Sidebar clicks (page and
+        // group switching) still fall through.
+        if self.page == Page::Settings && px > self.sidebar_w() {
+            return;
+        }
         let (w, h) = self.renderer.surface_size();
         let grab = GRAB * scale;
 
@@ -2928,6 +2946,15 @@ impl App {
         let _ = window;
         let scale = self.renderer.scale;
         let (px, py) = (self.cursor.0 as f32, self.cursor.1 as f32);
+
+        // Component Settings page: hover belongs to its widgets, but active
+        // drags (sidebar resize) still track across the whole window.
+        if self.page == Page::Settings
+            && matches!(self.drag, Drag::None)
+            && px > self.sidebar_w()
+        {
+            return;
+        }
 
         match &self.drag {
             Drag::Sidebar => {
@@ -4614,6 +4641,37 @@ fn key_to_bytes(ks: &Keystroke) -> Option<Vec<u8>> {
 
 impl Render for App {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // While the Settings page is active, the content area is a
+        // gpui-component view overlaid on the canvas (painted above it in
+        // document order); the sidebar stays painted. Created lazily so
+        // sessions-only use never builds it.
+        let settings_overlay = if self.page == Page::Settings {
+            if self.settings_ui.is_none() {
+                let weak = cx.entity().downgrade();
+                self.settings_ui = Some(cx.new(|_| {
+                    settings_ui::SettingsUi::new(std::rc::Rc::new(move |cx: &mut GpuiApp| {
+                        if let Some(app) = weak.upgrade() {
+                            app.update(cx, |app, cx| {
+                                app.request_redraw();
+                                cx.notify();
+                            });
+                        }
+                    }))
+                }));
+            }
+            let sidebar = px(self.sidebar_w() / self.scale());
+            Some(
+                div()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .right_0()
+                    .left(sidebar)
+                    .child(self.settings_ui.clone().unwrap()),
+            )
+        } else {
+            None
+        };
         // A full-window canvas element that paints the terminal frame.
         let view = cx.entity();
         div()
@@ -4622,6 +4680,9 @@ impl Render for App {
             .key_context("Terminal")
             .on_key_down(cx.listener(|app, ev: &KeyDownEvent, _win, cx| {
                 app.on_key_down(ev);
+                // The terminal consumes every key it receives; without this,
+                // Root's tab/cmd-c bindings (focus cycling) would also fire.
+                cx.stop_propagation();
                 cx.notify();
             }))
             .on_mouse_move(cx.listener(|app, ev: &MouseMoveEvent, window, cx| {
@@ -4680,6 +4741,7 @@ impl Render for App {
                 // the terminal never paints.
                 .size_full(),
             )
+            .children(settings_overlay)
     }
 }
 
@@ -4813,8 +4875,10 @@ impl App {
             self.profile_picker.as_ref(),
             save_view.as_ref(),
             self.palette.as_ref(),
-            self.message.as_ref(),
-            self.confirm.as_ref().map(|c| (c.text.as_str(), c.accept_label())),
+            // Message + confirm render as gpui-component notifications and
+            // AlertDialogs instead of painted chrome (sync_component_overlays).
+            None,
+            None,
             &chrome,
         );
         // The flyover panel lives outside the workspace tree, so its layer is
@@ -5407,6 +5471,108 @@ impl Render for FlyoverPopout {
 
 /// Open the flyover popout window and store its handle on the [`App`].
 /// Called by the frame pump when windowed mode wants a window up.
+/// Marker type keying the blocking progress notification so it can be
+/// removed when the underlying `message` state clears or changes.
+struct UiToast;
+
+/// Bridge painted-modal state to gpui-component overlays: `confirm` becomes
+/// an AlertDialog on the Root layer, `message` becomes a notification. Runs
+/// on the foreground executor each drain tick; the painted chrome for both
+/// is disabled at the `build_frame` call site.
+fn sync_component_overlays(app: &gpui::Entity<App>, cx: &mut GpuiApp) {
+    use gpui_component::WindowExt as _;
+    let Some(window) = app.read(cx).main_window else { return };
+
+    // Confirm → AlertDialog. State stays `Some` while the dialog is up so the
+    // existing input guards keep blocking the surfaces underneath; the
+    // dialog's buttons drive the same accept/dismiss paths the painted
+    // version did.
+    if app.read(cx).confirm.is_some() && !app.read(cx).ui_confirm_open {
+        let (text, label, danger) = {
+            let a = app.read(cx);
+            let c = a.confirm.as_ref().unwrap();
+            (
+                c.text.clone(),
+                c.accept_label(),
+                matches!(c.action, ConfirmAction::CleanupDelete { .. }),
+            )
+        };
+        app.update(cx, |a, _| a.ui_confirm_open = true);
+        let entity = app.clone();
+        let _ = window.update(cx, move |_, window, cx| {
+            window.open_alert_dialog(cx, move |alert, _, _| {
+                let ok_entity = entity.clone();
+                let close_entity = entity.clone();
+                let props = gpui_component::dialog::DialogButtonProps::default()
+                    .ok_text(label)
+                    .show_cancel(true);
+                let props = if danger {
+                    props.ok_variant(gpui_component::button::ButtonVariant::Danger)
+                } else {
+                    props
+                };
+                alert
+                    .title(label)
+                    .description(text.clone())
+                    .button_props(props)
+                    .on_ok(move |_, _, cx| {
+                        ok_entity.update(cx, |a, cx| {
+                            a.confirm_accept();
+                            cx.notify();
+                        });
+                        true
+                    })
+                    // Fires after OK and Cancel alike (and on Esc): drop any
+                    // un-accepted confirm and re-arm the bridge.
+                    .on_close(move |_, _, cx| {
+                        close_entity.update(cx, |a, cx| {
+                            a.confirm = None;
+                            a.ui_confirm_open = false;
+                            cx.notify();
+                        });
+                    })
+            });
+        });
+    }
+
+    // Message → notification. Dismissable notes hand off to an autohiding
+    // toast and unblock input immediately; the non-dismissable provisioning
+    // note stays pinned (and keeps `message` set, so input stays swallowed)
+    // until the state clears it.
+    let msg = app.read(cx).message.clone();
+    let shown = app.read(cx).ui_message_shown.clone();
+    match msg {
+        Some((text, true)) => {
+            let _ = window.update(cx, |_, window, cx| {
+                let note = gpui_component::notification::Notification::info(text);
+                window.push_notification(note, cx);
+            });
+            app.update(cx, |a, cx| {
+                a.message = None;
+                a.ui_message_shown = None;
+                cx.notify();
+            });
+        },
+        Some((text, false)) if shown.as_deref() != Some(text.as_str()) => {
+            let t = text.clone();
+            let _ = window.update(cx, move |_, window, cx| {
+                window.remove_notification::<UiToast>(cx);
+                let note = gpui_component::notification::Notification::info(t)
+                    .id::<UiToast>()
+                    .autohide(false);
+                window.push_notification(note, cx);
+            });
+            app.update(cx, |a, _| a.ui_message_shown = Some(text));
+        },
+        None if shown.is_some() => {
+            let _ =
+                window.update(cx, |_, window, cx| window.remove_notification::<UiToast>(cx));
+            app.update(cx, |a, _| a.ui_message_shown = None);
+        },
+        _ => {},
+    }
+}
+
 fn open_flyover_window(app: gpui::Entity<App>, cx: &mut GpuiApp) {
     let bounds = Bounds::centered(None, gpui::size(px(880.0), px(480.0)), cx);
     let app_for_view = app.clone();
@@ -5463,11 +5629,25 @@ fn main() {
     let platform = gpui_platform::current_platform(false);
     // macOS's default keeps the process alive after the last window closes
     // (document-app convention); a single-window terminal should just quit.
-    let app = Application::with_platform(platform).with_quit_mode(QuitMode::LastWindowClosed);
+    let app = Application::with_platform(platform)
+        // gpui-component's icons resolve through the asset source; without it
+        // every Icon in dialogs/inputs silently renders nothing.
+        .with_assets(gpui_component_assets::Assets)
+        .with_quit_mode(QuitMode::LastWindowClosed);
     app.run(|cx: &mut GpuiApp| {
+        // Must run before any gpui-component widget is built (theme, focus
+        // traps, dialog layers all hang off globals installed here).
+        gpui_component::init(cx);
+        gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
         let bounds = Bounds::centered(None, gpui::size(px(1200.0), px(720.0)), cx);
         let (events_tx, events_rx) = mpsc::channel::<TermEvent>();
 
+        // The window's root view is gpui-component's Root (dialog/notification
+        // layers); the App entity is created inside the closure but needed
+        // afterwards for the main_window back-reference, so smuggle it out.
+        let app_slot: std::rc::Rc<std::cell::RefCell<Option<gpui::Entity<App>>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let app_slot_in = app_slot.clone();
         let main_window = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -5486,7 +5666,7 @@ fn main() {
                 app_owns_titlebar_drag: true,
                 ..Default::default()
             },
-            |window, cx| {
+            move |window, cx| {
                 #[cfg(target_os = "macos")]
                 hide_titlebar_decoration(window);
 
@@ -5524,6 +5704,9 @@ fn main() {
                         palette: None,
                         message: None,
                         confirm: None,
+                        settings_ui: None,
+                        ui_confirm_open: false,
+                        ui_message_shown: None,
                         pending_primary_cmd: std::collections::HashMap::new(),
                         editing_command: None,
                         editing_section: None,
@@ -5624,6 +5807,9 @@ fn main() {
                                 },
                                 (false, None) => {},
                             }
+                            // Reflect modal state into gpui-component's
+                            // dialog/notification layers.
+                            let _ = cx.update(|cx| sync_component_overlays(&app, cx));
                         }
                     })
                     .detach();
@@ -5656,12 +5842,14 @@ fn main() {
                 // Establish keyboard focus so key events reach the terminal.
                 let handle = entity.read(cx).focus_handle.clone();
                 window.focus(&handle, cx);
-                entity
+                *app_slot_in.borrow_mut() = Some(entity.clone());
+                cx.new(|cx| gpui_component::Root::new(entity, window, cx))
             },
         )
         .expect("open window");
         // Remember the main window so popout flows can bring it forward.
-        let _ = main_window.update(cx, |app, _, _| app.main_window = Some(main_window.into()));
+        let app_entity = app_slot.borrow().clone().expect("App entity created in window");
+        app_entity.update(cx, |app, _| app.main_window = Some(main_window.into()));
 
         cx.activate(true);
     });

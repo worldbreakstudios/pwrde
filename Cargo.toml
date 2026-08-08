@@ -29,6 +29,8 @@ gpui_platform = { git = "https://github.com/zed-industries/zed", package = "gpui
 # Longbridge's component library on top of gpui (buttons, inputs, modals, tabs,
 # sidebar, theming). Pinned to a rev whose lockfile matches the gpui rev above.
 gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "6d7847e33ef3b8e043d1fcea82eb7e1b7f919d8b" }
+# Embedded SVG icons for gpui-component's IconName; registered via with_assets.
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "6d7847e33ef3b8e043d1fcea82eb7e1b7f919d8b" }
 arboard = "3.6.1"
 # Both already in gpui's dependency tree at these versions; used to reach the
 # NSWindow and hide AppKit's titlebar top-highlight hairline (see main.rs).

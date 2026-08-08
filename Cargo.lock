@@ -5509,6 +5509,7 @@ dependencies = [
  "glyphon",
  "gpui",
  "gpui-component",
+ "gpui-component-assets",
  "gpui_platform",
  "objc",
  "pollster 0.4.0",
