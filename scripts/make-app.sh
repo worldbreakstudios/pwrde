@@ -25,6 +25,21 @@ mkdir -p "${APP_DIR}/Contents/MacOS" "${APP_DIR}/Contents/Resources"
 
 cp "${BIN_PATH}" "${APP_DIR}/Contents/MacOS/${BIN_NAME}"
 
+# Generate AppIcon.icns from the source PNG (2048x2048 recommended).
+ICON_SRC="resources/pwrde-app-icon.png"
+if [[ -f "${ICON_SRC}" ]]; then
+  ICONSET="$(mktemp -d)/AppIcon.iconset"
+  mkdir -p "${ICONSET}"
+  for size in 16 32 128 256 512; do
+    sips -z "${size}" "${size}" "${ICON_SRC}" --out "${ICONSET}/icon_${size}x${size}.png" >/dev/null
+    sips -z "$((size * 2))" "$((size * 2))" "${ICON_SRC}" --out "${ICONSET}/icon_${size}x${size}@2x.png" >/dev/null
+  done
+  iconutil -c icns "${ICONSET}" -o "${APP_DIR}/Contents/Resources/AppIcon.icns"
+  rm -rf "$(dirname "${ICONSET}")"
+else
+  echo "warning: ${ICON_SRC} not found; bundling without an app icon" >&2
+fi
+
 cat > "${APP_DIR}/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -38,6 +53,8 @@ cat > "${APP_DIR}/Contents/Info.plist" <<PLIST
 	<string>${BIN_NAME}</string>
 	<key>CFBundleIdentifier</key>
 	<string>${BUNDLE_ID}</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleInfoDictionaryVersion</key>
