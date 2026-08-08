@@ -24,6 +24,7 @@ mod rect;
 mod renderer;
 mod settings;
 mod term;
+mod term_theme;
 mod theme;
 mod workspace;
 
@@ -1394,12 +1395,47 @@ impl App {
                 // A click anywhere else cancels an armed recording.
                 self.recording = None;
             },
-            Section::Themes => {
-                for (i, preset) in theme::ALL.iter().enumerate() {
-                    if workspace::settings_row_rect(&area, i, scale).contains(px, py) {
-                        settings::set("theme", preset.name.into());
-                        break;
+            Section::Appearance => {
+                for (row, col, item) in pages::appearance_layout() {
+                    let slot = workspace::appearance_slot_rect(
+                        &area,
+                        row,
+                        col,
+                        item.full_width(),
+                        scale,
+                    );
+                    if !slot.contains(px, py) {
+                        continue;
                     }
+                    match item {
+                        pages::AppearanceItem::Mode => {
+                            for (i, m) in theme::Mode::ALL.into_iter().enumerate() {
+                                let seg = workspace::mode_segment_rect(
+                                    &slot,
+                                    i,
+                                    self.renderer.cell_width,
+                                    scale,
+                                );
+                                if seg.contains(px, py) {
+                                    settings::set("appearance.mode", m.name().into());
+                                    break;
+                                }
+                            }
+                        },
+                        pages::AppearanceItem::Header(_) => {},
+                        pages::AppearanceItem::Theme(t) => {
+                            settings::set(theme::setting_key(t.dark), t.name.into());
+                        },
+                        // Adaptive default applies to both polarities at once.
+                        pages::AppearanceItem::TermDefault => {
+                            settings::set(term_theme::setting_key(false), "default".into());
+                            settings::set(term_theme::setting_key(true), "default".into());
+                        },
+                        pages::AppearanceItem::Term(t) => {
+                            settings::set(term_theme::setting_key(t.dark), t.name.into());
+                        },
+                    }
+                    break;
                 }
             },
             Section::Debug => {
@@ -2164,6 +2200,29 @@ fn main() {
 
                     app
                 });
+                // Track macOS dark/light for the "System" appearance mode:
+                // seed from the window's current appearance, then follow
+                // changes live (themes re-resolve on the next paint).
+                let is_dark = |a: gpui::WindowAppearance| {
+                    matches!(
+                        a,
+                        gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark
+                    )
+                };
+                theme::set_system_dark(is_dark(window.appearance()));
+                window
+                    .observe_window_appearance({
+                        let entity = entity.clone();
+                        move |window, cx| {
+                            theme::set_system_dark(is_dark(window.appearance()));
+                            entity.update(cx, |app, cx| {
+                                app.request_redraw();
+                                cx.notify();
+                            });
+                        }
+                    })
+                    .detach();
+
                 // Establish keyboard focus so key events reach the terminal.
                 let handle = entity.read(cx).focus_handle.clone();
                 window.focus(&handle, cx);

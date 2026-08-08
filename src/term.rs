@@ -37,8 +37,11 @@ pub enum TermEvent {
 struct TermConfig;
 
 impl TerminalConfiguration for TermConfig {
+    /// The palette apps see through OSC color queries (10/11/4…). Resolved
+    /// from the live settings each call so wezterm-term's lazy palette always
+    /// reports the scheme currently on screen, not the one at spawn time.
     fn color_palette(&self) -> ColorPalette {
-        ColorPalette::default()
+        crate::term_theme::palette(crate::theme::current())
     }
 }
 
@@ -112,6 +115,9 @@ impl Session {
 
         let mut cmd = CommandBuilder::new_default_prog(); // user's shell
         cmd.env("TERM", "xterm-256color");
+        // Advertise 24-bit color: wezterm-term parses truecolor SGR and the
+        // renderer paints full RGB per cell, so apps should emit it.
+        cmd.env("COLORTERM", "truecolor");
         // Only honor a cwd that still exists — a pinned/recent dir may have
         // been deleted since it was saved, and spawning a shell in a missing
         // directory would fail. Fall back to inheriting our own cwd.
