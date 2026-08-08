@@ -141,6 +141,12 @@ pub fn links_in_lines(lines: &[Line]) -> Vec<LinkHit> {
     hits
 }
 
+/// Return the URL of the first `LinkHit` that contains `(row, col)`, or
+/// `None` if no hit covers that cell.
+pub fn hovered_url<'a>(hits: &'a [LinkHit], row: usize, col: usize) -> Option<&'a str> {
+    hits.iter().find(|h| h.contains(row, col)).map(|h| h.url.as_str())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,5 +196,25 @@ mod tests {
         let hits = links_in_lines(&lines);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].url, "https://example.com/x");
+    }
+
+    #[test]
+    fn hovered_url_hit_and_miss() {
+        // "see https://example.com/x for info"
+        //  col  4..24
+        let lines = [line("see https://example.com/x for info", false)];
+        let hits = links_in_lines(&lines);
+
+        // Cell inside the URL.
+        assert_eq!(hovered_url(&hits, 0, 4), Some("https://example.com/x"));
+        assert_eq!(hovered_url(&hits, 0, 14), Some("https://example.com/x"));
+        assert_eq!(hovered_url(&hits, 0, 24), Some("https://example.com/x"));
+
+        // Cell outside the URL.
+        assert_eq!(hovered_url(&hits, 0, 3), None);
+        assert_eq!(hovered_url(&hits, 0, 25), None);
+
+        // Wrong row.
+        assert_eq!(hovered_url(&hits, 1, 10), None);
     }
 }

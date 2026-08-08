@@ -37,7 +37,8 @@ use gpui::{
     canvas, div, px, App as GpuiApp, AppContext, Application, Bounds, Context, CursorStyle,
     FocusHandle,
     InteractiveElement, IntoElement, KeyDownEvent, Keystroke, Modifiers, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render, ShapedLine,
+    ModifiersChangedEvent, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
+    Point, Render, ShapedLine,
     Size, Styled, TextAlign, TextRun, Window, WindowBounds, WindowOptions,
 };
 
@@ -177,6 +178,9 @@ struct App {
     /// Resize handle currently under the pointer (sidebar edge or tile divider).
     /// Drives the cursor style and hover highlight; sticky for the drag duration.
     resize_hover: Option<workspace::ResizeHover>,
+    /// Link currently under the pointer: (tile id, col, row).
+    /// Used to brighten the hovered link and show a pointing-hand cursor.
+    link_hover: Option<(u64, usize, usize)>,
 }
 
 impl App {
@@ -1983,6 +1987,39 @@ impl App {
                     self.resize_hover = hover;
                     self.request_redraw();
                 }
+                // Link hover: suppress when any overlay is open or not in Sessions page.
+                let link_hover = if self.page != Page::Sessions
+                    || self.confirm.is_some()
+                    || self.message.is_some()
+                    || self.fork.is_some()
+                    || self.picker.is_some()
+                {
+                    None
+                } else {
+                    let scale = self.renderer.scale;
+                    let ws = &self.workspaces[self.active];
+                    let (tiles, _) = workspace::layout_tiles(&ws.root, self.area(), scale);
+                    let mut found = None;
+                    for (id, rect) in &tiles {
+                        let content = workspace::tile_content(rect, scale);
+                        if !content.contains(px, py) {
+                            continue;
+                        }
+                        if let Some((col, row)) = self.renderer.cell_at(&content, px, py)
+                            && let Some(tab) =
+                                ws.root.find_tile(*id).and_then(|t| t.active_tab())
+                            && tab.session.link_at(col, row).is_some()
+                        {
+                            found = Some((*id, col, row));
+                        }
+                        break;
+                    }
+                    found
+                };
+                if link_hover != self.link_hover {
+                    self.link_hover = link_hover;
+                    self.request_redraw();
+                }
             },
         }
     }
@@ -2826,6 +2863,10 @@ impl Render for App {
                 app.on_mouse_move(window);
                 cx.notify();
             }))
+            .on_modifiers_changed(cx.listener(|app, ev: &ModifiersChangedEvent, _window, cx| {
+                app.modifiers = ev.modifiers;
+                cx.notify();
+            }))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|app, ev: &MouseDownEvent, window, cx| {
@@ -2952,12 +2993,24 @@ impl App {
                 .as_ref()
                 .map(|(id, buf)| (*id, buf.as_str())),
         };
+        let link_hover_suppressed = if overlay_open
+            || !matches!(self.drag, Drag::None)
+        {
+            None
+        } else {
+            self.link_hover
+        };
+        // Show pointing-hand cursor when hovering a link while ⌘ is held.
+        if resize_hover.is_none() && link_hover_suppressed.is_some() && self.modifiers.platform {
+            window.set_window_cursor_style(CursorStyle::PointingHand);
+        }
         let frame = self.renderer.build_frame(
             &self.workspaces,
             self.active,
             self.sidebar_w,
             drop_hint,
             resize_hover,
+            link_hover_suppressed,
             self.picker.as_ref(),
             self.fork.as_ref(),
             self.message.as_ref(),
@@ -3267,6 +3320,7 @@ fn main() {
                         },
                         dot_hover: None,
                         resize_hover: None,
+                        link_hover: None,
                     };
                     // With persistence on, reattach to the previous session's
                     // groups; otherwise launch into the empty state — no shell
