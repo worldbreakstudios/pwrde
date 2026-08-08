@@ -47,9 +47,6 @@ const CARD_DIVIDER: (u8, u8, u8) = (51, 48, 46);
 const INK: (u8, u8, u8) = (32, 30, 29);
 const INK_DIM: (u8, u8, u8) = (87, 83, 79);
 const WHITE: (u8, u8, u8) = (255, 255, 255);
-/// Popover panels (picker / fork / message) stay dark.
-const PANEL_BG: (u8, u8, u8) = (38, 36, 35);
-const ROW_ACTIVE: (u8, u8, u8) = (58, 54, 51);
 pub const ACCENT: (u8, u8, u8) = (236, 48, 19);
 const TEXT_BRIGHT: (u8, u8, u8) = (243, 242, 242);
 const TEXT_DIM: (u8, u8, u8) = (138, 133, 128);
@@ -448,20 +445,25 @@ impl Renderer {
         let pad = (12.0 * scale).round();
         let mut labels = Vec::new();
 
-        // Full-window dimming scrim behind the popover.
+        // Full-window dimming scrim behind the popover (light, so the warm
+        // gradient still reads through it).
         let scrim = LayoutRect { x: 0.0, y: 0.0, w: self.width as f32, h: self.height as f32 };
-        rects.push(self.px_rect(&scrim, SCRIM, 0.55, 0.0));
+        rects.push(self.px_rect(&scrim, SCRIM, 0.30, 0.0));
 
-        // The popover panel and its search box (both rounded).
-        rects.push(self.px_rect(&layout.panel, PANEL_BG, 1.0, (10.0 * scale).round()));
-        rects.push(self.px_rect(&layout.search, TERM_BG, 1.0, (6.0 * scale).round()));
+        // The popover: a floating white card matching the Arc chrome, with an
+        // ink-tinted search field inside it.
+        rects.push(
+            self.px_rect(&layout.panel, WHITE, 0.96, (CARD_RADIUS * scale).round())
+                .shadow(Shadow::Card),
+        );
+        rects.push(self.px_rect(&layout.search, INK, 0.06, (7.0 * scale).round()));
 
         // Search text (or placeholder) with a caret trailing the query.
         let search_top = (layout.search.y + (layout.search.h - self.cell_height) / 2.0).round();
         let (text, c) = if picker.query.is_empty() {
-            ("Search repos…".to_string(), TEXT_DIM)
+            ("Search repos…".to_string(), INK_DIM)
         } else {
-            (picker.query.clone(), TEXT_BRIGHT)
+            (picker.query.clone(), INK)
         };
         labels.push(LabelSpec {
             text,
@@ -488,21 +490,25 @@ impl Renderer {
             match prow {
                 PickerRow::Header(title) => labels.push(LabelSpec {
                     text: title.to_string(),
-                    color: color(TEXT_DIM, 1.0),
+                    color: color(INK_DIM, 1.0),
                     left: row.x + pad,
                     top,
                     clip: row,
                 }),
                 PickerRow::Entry(entry) => {
                     if i == picker.selected {
-                        rects.push(self.px_rect(&row, ROW_ACTIVE, 1.0, 0.0));
+                        // Accent-tinted rounded pill, inset from the panel edges.
+                        let m = (6.0 * scale).round();
+                        let pill =
+                            LayoutRect { x: row.x + m, w: (row.w - 2.0 * m).max(0.0), ..row };
+                        rects.push(self.px_rect(&pill, ACCENT, 0.10, (7.0 * scale).round()));
                     }
                     // Label, clipped short of the glyph gutter on the right.
                     let label_bounds =
                         LayoutRect { w: (row.w - 2.0 * layout.row_h).max(0.0), ..row };
                     labels.push(LabelSpec {
                         text: entry.label.clone(),
-                        color: color(TEXT_BRIGHT, 1.0),
+                        color: color(INK, 1.0),
                         left: row.x + pad,
                         top,
                         clip: label_bounds,
@@ -522,7 +528,7 @@ impl Renderer {
                         let star = layout.star_rect(&row);
                         labels.push(LabelSpec {
                             text: "★".to_string(),
-                            color: color((240, 190, 70), 1.0),
+                            color: color((205, 150, 35), 1.0),
                             left: star.x + (layout.row_h - self.cell_width) / 2.0,
                             top,
                             clip: star,
@@ -542,11 +548,12 @@ impl Renderer {
         let pad = (12.0 * scale).round();
         let mut labels = Vec::new();
 
-        // Dimming scrim behind the popover.
+        // Dimming scrim behind the popover (light, matching the dir picker).
         let scrim = LayoutRect { x: 0.0, y: 0.0, w: self.width as f32, h: self.height as f32 };
-        rects.push(self.px_rect(&scrim, SCRIM, 0.55, 0.0));
+        rects.push(self.px_rect(&scrim, SCRIM, 0.30, 0.0));
 
-        // Centered panel sized to the (capped) row count.
+        // Centered panel sized to the (capped) row count: a floating white
+        // card matching the Arc chrome.
         let row_h = (self.cell_height + 8.0 * scale).round();
         let visible = fork.rows.len().min(12);
         let panel_w = (self.width as f32 * 0.5).min(560.0 * scale).round();
@@ -554,13 +561,16 @@ impl Renderer {
         let panel_x = ((self.width as f32 - panel_w) / 2.0).round();
         let panel_y = ((self.height as f32 - panel_h) / 3.0).round().max(pad);
         let panel = LayoutRect { x: panel_x, y: panel_y, w: panel_w, h: panel_h };
-        rects.push(self.px_rect(&panel, PANEL_BG, 1.0, (10.0 * scale).round()));
+        rects.push(
+            self.px_rect(&panel, WHITE, 0.96, (CARD_RADIUS * scale).round())
+                .shadow(Shadow::Card),
+        );
 
         // Header: "fork <name> from…".
         let header = LayoutRect { x: panel_x, y: panel_y + pad, w: panel_w, h: row_h };
         labels.push(LabelSpec {
             text: format!("fork {} from…", fork.name),
-            color: color(TEXT_DIM, 1.0),
+            color: color(INK_DIM, 1.0),
             left: panel_x + pad,
             top: (header.y + (row_h - self.cell_height) / 2.0).round(),
             clip: header,
@@ -569,12 +579,12 @@ impl Renderer {
         // Filter box + caret.
         let search =
             LayoutRect { x: panel_x + pad, y: panel_y + pad + row_h, w: panel_w - 2.0 * pad, h: row_h };
-        rects.push(self.px_rect(&search, TERM_BG, 1.0, (6.0 * scale).round()));
+        rects.push(self.px_rect(&search, INK, 0.06, (7.0 * scale).round()));
         let search_top = (search.y + (search.h - self.cell_height) / 2.0).round();
         let (text, c) = if fork.query.is_empty() {
-            ("Filter branches…".to_string(), TEXT_DIM)
+            ("Filter branches…".to_string(), INK_DIM)
         } else {
-            (fork.query.clone(), TEXT_BRIGHT)
+            (fork.query.clone(), INK)
         };
         labels.push(LabelSpec {
             text,
@@ -598,11 +608,14 @@ impl Renderer {
             let row = LayoutRect { x: panel_x, y: rows_top + row_h * i as f32, w: panel_w, h: row_h };
             let top = (row.y + (row.h - self.cell_height) / 2.0).round();
             if i == fork.selected {
-                rects.push(self.px_rect(&row, ROW_ACTIVE, 1.0, 0.0));
+                // Accent-tinted rounded pill, inset from the panel edges.
+                let m = (6.0 * scale).round();
+                let pill = LayoutRect { x: row.x + m, w: (row.w - 2.0 * m).max(0.0), ..row };
+                rects.push(self.px_rect(&pill, ACCENT, 0.10, (7.0 * scale).round()));
             }
             labels.push(LabelSpec {
                 text: entry.label.clone(),
-                color: color(TEXT_BRIGHT, 1.0),
+                color: color(INK, 1.0),
                 left: row.x + pad,
                 top,
                 clip: LayoutRect { w: panel_w - 2.0 * pad, ..row },
@@ -616,7 +629,7 @@ impl Renderer {
         let scale = self.scale;
         let pad = (16.0 * scale).round();
         let scrim = LayoutRect { x: 0.0, y: 0.0, w: self.width as f32, h: self.height as f32 };
-        rects.push(self.px_rect(&scrim, SCRIM, 0.55, 0.0));
+        rects.push(self.px_rect(&scrim, SCRIM, 0.30, 0.0));
 
         let w = (text.chars().count() as f32 * self.cell_width + pad * 2.0)
             .min(self.width as f32 - pad * 2.0);
@@ -624,10 +637,13 @@ impl Renderer {
         let x = ((self.width as f32 - w) / 2.0).round();
         let y = ((self.height as f32 - h) / 2.0).round();
         let panel = LayoutRect { x, y, w, h };
-        rects.push(self.px_rect(&panel, PANEL_BG, 1.0, (8.0 * scale).round()));
+        rects.push(
+            self.px_rect(&panel, WHITE, 0.96, (CARD_RADIUS * scale).round())
+                .shadow(Shadow::Card),
+        );
         vec![LabelSpec {
             text: text.to_string(),
-            color: color(TEXT_BRIGHT, 1.0),
+            color: color(INK, 1.0),
             left: x + pad,
             top: (y + (h - self.cell_height) / 2.0).round(),
             clip: panel,
