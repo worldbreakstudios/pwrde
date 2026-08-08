@@ -182,6 +182,10 @@ pub enum Action {
     NextTile,
     PrevTab,
     NextTab,
+    FocusLeft,
+    FocusDown,
+    FocusUp,
+    FocusRight,
     PrevSidebarTab,
     NextSidebarTab,
     PrevPage,
@@ -191,7 +195,7 @@ pub enum Action {
 
 impl Action {
     /// Keyboard-page row order.
-    pub const ALL: [Action; 17] = [
+    pub const ALL: [Action; 21] = [
         Action::SplitRight,
         Action::SplitDown,
         Action::NewTab,
@@ -204,6 +208,10 @@ impl Action {
         Action::NextTile,
         Action::PrevTab,
         Action::NextTab,
+        Action::FocusLeft,
+        Action::FocusDown,
+        Action::FocusUp,
+        Action::FocusRight,
         Action::PrevSidebarTab,
         Action::NextSidebarTab,
         Action::PrevPage,
@@ -226,6 +234,10 @@ impl Action {
             Action::NextTile => "next_tile",
             Action::PrevTab => "prev_tab",
             Action::NextTab => "next_tab",
+            Action::FocusLeft => "focus_left",
+            Action::FocusDown => "focus_down",
+            Action::FocusUp => "focus_up",
+            Action::FocusRight => "focus_right",
             Action::PrevSidebarTab => "prev_sidebar_tab",
             Action::NextSidebarTab => "next_sidebar_tab",
             Action::PrevPage => "prev_page",
@@ -248,6 +260,10 @@ impl Action {
             Action::NextTile => "Focus next tile",
             Action::PrevTab => "Previous tab",
             Action::NextTab => "Next tab",
+            Action::FocusLeft => "Focus pane left",
+            Action::FocusDown => "Focus pane down",
+            Action::FocusUp => "Focus pane up",
+            Action::FocusRight => "Focus pane right",
             Action::PrevSidebarTab => "Previous sidebar tab",
             Action::NextSidebarTab => "Next sidebar tab",
             Action::PrevPage => "Previous page",
@@ -274,6 +290,10 @@ impl Action {
             Action::NextTile => (false, "]"),
             Action::PrevTab => (true, "["),
             Action::NextTab => (true, "]"),
+            Action::FocusLeft => (true, "h"),
+            Action::FocusDown => (true, "j"),
+            Action::FocusUp => (true, "k"),
+            Action::FocusRight => (true, "l"),
             Action::PrevSidebarTab => (true, "up"),
             Action::NextSidebarTab => (true, "down"),
             Action::PrevPage => (true, "left"),
@@ -487,6 +507,25 @@ mod tests {
         };
         assert_eq!(match_action(&ks("up")), Some(Action::PrevSidebarTab));
         assert_eq!(match_action(&ks("down")), Some(Action::NextSidebarTab));
+    }
+
+    #[test]
+    fn focus_dir_bindings_resolve() {
+        let ks = |key: &str| Keystroke {
+            modifiers: Modifiers {
+                platform: true,
+                shift: true,
+                control: false,
+                alt: false,
+                function: false,
+            },
+            key: key.into(),
+            key_char: None,
+        };
+        assert_eq!(match_action(&ks("h")), Some(Action::FocusLeft));
+        assert_eq!(match_action(&ks("j")), Some(Action::FocusDown));
+        assert_eq!(match_action(&ks("k")), Some(Action::FocusUp));
+        assert_eq!(match_action(&ks("l")), Some(Action::FocusRight));
     }
 
     #[test]
