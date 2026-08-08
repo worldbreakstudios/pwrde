@@ -429,7 +429,7 @@ impl Renderer {
                         }
                         let inset = ((tab.h - (self.cell_height + cwd_line_h)) / 2.0).max(0.0);
                         labels.push(LabelSpec {
-                            text: ws_item.name.clone(),
+                            text: ws_item.title(),
                             color: color(if i == active { th.ink } else { th.ink_dim }, 1.0),
                             left: tab.x + group_pad,
                             top: (tab.y + inset).round(),
