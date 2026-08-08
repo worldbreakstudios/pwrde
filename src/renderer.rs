@@ -307,9 +307,15 @@ impl Renderer {
         let ws = &workspaces[active];
         let (width, height) = (self.width, self.height);
         let area = workspace::terminal_area(width, height, self.scale, sidebar_w);
+        let empty = workspaces.len() == 1 && workspaces[0].is_empty();
         // Dividers aren't painted (the gap between cards shows the gradient);
-        // they remain drag handles for hit-testing in `main.rs`.
-        let (tiles, _dividers) = workspace::layout_tiles(&ws.root, area, self.scale);
+        // they remain drag handles for hit-testing in `main.rs`. The empty
+        // state draws no tile cards at all — just the centered CTA.
+        let (tiles, _dividers) = if empty {
+            (Vec::new(), Vec::new())
+        } else {
+            workspace::layout_tiles(&ws.root, area, self.scale)
+        };
 
         let mut bg_quads: Vec<Quad> = Vec::new();
         let mut fg_quads: Vec<Quad> = Vec::new();
@@ -333,20 +339,42 @@ impl Renderer {
             top: (new_group.y + (new_group.h - self.cell_height) / 2.0).round(),
             clip: new_group,
         });
-        for (i, ws_item) in workspaces.iter().enumerate() {
-            let tab = workspace::tab_rect(i, self.scale, sidebar_w);
-            if i == active {
-                // Active row: a white rounded pill with a subtle shadow.
-                bg_quads.push(self.px_rect(&tab, WHITE, 0.78, row_r).shadow(Shadow::Soft));
-            }
-            // The group's name, so the sidebar tab isn't blank.
+        if empty {
+            let cta = workspace::empty_state_cta(width, height, self.scale, sidebar_w);
+            let hint = workspace::empty_state_hint(width, height, self.scale, sidebar_w);
+            bg_quads.push(self.px_rect(&cta, WHITE, 0.62, row_r).shadow(Shadow::Soft));
+            let cta_text = "New group";
+            let cta_w = cta_text.chars().count() as f32 * self.cell_width;
             labels.push(LabelSpec {
-                text: ws_item.name.clone(),
-                color: color(if i == active { INK } else { INK_DIM }, 1.0),
-                left: tab.x + group_pad,
-                top: (tab.y + (tab.h - self.cell_height) / 2.0).round(),
-                clip: LayoutRect { w: tab.w - group_pad, ..tab },
+                text: cta_text.into(),
+                color: color(INK, 1.0),
+                left: (cta.x + ((cta.w - cta_w) / 2.0).max(0.0)).round(),
+                top: (cta.y + (cta.h - self.cell_height) / 2.0).round(),
+                clip: cta,
             });
+            let hint_text = "press ⇧⌘T";
+            let hint_w = hint_text.chars().count() as f32 * self.cell_width;
+            labels.push(LabelSpec {
+                text: hint_text.into(),
+                color: color(INK_DIM, 0.9),
+                left: (hint.x + ((hint.w - hint_w) / 2.0).max(0.0)).round(),
+                top: (hint.y + (hint.h - self.cell_height) / 2.0).round(),
+                clip: hint,
+            });
+        } else {
+            for (i, ws_item) in workspaces.iter().enumerate() {
+                let tab = workspace::tab_rect(i, self.scale, sidebar_w);
+                if i == active {
+                    bg_quads.push(self.px_rect(&tab, WHITE, 0.78, row_r).shadow(Shadow::Soft));
+                }
+                labels.push(LabelSpec {
+                    text: ws_item.name.clone(),
+                    color: color(if i == active { INK } else { INK_DIM }, 1.0),
+                    left: tab.x + group_pad,
+                    top: (tab.y + (tab.h - self.cell_height) / 2.0).round(),
+                    clip: LayoutRect { w: tab.w - group_pad, ..tab },
+                });
+            }
         }
         let card_r = (CARD_RADIUS * self.scale).round();
         let hair = (1.0 * self.scale).round().max(1.0);
