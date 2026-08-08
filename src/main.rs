@@ -449,6 +449,18 @@ impl App {
         self.request_redraw();
     }
 
+    /// Move focus to the pane in the given direction, if one exists.
+    fn focus_dir(&mut self, dir: workspace::NavDir) {
+        let ws = &self.workspaces[self.active];
+        let scale = self.scale();
+        let (tiles, _) = workspace::layout_tiles(&ws.root, self.area(), scale);
+        let from = ws.focused_tile;
+        if let Some(id) = workspace::directional_neighbor(&tiles, from, dir) {
+            self.workspaces[self.active].focused_tile = id;
+            self.request_redraw();
+        }
+    }
+
     fn cycle_tab(&mut self, delta: isize) {
         let ws = &mut self.workspaces[self.active];
         let focused = ws.focused_tile;
@@ -2450,6 +2462,10 @@ impl App {
             Action::NextTile => self.cycle_tile(1),
             Action::PrevTab => self.cycle_tab(-1),
             Action::NextTab => self.cycle_tab(1),
+            Action::FocusLeft => self.focus_dir(workspace::NavDir::Left),
+            Action::FocusDown => self.focus_dir(workspace::NavDir::Down),
+            Action::FocusUp => self.focus_dir(workspace::NavDir::Up),
+            Action::FocusRight => self.focus_dir(workspace::NavDir::Right),
             Action::PrevSidebarTab
             | Action::NextSidebarTab
             | Action::PrevPage

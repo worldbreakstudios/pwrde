@@ -937,6 +937,119 @@ pub fn layout_tiles(
     (tiles, dividers)
 }
 
+// ── Directional navigation ──────────────────────────────────────────────
+
+/// Direction for vim-style pane focus navigation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NavDir {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+/// Given a flat list of (id, rect) pairs (as produced by `layout_tiles`),
+/// return the id of the best neighbour of tile `from` in direction `dir`.
+///
+/// Candidates are tiles strictly in the given direction (using facing edges
+/// plus a small epsilon to handle flush splits).  Among candidates that
+/// overlap `from` on the perpendicular axis the one with the smallest edge
+/// gap wins; ties are broken by perpendicular center distance.  When no
+/// overlapping candidate exists the function falls back to the nearest by
+/// Euclidean center distance.  Returns `None` when `from` is not found or
+/// there are no candidates in the requested direction (no wraparound).
+pub fn directional_neighbor(tiles: &[(u64, LayoutRect)], from: u64, dir: NavDir) -> Option<u64> {
+    let eps = 1.0_f32;
+
+    // Find the source rect.
+    let from_rect = tiles.iter().find(|(id, _)| *id == from).map(|(_, r)| *r)?;
+
+    let from_cx = from_rect.x + from_rect.w / 2.0;
+    let from_cy = from_rect.y + from_rect.h / 2.0;
+
+    struct Candidate {
+        id: u64,
+        edge_gap: f32,
+        perp_dist: f32,
+        center_dist: f32,
+        overlaps: bool,
+    }
+
+    let mut candidates: Vec<Candidate> = tiles
+        .iter()
+        .filter(|(id, _)| *id != from)
+        .filter_map(|(id, r)| {
+            let cx = r.x + r.w / 2.0;
+            let cy = r.y + r.h / 2.0;
+
+            let (in_dir, edge_gap, overlaps) = match dir {
+                NavDir::Left => {
+                    let in_dir = cx < from_cx && r.x + r.w <= from_rect.x + eps;
+                    let edge_gap = (from_rect.x - (r.x + r.w)).max(0.0);
+                    // Vertical overlap
+                    let overlaps = r.y < from_rect.y + from_rect.h && r.y + r.h > from_rect.y;
+                    (in_dir, edge_gap, overlaps)
+                },
+                NavDir::Right => {
+                    let in_dir = cx > from_cx && r.x >= from_rect.x + from_rect.w - eps;
+                    let edge_gap = (r.x - (from_rect.x + from_rect.w)).max(0.0);
+                    let overlaps = r.y < from_rect.y + from_rect.h && r.y + r.h > from_rect.y;
+                    (in_dir, edge_gap, overlaps)
+                },
+                NavDir::Up => {
+                    let in_dir = cy < from_cy && r.y + r.h <= from_rect.y + eps;
+                    let edge_gap = (from_rect.y - (r.y + r.h)).max(0.0);
+                    // Horizontal overlap
+                    let overlaps = r.x < from_rect.x + from_rect.w && r.x + r.w > from_rect.x;
+                    (in_dir, edge_gap, overlaps)
+                },
+                NavDir::Down => {
+                    let in_dir = cy > from_cy && r.y >= from_rect.y + from_rect.h - eps;
+                    let edge_gap = (r.y - (from_rect.y + from_rect.h)).max(0.0);
+                    let overlaps = r.x < from_rect.x + from_rect.w && r.x + r.w > from_rect.x;
+                    (in_dir, edge_gap, overlaps)
+                },
+            };
+
+            if !in_dir {
+                return None;
+            }
+
+            let perp_dist = match dir {
+                NavDir::Left | NavDir::Right => (cy - from_cy).abs(),
+                NavDir::Up | NavDir::Down => (cx - from_cx).abs(),
+            };
+
+            let dx = cx - from_cx;
+            let dy = cy - from_cy;
+            let center_dist = (dx * dx + dy * dy).sqrt();
+
+            Some(Candidate { id: *id, edge_gap, perp_dist, center_dist, overlaps })
+        })
+        .collect();
+
+    if candidates.is_empty() {
+        return None;
+    }
+
+    // Prefer overlapping candidates; fall back to nearest by center dist.
+    let has_overlap = candidates.iter().any(|c| c.overlaps);
+    if has_overlap {
+        candidates.retain(|c| c.overlaps);
+        // Pick smallest edge gap, tie-break by perp center distance.
+        candidates.sort_by(|a, b| {
+            a.edge_gap
+                .partial_cmp(&b.edge_gap)
+                .unwrap()
+                .then(a.perp_dist.partial_cmp(&b.perp_dist).unwrap())
+        });
+    } else {
+        candidates.sort_by(|a, b| a.center_dist.partial_cmp(&b.center_dist).unwrap());
+    }
+
+    Some(candidates[0].id)
+}
+
 fn walk(
     node: &Node,
     rect: LayoutRect,
@@ -1516,5 +1629,90 @@ mod tests {
             resize_hover_at(&node, area, scale, -100.0, grab, true, dx, dy),
             Some(ResizeHover::Divider { path: vec![], dir: Dir::Column })
         );
+    }
+
+    // ── directional_neighbor tests ───────────────────────────────────────────
+
+    /// Helper: build a LayoutRect from (x, y, w, h).
+    fn r(x: f32, y: f32, w: f32, h: f32) -> LayoutRect {
+        LayoutRect { x, y, w, h }
+    }
+
+    /// 2×2 grid:
+    ///   1(TL) | 2(TR)
+    ///   3(BL) | 4(BR)
+    /// Each cell is 100×100; gap is 0 for simplicity.
+    fn grid_2x2() -> Vec<(u64, LayoutRect)> {
+        vec![
+            (1, r(0.0,   0.0,   100.0, 100.0)),  // top-left
+            (2, r(100.0, 0.0,   100.0, 100.0)),  // top-right
+            (3, r(0.0,   100.0, 100.0, 100.0)),  // bottom-left
+            (4, r(100.0, 100.0, 100.0, 100.0)),  // bottom-right
+        ]
+    }
+
+    #[test]
+    fn directional_neighbor_2x2_all_directions() {
+        let tiles = grid_2x2();
+
+        // From top-left (1): right→2, down→3, left→None, up→None
+        assert_eq!(directional_neighbor(&tiles, 1, NavDir::Right), Some(2));
+        assert_eq!(directional_neighbor(&tiles, 1, NavDir::Down),  Some(3));
+        assert_eq!(directional_neighbor(&tiles, 1, NavDir::Left),  None);
+        assert_eq!(directional_neighbor(&tiles, 1, NavDir::Up),    None);
+
+        // From top-right (2): left→1, down→4, right→None, up→None
+        assert_eq!(directional_neighbor(&tiles, 2, NavDir::Left),  Some(1));
+        assert_eq!(directional_neighbor(&tiles, 2, NavDir::Down),  Some(4));
+        assert_eq!(directional_neighbor(&tiles, 2, NavDir::Right), None);
+        assert_eq!(directional_neighbor(&tiles, 2, NavDir::Up),    None);
+
+        // From bottom-left (3): right→4, up→1
+        assert_eq!(directional_neighbor(&tiles, 3, NavDir::Right), Some(4));
+        assert_eq!(directional_neighbor(&tiles, 3, NavDir::Up),    Some(1));
+        assert_eq!(directional_neighbor(&tiles, 3, NavDir::Left),  None);
+        assert_eq!(directional_neighbor(&tiles, 3, NavDir::Down),  None);
+
+        // From bottom-right (4): left→3, up→2
+        assert_eq!(directional_neighbor(&tiles, 4, NavDir::Left),  Some(3));
+        assert_eq!(directional_neighbor(&tiles, 4, NavDir::Up),    Some(2));
+        assert_eq!(directional_neighbor(&tiles, 4, NavDir::Right), None);
+        assert_eq!(directional_neighbor(&tiles, 4, NavDir::Down),  None);
+    }
+
+    #[test]
+    fn directional_neighbor_missing_from_returns_none() {
+        let tiles = grid_2x2();
+        assert_eq!(directional_neighbor(&tiles, 99, NavDir::Left), None);
+        assert_eq!(directional_neighbor(&tiles, 99, NavDir::Right), None);
+    }
+
+    #[test]
+    fn directional_neighbor_overlap_preferred_over_nearer_nonoverlapping() {
+        // Layout: tile 1 is on the left (tall).
+        //         tile 2 is directly to the right of 1 (overlapping vertically).
+        //         tile 3 is also to the right but far above (no vertical overlap).
+        //   1 (0,50,100,100)  |  2 (100,50,100,100)   <- same vertical band
+        //                        3 (100,0,40,40)       <- above, no overlap with 1
+        // Euclidean center of 3 from 1: ~(150,20) vs (150,100) for 2.
+        // Even if 3 were closer in raw distance, 2 overlaps so 2 wins.
+        let tiles = vec![
+            (1, r(0.0,  50.0, 100.0, 100.0)),
+            (2, r(100.0, 50.0, 100.0, 100.0)),
+            (3, r(100.0,  0.0,  40.0,  40.0)),
+        ];
+        assert_eq!(directional_neighbor(&tiles, 1, NavDir::Right), Some(2));
+    }
+
+    #[test]
+    fn directional_neighbor_fallback_to_nearest_when_no_overlap() {
+        // Two tiles to the right of 1 but neither overlaps vertically.
+        // tile 2 is closer (center distance).
+        let tiles = vec![
+            (1, r(0.0, 0.0, 100.0, 50.0)),   // center (50, 25)
+            (2, r(100.0, 60.0, 100.0, 50.0)), // center (150, 85) — closer
+            (3, r(100.0, 200.0, 100.0, 50.0)),// center (150, 225) — farther
+        ];
+        assert_eq!(directional_neighbor(&tiles, 1, NavDir::Right), Some(2));
     }
 }
