@@ -171,6 +171,18 @@ impl Workspace {
         Self { name, root: Node::Leaf(tile), focused_tile, cwd }
     }
 
+    /// The tab-less workspace shown behind the empty-state CTA. Kept around
+    /// (instead of allowing `workspaces` to be empty) because much of the app
+    /// indexes `workspaces[active]` unguarded.
+    pub fn placeholder() -> Self {
+        Self::new("group 1".into(), Tile::empty(0), None)
+    }
+
+    /// True when no tile has any tab — the empty-state predicate.
+    pub fn is_empty(&self) -> bool {
+        self.root.tiles().iter().all(|t| t.tabs.is_empty())
+    }
+
     pub fn focused(&self) -> Option<&Tile> {
         self.root.find_tile(self.focused_tile)
     }
@@ -254,6 +266,24 @@ pub fn new_group_button(scale: f32, sidebar_w: f32) -> LayoutRect {
         w: ((sidebar_w * scale).round() - 2.0 * pad).max(0.0),
         h: (NEW_GROUP_H * scale).round(),
     }
+}
+
+/// Centered CTA used by the empty-state launch view.
+pub fn empty_state_cta(width: u32, height: u32, scale: f32, sidebar_w: f32) -> LayoutRect {
+    let area = terminal_area(width, height, scale, sidebar_w);
+    let w = (180.0 * scale).round();
+    let h = (52.0 * scale).round();
+    LayoutRect {
+        x: area.x + ((area.w - w) / 2.0).max(0.0),
+        y: area.y + ((area.h - h) / 2.0).max(0.0) - (18.0 * scale).round(),
+        w,
+        h,
+    }
+}
+
+pub fn empty_state_hint(width: u32, height: u32, scale: f32, sidebar_w: f32) -> LayoutRect {
+    let cta = empty_state_cta(width, height, scale, sidebar_w);
+    LayoutRect { x: cta.x, y: cta.y + cta.h + (14.0 * scale).round(), w: cta.w, h: (22.0 * scale).round() }
 }
 
 /// Group tab `index` in the sidebar, stacked below the new-group button.
@@ -381,4 +411,42 @@ pub fn tile_tab_rect(rect: &LayoutRect, i: usize, n: usize, scale: f32) -> Layou
     let bar = tile_tab_bar(rect, scale);
     let w = (bar.w / n.max(1) as f32).min((TILE_TAB_MAX_W * scale).round()).round();
     LayoutRect { x: bar.x + i as f32 * w, y: bar.y, w, h: bar.h }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn placeholder_is_empty() {
+        let ws = Workspace::placeholder();
+        assert!(ws.is_empty());
+        assert!(ws.cwd.is_none());
+        // Exactly one (tab-less) tile, so unguarded workspace indexing and
+        // layout code always have something to work with.
+        assert_eq!(ws.root.tiles().len(), 1);
+        assert!(ws.focused().is_some());
+    }
+
+    #[test]
+    fn empty_state_cta_centered_in_terminal_area() {
+        let (w, h, scale, sidebar_w) = (1600, 1000, 2.0, SIDEBAR_DEFAULT_W);
+        let area = terminal_area(w, h, scale, sidebar_w);
+        let cta = empty_state_cta(w, h, scale, sidebar_w);
+        assert!(cta.x >= area.x && cta.x + cta.w <= area.x + area.w);
+        assert!(cta.y >= area.y && cta.y + cta.h <= area.y + area.h);
+        // Horizontally centered.
+        let left_gap = cta.x - area.x;
+        let right_gap = (area.x + area.w) - (cta.x + cta.w);
+        assert!((left_gap - right_gap).abs() <= 1.0);
+    }
+
+    #[test]
+    fn empty_state_hint_sits_below_cta() {
+        let (w, h, scale, sidebar_w) = (1600, 1000, 2.0, SIDEBAR_DEFAULT_W);
+        let cta = empty_state_cta(w, h, scale, sidebar_w);
+        let hint = empty_state_hint(w, h, scale, sidebar_w);
+        assert!(hint.y >= cta.y + cta.h);
+        assert_eq!(hint.x, cta.x);
+    }
 }

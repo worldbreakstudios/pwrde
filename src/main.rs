@@ -276,6 +276,10 @@ impl App {
                     if self.active >= self.workspaces.len() {
                         self.active = self.workspaces.len() - 1;
                     }
+                } else {
+                    // Last pane of the last group: back to the empty state
+                    // rather than a dead window (⌘Q / traffic lights quit).
+                    self.reset_empty_workspace(0);
                 }
             }
         }
@@ -445,11 +449,32 @@ impl App {
         Tile::new(id, session)
     }
 
+    /// True when the app shows the empty state: a sole, tab-less group.
+    fn is_empty_state(&self) -> bool {
+        self.workspaces.len() == 1 && self.workspaces[0].is_empty()
+    }
+
+    /// Return to the empty state: swap the sole leftover workspace for a
+    /// fresh placeholder so it matches launch exactly (name and cwd reset).
+    fn reset_empty_workspace(&mut self, wi: usize) {
+        self.workspaces[wi] = Workspace::placeholder();
+        self.active = wi;
+    }
+
     /// Open a new group named `name`, rooted at `cwd`, and make it active.
+    /// From the empty state the new group replaces the placeholder instead of
+    /// stacking beside it.
     fn add_group(&mut self, name: String, cwd: Option<std::path::PathBuf>) {
+        let empty = self.is_empty_state();
         let tile = self.new_tile_in(cwd.as_deref());
-        self.workspaces.push(Workspace::new(name, tile, cwd));
-        self.active = self.workspaces.len() - 1;
+        let ws = Workspace::new(name, tile, cwd);
+        if empty {
+            self.workspaces[0] = ws;
+            self.active = 0;
+        } else {
+            self.workspaces.push(ws);
+            self.active = self.workspaces.len() - 1;
+        }
         self.sync_layout();
         self.request_redraw();
     }
@@ -724,6 +749,15 @@ impl App {
         // Sidebar edge → resize sidebar.
         if (px - sidebar.w).abs() <= grab {
             self.drag = Drag::Sidebar;
+            return;
+        }
+
+        // Empty state: the centered CTA is the only interactive element in
+        // the content area (the placeholder tile must not arm tab drags).
+        if self.is_empty_state() && !sidebar.contains(px, py) {
+            if workspace::empty_state_cta(w, h, scale, self.sidebar_w).contains(px, py) {
+                self.open_picker();
+            }
             return;
         }
 
@@ -1005,6 +1039,17 @@ impl App {
     fn handle_shortcut(&mut self, ev: &KeyDownEvent) {
         let shift = ev.keystroke.modifiers.shift;
         let key = ev.keystroke.key.as_str();
+        // Empty state: there is no pane to act on. ⌘T/⇧⌘T start a group via
+        // the picker, ⌘Q still quits, everything else is a no-op.
+        if self.is_empty_state() {
+            match key {
+                "t" => self.open_picker(),
+                "q" => std::process::exit(0),
+                _ => {},
+            }
+            self.request_redraw();
+            return;
+        }
         match (key, shift) {
             ("d", false) => self.split(Dir::Row),
             ("d", true) => self.split(Dir::Column),
@@ -1092,11 +1137,12 @@ impl App {
                         self.active = self.workspaces.len().saturating_sub(1);
                     }
                 } else if self.workspaces.len() == 1 && group_empty(&self.workspaces[0]) {
-                    std::process::exit(0);
+                    self.reset_empty_workspace(0);
                 } else {
                     self.workspaces[wi].fix_focus();
                 }
                 self.sync_layout();
+                self.request_redraw();
                 return;
             }
         }
@@ -1619,8 +1665,9 @@ fn main() {
                         dirty: true,
                         scroll_accum: 0.0,
                     };
-                    let tile = app.new_tile();
-                    app.workspaces.push(Workspace::new("group 1".into(), tile, None));
+                    // Launch into the empty state: no shell is spawned until
+                    // the user starts a group (CTA click or ⇧⌘T).
+                    app.workspaces.push(Workspace::placeholder());
                     app.sync_layout();
 
                     // Drain PTY wakeups on the foreground executor: poll the
