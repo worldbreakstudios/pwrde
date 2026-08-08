@@ -37,8 +37,11 @@ pub enum TermEvent {
 struct TermConfig;
 
 impl TerminalConfiguration for TermConfig {
+    /// The palette apps see through OSC color queries (10/11/4…). Resolved
+    /// from the live settings each call so wezterm-term's lazy palette always
+    /// reports the scheme currently on screen, not the one at spawn time.
     fn color_palette(&self) -> ColorPalette {
-        ColorPalette::default()
+        crate::term_theme::palette(crate::theme::current())
     }
 }
 
@@ -145,6 +148,8 @@ impl Session {
                 // The daemon spawns the session's shell, so the client's cwd
                 // doesn't reach it — pass the start dir explicitly (only used
                 // when the session is first created; ignored on reattach).
+                // Only honor a cwd that still exists — a pinned/recent dir may
+                // have been deleted since it was saved.
                 if let Some(dir) = cwd.filter(|d| d.is_dir()) {
                     cmd.arg("--dir");
                     cmd.arg(dir);
@@ -152,14 +157,21 @@ impl Session {
                 }
                 cmd.arg(name);
                 cmd.env("TERM", "xterm-256color");
+                // Advertise 24-bit color: wezterm-term parses truecolor SGR and
+                // the renderer paints full RGB per cell, so apps should emit it.
+                cmd.env("COLORTERM", "truecolor");
                 (Some(cmd), None)
             } else {
                 // Fail the pane loudly rather than silently losing persistence.
                 (None, Some("shpool not found — install it (brew install shell-pool/shpool/shpool) or disable Persist sessions\r\n"))
             }
         } else {
-            let mut cmd = CommandBuilder::new_default_prog();
+            let mut cmd = CommandBuilder::new_default_prog(); // user's shell
             cmd.env("TERM", "xterm-256color");
+            cmd.env("COLORTERM", "truecolor");
+            // Only honor a cwd that still exists — a pinned/recent dir may have
+            // been deleted since it was saved, and spawning a shell in a missing
+            // directory would fail. Fall back to inheriting our own cwd.
             if let Some(dir) = cwd.filter(|d| d.is_dir()) {
                 cmd.cwd(dir);
             }

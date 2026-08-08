@@ -1,0 +1,518 @@
+//! Terminal color presets: the ANSI palette the panes render with.
+//!
+//! Like chrome themes, terminal colors are chosen per appearance polarity on
+//! Settings → Appearance (`"terminal.light"` / `"terminal.dark"`), and the
+//! resolved mode decides which slot applies. The value `"default"` (also the
+//! unset default) means the adaptive scheme: wezterm's stock ANSI table on
+//! the chrome theme's `term_bg` — exactly the pre-theming look. Presets carry
+//! only the 16 ANSI slots plus fg/bg; the 240 extended cube/gray entries are
+//! universal and stay stock.
+
+use wezterm_term::color::{ColorPalette, RgbColor};
+
+/// sRGB u8 triples, same convention as `theme::Theme`.
+/// `ansi` order: black, red, green, yellow, blue, magenta, cyan, white.
+pub struct TermTheme {
+    /// Settings value + stable identifier.
+    pub name: &'static str,
+    /// Slot label on the Appearance page.
+    pub label: &'static str,
+    /// Which appearance slot this scheme belongs to.
+    pub dark: bool,
+    pub fg: (u8, u8, u8),
+    pub bg: (u8, u8, u8),
+    pub ansi: [(u8, u8, u8); 8],
+    pub brights: [(u8, u8, u8); 8],
+}
+
+pub const SOLARIZED_DARK: TermTheme = TermTheme {
+    name: "solarized-dark",
+    label: "Solarized Dark",
+    dark: true,
+    fg: (0x83, 0x94, 0x96),
+    bg: (0x00, 0x2b, 0x36),
+    ansi: [
+        (0x07, 0x36, 0x42),
+        (0xdc, 0x32, 0x2f),
+        (0x85, 0x99, 0x00),
+        (0xb5, 0x89, 0x00),
+        (0x26, 0x8b, 0xd2),
+        (0xd3, 0x36, 0x82),
+        (0x2a, 0xa1, 0x98),
+        (0xee, 0xe8, 0xd5),
+    ],
+    brights: [
+        (0x00, 0x2b, 0x36),
+        (0xcb, 0x4b, 0x16),
+        (0x58, 0x6e, 0x75),
+        (0x65, 0x7b, 0x83),
+        (0x83, 0x94, 0x96),
+        (0x6c, 0x71, 0xc4),
+        (0x93, 0xa1, 0xa1),
+        (0xfd, 0xf6, 0xe3),
+    ],
+};
+
+/// Solarized's light half: same accents, inverted base tones.
+pub const SOLARIZED_LIGHT: TermTheme = TermTheme {
+    name: "solarized-light",
+    label: "Solarized Light",
+    dark: false,
+    fg: (0x65, 0x7b, 0x83),
+    bg: (0xfd, 0xf6, 0xe3),
+    ansi: SOLARIZED_DARK.ansi,
+    brights: SOLARIZED_DARK.brights,
+};
+
+pub const DRACULA: TermTheme = TermTheme {
+    name: "dracula",
+    label: "Dracula",
+    dark: true,
+    fg: (0xf8, 0xf8, 0xf2),
+    bg: (0x28, 0x2a, 0x36),
+    ansi: [
+        (0x21, 0x22, 0x2c),
+        (0xff, 0x55, 0x55),
+        (0x50, 0xfa, 0x7b),
+        (0xf1, 0xfa, 0x8c),
+        (0xbd, 0x93, 0xf9),
+        (0xff, 0x79, 0xc6),
+        (0x8b, 0xe9, 0xfd),
+        (0xf8, 0xf8, 0xf2),
+    ],
+    brights: [
+        (0x62, 0x72, 0xa4),
+        (0xff, 0x6e, 0x6e),
+        (0x69, 0xff, 0x94),
+        (0xff, 0xff, 0xa5),
+        (0xd6, 0xac, 0xff),
+        (0xff, 0x92, 0xdf),
+        (0xa4, 0xff, 0xff),
+        (0xff, 0xff, 0xff),
+    ],
+};
+
+pub const GRUVBOX_DARK: TermTheme = TermTheme {
+    name: "gruvbox-dark",
+    label: "Gruvbox Dark",
+    dark: true,
+    fg: (0xeb, 0xdb, 0xb2),
+    bg: (0x28, 0x28, 0x28),
+    ansi: [
+        (0x28, 0x28, 0x28),
+        (0xcc, 0x24, 0x1d),
+        (0x98, 0x97, 0x1a),
+        (0xd7, 0x99, 0x21),
+        (0x45, 0x85, 0x88),
+        (0xb1, 0x62, 0x86),
+        (0x68, 0x9d, 0x6a),
+        (0xa8, 0x99, 0x84),
+    ],
+    brights: [
+        (0x92, 0x83, 0x74),
+        (0xfb, 0x49, 0x34),
+        (0xb8, 0xbb, 0x26),
+        (0xfa, 0xbd, 0x2f),
+        (0x83, 0xa5, 0x98),
+        (0xd3, 0x86, 0x9b),
+        (0x8e, 0xc0, 0x7c),
+        (0xeb, 0xdb, 0xb2),
+    ],
+};
+
+pub const GRUVBOX_LIGHT: TermTheme = TermTheme {
+    name: "gruvbox-light",
+    label: "Gruvbox Light",
+    dark: false,
+    fg: (0x3c, 0x38, 0x36),
+    bg: (0xfb, 0xf1, 0xc7),
+    ansi: [
+        (0xfb, 0xf1, 0xc7),
+        (0xcc, 0x24, 0x1d),
+        (0x98, 0x97, 0x1a),
+        (0xd7, 0x99, 0x21),
+        (0x45, 0x85, 0x88),
+        (0xb1, 0x62, 0x86),
+        (0x68, 0x9d, 0x6a),
+        (0x7c, 0x6f, 0x64),
+    ],
+    brights: [
+        (0x92, 0x83, 0x74),
+        (0x9d, 0x00, 0x06),
+        (0x79, 0x74, 0x0e),
+        (0xb5, 0x76, 0x14),
+        (0x07, 0x66, 0x78),
+        (0x8f, 0x3f, 0x71),
+        (0x42, 0x7b, 0x58),
+        (0x3c, 0x38, 0x36),
+    ],
+};
+
+pub const NORD: TermTheme = TermTheme {
+    name: "nord",
+    label: "Nord",
+    dark: true,
+    fg: (0xd8, 0xde, 0xe9),
+    bg: (0x2e, 0x34, 0x40),
+    ansi: [
+        (0x3b, 0x42, 0x52),
+        (0xbf, 0x61, 0x6a),
+        (0xa3, 0xbe, 0x8c),
+        (0xeb, 0xcb, 0x8b),
+        (0x81, 0xa1, 0xc1),
+        (0xb4, 0x8e, 0xad),
+        (0x88, 0xc0, 0xd0),
+        (0xe5, 0xe9, 0xf0),
+    ],
+    brights: [
+        (0x4c, 0x56, 0x6a),
+        (0xbf, 0x61, 0x6a),
+        (0xa3, 0xbe, 0x8c),
+        (0xeb, 0xcb, 0x8b),
+        (0x81, 0xa1, 0xc1),
+        (0xb4, 0x8e, 0xad),
+        (0x8f, 0xbc, 0xbb),
+        (0xec, 0xef, 0xf4),
+    ],
+};
+
+pub const ONE_DARK: TermTheme = TermTheme {
+    name: "one-dark",
+    label: "One Dark",
+    dark: true,
+    fg: (0xab, 0xb2, 0xbf),
+    bg: (0x28, 0x2c, 0x34),
+    ansi: [
+        (0x28, 0x2c, 0x34),
+        (0xe0, 0x6c, 0x75),
+        (0x98, 0xc3, 0x79),
+        (0xe5, 0xc0, 0x7b),
+        (0x61, 0xaf, 0xef),
+        (0xc6, 0x78, 0xdd),
+        (0x56, 0xb6, 0xc2),
+        (0xab, 0xb2, 0xbf),
+    ],
+    brights: [
+        (0x5c, 0x63, 0x70),
+        (0xe0, 0x6c, 0x75),
+        (0x98, 0xc3, 0x79),
+        (0xe5, 0xc0, 0x7b),
+        (0x61, 0xaf, 0xef),
+        (0xc6, 0x78, 0xdd),
+        (0x56, 0xb6, 0xc2),
+        (0xff, 0xff, 0xff),
+    ],
+};
+
+pub const ONE_LIGHT: TermTheme = TermTheme {
+    name: "one-light",
+    label: "One Light",
+    dark: false,
+    fg: (0x38, 0x3a, 0x42),
+    bg: (0xfa, 0xfa, 0xfa),
+    ansi: [
+        (0x38, 0x3a, 0x42),
+        (0xe4, 0x56, 0x49),
+        (0x50, 0xa1, 0x4f),
+        (0xc1, 0x84, 0x01),
+        (0x01, 0x84, 0xbc),
+        (0xa6, 0x26, 0xa4),
+        (0x09, 0x97, 0xb3),
+        (0xfa, 0xfa, 0xfa),
+    ],
+    brights: [
+        (0x4f, 0x52, 0x5e),
+        (0xe4, 0x56, 0x49),
+        (0x50, 0xa1, 0x4f),
+        (0xc1, 0x84, 0x01),
+        (0x01, 0x84, 0xbc),
+        (0xa6, 0x26, 0xa4),
+        (0x09, 0x97, 0xb3),
+        (0xff, 0xff, 0xff),
+    ],
+};
+
+pub const TOKYO_NIGHT: TermTheme = TermTheme {
+    name: "tokyo-night",
+    label: "Tokyo Night",
+    dark: true,
+    fg: (0xc0, 0xca, 0xf5),
+    bg: (0x1a, 0x1b, 0x26),
+    ansi: [
+        (0x15, 0x16, 0x1e),
+        (0xf7, 0x76, 0x8e),
+        (0x9e, 0xce, 0x6a),
+        (0xe0, 0xaf, 0x68),
+        (0x7a, 0xa2, 0xf7),
+        (0xbb, 0x9a, 0xf7),
+        (0x7d, 0xcf, 0xff),
+        (0xa9, 0xb1, 0xd6),
+    ],
+    brights: [
+        (0x41, 0x48, 0x68),
+        (0xf7, 0x76, 0x8e),
+        (0x9e, 0xce, 0x6a),
+        (0xe0, 0xaf, 0x68),
+        (0x7a, 0xa2, 0xf7),
+        (0xbb, 0x9a, 0xf7),
+        (0x7d, 0xcf, 0xff),
+        (0xc0, 0xca, 0xf5),
+    ],
+};
+
+pub const CATPPUCCIN_MOCHA: TermTheme = TermTheme {
+    name: "catppuccin-mocha",
+    label: "Catppuccin Mocha",
+    dark: true,
+    fg: (0xcd, 0xd6, 0xf4),
+    bg: (0x1e, 0x1e, 0x2e),
+    ansi: [
+        (0x45, 0x47, 0x5a),
+        (0xf3, 0x8b, 0xa8),
+        (0xa6, 0xe3, 0xa1),
+        (0xf9, 0xe2, 0xaf),
+        (0x89, 0xb4, 0xfa),
+        (0xf5, 0xc2, 0xe7),
+        (0x94, 0xe2, 0xd5),
+        (0xba, 0xc2, 0xde),
+    ],
+    brights: [
+        (0x58, 0x5b, 0x70),
+        (0xf3, 0x8b, 0xa8),
+        (0xa6, 0xe3, 0xa1),
+        (0xf9, 0xe2, 0xaf),
+        (0x89, 0xb4, 0xfa),
+        (0xf5, 0xc2, 0xe7),
+        (0x94, 0xe2, 0xd5),
+        (0xa6, 0xad, 0xc8),
+    ],
+};
+
+pub const GITHUB_DARK: TermTheme = TermTheme {
+    name: "github-dark",
+    label: "GitHub Dark",
+    dark: true,
+    fg: (0xc9, 0xd1, 0xd9),
+    bg: (0x0d, 0x11, 0x17),
+    ansi: [
+        (0x48, 0x4f, 0x58),
+        (0xff, 0x7b, 0x72),
+        (0x3f, 0xb9, 0x50),
+        (0xd2, 0x99, 0x22),
+        (0x58, 0xa6, 0xff),
+        (0xbc, 0x8c, 0xff),
+        (0x39, 0xc5, 0xcf),
+        (0xb1, 0xba, 0xc4),
+    ],
+    brights: [
+        (0x6e, 0x76, 0x81),
+        (0xff, 0xa1, 0x98),
+        (0x56, 0xd3, 0x64),
+        (0xe3, 0xb3, 0x41),
+        (0x79, 0xc0, 0xff),
+        (0xd2, 0xa8, 0xff),
+        (0x56, 0xd4, 0xdd),
+        (0xff, 0xff, 0xff),
+    ],
+};
+
+pub const GITHUB_LIGHT: TermTheme = TermTheme {
+    name: "github-light",
+    label: "GitHub Light",
+    dark: false,
+    fg: (0x24, 0x29, 0x2f),
+    bg: (0xff, 0xff, 0xff),
+    ansi: [
+        (0x24, 0x29, 0x2f),
+        (0xcf, 0x22, 0x2e),
+        (0x11, 0x63, 0x29),
+        (0xb0, 0x88, 0x00),
+        (0x09, 0x69, 0xda),
+        (0x82, 0x50, 0xdf),
+        (0x1b, 0x7c, 0x83),
+        (0x6e, 0x77, 0x81),
+    ],
+    brights: [
+        (0x57, 0x60, 0x6a),
+        (0xa4, 0x0e, 0x26),
+        (0x1a, 0x7f, 0x37),
+        (0xd4, 0xa7, 0x2c),
+        (0x21, 0x8b, 0xff),
+        (0xa4, 0x75, 0xf9),
+        (0x31, 0x92, 0xaa),
+        (0x8c, 0x95, 0x9f),
+    ],
+};
+
+pub const GITHUB_DARK_HC: TermTheme = TermTheme {
+    name: "github-dark-hc",
+    label: "GitHub Dark HC",
+    dark: true,
+    fg: (0xf0, 0xf3, 0xf6),
+    bg: (0x0a, 0x0c, 0x10),
+    ansi: [
+        (0x7a, 0x82, 0x8e),
+        (0xff, 0x94, 0x92),
+        (0x26, 0xcd, 0x4d),
+        (0xf0, 0xb7, 0x2f),
+        (0x71, 0xb7, 0xff),
+        (0xcb, 0x9e, 0xff),
+        (0x39, 0xc5, 0xcf),
+        (0xd9, 0xde, 0xe3),
+    ],
+    brights: [
+        (0x9e, 0xa7, 0xb3),
+        (0xff, 0xb1, 0xaf),
+        (0x4a, 0xe1, 0x68),
+        (0xf7, 0xc8, 0x43),
+        (0x91, 0xcb, 0xff),
+        (0xdb, 0xb7, 0xff),
+        (0x56, 0xd4, 0xdd),
+        (0xff, 0xff, 0xff),
+    ],
+};
+
+pub const GITHUB_LIGHT_HC: TermTheme = TermTheme {
+    name: "github-light-hc",
+    label: "GitHub Light HC",
+    dark: false,
+    fg: (0x0e, 0x11, 0x16),
+    bg: (0xff, 0xff, 0xff),
+    ansi: [
+        (0x0e, 0x11, 0x16),
+        (0xa0, 0x11, 0x1f),
+        (0x02, 0x4c, 0x1a),
+        (0x3f, 0x22, 0x00),
+        (0x03, 0x49, 0xb4),
+        (0x62, 0x2c, 0xbc),
+        (0x1b, 0x7c, 0x83),
+        (0x66, 0x70, 0x7b),
+    ],
+    brights: [
+        (0x4b, 0x53, 0x5d),
+        (0x86, 0x06, 0x1d),
+        (0x05, 0x5d, 0x20),
+        (0x4e, 0x2c, 0x00),
+        (0x11, 0x68, 0xe3),
+        (0x84, 0x4a, 0xe7),
+        (0x31, 0x92, 0xaa),
+        (0x88, 0x92, 0x9d),
+    ],
+};
+
+/// Appearance-page order: light schemes first, then dark (the page groups by
+/// polarity, and packs slots in this sequence).
+pub const ALL: [&TermTheme; 14] = [
+    &SOLARIZED_LIGHT,
+    &GRUVBOX_LIGHT,
+    &ONE_LIGHT,
+    &GITHUB_LIGHT,
+    &GITHUB_LIGHT_HC,
+    &SOLARIZED_DARK,
+    &DRACULA,
+    &GRUVBOX_DARK,
+    &NORD,
+    &ONE_DARK,
+    &TOKYO_NIGHT,
+    &CATPPUCCIN_MOCHA,
+    &GITHUB_DARK,
+    &GITHUB_DARK_HC,
+];
+
+/// Look a preset up by its settings name. `"default"` and unknown names yield
+/// `None` — the adaptive default scheme.
+pub fn find(name: &str) -> Option<&'static TermTheme> {
+    ALL.iter().find(|t| t.name == name).copied()
+}
+
+/// Settings key holding the scheme for one polarity slot.
+pub fn setting_key(dark: bool) -> &'static str {
+    if dark { "terminal.dark" } else { "terminal.light" }
+}
+
+/// Pure slot resolution over a raw setting value (unit-testable).
+pub fn resolve_slot(slot: Option<&str>) -> Option<&'static TermTheme> {
+    slot.and_then(find)
+}
+
+/// The scheme configured for a polarity slot; `None` is the adaptive default.
+pub fn selected(dark: bool) -> Option<&'static TermTheme> {
+    resolve_slot(crate::settings::get_str(setting_key(dark)).as_deref())
+}
+
+fn srgba(rgb: (u8, u8, u8)) -> wezterm_term::color::SrgbaTuple {
+    RgbColor::new_8bpc(rgb.0, rgb.1, rgb.2).into()
+}
+
+/// Build a wezterm palette from a preset (or the adaptive default when
+/// `scheme` is `None`). Pure so tests can exercise the mapping directly.
+pub fn build(scheme: Option<&TermTheme>, chrome_bg: (u8, u8, u8)) -> ColorPalette {
+    let mut p = ColorPalette::default();
+    match scheme {
+        // Adaptive default: stock ANSI table, pane ground from the chrome
+        // theme — the exact pre-theming look.
+        None => p.background = srgba(chrome_bg),
+        Some(t) => {
+            for (i, c) in t.ansi.iter().chain(t.brights.iter()).enumerate() {
+                p.colors.0[i] = srgba(*c);
+            }
+            p.foreground = srgba(t.fg);
+            p.background = srgba(t.bg);
+            // A plain fg-colored block cursor (the renderer draws the block
+            // itself from `foreground`; these keep OSC color reports honest).
+            p.cursor_bg = srgba(t.fg);
+            p.cursor_border = srgba(t.fg);
+            p.cursor_fg = srgba(t.bg);
+        },
+    }
+    p
+}
+
+/// The palette in effect right now, for the given chrome theme.
+pub fn palette(chrome: &crate::theme::Theme) -> ColorPalette {
+    build(selected(crate::theme::dark_active()), chrome.term_bg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn find_locates_every_preset_and_default_is_none() {
+        for t in ALL {
+            assert_eq!(find(t.name).map(|f| f.name), Some(t.name));
+        }
+        assert!(find("default").is_none());
+        assert!(find("no-such-scheme").is_none());
+        assert!(resolve_slot(None).is_none());
+    }
+
+    #[test]
+    fn preset_names_are_unique() {
+        for (i, a) in ALL.iter().enumerate() {
+            for b in &ALL[i + 1..] {
+                assert_ne!(a.name, b.name);
+            }
+        }
+    }
+
+    #[test]
+    fn build_maps_ansi_slots_and_base_tones() {
+        let p = build(Some(&DRACULA), (0, 0, 0));
+        assert_eq!(p.colors.0[1], srgba(DRACULA.ansi[1]), "red");
+        assert_eq!(p.colors.0[9], srgba(DRACULA.brights[1]), "bright red");
+        assert_eq!(p.foreground, srgba(DRACULA.fg));
+        assert_eq!(p.background, srgba(DRACULA.bg));
+        // Extended entries stay stock (index 21 is pure blue in the cube).
+        assert_eq!(p.colors.0[16..], ColorPalette::default().colors.0[16..]);
+    }
+
+    #[test]
+    fn adaptive_default_keeps_stock_ansi_on_chrome_ground() {
+        let stock = ColorPalette::default();
+        let p = build(None, (32, 30, 29));
+        assert_eq!(p.background, srgba((32, 30, 29)));
+        assert_eq!(p.foreground, stock.foreground);
+        assert_eq!(p.colors.0[..], stock.colors.0[..]);
+    }
+}

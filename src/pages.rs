@@ -3,7 +3,8 @@
 //! pwrde has Arc-style *pages*: Sessions (the terminal workspace) and
 //! Settings. The sidebar's bottom strip shows one slot per page — a subtle
 //! dot that crossfades into the page's glyph on hover, and stays a glyph on
-//! the active page. ⌘⇧←/→ cycle pages with wraparound.
+//! the active page. ⌘⇧←/→ cycle pages with wraparound; ⌘⇧↑/↓ cycle the
+//! sidebar's tabs (groups on Sessions, sections on Settings) the same way.
 //!
 //! Every ⌘ shortcut is an [`Action`] dispatched through a bindings table
 //! resolved from the settings store (`"keyboard.<action>"` keys, falling back
@@ -47,23 +48,114 @@ pub fn cycle(i: usize, n: usize, delta: isize) -> usize {
 /// Sections of the Settings page (sidebar tabs while it is active).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Section {
+    Sessions,
     Keyboard,
     Terminal,
-    Themes,
+    Appearance,
     Debug,
 }
 
 impl Section {
-    pub const ALL: [Section; 4] = [Section::Keyboard, Section::Terminal, Section::Themes, Section::Debug];
+    pub const ALL: [Section; 5] = [
+        Section::Sessions,
+        Section::Keyboard,
+        Section::Terminal,
+        Section::Appearance,
+        Section::Debug,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
+            Section::Sessions => "Sessions",
             Section::Keyboard => "Keyboard",
             Section::Terminal => "Terminal",
-            Section::Themes => "Themes",
+            Section::Appearance => "Appearance",
             Section::Debug => "Debug",
         }
     }
+}
+
+// ── Appearance page layout ──────────────────────────────────────────────
+
+/// One interactive (or header) item on the Appearance page.
+#[derive(Clone, Copy)]
+pub enum AppearanceItem {
+    /// The System/Dark/Light segmented control.
+    Mode,
+    /// A section header ("Theme", "Terminal Colors").
+    Header(&'static str),
+    /// A chrome theme slot; clicking assigns it to its polarity's slot.
+    Theme(&'static crate::theme::Theme),
+    /// The adaptive terminal scheme; clicking resets both polarity slots.
+    TermDefault,
+    /// A terminal scheme slot; clicking assigns it to its polarity's slot.
+    Term(&'static crate::term_theme::TermTheme),
+}
+
+impl AppearanceItem {
+    /// Mode and headers own their whole row; theme/scheme slots pack in halves.
+    pub fn full_width(self) -> bool {
+        matches!(self, AppearanceItem::Mode | AppearanceItem::Header(_))
+    }
+}
+
+/// The Appearance page as `(row, col, item)` triples — the single source of
+/// truth walked by both the renderer (drawing) and main.rs (hit-testing), so
+/// clicks always agree with pixels. `col` is 0 (left half) or 1 (right half);
+/// full-width items sit alone in col 0. Slots pack two per row, light-
+/// polarity entries before dark ones (mirroring the light/dark slot model).
+pub fn appearance_layout() -> Vec<(usize, usize, AppearanceItem)> {
+    struct Packer {
+        out: Vec<(usize, usize, AppearanceItem)>,
+        row: usize,
+        col: usize,
+    }
+    impl Packer {
+        /// Finish a half-filled row so the next item starts on a fresh one.
+        fn settle(&mut self) {
+            if self.col == 1 {
+                self.row += 1;
+                self.col = 0;
+            }
+        }
+        fn push(&mut self, item: AppearanceItem) {
+            if item.full_width() {
+                self.settle();
+                self.out.push((self.row, 0, item));
+                self.row += 1;
+            } else {
+                self.out.push((self.row, self.col, item));
+                if self.col == 1 {
+                    self.row += 1;
+                }
+                self.col ^= 1;
+            }
+        }
+    }
+
+    let mut p = Packer { out: vec![(0, 0, AppearanceItem::Mode)], row: 2, col: 0 };
+
+    p.push(AppearanceItem::Header("Theme"));
+    for t in crate::theme::ALL.iter().filter(|t| !t.dark) {
+        p.push(AppearanceItem::Theme(t));
+    }
+    for t in crate::theme::ALL.iter().filter(|t| t.dark) {
+        p.push(AppearanceItem::Theme(t));
+    }
+
+    // A blank row between the sections.
+    p.settle();
+    p.row += 1;
+
+    p.push(AppearanceItem::Header("Terminal Colors"));
+    p.push(AppearanceItem::TermDefault);
+    for t in crate::term_theme::ALL.iter().filter(|t| !t.dark) {
+        p.push(AppearanceItem::Term(t));
+    }
+    for t in crate::term_theme::ALL.iter().filter(|t| t.dark) {
+        p.push(AppearanceItem::Term(t));
+    }
+    p.out
 }
 
 /// Row index of the "Show frame stats" toggle on the Debug page. Rows 0..N
@@ -90,13 +182,15 @@ pub enum Action {
     NextTile,
     PrevTab,
     NextTab,
+    PrevSidebarTab,
+    NextSidebarTab,
     PrevPage,
     NextPage,
 }
 
 impl Action {
     /// Keyboard-page row order.
-    pub const ALL: [Action; 14] = [
+    pub const ALL: [Action; 16] = [
         Action::SplitRight,
         Action::SplitDown,
         Action::NewTab,
@@ -109,6 +203,8 @@ impl Action {
         Action::NextTile,
         Action::PrevTab,
         Action::NextTab,
+        Action::PrevSidebarTab,
+        Action::NextSidebarTab,
         Action::PrevPage,
         Action::NextPage,
     ];
@@ -128,6 +224,8 @@ impl Action {
             Action::NextTile => "next_tile",
             Action::PrevTab => "prev_tab",
             Action::NextTab => "next_tab",
+            Action::PrevSidebarTab => "prev_sidebar_tab",
+            Action::NextSidebarTab => "next_sidebar_tab",
             Action::PrevPage => "prev_page",
             Action::NextPage => "next_page",
         }
@@ -147,6 +245,8 @@ impl Action {
             Action::NextTile => "Focus next tile",
             Action::PrevTab => "Previous tab",
             Action::NextTab => "Next tab",
+            Action::PrevSidebarTab => "Previous sidebar tab",
+            Action::NextSidebarTab => "Next sidebar tab",
             Action::PrevPage => "Previous page",
             Action::NextPage => "Next page",
         }
@@ -170,6 +270,8 @@ impl Action {
             Action::NextTile => (false, "]"),
             Action::PrevTab => (true, "["),
             Action::NextTab => (true, "]"),
+            Action::PrevSidebarTab => (true, "up"),
+            Action::NextSidebarTab => (true, "down"),
             Action::PrevPage => (true, "left"),
             Action::NextPage => (true, "right"),
         };
@@ -299,6 +401,30 @@ mod tests {
     use gpui::Modifiers;
 
     #[test]
+    fn appearance_layout_covers_everything_once_without_collisions() {
+        let layout = appearance_layout();
+        let mut themes = 0;
+        let mut terms = 0;
+        let mut defaults = 0;
+        let mut slots: Vec<(usize, usize)> = Vec::new();
+        for (row, col, item) in layout {
+            assert!(col < 2, "col out of range");
+            assert!(!(item.full_width() && col != 0), "full-width items sit in col 0");
+            assert!(!slots.contains(&(row, col)), "slot ({row},{col}) used twice");
+            slots.push((row, col));
+            match item {
+                AppearanceItem::Theme(_) => themes += 1,
+                AppearanceItem::Term(_) => terms += 1,
+                AppearanceItem::TermDefault => defaults += 1,
+                _ => {},
+            }
+        }
+        assert_eq!(themes, crate::theme::ALL.len());
+        assert_eq!(terms, crate::term_theme::ALL.len());
+        assert_eq!(defaults, 1);
+    }
+
+    #[test]
     fn cycle_wraps_both_ways() {
         assert_eq!(cycle(0, 2, 1), 1);
         assert_eq!(cycle(1, 2, 1), 0);
@@ -339,6 +465,23 @@ mod tests {
             key_char: None,
         };
         assert!(b.matches(&ks));
+    }
+
+    #[test]
+    fn sidebar_tab_bindings_resolve() {
+        let ks = |key: &str| Keystroke {
+            modifiers: Modifiers {
+                platform: true,
+                shift: true,
+                control: false,
+                alt: false,
+                function: false,
+            },
+            key: key.into(),
+            key_char: None,
+        };
+        assert_eq!(match_action(&ks("up")), Some(Action::PrevSidebarTab));
+        assert_eq!(match_action(&ks("down")), Some(Action::NextSidebarTab));
     }
 
     #[test]
