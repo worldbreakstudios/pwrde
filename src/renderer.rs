@@ -2108,7 +2108,7 @@ impl Renderer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cleanup::{Cleanup, ScanState, WorktreeInfo};
+    use crate::cleanup::{Cleanup, WorktreeInfo};
 
     fn cleanup_chrome(cleanup: &Cleanup) -> ChromeState<'_> {
         ChromeState {
@@ -2156,7 +2156,7 @@ mod tests {
             None,
         );
         let frame = renderer.build_frame(
-            &[ws], 0, 240.0, None, None, None, None, None, None, &chrome,
+            &[ws], 0, 240.0, None, None, None, None, None, None, None, &chrome,
         );
         let texts: Vec<&str> = frame.labels.iter().map(|l| l.text.as_str()).collect();
         // Sidebar: All + one tab per repo, with counts.
@@ -2187,7 +2187,7 @@ mod tests {
             None,
         );
         let frame = renderer.build_frame(
-            &[ws], 0, 240.0, None, None, None, None, None, None, &chrome,
+            &[ws], 0, 240.0, None, None, None, None, None, None, None, &chrome,
         );
         let texts: Vec<&str> = frame.labels.iter().map(|l| l.text.as_str()).collect();
         assert!(texts.contains(&"Scanning worktrees…"));
@@ -2207,7 +2207,7 @@ mod tests {
             None,
         );
         let frame = renderer.build_frame(
-            &[ws], 0, 240.0, None, None, None, None, None, None, &chrome,
+            &[ws], 0, 240.0, None, None, None, None, None, None, None, &chrome,
         );
         let texts: Vec<&str> = frame.labels.iter().map(|l| l.text.as_str()).collect();
         assert!(texts.contains(&"Delete 1 selected"));
