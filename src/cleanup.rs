@@ -287,6 +287,19 @@ impl Cleanup {
         self.selected.clear();
     }
 
+    /// How many selected worktrees carry uncommitted changes — deletion
+    /// discards those, so the confirm dialog calls them out.
+    pub fn selected_dirty_count(&self) -> usize {
+        let worktrees = match &self.scan {
+            Some(ScanState::Ready(v)) => v,
+            _ => return 0,
+        };
+        worktrees
+            .iter()
+            .filter(|w| self.selected.contains(&w.id) && w.dirty_count > 0)
+            .count()
+    }
+
     /// Every selected worktree grouped by repo, for `drop rm` — which resolves
     /// ids only within one repo, so deletion runs once per repo root.
     pub fn selected_by_repo(&self) -> Vec<(String, Vec<String>)> {
@@ -857,6 +870,15 @@ mod tests {
         assert!(c.hover_entry().is_none());
         c.hover = Some("wt-2".to_string());
         assert_eq!(c.hover_entry().map(|w| w.id.as_str()), Some("wt-2"));
+    }
+
+    #[test]
+    fn test_selected_dirty_count() {
+        let mut c = make_cleanup(sample_worktrees());
+        c.selected.insert("wt-1".to_string()); // clean
+        assert_eq!(c.selected_dirty_count(), 0);
+        c.selected.insert("wt-2".to_string()); // dirtyCount 3
+        assert_eq!(c.selected_dirty_count(), 1);
     }
 
     #[test]

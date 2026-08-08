@@ -37,8 +37,9 @@ pub enum TermEvent {
     CleanupScanned(Vec<crate::cleanup::WorktreeInfo>),
     /// `drop -d --json` failed with an error message.
     CleanupScanFailed(String),
-    /// `drop rm … --json` completed: counts of removed and failed worktrees.
-    CleanupRemoved { removed: usize, failed: usize },
+    /// `drop rm … --json` completed: counts of removed and failed worktrees,
+    /// plus the first failure's reason when there is one.
+    CleanupRemoved { removed: usize, failed: usize, error: Option<String> },
 }
 
 /// Forwards `Alert::ToastNotification` from wezterm-term to the UI event channel

@@ -590,8 +590,8 @@ impl App {
                 self.message = Some((format!("Deleting {count} worktree(s)…"), false));
                 let tx = self.events_tx.clone();
                 std::thread::spawn(move || {
-                    let (removed, failed) = run_drop_rm(targets);
-                    let _ = tx.send(TermEvent::CleanupRemoved { removed, failed });
+                    let (removed, failed, error) = run_drop_rm(targets);
+                    let _ = tx.send(TermEvent::CleanupRemoved { removed, failed, error });
                 });
             },
         }
@@ -2660,11 +2660,18 @@ impl App {
         if delete.contains(px, py) && !self.cleanup.selected.is_empty() {
             let targets = self.cleanup.selected_by_repo();
             let count: usize = targets.iter().map(|(_, ids)| ids.len()).sum();
+            let dirty = self.cleanup.selected_dirty_count();
+            let plural = if count == 1 { "" } else { "s" };
+            let text = if dirty > 0 {
+                format!(
+                    "Delete {count} worktree{plural}? {dirty} ha{} uncommitted changes — those are discarded.",
+                    if dirty == 1 { "s" } else { "ve" }
+                )
+            } else {
+                format!("Delete {count} worktree{plural}? Unmerged branches are kept.")
+            };
             self.confirm = Some(ConfirmClose {
-                text: format!(
-                    "Delete {count} worktree{}? Merged branches are deleted; unmerged kept.",
-                    if count == 1 { "" } else { "s" }
-                ),
+                text,
                 action: ConfirmAction::CleanupDelete { targets },
             });
             self.request_redraw();
@@ -2886,13 +2893,15 @@ impl App {
                     self.cleanup.set_failed(msg);
                     redraw = true;
                 },
-                TermEvent::CleanupRemoved { removed, failed } => {
+                TermEvent::CleanupRemoved { removed, failed, error } => {
                     // Replace the modal "Deleting…" message with the outcome
                     // (dismissable), and refresh the table to match disk.
                     let msg = if failed == 0 {
                         format!("Removed {removed} worktree{}.", if removed == 1 { "" } else { "s" })
                     } else {
-                        format!("Removed {removed}, failed {failed}.")
+                        let reason =
+                            error.map(|e| format!(" — {e}")).unwrap_or_default();
+                        format!("Removed {removed}, failed {failed}{reason}")
                     };
                     self.message = Some((msg, true));
                     self.spawn_cleanup_scan();
@@ -3151,30 +3160,51 @@ fn dirty_file_details(worktree: &std::path::Path) -> Vec<cleanup::DirtyFile> {
     files
 }
 
-/// Remove worktrees via `drop rm <ids...> --repo <root> --json`, once per
-/// repo — drop resolves ids only within a single repo. Returns
-/// `(removed, failed)` totals. Runs synchronously — callers spawn it on a
+/// Remove worktrees via `drop rm <ids...> --repo <root> --force --json`, once
+/// per repo — drop resolves ids only within a single repo. `--force` mirrors
+/// drop's own TUI: the user explicitly selected and confirmed these rows, so
+/// dirty worktrees are removed too (branch deletion stays safe-only either
+/// way — unmerged branches survive). Returns `(removed, failed)` totals plus
+/// the first failure's reason. Runs synchronously — callers spawn it on a
 /// background thread.
-fn run_drop_rm(targets: Vec<(String, Vec<String>)>) -> (usize, usize) {
+fn run_drop_rm(targets: Vec<(String, Vec<String>)>) -> (usize, usize, Option<String>) {
     #[derive(serde::Deserialize)]
     struct RmResult {
         removed: bool,
+        error: Option<String>,
     }
     let mut removed = 0;
     let mut failed = 0;
+    let mut first_error: Option<String> = None;
     for (repo, ids) in targets {
         let count = ids.len();
         let mut cmd = git::augmented_command("drop");
-        cmd.arg("rm").args(&ids).arg("--repo").arg(&repo).arg("--json");
+        cmd.arg("rm").args(&ids).arg("--repo").arg(&repo).arg("--force").arg("--json");
         let results: Vec<RmResult> = match cmd.output() {
-            Ok(o) => serde_json::from_slice(&o.stdout).unwrap_or_default(),
-            Err(_) => Vec::new(),
+            Ok(o) => {
+                let parsed: Vec<RmResult> =
+                    serde_json::from_slice(&o.stdout).unwrap_or_default();
+                if parsed.is_empty() && first_error.is_none() {
+                    // drop itself failed to run — its last stderr line says why.
+                    let stderr = String::from_utf8_lossy(&o.stderr).into_owned();
+                    first_error =
+                        stderr.lines().rev().find(|l| !l.trim().is_empty()).map(str::to_string);
+                }
+                parsed
+            },
+            Err(e) => {
+                first_error.get_or_insert(format!("could not run drop: {e}"));
+                Vec::new()
+            },
         };
         let ok = results.iter().filter(|r| r.removed).count();
+        if first_error.is_none() {
+            first_error = results.iter().filter_map(|r| r.error.clone()).next();
+        }
         removed += ok;
         failed += count.saturating_sub(ok);
     }
-    (removed, failed)
+    (removed, failed, first_error)
 }
 
 /// Convert accumulated fractional wheel travel into whole scroll steps,
