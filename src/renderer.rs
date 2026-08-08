@@ -46,6 +46,21 @@ const CARD_RADIUS: f32 = 12.0;
 const ROW_RADIUS: f32 = 9.0;
 
 /// Blend `c` 40% toward white — brightens the hovered link color.
+/// Truncate `text` to at most `max_chars` characters, ending in `…` when
+/// anything was cut. Zero (or one) available column yields an empty string
+/// rather than a lone ellipsis.
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    if max_chars <= 1 {
+        return String::new();
+    }
+    let mut out: String = text.chars().take(max_chars - 1).collect();
+    out.push('…');
+    out
+}
+
 fn brighten(c: (u8, u8, u8)) -> (u8, u8, u8) {
     let blend = |v: u8| v.saturating_add(((255 - v) as f32 * 0.4) as u8);
     (blend(c.0), blend(c.1), blend(c.2))
@@ -2173,11 +2188,17 @@ impl Renderer {
                 let pill = LayoutRect { x: row.x + m, w: (row.w - 2.0 * m).max(0.0), ..row };
                 rects.push(self.px_rect(&pill, th.accent, 0.10, (7.0 * scale).round()));
             }
-            let detail_w = entry.detail.chars().count() as f32 * self.cell_width;
+            // The name has priority: the detail only gets the width left over
+            // after it (a long description truncates with an ellipsis rather
+            // than pushing the name out of the row).
+            let label_w = entry.label.chars().count() as f32 * self.cell_width;
+            let room = row.w - 2.0 * pad - label_w - 2.0 * self.cell_width;
+            let detail = truncate_chars(&entry.detail, (room / self.cell_width) as usize);
+            let detail_w = detail.chars().count() as f32 * self.cell_width;
             let detail_x = row.x + row.w - pad - detail_w;
-            if !entry.detail.is_empty() {
+            if !detail.is_empty() {
                 labels.push(LabelSpec {
-                    text: entry.detail.clone(),
+                    text: detail,
                     color: color(th.ink_dim, 1.0),
                     left: detail_x,
                     top,
@@ -2662,6 +2683,18 @@ impl Renderer {
 mod tests {
     use super::*;
     use crate::cleanup::{Cleanup, WorktreeInfo};
+
+    /// Long profile details truncate with an ellipsis instead of overrunning
+    /// the row; degenerate widths drop the detail entirely.
+    #[test]
+    fn truncate_chars_caps_length_with_ellipsis() {
+        assert_eq!(truncate_chars("short", 10), "short");
+        assert_eq!(truncate_chars("exactly-ten", 11), "exactly-ten");
+        assert_eq!(truncate_chars("a long description · user", 10), "a long de…");
+        assert_eq!(truncate_chars("ab", 1), "");
+        assert_eq!(truncate_chars("ab", 0), "");
+        assert_eq!(truncate_chars("", 0), "");
+    }
 
     fn cleanup_chrome(cleanup: &Cleanup) -> ChromeState<'_> {
         ChromeState {
