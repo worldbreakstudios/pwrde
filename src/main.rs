@@ -143,6 +143,8 @@ enum Drag {
     Select { tile: u64 },
     /// A text selection is being dragged inside the flyover panel.
     FlyoverSelect,
+    /// The flyover panel's top edge is being dragged to resize it.
+    FlyoverResize,
     /// Sidebar group row pressed; may become a group drag past threshold.
     GroupPress { ws: usize, start: (f64, f64) },
     /// Dragging a sidebar workspace group tab.
@@ -244,6 +246,11 @@ struct App {
     flyover_anim: f32,
     /// Whether keyboard focus is currently inside the flyover panel.
     flyover_focused: bool,
+    /// Panel height as a fraction of the window, drag-resizable from the
+    /// panel's top edge; persisted under the `flyover.height` settings key.
+    flyover_height_frac: f32,
+    /// Whether the panel fills the whole window (the □ button toggles it).
+    flyover_maximized: bool,
     /// Whether the flyover lives in its own popout window instead of the
     /// in-window panel.
     flyover_windowed: bool,
@@ -489,8 +496,7 @@ impl App {
             return;
         }
         let scale = self.scale();
-        let (w, h) = self.renderer.surface_size();
-        let panel = workspace::flyover_rect(w, h, scale, self.flyover_anim);
+        let panel = self.flyover_rect_now();
         let content = workspace::flyover_content(&panel, scale);
         let (cols, rows) = self.renderer.grid_size_for(&content);
         let (cw, ch) = self.cell_px();
@@ -791,9 +797,8 @@ impl App {
         // Flyover panel scroll: intercept first when panel is open and cursor is inside.
         if self.flyover_open && !self.flyover_tabs.is_empty() {
             let scale = self.scale();
-            let (w, h) = self.renderer.surface_size();
             let (px, py) = (self.cursor.0 as f32, self.cursor.1 as f32);
-            let panel = workspace::flyover_rect(w, h, scale, self.flyover_anim);
+            let panel = self.flyover_rect_now();
             let content = workspace::flyover_content(&panel, scale);
             if panel.contains(px, py) {
                 let cell_h = cell_height as f64;
@@ -925,6 +930,47 @@ impl App {
         if let Some(tab) = self.flyover_tabs.get_mut(self.flyover_active) {
             tab.unread = false;
         }
+    }
+
+    /// The flyover panel's rect for the current animation/size state.
+    fn flyover_rect_now(&self) -> workspace::LayoutRect {
+        let (w, h) = self.renderer.surface_size();
+        workspace::flyover_rect(
+            w,
+            h,
+            self.scale(),
+            self.flyover_anim,
+            self.flyover_height_frac,
+            self.flyover_maximized,
+        )
+    }
+
+    /// Close flyover tab `ti`, dropping its session (which kills the PTY).
+    /// The last tab closing hides whichever surface was showing the flyover.
+    fn close_flyover_tab(&mut self, ti: usize) {
+        if ti >= self.flyover_tabs.len() {
+            return;
+        }
+        self.flyover_tabs.remove(ti);
+        if self.flyover_tabs.is_empty() {
+            self.flyover_open = false;
+            self.flyover_focused = false;
+            self.flyover_window_visible = false;
+        } else {
+            if ti < self.flyover_active {
+                self.flyover_active -= 1;
+            }
+            self.flyover_active = self.flyover_active.min(self.flyover_tabs.len() - 1);
+        }
+        self.request_redraw();
+    }
+
+    /// Toggle the flyover panel between its resizable height and filling the
+    /// whole window.
+    fn flyover_toggle_maximized(&mut self) {
+        self.flyover_maximized = !self.flyover_maximized;
+        self.sync_flyover_layout(true);
+        self.request_redraw();
     }
 
     /// Move the flyover between the in-window panel and its own popout
@@ -1188,17 +1234,7 @@ impl App {
                 self.open_flyover_picker();
             },
             Action::CloseTab => {
-                if !self.flyover_tabs.is_empty() {
-                    self.flyover_tabs.remove(self.flyover_active);
-                    if self.flyover_tabs.is_empty() {
-                        self.flyover_open = false;
-                        self.flyover_focused = false;
-                        self.flyover_window_visible = false;
-                    } else {
-                        self.flyover_active =
-                            self.flyover_active.min(self.flyover_tabs.len() - 1);
-                    }
-                }
+                self.close_flyover_tab(self.flyover_active);
             },
             Action::PrevTab => {
                 if !self.flyover_tabs.is_empty() {
@@ -2279,15 +2315,36 @@ impl App {
 
         // Flyover panel hit-testing: after modal-overlay check, before sidebar/tiles.
         if self.flyover_open && !self.flyover_tabs.is_empty() {
-            let panel = workspace::flyover_rect(w, h, scale, self.flyover_anim);
+            let panel = self.flyover_rect_now();
+            // Top-edge grab zone starts a height-resize drag (not when
+            // maximized — there's no meaningful height to drag).
+            let grab = (workspace::FLYOVER_RESIZE_GRAB * scale).max(1.0);
+            if !self.flyover_maximized && (py - panel.y).abs() <= grab {
+                self.drag = Drag::FlyoverResize;
+                self.request_redraw();
+                return;
+            }
             if panel.contains(px, py) {
                 let tab_bar = workspace::flyover_tab_bar(&panel, scale);
                 let n = self.flyover_tabs.len();
                 if tab_bar.contains(px, py) && n > 0 {
-                    // Determine which tab was clicked.
+                    // Window buttons at the bar's right edge.
+                    if workspace::flyover_minimize_rect(&panel, scale).contains(px, py) {
+                        self.toggle_flyover();
+                        return;
+                    }
+                    if workspace::flyover_maximize_rect(&panel, scale).contains(px, py) {
+                        self.flyover_toggle_maximized();
+                        return;
+                    }
+                    // Determine which tab was clicked; × closes it.
                     let tab_rect = workspace::flyover_tab_rect(&panel, 0, n.max(1), scale);
                     let ti = ((((px - tab_rect.x).max(0.0)) / tab_rect.w).floor() as usize)
                         .min(n.saturating_sub(1));
+                    if workspace::flyover_tab_close_rect(&panel, ti, n, scale).contains(px, py) {
+                        self.close_flyover_tab(ti);
+                        return;
+                    }
                     self.flyover_active = ti;
                     self.flyover_focused = true;
                     self.flyover_mark_read();
@@ -2637,11 +2694,20 @@ impl App {
                 }
             },
             Drag::Section { .. } => self.request_redraw(),
+            Drag::FlyoverResize => {
+                // Top edge follows the pointer; PTYs resize on release.
+                let (_, h) = self.renderer.surface_size();
+                let frac = ((h as f32 - self.cursor.1 as f32) / h as f32)
+                    .clamp(workspace::FLYOVER_MIN_FRAC, workspace::FLYOVER_MAX_FRAC);
+                if frac != self.flyover_height_frac {
+                    self.flyover_height_frac = frac;
+                    self.request_redraw();
+                }
+            },
             Drag::FlyoverSelect => {
                 let scale = self.renderer.scale;
                 let (px, py) = (self.cursor.0 as f32, self.cursor.1 as f32);
-                let (w, h) = self.renderer.surface_size();
-                let panel = workspace::flyover_rect(w, h, scale, self.flyover_anim);
+                let panel = self.flyover_rect_now();
                 let content = workspace::flyover_content(&panel, scale);
                 if let Some((col, row)) = self.renderer.cell_at(&content, px, py) {
                     if let Some(tab) = self.flyover_tabs.get(self.flyover_active) {
@@ -2794,6 +2860,16 @@ impl App {
                 if let Some(target) = self.resolve_drop(px, py) {
                     self.apply_drop(tile, tab, target);
                 }
+                self.request_redraw();
+            },
+            // Resize released: fit the PTYs to the final height and keep it
+            // for future launches.
+            Drag::FlyoverResize => {
+                settings::set(
+                    "flyover.height",
+                    format!("{:.3}", self.flyover_height_frac).into(),
+                );
+                self.sync_flyover_layout(true);
                 self.request_redraw();
             },
             // Sidebar group click (no drag): activate the workspace.
@@ -4191,6 +4267,22 @@ impl App {
             };
             window.set_window_cursor_style(style);
         }
+        // The flyover's top edge resizes: show the up-down cursor while
+        // hovering the grab zone or mid-drag.
+        if !overlay_open
+            && self.flyover_open
+            && !self.flyover_windowed
+            && !self.flyover_maximized
+            && !self.flyover_tabs.is_empty()
+        {
+            let panel = self.flyover_rect_now();
+            let grab = (workspace::FLYOVER_RESIZE_GRAB * scale).max(1.0);
+            if (self.cursor.1 as f32 - panel.y).abs() <= grab
+                || matches!(self.drag, Drag::FlyoverResize)
+            {
+                window.set_window_cursor_style(CursorStyle::ResizeUpDown);
+            }
+        }
 
         // While a tab/group/section is being dragged, resolve the current
         // landing zone and compute its translucent preview rect.
@@ -4255,14 +4347,14 @@ impl App {
         // fields (painted above tiles/labels, below the modal overlays).
         // In windowed mode the popout window renders it instead.
         if self.flyover_anim > 0.0 && !self.flyover_windowed {
-            let (w, h) = self.renderer.surface_size();
-            let panel = workspace::flyover_rect(w, h, scale, self.flyover_anim);
+            let panel = self.flyover_rect_now();
             let (quads, panes, fg_quads, labels) = self.renderer.flyover_overlay(
                 &self.flyover_tabs,
                 self.flyover_active,
                 &panel,
                 self.flyover_focused,
                 !overlay_open,
+                true,
             );
             frame.flyover_quads = quads;
             frame.flyover_panes = panes;
@@ -4661,6 +4753,10 @@ impl FlyoverPopout {
             if tab_bar.contains(mx, my) {
                 let tr = workspace::flyover_tab_rect(&panel, 0, n, scale);
                 let ti = (((mx - tr.x).max(0.0) / tr.w).floor() as usize).min(n - 1);
+                if workspace::flyover_tab_close_rect(&panel, ti, n, scale).contains(mx, my) {
+                    app.close_flyover_tab(ti);
+                    return;
+                }
                 app.flyover_active = ti;
                 app.flyover_mark_read();
                 app.request_redraw();
@@ -4757,13 +4853,7 @@ impl FlyoverPopout {
                     tab.session.resize(cols, rows, cw, ch, dpi);
                 }
             }
-            renderer.flyover_overlay(
-                &app.flyover_tabs,
-                app.flyover_active,
-                &panel,
-                focused,
-                true,
-            )
+            renderer.flyover_overlay(&app.flyover_tabs, app.flyover_active, &panel, focused, true, false)
         });
 
         let origin = bounds.origin;
@@ -4985,6 +5075,10 @@ fn main() {
                         flyover_open: false,
                         flyover_anim: 0.0,
                         flyover_focused: false,
+                        flyover_height_frac: settings::get_str("flyover.height")
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(workspace::FLYOVER_DEFAULT_FRAC),
+                        flyover_maximized: false,
                         flyover_windowed: false,
                         flyover_window_visible: false,
                         flyover_window: None,

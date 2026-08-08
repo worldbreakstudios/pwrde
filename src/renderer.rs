@@ -2220,6 +2220,9 @@ impl Renderer {
     /// the popout — and `focused` indicates whether it holds keyboard focus.
     /// An open-but-empty panel (first-open picker flow) still paints its card
     /// so the slide-in reads; only the tab/content parts need tabs.
+    /// `show_window_buttons` draws the minimize/maximize squares at the
+    /// bar's right — the in-window panel wants them, the popout window has
+    /// real window controls instead.
     pub fn flyover_overlay(
         &self,
         tabs: &[crate::workspace::Tab],
@@ -2227,6 +2230,7 @@ impl Renderer {
         panel_rect: &crate::workspace::LayoutRect,
         focused: bool,
         draw_cursor: bool,
+        show_window_buttons: bool,
     ) -> (Vec<Quad>, Vec<PaneText>, Vec<Quad>, Vec<LabelSpec>) {
         let th = self.theme();
         let scale = self.scale;
@@ -2273,10 +2277,11 @@ impl Renderer {
             quads.push(self.px_rect(&tr, pane_pill.0, pane_pill.1, (5.0 * scale).round()));
         }
 
-        // Tab labels.
+        // Tab labels + per-tab × close button (mirrors the tile tab strip).
         let tab_text_pad = (8.0 * scale).round();
         for (i, tab) in tabs.iter().enumerate() {
             let tr = crate::workspace::flyover_tab_rect(panel_rect, i, n, scale);
+            let close = crate::workspace::flyover_tab_close_rect(panel_rect, i, n, scale);
             let title = tab.session.title();
             let text = if title.is_empty() { "shell".to_string() } else { title };
             let mut text_left = tr.x + tab_text_pad;
@@ -2301,9 +2306,38 @@ impl Renderer {
                 },
                 left: text_left,
                 top: (tr.y + (tr.h - self.cell_height) / 2.0).round(),
+                clip: crate::workspace::LayoutRect {
+                    w: (close.x - tr.x - tab_text_pad).max(0.0),
+                    ..tr
+                },
+                size: None,
+            });
+            labels.push(LabelSpec {
+                text: "×".to_string(),
+                color: color(pane_ink_dim.0, pane_ink_dim.1),
+                left: close.x + ((close.w - self.cell_width) / 2.0).round(),
+                top: (tr.y + (tr.h - self.cell_height) / 2.0).round(),
                 clip: tr,
                 size: None,
             });
+        }
+
+        // Minimize / maximize buttons at the bar's right edge.
+        if show_window_buttons {
+            let bar_h = tab_bar.h;
+            for (rect, glyph) in [
+                (crate::workspace::flyover_minimize_rect(panel_rect, scale), "–"),
+                (crate::workspace::flyover_maximize_rect(panel_rect, scale), "□"),
+            ] {
+                labels.push(LabelSpec {
+                    text: glyph.to_string(),
+                    color: color(pane_ink_dim.0, pane_ink_dim.1),
+                    left: rect.x + ((rect.w - self.cell_width) / 2.0).round(),
+                    top: (rect.y + (bar_h - self.cell_height) / 2.0).round(),
+                    clip: rect,
+                    size: None,
+                });
+            }
         }
 
         // Tab-bar bottom divider line.

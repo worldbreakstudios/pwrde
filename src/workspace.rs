@@ -1321,27 +1321,45 @@ pub fn tile_tab_close_rect(rect: &LayoutRect, i: usize, n: usize, scale: f32, ha
 /// Horizontal inset (logical px) applied to each side of the flyover panel.
 const FLYOVER_INSET: f32 = 6.0;
 
-/// Height of the flyover panel as a fraction of the window height.
-const FLYOVER_HEIGHT_FRAC: f32 = 0.40;
+/// Height of the flyover panel as a fraction of the window height when the
+/// user hasn't drag-resized it.
+pub const FLYOVER_DEFAULT_FRAC: f32 = 0.40;
+
+/// Drag-resize bounds for the flyover height fraction.
+pub const FLYOVER_MIN_FRAC: f32 = 0.15;
+pub const FLYOVER_MAX_FRAC: f32 = 0.90;
+
+/// Half-height (logical px) of the grab zone around the panel's top edge for
+/// drag-resizing.
+pub const FLYOVER_RESIZE_GRAB: f32 = 4.0;
 
 /// Resting rect of the flyover panel in physical pixels, interpolated by
 /// `anim` (0.0 = fully off-screen below, 1.0 = fully visible).
 ///
 /// The panel spans the window width minus a small horizontal inset and sits
-/// above the bottom edge, occupying ~40 % of the window height.
-pub fn flyover_rect(width: u32, height: u32, scale: f32, anim: f32) -> LayoutRect {
-    let inset = (FLYOVER_INSET * scale).round();
-    let panel_h = ((height as f32) * FLYOVER_HEIGHT_FRAC).round();
+/// above the bottom edge, `frac` of the window tall (clamped to the resize
+/// bounds). `maximized` fills the whole window instead; the slide animation
+/// still applies.
+pub fn flyover_rect(
+    width: u32,
+    height: u32,
+    scale: f32,
+    anim: f32,
+    frac: f32,
+    maximized: bool,
+) -> LayoutRect {
+    let (x, w, panel_h) = if maximized {
+        (0.0, width as f32, height as f32)
+    } else {
+        let inset = (FLYOVER_INSET * scale).round();
+        let frac = frac.clamp(FLYOVER_MIN_FRAC, FLYOVER_MAX_FRAC);
+        (inset, ((width as f32) - 2.0 * inset).max(0.0), ((height as f32) * frac).round())
+    };
     let resting_y = (height as f32) - panel_h;
     // Off-screen bottom: panel sits just below the window.
     let offscreen_y = height as f32;
     let y = lerp(offscreen_y, resting_y, anim.clamp(0.0, 1.0));
-    LayoutRect {
-        x: inset,
-        y,
-        w: ((width as f32) - 2.0 * inset).max(0.0),
-        h: panel_h,
-    }
+    LayoutRect { x, y, w, h: panel_h }
 }
 
 /// Tab-bar strip at the top of the flyover panel (mirrors `tile_tab_bar`).
@@ -1355,12 +1373,46 @@ pub fn flyover_content(rect: &LayoutRect, scale: f32) -> LayoutRect {
     LayoutRect { y: rect.y + bar, h: (rect.h - bar).max(0.0), ..*rect }
 }
 
+/// Width (physical px) reserved at the right end of the flyover tab bar for
+/// the minimize/maximize buttons — two square slots, one bar-height each.
+fn flyover_buttons_w(rect: &LayoutRect, scale: f32) -> f32 {
+    2.0 * flyover_tab_bar(rect, scale).h
+}
+
 /// Rect of tab `i` of `n` in the flyover tab strip (mirrors `tile_tab_rect`,
-/// no caret button so no `has_caret` parameter).
+/// no caret button so no `has_caret` parameter). Tabs share the bar minus
+/// the window-button strip at the right.
 pub fn flyover_tab_rect(rect: &LayoutRect, i: usize, n: usize, scale: f32) -> LayoutRect {
     let bar = flyover_tab_bar(rect, scale);
-    let w = (bar.w / n.max(1) as f32).min((TILE_TAB_MAX_W * scale).round()).round();
+    let avail = (bar.w - flyover_buttons_w(rect, scale)).max(0.0);
+    let w = (avail / n.max(1) as f32).min((TILE_TAB_MAX_W * scale).round()).round();
     LayoutRect { x: bar.x + i as f32 * w, y: bar.y, w, h: bar.h }
+}
+
+/// Rect of the × close button inside flyover tab `i` (mirrors
+/// `tile_tab_close_rect`).
+pub fn flyover_tab_close_rect(rect: &LayoutRect, i: usize, n: usize, scale: f32) -> LayoutRect {
+    let tr = flyover_tab_rect(rect, i, n, scale);
+    let s = (16.0 * scale).round();
+    let pad = (6.0 * scale).round();
+    LayoutRect {
+        x: tr.x + tr.w - s - pad,
+        y: (tr.y + (tr.h - s) / 2.0).round(),
+        w: s,
+        h: s,
+    }
+}
+
+/// The minimize (−) button: second-from-right square in the flyover tab bar.
+pub fn flyover_minimize_rect(rect: &LayoutRect, scale: f32) -> LayoutRect {
+    let bar = flyover_tab_bar(rect, scale);
+    LayoutRect { x: bar.x + bar.w - 2.0 * bar.h, y: bar.y, w: bar.h, h: bar.h }
+}
+
+/// The maximize button: rightmost square in the flyover tab bar.
+pub fn flyover_maximize_rect(rect: &LayoutRect, scale: f32) -> LayoutRect {
+    let bar = flyover_tab_bar(rect, scale);
+    LayoutRect { x: bar.x + bar.w - bar.h, y: bar.y, w: bar.h, h: bar.h }
 }
 
 #[cfg(test)]
@@ -1370,8 +1422,8 @@ mod flyover_tests {
     /// At anim=1.0, the panel should be fully on-screen (resting_y = height - panel_h).
     #[test]
     fn flyover_rect_fully_visible() {
-        let r = flyover_rect(1000, 800, 1.0, 1.0);
-        let expected_h = (800.0 * FLYOVER_HEIGHT_FRAC).round();
+        let r = flyover_rect(1000, 800, 1.0, 1.0, FLYOVER_DEFAULT_FRAC, false);
+        let expected_h = (800.0 * FLYOVER_DEFAULT_FRAC).round();
         let expected_y = 800.0 - expected_h;
         assert_eq!(r.h, expected_h);
         assert!((r.y - expected_y).abs() < 1.0, "y={} expected={}", r.y, expected_y);
@@ -1383,15 +1435,15 @@ mod flyover_tests {
     /// At anim=0.0, the panel top should be at the bottom of the window (off-screen).
     #[test]
     fn flyover_rect_hidden() {
-        let r = flyover_rect(1000, 800, 1.0, 0.0);
+        let r = flyover_rect(1000, 800, 1.0, 0.0, FLYOVER_DEFAULT_FRAC, false);
         assert!((r.y - 800.0).abs() < 1.0, "y={} should equal height={}", r.y, 800.0);
     }
 
     /// At anim=0.5, the panel should be halfway between off-screen and resting.
     #[test]
     fn flyover_rect_mid_anim() {
-        let r = flyover_rect(1000, 800, 1.0, 0.5);
-        let panel_h = (800.0 * FLYOVER_HEIGHT_FRAC).round();
+        let r = flyover_rect(1000, 800, 1.0, 0.5, FLYOVER_DEFAULT_FRAC, false);
+        let panel_h = (800.0 * FLYOVER_DEFAULT_FRAC).round();
         let resting_y = 800.0 - panel_h;
         let expected_y = lerp(800.0, resting_y, 0.5);
         assert!((r.y - expected_y).abs() < 1.0, "y={} expected={}", r.y, expected_y);
@@ -1400,7 +1452,7 @@ mod flyover_tests {
     /// Tab-bar height matches TILE_TAB_H * scale.
     #[test]
     fn flyover_tab_bar_height() {
-        let panel = flyover_rect(1000, 800, 2.0, 1.0);
+        let panel = flyover_rect(1000, 800, 2.0, 1.0, FLYOVER_DEFAULT_FRAC, false);
         let bar = flyover_tab_bar(&panel, 2.0);
         assert_eq!(bar.h, (TILE_TAB_H * 2.0).round());
         assert_eq!(bar.y, panel.y);
@@ -1409,17 +1461,65 @@ mod flyover_tests {
     /// Content rect starts just below the tab bar.
     #[test]
     fn flyover_content_below_tab_bar() {
-        let panel = flyover_rect(1000, 800, 2.0, 1.0);
+        let panel = flyover_rect(1000, 800, 2.0, 1.0, FLYOVER_DEFAULT_FRAC, false);
         let bar = flyover_tab_bar(&panel, 2.0);
         let content = flyover_content(&panel, 2.0);
         assert_eq!(content.y, panel.y + bar.h);
         assert_eq!(content.h, (panel.h - bar.h).max(0.0));
     }
 
+    /// A custom height fraction drives the panel height; out-of-range values
+    /// clamp to the resize bounds.
+    #[test]
+    fn flyover_rect_respects_frac_and_clamps() {
+        let r = flyover_rect(1000, 800, 1.0, 1.0, 0.6, false);
+        assert_eq!(r.h, (800.0_f32 * 0.6).round());
+        let low = flyover_rect(1000, 800, 1.0, 1.0, 0.01, false);
+        assert_eq!(low.h, (800.0 * FLYOVER_MIN_FRAC).round());
+        let high = flyover_rect(1000, 800, 1.0, 1.0, 5.0, false);
+        assert_eq!(high.h, (800.0 * FLYOVER_MAX_FRAC).round());
+    }
+
+    /// Maximized fills the window edge-to-edge regardless of frac.
+    #[test]
+    fn flyover_rect_maximized_fills_window() {
+        let r = flyover_rect(1000, 800, 1.0, 1.0, 0.3, true);
+        assert_eq!((r.x, r.y, r.w, r.h), (0.0, 0.0, 1000.0, 800.0));
+    }
+
+    /// The window buttons sit inside the bar's right edge, minimize left of
+    /// maximize, and tabs never overlap them.
+    #[test]
+    fn flyover_buttons_and_tabs_share_the_bar() {
+        let panel = flyover_rect(1000, 800, 1.0, 1.0, FLYOVER_DEFAULT_FRAC, false);
+        let bar = flyover_tab_bar(&panel, 1.0);
+        let min = flyover_minimize_rect(&panel, 1.0);
+        let max = flyover_maximize_rect(&panel, 1.0);
+        assert_eq!(max.x + max.w, bar.x + bar.w);
+        assert_eq!(min.x + min.w, max.x);
+        let n = 3;
+        let last = flyover_tab_rect(&panel, n - 1, n, 1.0);
+        assert!(last.x + last.w <= min.x + 0.5);
+    }
+
+    /// The close button sits inside its tab.
+    #[test]
+    fn flyover_tab_close_rect_inside_tab() {
+        let panel = flyover_rect(1000, 800, 1.0, 1.0, FLYOVER_DEFAULT_FRAC, false);
+        for n in 1..=4 {
+            for i in 0..n {
+                let tr = flyover_tab_rect(&panel, i, n, 1.0);
+                let close = flyover_tab_close_rect(&panel, i, n, 1.0);
+                assert!(close.x >= tr.x && close.x + close.w <= tr.x + tr.w + 0.5);
+                assert!(close.y >= tr.y && close.y + close.h <= tr.y + tr.h + 0.5);
+            }
+        }
+    }
+
     /// Tab rects are evenly divided and don't exceed TILE_TAB_MAX_W.
     #[test]
     fn flyover_tab_rect_layout() {
-        let panel = flyover_rect(1000, 800, 1.0, 1.0);
+        let panel = flyover_rect(1000, 800, 1.0, 1.0, FLYOVER_DEFAULT_FRAC, false);
         let t0 = flyover_tab_rect(&panel, 0, 3, 1.0);
         let t1 = flyover_tab_rect(&panel, 1, 3, 1.0);
         let t2 = flyover_tab_rect(&panel, 2, 3, 1.0);
