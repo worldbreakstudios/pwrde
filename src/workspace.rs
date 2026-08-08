@@ -228,7 +228,7 @@ const TILE_TAB_H: f32 = 28.0;
 /// Gap between tile cards; doubles as the divider drag handle.
 const TILE_GAP: f32 = 12.0;
 /// Padding between the tile cards and the window edges (top/right/bottom).
-const AREA_PAD: f32 = 14.0;
+const AREA_PAD: f32 = 7.0;
 const TILE_TAB_MAX_W: f32 = 180.0;
 
 /// `sidebar_w` is the user-adjustable sidebar width in logical px.
