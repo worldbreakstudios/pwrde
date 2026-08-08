@@ -351,6 +351,46 @@ pub fn settings_row_rect(card: &LayoutRect, i: usize, scale: f32) -> LayoutRect 
     }
 }
 
+/// One Appearance-page slot inside settings row `row`: the whole row for
+/// full-width items, else the left (`col` 0) or right (`col` 1) half with an
+/// inner gap. Shared by the renderer and main.rs like `settings_row_rect`.
+pub fn appearance_slot_rect(
+    card: &LayoutRect,
+    row: usize,
+    col: usize,
+    full_width: bool,
+    scale: f32,
+) -> LayoutRect {
+    let r = settings_row_rect(card, row, scale);
+    if full_width {
+        return r;
+    }
+    let gap = (8.0 * scale).round();
+    let w = ((r.w - gap) / 2.0).floor().max(0.0);
+    LayoutRect { x: if col == 0 { r.x } else { r.x + w + gap }, w, ..r }
+}
+
+/// The `i`-th of the three mode segments (System/Dark/Light), right-aligned
+/// inside the Appearance page's mode row. Sized from the label text so the
+/// renderer's pill and main.rs's hit-test share the same pixels.
+pub fn mode_segment_rect(row: &LayoutRect, i: usize, cell_width: f32, scale: f32) -> LayoutRect {
+    let pad = (10.0 * scale).round();
+    let gap = (4.0 * scale).round();
+    let inset = (4.0 * scale).round();
+    let edge = (SETTINGS_PAD * scale).round();
+    let w = |i: usize| {
+        (crate::theme::Mode::ALL[i].label().chars().count() as f32 * cell_width + 2.0 * pad)
+            .round()
+    };
+    let total: f32 = (0..crate::theme::Mode::ALL.len()).map(w).sum::<f32>()
+        + (crate::theme::Mode::ALL.len() - 1) as f32 * gap;
+    let mut x = row.x + row.w - edge - total;
+    for j in 0..i {
+        x += w(j) + gap;
+    }
+    LayoutRect { x: x.round(), y: row.y + inset, w: w(i), h: (row.h - 2.0 * inset).max(0.0) }
+}
+
 /// The region right of the sidebar where the split tree lives. Inset from the
 /// window's top/right/bottom edges so the tile cards float on the gradient.
 pub fn terminal_area(width: u32, height: u32, scale: f32, sidebar_w: f32) -> LayoutRect {

@@ -150,11 +150,11 @@ pub struct Frame {
     pub picker_labels: Vec<LabelSpec>,
 }
 
-/// Stateless renderer: owns only cell metrics, scale, and the terminal color
-/// palette. All measurements come from gpui's text system (see `main.rs`), so
-/// `new` takes them as arguments instead of creating a GPU surface.
+/// Stateless renderer: owns only cell metrics and scale. All measurements
+/// come from gpui's text system (see `main.rs`), so `new` takes them as
+/// arguments instead of creating a GPU surface. The terminal color palette is
+/// resolved from settings once per frame in [`Renderer::build_frame`].
 pub struct Renderer {
-    palette: ColorPalette,
     width: u32,
     height: u32,
 
@@ -184,7 +184,6 @@ pub fn measure_cell_width(window: &mut gpui::Window, scale: f32) -> f32 {
 impl Renderer {
     pub fn new(scale: f32, cell_width: f32, width: u32, height: u32) -> Self {
         let mut renderer = Self {
-            palette: ColorPalette::default(),
             width: width.max(1),
             height: height.max(1),
             scale,
@@ -318,6 +317,23 @@ impl Renderer {
         chrome: &ChromeState,
     ) -> Frame {
         let th = self.theme();
+        // Terminal scheme, resolved once per frame like the chrome theme so
+        // an Appearance-page click restyles the very next paint. Pane chrome
+        // (card fill, tab text, divider, active-tab pill) follows the scheme
+        // so tab strips stay legible on light palettes; the adaptive default
+        // keeps the chrome theme's exact colors.
+        let scheme = crate::term_theme::selected(crate::theme::dark_active());
+        let term_palette = crate::term_theme::build(scheme, th.term_bg);
+        let (pane_bg, pane_ink, pane_ink_dim, pane_divider, pane_pill) = match scheme {
+            Some(t) => (t.bg, (t.fg, 1.0), (t.fg, 0.55), (t.fg, 0.15), (t.fg, 0.12)),
+            None => (
+                th.term_bg,
+                (th.text_bright, 1.0),
+                (th.text_dim, 1.0),
+                (th.card_divider, 1.0),
+                ((255, 255, 255), 0.09),
+            ),
+        };
         let ws = &workspaces[active];
         let (width, height) = (self.width, self.height);
         let area = workspace::terminal_area(width, height, self.scale, sidebar_w);
@@ -460,10 +476,10 @@ impl Renderer {
             for (id, rect) in &tiles {
                 // Each tile is a floating dark card: rounded, shadowed, with its
                 // tab strip inside the card above a hairline divider.
-                bg_quads.push(self.px_rect(rect, th.term_bg, 1.0, card_r).shadow(Shadow::Card));
+                bg_quads.push(self.px_rect(rect, pane_bg, 1.0, card_r).shadow(Shadow::Card));
                 let bar = workspace::tile_tab_bar(rect, self.scale);
                 let divider = LayoutRect { x: rect.x, y: bar.y + bar.h - hair, w: rect.w, h: hair };
-                bg_quads.push(self.px_rect(&divider, th.card_divider, 1.0, 0.0));
+                bg_quads.push(self.px_rect(&divider, pane_divider.0, pane_divider.1, 0.0));
                 if let Some(tile) = ws.root.find_tile(*id) {
                     // Active tab: a subtle rounded pill inside the strip (white
                     // works on every theme's dark card).
@@ -475,7 +491,7 @@ impl Renderer {
                         w: (tr.w - 2.0 * m).max(0.0),
                         h: (tr.h - 2.0 * m).max(0.0),
                     };
-                    bg_quads.push(self.px_rect(&pill, (255, 255, 255), 0.09, (7.0 * self.scale).round()));
+                    bg_quads.push(self.px_rect(&pill, pane_pill.0, pane_pill.1, (7.0 * self.scale).round()));
                 }
             }
 
@@ -490,8 +506,14 @@ impl Renderer {
                         && picker.is_none()
                         && fork.is_none()
                         && message.is_none();
-                    let rows =
-                        self.snapshot_pane(session, origin, draw_cursor, &mut bg_quads, &mut fg_quads);
+                    let rows = self.snapshot_pane(
+                        session,
+                        &term_palette,
+                        origin,
+                        draw_cursor,
+                        &mut bg_quads,
+                        &mut fg_quads,
+                    );
                     panes.push(PaneText { origin, rows });
                     self.selection_rects(session, origin, &mut fg_quads);
                 }
@@ -504,7 +526,11 @@ impl Renderer {
                     let text = if title.is_empty() { "shell".to_string() } else { title };
                     labels.push(LabelSpec {
                         text,
-                        color: color(if ti == tile.active { th.text_bright } else { th.text_dim }, 1.0),
+                        color: if ti == tile.active {
+                            color(pane_ink.0, pane_ink.1)
+                        } else {
+                            color(pane_ink_dim.0, pane_ink_dim.1)
+                        },
                         left: tr.x + tab_text_pad,
                         top: (tr.y + (tr.h - self.cell_height) / 2.0).round(),
                         clip: LayoutRect { w: tr.w - tab_text_pad, ..tr },
@@ -630,31 +656,88 @@ impl Renderer {
                     });
                 }
             },
-            Section::Themes => {
-                for (i, preset) in crate::theme::ALL.iter().enumerate() {
-                    let row = workspace::settings_row_rect(area, i, scale);
-                    if !fits(&row) {
+            Section::Appearance => {
+                let dark_now = crate::theme::dark_active();
+                let mode = crate::theme::mode();
+                for (row_i, col, item) in pages::appearance_layout() {
+                    let slot =
+                        workspace::appearance_slot_rect(area, row_i, col, item.full_width(), scale);
+                    if !fits(&slot) {
                         break;
                     }
-                    let selected = preset.name == th.name;
-                    if selected {
-                        bg_quads.push(self.px_rect(&row, th.accent, 0.14, pill_r));
-                    }
-                    labels.push(LabelSpec {
-                        text: preset.label.into(),
-                        color: color(if selected { th.text_bright } else { th.text_dim }, 1.0),
-                        left: row.x + pad,
-                        top: mid(&row),
-                        clip: row,
-                    });
-                    if selected {
-                        labels.push(LabelSpec {
-                            text: "●".into(),
-                            color: color(th.accent, 1.0),
-                            left: (row.x + row.w - pad - self.cell_width).round(),
-                            top: mid(&row),
-                            clip: row,
-                        });
+                    match item {
+                        pages::AppearanceItem::Mode => {
+                            labels.push(LabelSpec {
+                                text: "Mode".into(),
+                                color: color(th.text_bright, 1.0),
+                                left: slot.x + pad,
+                                top: mid(&slot),
+                                clip: slot,
+                            });
+                            for (i, m) in crate::theme::Mode::ALL.iter().enumerate() {
+                                let seg = workspace::mode_segment_rect(
+                                    &slot,
+                                    i,
+                                    self.cell_width,
+                                    scale,
+                                );
+                                let on = *m == mode;
+                                bg_quads.push(self.px_rect(
+                                    &seg,
+                                    if on { th.accent } else { (255, 255, 255) },
+                                    if on { 0.9 } else { 0.12 },
+                                    seg.h / 2.0,
+                                ));
+                                let lw = m.label().chars().count() as f32 * self.cell_width;
+                                labels.push(LabelSpec {
+                                    text: m.label().into(),
+                                    color: color(if on { (255, 255, 255) } else { th.text_dim }, 1.0),
+                                    left: (seg.x + (seg.w - lw) / 2.0).round(),
+                                    top: mid(&slot),
+                                    clip: seg,
+                                });
+                            }
+                        },
+                        pages::AppearanceItem::Header(text) => {
+                            labels.push(LabelSpec {
+                                text: text.into(),
+                                color: color(th.text_dim, 1.0),
+                                left: slot.x + pad,
+                                top: mid(&slot),
+                                clip: slot,
+                            });
+                        },
+                        pages::AppearanceItem::Theme(t) => {
+                            let picked = crate::theme::selected(t.dark).name == t.name;
+                            self.appearance_slot(
+                                &slot,
+                                t.label,
+                                picked,
+                                picked && t.dark == dark_now,
+                                None,
+                                bg_quads,
+                                labels,
+                            );
+                        },
+                        pages::AppearanceItem::TermDefault => {
+                            let picked = crate::term_theme::selected(dark_now).is_none();
+                            self.appearance_slot(
+                                &slot, "Default", picked, picked, None, bg_quads, labels,
+                            );
+                        },
+                        pages::AppearanceItem::Term(t) => {
+                            let picked = crate::term_theme::selected(t.dark)
+                                .is_some_and(|s| s.name == t.name);
+                            self.appearance_slot(
+                                &slot,
+                                t.label,
+                                picked,
+                                picked && t.dark == dark_now,
+                                Some(&t.ansi),
+                                bg_quads,
+                                labels,
+                            );
+                        },
                     }
                 }
             },
@@ -726,6 +809,68 @@ impl Renderer {
                 }
             },
         }
+    }
+
+    /// One half-width Appearance slot: a pill with the entry's label, ANSI
+    /// preview chips for terminal schemes, and an accent dot on the entry the
+    /// resolved mode is actually applying. `picked` marks the entry its own
+    /// polarity slot points at (both slots stay visible at once).
+    #[allow(clippy::too_many_arguments)]
+    fn appearance_slot(
+        &self,
+        slot: &LayoutRect,
+        label: &str,
+        picked: bool,
+        applied: bool,
+        chips: Option<&[(u8, u8, u8); 8]>,
+        bg_quads: &mut Vec<Quad>,
+        labels: &mut Vec<LabelSpec>,
+    ) {
+        let th = self.theme();
+        let scale = self.scale;
+        let pad = (10.0 * scale).round();
+        let inset = (2.0 * scale).round();
+        let mid = (slot.y + (slot.h - self.cell_height) / 2.0).round();
+        let pill = LayoutRect {
+            y: slot.y + inset,
+            h: (slot.h - 2.0 * inset).max(0.0),
+            ..*slot
+        };
+        bg_quads.push(self.px_rect(
+            &pill,
+            if picked { th.accent } else { (255, 255, 255) },
+            if picked { 0.14 } else { 0.06 },
+            (7.0 * scale).round(),
+        ));
+        // The dot column is always reserved so chips align across rows.
+        if applied {
+            labels.push(LabelSpec {
+                text: "●".into(),
+                color: color(th.accent, 1.0),
+                left: (slot.x + slot.w - pad - self.cell_width).round(),
+                top: mid,
+                clip: *slot,
+            });
+        }
+        let mut right = slot.x + slot.w - pad - self.cell_width - (6.0 * scale).round();
+        if let Some(ansi) = chips {
+            let cw = (8.0 * scale).round();
+            let gap = (2.0 * scale).round();
+            let x0 = right - (8.0 * cw + 7.0 * gap);
+            let y = (slot.y + (slot.h - cw) / 2.0).round();
+            for (i, c) in ansi.iter().enumerate() {
+                let chip = LayoutRect { x: (x0 + i as f32 * (cw + gap)).round(), y, w: cw, h: cw };
+                bg_quads.push(self.px_rect(&chip, *c, 1.0, (2.0 * scale).round()));
+            }
+            right = x0 - pad;
+        }
+        labels.push(LabelSpec {
+            text: label.into(),
+            color: color(if picked { th.text_bright } else { th.text_dim }, 1.0),
+            left: slot.x + pad,
+            top: mid,
+            clip: LayoutRect { w: (right - slot.x - pad).max(0.0), ..*slot },
+        });
     }
 
     fn picker_overlay(
@@ -952,6 +1097,7 @@ impl Renderer {
     fn snapshot_pane(
         &self,
         session: &Session,
+        palette: &ColorPalette,
         origin: (f32, f32),
         draw_cursor: bool,
         bg_rects: &mut Vec<Quad>,
@@ -995,13 +1141,13 @@ impl Renderer {
                 // so reversed cells stay legible instead of vanishing.
                 let (fg, bg) = if attrs.reverse() {
                     (
-                        self.palette.resolve_bg(attrs.background()),
-                        self.palette.resolve_fg(attrs.foreground()),
+                        palette.resolve_bg(attrs.background()),
+                        palette.resolve_fg(attrs.foreground()),
                     )
                 } else {
                     (
-                        self.palette.resolve_fg(attrs.foreground()),
-                        self.palette.resolve_bg(attrs.background()),
+                        palette.resolve_fg(attrs.foreground()),
+                        palette.resolve_bg(attrs.background()),
                     )
                 };
                 // Cell background fill goes in the BG layer (painted before the
@@ -1009,7 +1155,7 @@ impl Renderer {
                 // highlight, Claude's selected rows) don't cover their text with
                 // a solid box. Skip the terminal default bg (window clear covers
                 // it) so we only emit quads for cells that actually differ.
-                if bg != self.palette.background {
+                if bg != palette.background {
                     let (br, bg8, bb, _) = bg.to_srgb_u8();
                     bg_rects.push(self.cell_rect(
                         origin, col, row, 0.0, 0.0, 1.0, 1.0, (br, bg8, bb), 1.0,
@@ -1053,7 +1199,7 @@ impl Renderer {
         // Cursor: a solid quad, drawn on top of the text (focused tile only).
         let cur = term.cursor_pos();
         if draw_cursor && cur.visibility == CursorVisibility::Visible && cur.y >= 0 {
-            let (r, g, b, _) = self.palette.foreground.to_srgb_u8();
+            let (r, g, b, _) = palette.foreground.to_srgb_u8();
             rects.push(self.cell_rect(
                 origin,
                 cur.x,
