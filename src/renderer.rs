@@ -455,33 +455,38 @@ impl Renderer {
         // ── Sidebar chrome (identical geometry on every page) ──────────
         // The window gradient is painted by `main.rs` before these quads;
         // the sidebar itself is transparent — its rounded rows float on it.
+        // `sidebar_w == 0.0` means collapsed: skip all of it (the empty-state
+        // CTA still paints — it is positioned off `terminal_area`).
+        let collapsed = sidebar_w == 0.0;
         let row_r = (ROW_RADIUS * self.scale).round();
         let group_pad = (12.0 * self.scale).round();
         // Traffic lights are the native macOS buttons now (transparent titlebar),
         // so we no longer draw our own here.
         match chrome.page {
             Page::Sessions => {
-                // Side-by-side "+ group" / "+ section" buttons below the titlebar.
-                let new_group = workspace::new_group_button(self.scale, sidebar_w);
-                bg_quads.push(self.px_rect(&new_group, th.card, 0.55, row_r));
-                labels.push(LabelSpec {
-                    text: "+ group".into(),
-                    color: color(th.ink_dim, 1.0),
-                    left: (new_group.x + group_pad).round(),
-                    top: (new_group.y + (new_group.h - self.cell_height) / 2.0).round(),
-                    clip: new_group,
-                    size: None,
-                });
-                let new_section = workspace::new_section_button(self.scale, sidebar_w);
-                bg_quads.push(self.px_rect(&new_section, th.card, 0.55, row_r));
-                labels.push(LabelSpec {
-                    text: "+ section".into(),
-                    color: color(th.ink_dim, 1.0),
-                    left: (new_section.x + group_pad).round(),
-                    top: (new_section.y + (new_section.h - self.cell_height) / 2.0).round(),
-                    clip: new_section,
-                    size: None,
-                });
+                if !collapsed {
+                    // Side-by-side "+ group" / "+ section" buttons below the titlebar.
+                    let new_group = workspace::new_group_button(self.scale, sidebar_w);
+                    bg_quads.push(self.px_rect(&new_group, th.card, 0.55, row_r));
+                    labels.push(LabelSpec {
+                        text: "+ group".into(),
+                        color: color(th.ink_dim, 1.0),
+                        left: (new_group.x + group_pad).round(),
+                        top: (new_group.y + (new_group.h - self.cell_height) / 2.0).round(),
+                        clip: new_group,
+                        size: None,
+                    });
+                    let new_section = workspace::new_section_button(self.scale, sidebar_w);
+                    bg_quads.push(self.px_rect(&new_section, th.card, 0.55, row_r));
+                    labels.push(LabelSpec {
+                        text: "+ section".into(),
+                        color: color(th.ink_dim, 1.0),
+                        left: (new_section.x + group_pad).round(),
+                        top: (new_section.y + (new_section.h - self.cell_height) / 2.0).round(),
+                        clip: new_section,
+                        size: None,
+                    });
+                }
                 if empty {
                     // Empty state: a centered CTA instead of group rows.
                     // Empty sections (if any) still render below the buttons.
@@ -508,20 +513,10 @@ impl Renderer {
                         clip: hint,
                         size: None,
                     });
-                    // Still paint empty-section headers under the CTA so a just-
-                    // created section is visible before it gains members.
-                    self.paint_sidebar_rows(
-                        workspaces,
-                        active,
-                        sidebar_w,
-                        chrome,
-                        th,
-                        row_r,
-                        group_pad,
-                        &mut bg_quads,
-                        &mut labels,
-                    );
-                } else {
+                }
+                // Painted even in the empty state (under the CTA) so a just-
+                // created section is visible before it gains members.
+                if !collapsed {
                     self.paint_sidebar_rows(
                         workspaces,
                         active,
@@ -535,6 +530,7 @@ impl Renderer {
                     );
                 }
             },
+            Page::Settings if collapsed => {},
             Page::Settings => {
                 // Settings sections as sidebar tabs, in the same rows the
                 // groups occupy on Sessions so the chrome reads as one.
@@ -554,6 +550,7 @@ impl Renderer {
                     });
                 }
             },
+            Page::Cleanup if collapsed => {},
             Page::Cleanup => {
                 // "All" plus one tab per repo with drop worktrees, in the same
                 // rows the groups occupy on Sessions so the chrome reads as one.
@@ -587,33 +584,35 @@ impl Renderer {
         // ── Page-dot strip (bottom of the sidebar, every page) ─────────
         // Each slot crossfades between a subtle dot and the page's glyph as
         // its animation progress moves 0 → 1 (hovered or active page).
-        let n_pages = Page::ALL.len();
-        for (i, page) in Page::ALL.iter().enumerate() {
-            let slot = workspace::page_slot_rect(i, n_pages, height, self.scale, sidebar_w);
-            let p = chrome.dot_anim.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-            if p < 1.0 {
-                let d = (5.0 * self.scale).round().max(2.0);
-                let dot = LayoutRect {
-                    x: (slot.x + (slot.w - d) / 2.0).round(),
-                    y: (slot.y + (slot.h - d) / 2.0).round(),
-                    w: d,
-                    h: d,
-                };
-                bg_quads.push(self.px_rect(&dot, th.ink_dim, 0.45 * (1.0 - p), d / 2.0));
-            }
-            if p > 0.0 {
-                let glyph = page.glyph();
-                let gw = glyph.chars().count() as f32 * self.cell_width;
-                labels.push(LabelSpec {
-                    text: glyph.into(),
-                    color: color(th.ink, p),
-                    left: (slot.x + (slot.w - gw) / 2.0).round(),
-                    // Glyphs may be a hair wider than the slot ("<>"): allow
-                    // a small clip overhang so they aren't shaved.
-                    top: (slot.y + (slot.h - self.cell_height) / 2.0).round(),
-                    clip: slot.inflate((4.0 * self.scale).round()),
-                    size: None,
-                });
+        if !collapsed {
+            let n_pages = Page::ALL.len();
+            for (i, page) in Page::ALL.iter().enumerate() {
+                let slot = workspace::page_slot_rect(i, n_pages, height, self.scale, sidebar_w);
+                let p = chrome.dot_anim.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                if p < 1.0 {
+                    let d = (5.0 * self.scale).round().max(2.0);
+                    let dot = LayoutRect {
+                        x: (slot.x + (slot.w - d) / 2.0).round(),
+                        y: (slot.y + (slot.h - d) / 2.0).round(),
+                        w: d,
+                        h: d,
+                    };
+                    bg_quads.push(self.px_rect(&dot, th.ink_dim, 0.45 * (1.0 - p), d / 2.0));
+                }
+                if p > 0.0 {
+                    let glyph = page.glyph();
+                    let gw = glyph.chars().count() as f32 * self.cell_width;
+                    labels.push(LabelSpec {
+                        text: glyph.into(),
+                        color: color(th.ink, p),
+                        left: (slot.x + (slot.w - gw) / 2.0).round(),
+                        // Glyphs may be a hair wider than the slot ("<>"): allow
+                        // a small clip overhang so they aren't shaved.
+                        top: (slot.y + (slot.h - self.cell_height) / 2.0).round(),
+                        clip: slot.inflate((4.0 * self.scale).round()),
+                        size: None,
+                    });
+                }
             }
         }
 
@@ -637,7 +636,8 @@ impl Renderer {
                 // sideways-collapsed pane is a bare strip showing only the caret.
                 let collapsing = axis.is_some() && (tile.collapsed || tile.collapse_anim > 0.0);
                 let side_strip = axis == Some(workspace::Dir::Row) && collapsing;
-                let bar = workspace::tile_tab_bar(rect, self.scale);
+                let strip = workspace::tab_strip_rect(area, rect, self.scale, sidebar_w);
+                let bar = workspace::tile_tab_bar(&strip, self.scale);
                 if !collapsing {
                     let divider =
                         LayoutRect { x: rect.x, y: bar.y + bar.h - hair, w: rect.w, h: hair };
@@ -647,7 +647,7 @@ impl Renderer {
                     // Active tab: a subtle rounded pill inside the strip (white
                     // works on every theme's dark card).
                     let tr = workspace::tile_tab_rect(
-                        rect,
+                        &strip,
                         tile.active,
                         tile.tabs.len(),
                         self.scale,
@@ -735,11 +735,12 @@ impl Renderer {
                 }
 
                 // Tab labels for this tile's tab strip.
+                let strip = workspace::tab_strip_rect(area, rect, self.scale, sidebar_w);
                 let tab_text_pad = (8.0 * self.scale).round();
                 for (ti, tab) in tile.tabs.iter().enumerate() {
-                    let tr = workspace::tile_tab_rect(rect, ti, tile.tabs.len(), self.scale, has_caret);
+                    let tr = workspace::tile_tab_rect(&strip, ti, tile.tabs.len(), self.scale, has_caret);
                     let close =
-                        workspace::tile_tab_close_rect(rect, ti, tile.tabs.len(), self.scale, has_caret);
+                        workspace::tile_tab_close_rect(&strip, ti, tile.tabs.len(), self.scale, has_caret);
                     let title = tab.session.title();
                     let text = if title.is_empty() { "shell".to_string() } else { title };
                     // Unread: an accent dot before the title, which shifts
@@ -985,23 +986,23 @@ impl Renderer {
                         bg_quads
                             .push(self.px_rect(&rect, th.card, 0.78, row_r).shadow(Shadow::Soft));
                     }
+                    let clip_w = rect.w - group_pad;
+                    let inset =
+                        ((rect.h - (self.cell_height + cwd_line_h)) / 2.0).max(0.0);
                     // Unread (mirrors the title: the primary pane's active
-                    // tab): an accent dot at the card's right edge, with the
-                    // text clips shortened so titles never run under it.
-                    let mut clip_w = rect.w - group_pad;
+                    // tab): an accent dot in the left padding gutter, on the
+                    // title line; text stays put so rows keep alignment.
                     if ws_item.primary_unread() {
                         let ds = (7.0 * self.scale).round();
                         let dot = LayoutRect {
-                            x: rect.x + rect.w - group_pad - ds,
-                            y: (rect.y + (rect.h - ds) / 2.0).round(),
+                            x: (rect.x + (group_pad - ds) / 2.0).round(),
+                            y: (rect.y + inset + (self.cell_height - ds) / 2.0)
+                                .round(),
                             w: ds,
                             h: ds,
                         };
                         bg_quads.push(self.px_rect(&dot, th.accent, 1.0, ds / 2.0));
-                        clip_w -= ds + group_pad;
                     }
-                    let inset =
-                        ((rect.h - (self.cell_height + cwd_line_h)) / 2.0).max(0.0);
                     labels.push(LabelSpec {
                         text: ws_item.title(),
                         color: color(
@@ -1026,9 +1027,9 @@ impl Renderer {
         }
     }
 
-    /// The Settings page: a single card styled exactly like a terminal tile
-    /// (same fill, radius, shadow) filling the content area, holding the
-    /// active section's rows. Row geometry comes from
+    /// The Settings page: a single chrome-polarity card (same radius and
+    /// shadow as a terminal tile, but `card`-filled like Cleanup) filling the
+    /// content area, holding the active section's rows. Row geometry comes from
     /// `workspace::settings_row_rect` so `main.rs` hit-tests the same pixels.
     fn settings_page(
         &self,
@@ -1043,12 +1044,15 @@ impl Renderer {
         let scale = self.scale;
         let pad = (14.0 * scale).round();
         let pill_r = (7.0 * scale).round();
-        bg_quads.push(self.px_rect(area, th.term_bg, 1.0, (CARD_RADIUS * scale).round()).shadow(Shadow::Card));
+        // Like the Cleanup page, the card follows the chrome polarity (white
+        // in light themes, raised dark in dark ones) rather than the
+        // always-dark terminal fill, so it reads with ink like the sidebar.
+        bg_quads.push(self.px_rect(area, th.card, 1.0, (CARD_RADIUS * scale).round()).shadow(Shadow::Card));
 
         let header_h = (workspace::SETTINGS_HEADER_H * scale).round();
         labels.push(LabelSpec {
             text: chrome.section.label().into(),
-            color: color(th.text_bright, 1.0),
+            color: color(th.ink, 1.0),
             left: area.x + pad,
             top: (area.y + (header_h - self.cell_height) / 2.0).round(),
             clip: *area,
@@ -1070,7 +1074,7 @@ impl Renderer {
                     }
                     labels.push(LabelSpec {
                         text: "Primary command".into(),
-                        color: color(th.text_bright, 1.0),
+                        color: color(th.ink, 1.0),
                         left: row.x + pad,
                         top: mid(&row),
                         clip: row,
@@ -1085,7 +1089,7 @@ impl Renderer {
                     let right = row.x + row.w - pad - if editing { caret_w + 2.0 } else { 0.0 };
                     labels.push(LabelSpec {
                         text: value,
-                        color: color(if editing { th.text_bright } else { th.text_dim }, 1.0),
+                        color: color(if editing { th.ink } else { th.ink_dim }, 1.0),
                         left: (right - w).round(),
                         top: mid(&row),
                         clip: row,
@@ -1110,7 +1114,7 @@ impl Renderer {
                     };
                     labels.push(LabelSpec {
                         text: text.into(),
-                        color: color(th.text_dim, 1.0),
+                        color: color(th.ink_dim, 1.0),
                         left: hint.x + pad,
                         top: mid(&hint),
                         clip: hint,
@@ -1130,7 +1134,7 @@ impl Renderer {
                     }
                     labels.push(LabelSpec {
                         text: action.label().into(),
-                        color: color(th.text_bright, 1.0),
+                        color: color(th.ink, 1.0),
                         left: row.x + pad,
                         top: mid(&row),
                         clip: row,
@@ -1144,7 +1148,7 @@ impl Renderer {
                     let w = value.chars().count() as f32 * self.cell_width;
                     labels.push(LabelSpec {
                         text: value,
-                        color: color(if recording { th.text_bright } else { th.text_dim }, 1.0),
+                        color: color(if recording { th.ink } else { th.ink_dim }, 1.0),
                         left: (row.x + row.w - pad - w).round(),
                         top: mid(&row),
                         clip: row,
@@ -1165,7 +1169,7 @@ impl Renderer {
                         pages::AppearanceItem::Mode => {
                             labels.push(LabelSpec {
                                 text: "Mode".into(),
-                                color: color(th.text_bright, 1.0),
+                                color: color(th.ink, 1.0),
                                 left: slot.x + pad,
                                 top: mid(&slot),
                                 clip: slot,
@@ -1181,14 +1185,14 @@ impl Renderer {
                                 let on = *m == mode;
                                 bg_quads.push(self.px_rect(
                                     &seg,
-                                    if on { th.accent } else { (255, 255, 255) },
-                                    if on { 0.9 } else { 0.12 },
+                                    if on { th.accent } else { th.ink },
+                                    if on { 0.9 } else { 0.06 },
                                     seg.h / 2.0,
                                 ));
                                 let lw = m.label().chars().count() as f32 * self.cell_width;
                                 labels.push(LabelSpec {
                                     text: m.label().into(),
-                                    color: color(if on { (255, 255, 255) } else { th.text_dim }, 1.0),
+                                    color: color(if on { (255, 255, 255) } else { th.ink_dim }, 1.0),
                                     left: (seg.x + (seg.w - lw) / 2.0).round(),
                                     top: mid(&slot),
                                     clip: seg,
@@ -1199,7 +1203,7 @@ impl Renderer {
                         pages::AppearanceItem::Header(text) => {
                             labels.push(LabelSpec {
                                 text: text.into(),
-                                color: color(th.text_dim, 1.0),
+                                color: color(th.ink_dim, 1.0),
                                 left: slot.x + pad,
                                 top: mid(&slot),
                                 clip: slot,
@@ -1213,6 +1217,31 @@ impl Renderer {
                                 t.label,
                                 picked,
                                 picked && t.dark == dark_now,
+                                None,
+                                bg_quads,
+                                labels,
+                            );
+                        },
+                        // Action rows, never "picked": import installs the
+                        // clipboard's token string, export copies the active
+                        // theme's.
+                        pages::AppearanceItem::ImportTheme => {
+                            self.appearance_slot(
+                                &slot,
+                                "Import from Clipboard",
+                                false,
+                                false,
+                                None,
+                                bg_quads,
+                                labels,
+                            );
+                        },
+                        pages::AppearanceItem::ExportTheme => {
+                            self.appearance_slot(
+                                &slot,
+                                "Copy Theme String",
+                                false,
+                                false,
                                 None,
                                 bg_quads,
                                 labels,
@@ -1246,7 +1275,7 @@ impl Renderer {
                     let on = crate::settings::get_bool("terminal.persist", false);
                     labels.push(LabelSpec {
                         text: "Persist sessions".into(),
-                        color: color(th.text_bright, 1.0),
+                        color: color(th.ink, 1.0),
                         left: row.x + pad,
                         top: mid(&row),
                         clip: row,
@@ -1264,13 +1293,13 @@ impl Renderer {
                     };
                     bg_quads.push(self.px_rect(
                         &pill,
-                        if on { th.accent } else { (255, 255, 255) },
-                        if on { 0.9 } else { 0.12 },
+                        if on { th.accent } else { th.ink },
+                        if on { 0.9 } else { 0.06 },
                         pill.h / 2.0,
                     ));
                     labels.push(LabelSpec {
                         text: state.into(),
-                        color: color(if on { (255, 255, 255) } else { th.text_dim }, 1.0),
+                        color: color(if on { (255, 255, 255) } else { th.ink_dim }, 1.0),
                         left: (pill.x + pill_pad).round(),
                         top: mid(&row),
                         clip: row,
@@ -1296,7 +1325,7 @@ impl Renderer {
                     }
                     labels.push(LabelSpec {
                         text: (*key).into(),
-                        color: color(th.text_dim, 1.0),
+                        color: color(th.ink_dim, 1.0),
                         left: row.x + pad,
                         top: mid(&row),
                         clip: LayoutRect { w: (value_col - 2.0 * pad).max(0.0), ..row },
@@ -1304,7 +1333,7 @@ impl Renderer {
                     });
                     labels.push(LabelSpec {
                         text: value.clone(),
-                        color: color(th.text_bright, 1.0),
+                        color: color(th.ink, 1.0),
                         left: row.x + value_col,
                         top: mid(&row),
                         clip: row,
@@ -1317,7 +1346,7 @@ impl Renderer {
                     let on = crate::settings::get_bool("debug.overlay", false);
                     labels.push(LabelSpec {
                         text: "Show frame stats".into(),
-                        color: color(th.text_bright, 1.0),
+                        color: color(th.ink, 1.0),
                         left: row.x + pad,
                         top: mid(&row),
                         clip: row,
@@ -1335,13 +1364,13 @@ impl Renderer {
                     };
                     bg_quads.push(self.px_rect(
                         &pill,
-                        if on { th.accent } else { (255, 255, 255) },
-                        if on { 0.9 } else { 0.12 },
+                        if on { th.accent } else { th.ink },
+                        if on { 0.9 } else { 0.06 },
                         pill.h / 2.0,
                     ));
                     labels.push(LabelSpec {
                         text: state.into(),
-                        color: color(if on { (255, 255, 255) } else { th.text_dim }, 1.0),
+                        color: color(if on { (255, 255, 255) } else { th.ink_dim }, 1.0),
                         left: (pill.x + pill_pad).round(),
                         top: mid(&row),
                         clip: row,
@@ -1754,7 +1783,7 @@ impl Renderer {
         };
         bg_quads.push(self.px_rect(
             &pill,
-            if picked { th.accent } else { (255, 255, 255) },
+            if picked { th.accent } else { th.ink },
             if picked { 0.14 } else { 0.06 },
             (7.0 * scale).round(),
         ));
@@ -1783,7 +1812,7 @@ impl Renderer {
         }
         labels.push(LabelSpec {
             text: label.into(),
-            color: color(if picked { th.text_bright } else { th.text_dim }, 1.0),
+            color: color(if picked { th.ink } else { th.ink_dim }, 1.0),
             left: slot.x + pad,
             top: mid,
             clip: LayoutRect { w: (right - slot.x - pad).max(0.0), ..*slot },
@@ -2324,7 +2353,7 @@ impl Renderer {
         // stretch keeps the shaping input small.
         // Links get the accent color + an underline quad; ⌘-click opens.
         // Detection is wrap-aware: a URL broken across rows is one link.
-        let links = crate::links::links_in_lines(&lines);
+        let links = crate::links::links_in_lines(&lines, screen.physical_cols);
         // Resolve which URL (if any) the mouse is hovering over — covers all
         // rows of a wrapped link so the entire anchor brightens together.
         let hovered_url: Option<String> = hover.and_then(|(col, row)| {
@@ -2580,6 +2609,43 @@ mod tests {
         assert!(texts.contains(&"3±"));
         assert!(texts.contains(&"Delete 0 selected"));
         assert!(!frame.bg_quads.is_empty());
+    }
+
+    /// The sidebar unread dot sits in the row's left padding gutter, not at
+    /// the card's right edge.
+    #[test]
+    fn sidebar_unread_dot_sits_in_left_gutter() {
+        let scale = 2.0;
+        let renderer = Renderer::new(scale, 18.0, 1600, 1000);
+        let state = Cleanup::default();
+        let mut chrome = cleanup_chrome(&state);
+        chrome.page = Page::Sessions;
+
+        let mut tile = crate::workspace::Tile::new(1, crate::term::Session::placeholder());
+        if let Some(tab) = tile.active_tab_mut() {
+            tab.unread = true;
+        }
+        let wss = [crate::workspace::Workspace::new("g".into(), tile, None)];
+
+        let sidebar_w = 240.0;
+        let frame = renderer.build_frame(
+            &wss, 0, sidebar_w, None, None, None, None, None, None, None, None, &chrome,
+        );
+
+        let rows = crate::workspace::sidebar_rows(&wss, &[]);
+        let row = crate::workspace::sidebar_row_rect(&rows, 0, &wss, scale, sidebar_w);
+        let group_pad = (12.0 * scale).round();
+        let ds = (7.0 * scale).round();
+        let expected_x = (row.x + (group_pad - ds) / 2.0).round();
+        assert!(
+            frame.bg_quads.iter().any(|q| q.w == ds
+                && q.h == ds
+                && q.radius == ds / 2.0
+                && q.x == expected_x
+                && q.y >= row.y
+                && q.y + q.h <= row.y + row.h),
+            "unread dot should sit in the left gutter of the group row"
+        );
     }
 
     /// Scanning state shows the placeholder line instead of a table.

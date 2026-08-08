@@ -92,6 +92,10 @@ pub enum AppearanceItem {
     Header(&'static str),
     /// A chrome theme slot; clicking assigns it to its polarity's slot.
     Theme(&'static crate::theme::Theme),
+    /// Reads a token string from the clipboard into a custom theme slot.
+    ImportTheme,
+    /// Copies the active theme's token string to the clipboard.
+    ExportTheme,
     /// The adaptive terminal scheme; clicking resets both polarity slots.
     TermDefault,
     /// A terminal scheme slot; clicking assigns it to its polarity's slot.
@@ -145,9 +149,20 @@ pub fn appearance_layout() -> Vec<(usize, usize, AppearanceItem)> {
     for t in crate::theme::ALL.iter().filter(|t| !t.dark) {
         p.push(AppearanceItem::Theme(t));
     }
+    // Imported custom themes join their polarity's tiles when defined.
+    if let Some(t) = crate::theme::custom(false) {
+        p.push(AppearanceItem::Theme(t));
+    }
     for t in crate::theme::ALL.iter().filter(|t| t.dark) {
         p.push(AppearanceItem::Theme(t));
     }
+    if let Some(t) = crate::theme::custom(true) {
+        p.push(AppearanceItem::Theme(t));
+    }
+    // The import/export actions share a fresh row under the tiles.
+    p.settle();
+    p.push(AppearanceItem::ImportTheme);
+    p.push(AppearanceItem::ExportTheme);
 
     // A blank row between the sections.
     p.settle();
@@ -193,8 +208,10 @@ pub enum Action {
     FocusUp,
     FocusRight,
     ToggleCollapse,
+    ToggleFocusOthers,
     PrevSidebarTab,
     NextSidebarTab,
+    ToggleSidebar,
     PrevPage,
     NextPage,
     OpenSettings,
@@ -205,7 +222,7 @@ pub enum Action {
 
 impl Action {
     /// Keyboard-page row order.
-    pub const ALL: [Action; 25] = [
+    pub const ALL: [Action; 27] = [
         Action::SplitRight,
         Action::SplitDown,
         Action::NewTab,
@@ -223,8 +240,10 @@ impl Action {
         Action::FocusUp,
         Action::FocusRight,
         Action::ToggleCollapse,
+        Action::ToggleFocusOthers,
         Action::PrevSidebarTab,
         Action::NextSidebarTab,
+        Action::ToggleSidebar,
         Action::PrevPage,
         Action::NextPage,
         Action::OpenSettings,
@@ -253,8 +272,10 @@ impl Action {
             Action::FocusUp => "focus_up",
             Action::FocusRight => "focus_right",
             Action::ToggleCollapse => "toggle_collapse",
+            Action::ToggleFocusOthers => "toggle_focus_others",
             Action::PrevSidebarTab => "prev_sidebar_tab",
             Action::NextSidebarTab => "next_sidebar_tab",
+            Action::ToggleSidebar => "toggle_sidebar",
             Action::PrevPage => "prev_page",
             Action::NextPage => "next_page",
             Action::OpenSettings => "open_settings",
@@ -283,8 +304,10 @@ impl Action {
             Action::FocusUp => "Focus pane up",
             Action::FocusRight => "Focus pane right",
             Action::ToggleCollapse => "Collapse/expand pane",
+            Action::ToggleFocusOthers => "Collapse/expand other panes",
             Action::PrevSidebarTab => "Previous sidebar tab",
             Action::NextSidebarTab => "Next sidebar tab",
+            Action::ToggleSidebar => "Toggle sidebar",
             Action::PrevPage => "Previous page",
             Action::NextPage => "Next page",
             Action::OpenSettings => "Open settings",
@@ -317,8 +340,10 @@ impl Action {
             Action::FocusUp => (true, "k"),
             Action::FocusRight => (true, "l"),
             Action::ToggleCollapse => (true, "m"),
+            Action::ToggleFocusOthers => (true, "f"),
             Action::PrevSidebarTab => (true, "up"),
             Action::NextSidebarTab => (true, "down"),
+            Action::ToggleSidebar => (false, "s"),
             Action::PrevPage => (true, "left"),
             Action::NextPage => (true, "right"),
             Action::OpenSettings => (false, ","),
@@ -457,6 +482,8 @@ mod tests {
         let mut themes = 0;
         let mut terms = 0;
         let mut defaults = 0;
+        let mut imports = 0;
+        let mut exports = 0;
         let mut slots: Vec<(usize, usize)> = Vec::new();
         for (row, col, item) in layout {
             assert!(col < 2, "col out of range");
@@ -467,12 +494,16 @@ mod tests {
                 AppearanceItem::Theme(_) => themes += 1,
                 AppearanceItem::Term(_) => terms += 1,
                 AppearanceItem::TermDefault => defaults += 1,
+                AppearanceItem::ImportTheme => imports += 1,
+                AppearanceItem::ExportTheme => exports += 1,
                 _ => {},
             }
         }
+        // The test store holds no custom token strings, so only presets show.
         assert_eq!(themes, crate::theme::ALL.len());
         assert_eq!(terms, crate::term_theme::ALL.len());
         assert_eq!(defaults, 1);
+        assert_eq!((imports, exports), (1, 1));
     }
 
     #[test]
@@ -563,6 +594,20 @@ mod tests {
         assert_eq!(match_action(&ks("down")), Some(Action::NextSidebarTab));
     }
 
+    /// ⌘S must reach the sidebar toggle through the same lookup every hotkey
+    /// uses, and its default must round-trip as a plain (shiftless) chord.
+    #[test]
+    fn toggle_sidebar_binds_cmd_s() {
+        let b = Action::ToggleSidebar.default_binding();
+        assert_eq!(b, Binding { shift: false, alt: false, ctrl: false, key: "s".into() });
+        let ks = Keystroke {
+            modifiers: Modifiers { platform: true, ..Default::default() },
+            key: "s".into(),
+            key_char: None,
+        };
+        assert_eq!(match_action(&ks), Some(Action::ToggleSidebar));
+    }
+
     #[test]
     fn focus_dir_bindings_resolve() {
         let ks = |key: &str| Keystroke {
@@ -613,5 +658,27 @@ mod tests {
         assert!(Binding::from_keystroke(&ks("shift", cmd)).is_none());
         let got = Binding::from_keystroke(&ks("D", cmd)).unwrap();
         assert_eq!(got.key, "d");
+    }
+
+    #[test]
+    fn toggle_focus_others_binding() {
+        let b = Action::ToggleFocusOthers.default_binding();
+        assert!(b.shift, "ToggleFocusOthers should require shift");
+        assert_eq!(b.key, "f", "ToggleFocusOthers key should be 'f'");
+    }
+
+    #[test]
+    fn all_actions_have_unique_default_bindings() {
+        let mut seen = std::collections::HashSet::new();
+        for action in &Action::ALL {
+            let b = action.default_binding();
+            let key = (b.shift, b.alt, b.ctrl, b.key.clone());
+            assert!(
+                seen.insert(key.clone()),
+                "duplicate default binding {:?} on {:?}",
+                key,
+                action,
+            );
+        }
     }
 }

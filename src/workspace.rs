@@ -309,7 +309,7 @@ pub fn display_cwd(cwd: Option<&std::path::Path>) -> String {
 
 // ─── Layout ─────────────────────────────────────────────────────────────
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LayoutRect {
     pub x: f32,
     pub y: f32,
@@ -366,6 +366,37 @@ pub fn sidebar(height: u32, scale: f32, sidebar_w: f32) -> LayoutRect {
 /// The traffic-light / window-drag strip at the top of the sidebar.
 pub fn titlebar(scale: f32, sidebar_w: f32) -> LayoutRect {
     LayoutRect { x: 0.0, y: 0.0, w: (sidebar_w * scale).round(), h: (TITLEBAR_H * scale).round() }
+}
+
+/// Logical width of the top-left corner the native traffic lights occupy.
+/// The buttons themselves end around x=59; the extra headroom keeps the
+/// first tab from crowding them.
+const TRAFFIC_LIGHT_SAFE_W: f32 = 78.0;
+
+/// The window-drag corner while the sidebar is collapsed: the traffic-light
+/// span of the top-left tile's tab strip, plus the sliver of padding above.
+/// The native buttons float over it and handle their own clicks.
+pub fn collapsed_drag_zone(scale: f32) -> LayoutRect {
+    LayoutRect {
+        x: 0.0,
+        y: 0.0,
+        w: (TRAFFIC_LIGHT_SAFE_W * scale).round(),
+        h: ((AREA_PAD + TILE_TAB_H) * scale).round(),
+    }
+}
+
+/// A tile's rect adjusted for tab-strip geometry: while the sidebar is
+/// collapsed (`sidebar_w == 0.0`), the tile owning the area's top-left
+/// corner cedes its strip's left end to the native traffic lights, pushing
+/// its tabs right. Every strip consumer (painting, hit-testing, drops) must
+/// feed this to the `tile_tab_*` functions so they never disagree; the card
+/// and content keep the original rect.
+pub fn tab_strip_rect(area: LayoutRect, rect: &LayoutRect, scale: f32, sidebar_w: f32) -> LayoutRect {
+    if sidebar_w != 0.0 || rect.x > area.x || rect.y > area.y {
+        return *rect;
+    }
+    let inset = ((TRAFFIC_LIGHT_SAFE_W * scale).round() - rect.x).clamp(0.0, rect.w);
+    LayoutRect { x: rect.x + inset, w: rect.w - inset, ..*rect }
 }
 
 /// Shared geometry for the side-by-side "+ group" / "+ section" button row.
@@ -899,13 +930,20 @@ pub fn mode_segment_rect(row: &LayoutRect, i: usize, cell_width: f32, scale: f32
 
 /// The region right of the sidebar where the split tree lives. Inset from the
 /// window's top/right/bottom edges so the tile cards float on the gradient.
+///
+/// `sidebar_w == 0.0` means the sidebar is collapsed (the resize clamp keeps
+/// a visible sidebar at [`SIDEBAR_MIN_W`] or wider). Collapsed, the area
+/// keeps the full window height and just gains the thin left inset; the
+/// native traffic lights instead carve into the top-left tile's tab strip
+/// via [`tab_strip_rect`].
 pub fn terminal_area(width: u32, height: u32, scale: f32, sidebar_w: f32) -> LayoutRect {
     let sb = (sidebar_w * scale).round();
     let pad = (AREA_PAD * scale).round();
+    let x = if sidebar_w == 0.0 { pad } else { sb };
     LayoutRect {
-        x: sb,
+        x,
         y: pad,
-        w: (width as f32 - sb - pad).max(0.0),
+        w: (width as f32 - x - pad).max(0.0),
         h: (height as f32 - 2.0 * pad).max(0.0),
     }
 }
@@ -937,7 +975,8 @@ pub fn resize_hover_at(
     px: f32,
     py: f32,
 ) -> Option<ResizeHover> {
-    if (px - sidebar_edge_x).abs() <= grab {
+    // `sidebar_edge_x == 0.0` means collapsed: there is no edge to grab.
+    if sidebar_edge_x > 0.0 && (px - sidebar_edge_x).abs() <= grab {
         return Some(ResizeHover::Sidebar);
     }
     if !dividers_active {
@@ -1513,6 +1552,74 @@ mod tests {
         let left_gap = cta.x - area.x;
         let right_gap = (area.x + area.w) - (cta.x + cta.w);
         assert!((left_gap - right_gap).abs() <= 1.0);
+    }
+
+    #[test]
+    fn collapsed_terminal_area_fills_the_window() {
+        // sidebar_w == 0 (collapsed): full height, thin insets all around —
+        // the traffic lights carve into the tab strip, not the area.
+        let (w, h, scale) = (1600, 1000, 2.0);
+        let area = terminal_area(w, h, scale, 0.0);
+        let pad = (AREA_PAD * scale).round();
+        assert_eq!(area.x, pad);
+        assert_eq!(area.y, pad);
+        assert_eq!(area.w, w as f32 - 2.0 * pad);
+        assert_eq!(area.h, h as f32 - 2.0 * pad);
+    }
+
+    #[test]
+    fn tab_strip_inset_only_hits_the_top_left_tile_while_collapsed() {
+        let (w, h, scale) = (1600, 1000, 2.0);
+        let area = terminal_area(w, h, scale, 0.0);
+        let safe = (TRAFFIC_LIGHT_SAFE_W * scale).round();
+
+        // Top-left tile: strip starts right of the traffic lights, same span
+        // otherwise (right edge, y band unchanged).
+        let top_left = LayoutRect { x: area.x, y: area.y, w: 800.0, h: 400.0 };
+        let strip = tab_strip_rect(area, &top_left, scale, 0.0);
+        assert_eq!(strip.x, safe);
+        assert_eq!(strip.x + strip.w, top_left.x + top_left.w);
+        assert_eq!((strip.y, strip.h), (top_left.y, top_left.h));
+
+        // A tile in from either edge keeps its rect.
+        let right = LayoutRect { x: area.x + 800.0, y: area.y, w: 800.0, h: 400.0 };
+        assert_eq!(tab_strip_rect(area, &right, scale, 0.0), right);
+        let below = LayoutRect { x: area.x, y: area.y + 400.0, w: 800.0, h: 400.0 };
+        assert_eq!(tab_strip_rect(area, &below, scale, 0.0), below);
+
+        // Expanded, even the top-left tile keeps its rect.
+        let ex_area = terminal_area(w, h, scale, SIDEBAR_DEFAULT_W);
+        let ex_tile = LayoutRect { x: ex_area.x, y: ex_area.y, w: 800.0, h: 400.0 };
+        assert_eq!(tab_strip_rect(ex_area, &ex_tile, scale, SIDEBAR_DEFAULT_W), ex_tile);
+
+        // A tile narrower than the safe corner cedes everything, no negatives.
+        let sliver = LayoutRect { x: area.x, y: area.y, w: 40.0, h: 400.0 };
+        let s = tab_strip_rect(area, &sliver, scale, 0.0);
+        assert_eq!(s.w, 0.0);
+        assert_eq!(s.x, sliver.x + sliver.w);
+    }
+
+    #[test]
+    fn expanded_terminal_area_keeps_thin_top_inset() {
+        // Any visible sidebar width keeps the original geometry: flush to the
+        // sidebar edge, inset only by the thin pad on top.
+        let (w, h, scale) = (1600, 1000, 2.0);
+        for sidebar_w in [SIDEBAR_MIN_W, SIDEBAR_DEFAULT_W, SIDEBAR_MAX_W] {
+            let area = terminal_area(w, h, scale, sidebar_w);
+            let pad = (AREA_PAD * scale).round();
+            assert_eq!(area.x, (sidebar_w * scale).round());
+            assert_eq!(area.y, pad);
+            assert_eq!(area.h, h as f32 - 2.0 * pad);
+        }
+    }
+
+    #[test]
+    fn collapsed_sidebar_edge_never_hovers() {
+        // With the sidebar collapsed the edge sits at x=0; a pointer near the
+        // window's left edge must not read as a sidebar-resize grab.
+        let node = Node::Leaf(Tile::empty(1));
+        let area = terminal_area(1600, 1000, 2.0, 0.0);
+        assert_eq!(resize_hover_at(&node, area, 2.0, 0.0, 12.0, false, 4.0, 500.0), None);
     }
 
     #[test]
