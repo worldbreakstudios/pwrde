@@ -31,6 +31,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dirs = "6"
 
+# objc 0.2's msg_send! probes `feature = "cargo-clippy"` inside its expansion,
+# which rustc's check-cfg would flag at every call site. Registering the value
+# keeps the lint quiet there while still catching genuinely unknown cfgs.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
+
 # Perf: fat LTO + single codegen unit for release builds — meaningful wins in
 # the hot glyph/grid paths, same tricks Alacritty ships with.
 [profile.release]
