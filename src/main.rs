@@ -46,7 +46,7 @@ use gpui::{
     Size, Styled, TextAlign, TextRun, Window, WindowBounds, WindowOptions,
 };
 
-use pages::{Action, Binding, Page, Section};
+use pages::{Action, Page, Section};
 use renderer::Renderer;
 use term::{Session, TermEvent};
 use workspace::{Dir, Node, Tab, Tile, Workspace};
@@ -249,9 +249,6 @@ struct App {
     /// id. The command is written on the session's first wakeup (the shell has
     /// printed its prompt by then, so startup files can't eat the input).
     pending_primary_cmd: std::collections::HashMap<u64, String>,
-    /// In-progress edit buffer for the Settings → Sessions primary-command
-    /// row, or `None` when not editing.
-    editing_command: Option<String>,
     /// In-progress sidebar section rename: `(section_id, buffer)`, or `None`
     /// when not editing. Enter commits via `apply_section_rename`, Esc cancels.
     editing_section: Option<(u64, String)>,
@@ -270,8 +267,6 @@ struct App {
     page: Page,
     /// The active section while the Settings page is up.
     section: Section,
-    /// Keyboard-page row currently capturing a new binding, if any.
-    recording: Option<Action>,
     /// Dot↔glyph crossfade progress per page slot (0..1), advanced each tick
     /// toward 1 for the hovered/active slot and 0 otherwise.
     dot_anim: Vec<f32>,
@@ -2746,8 +2741,6 @@ impl App {
                 for (i, section) in Section::ALL.iter().enumerate() {
                     if workspace::tab_rect(i, scale, self.sidebar_w()).contains(px, py) {
                         self.section = *section;
-                        self.recording = None;
-                        self.editing_command = None;
                         self.request_redraw();
                         return;
                     }
@@ -2830,11 +2823,6 @@ impl App {
             return;
         }
 
-        // Settings page: the content area is the settings card.
-        if self.page == Page::Settings {
-            self.settings_click(px, py);
-            return;
-        }
         // Cleanup page: the content area is the cleanup card. A press on a
         // column boundary starts a resize drag; anything else is a click.
         if self.page == Page::Cleanup {
@@ -3634,49 +3622,11 @@ impl App {
         }
     }
 
-    /// Keyboard routing while the Settings page is up. A recording keyboard
-    /// row captures the next ⌘ chord as its new binding; otherwise ⌘
-    /// shortcuts still dispatch and plain typing is swallowed.
+    /// Keyboard routing while the Settings page is up: ⌘ shortcuts still
+    /// dispatch; plain typing is swallowed. The component Settings view's own
+    /// inputs (search, fields, binding recorder) capture their keys before
+    /// they bubble here.
     fn handle_settings_key(&mut self, ev: &KeyDownEvent) {
-        // An editing primary-command row captures typing: chars append, Enter
-        // saves, Escape cancels.
-        if self.editing_command.is_some() {
-            match ev.keystroke.key.as_str() {
-                "escape" => self.editing_command = None,
-                "enter" => {
-                    let value = self.editing_command.take().unwrap_or_default();
-                    settings::set("session.primary_command", value.trim().into());
-                },
-                "backspace" => {
-                    if let Some(buf) = self.editing_command.as_mut() {
-                        buf.pop();
-                    }
-                },
-                _ => {
-                    if !ev.keystroke.modifiers.control
-                        && !ev.keystroke.modifiers.platform
-                        && let Some(text) = ev.keystroke.key_char.as_deref()
-                        && let Some(buf) = self.editing_command.as_mut()
-                    {
-                        for ch in text.chars().filter(|c| !c.is_control()) {
-                            buf.push(ch);
-                        }
-                    }
-                },
-            }
-            self.request_redraw();
-            return;
-        }
-        if let Some(action) = self.recording {
-            if ev.keystroke.key == "escape" {
-                self.recording = None;
-            } else if let Some(binding) = Binding::from_keystroke(&ev.keystroke) {
-                settings::set(&action.setting_key(), binding.serialize().into());
-                self.recording = None;
-            }
-            self.request_redraw();
-            return;
-        }
         if ev.keystroke.modifiers.platform {
             self.handle_shortcut(ev);
         }
@@ -3814,8 +3764,6 @@ impl App {
     fn set_page(&mut self, page: Page) {
         if self.page != page {
             self.page = page;
-            self.recording = None;
-            self.editing_command = None;
             // Grids may have gone stale while the Settings page was up.
             if page == Page::Sessions {
                 self.sync_layout();
@@ -3948,123 +3896,6 @@ impl App {
             },
             _ => {},
         }
-    }
-
-    /// Route a click inside the settings card to the row it hit.
-    fn settings_click(&mut self, px: f32, py: f32) {
-        let area = self.area();
-        let scale = self.scale();
-        match self.section {
-            Section::Sessions => {
-                if workspace::settings_row_rect(&area, 0, scale).contains(px, py) {
-                    // Edit in place, starting from the current value.
-                    self.editing_command = Some(settings::primary_command());
-                } else {
-                    // A click anywhere else cancels an in-progress edit.
-                    self.editing_command = None;
-                }
-            },
-            Section::Keyboard => {
-                for (i, action) in Action::ALL.iter().enumerate() {
-                    if workspace::settings_row_rect(&area, i, scale).contains(px, py) {
-                        self.recording = Some(*action);
-                        self.request_redraw();
-                        return;
-                    }
-                }
-                // A click anywhere else cancels an armed recording.
-                self.recording = None;
-            },
-            Section::Appearance => {
-                for (row, col, item) in pages::appearance_layout() {
-                    let slot = workspace::appearance_slot_rect(
-                        &area,
-                        row,
-                        col,
-                        item.full_width(),
-                        scale,
-                    );
-                    if !slot.contains(px, py) {
-                        continue;
-                    }
-                    match item {
-                        pages::AppearanceItem::Mode => {
-                            for (i, m) in theme::Mode::ALL.into_iter().enumerate() {
-                                let seg = workspace::mode_segment_rect(
-                                    &slot,
-                                    i,
-                                    self.renderer.cell_width,
-                                    scale,
-                                );
-                                if seg.contains(px, py) {
-                                    settings::set("appearance.mode", m.name().into());
-                                    break;
-                                }
-                            }
-                        },
-                        pages::AppearanceItem::Header(_) => {},
-                        pages::AppearanceItem::Theme(t) => {
-                            settings::set(theme::setting_key(t.dark), t.name.into());
-                        },
-                        // The clipboard's token string becomes its polarity's
-                        // custom theme and is selected right away; anything
-                        // unparseable changes nothing.
-                        pages::AppearanceItem::ImportTheme => {
-                            if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                                if let Some(tokens) = clipboard
-                                    .get_text()
-                                    .ok()
-                                    .as_deref()
-                                    .and_then(theme::parse_tokens)
-                                {
-                                    let dark = theme::is_dark_color(tokens[0]);
-                                    settings::set(
-                                        theme::custom_key(dark),
-                                        theme::serialize_tokens(&tokens).into(),
-                                    );
-                                    settings::set(
-                                        theme::setting_key(dark),
-                                        theme::custom_name(dark).into(),
-                                    );
-                                }
-                            }
-                        },
-                        pages::AppearanceItem::ExportTheme => {
-                            if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                                let _ = clipboard.set_text(theme::export_current());
-                            }
-                        },
-                        // Adaptive default applies to both polarities at once.
-                        pages::AppearanceItem::TermDefault => {
-                            settings::set(term_theme::setting_key(false), "default".into());
-                            settings::set(term_theme::setting_key(true), "default".into());
-                        },
-                        pages::AppearanceItem::Term(t) => {
-                            settings::set(term_theme::setting_key(t.dark), t.name.into());
-                        },
-                    }
-                    break;
-                }
-            },
-            Section::Terminal => {
-                let row = workspace::settings_row_rect(&area, pages::PERSIST_TOGGLE_ROW, scale);
-                if row.contains(px, py) {
-                    let on = settings::get_bool("terminal.persist", false);
-                    settings::set("terminal.persist", (!on).into());
-                    // Snapshot right away so enabling then restarting (with no
-                    // further mutations) still restores the current groups.
-                    self.persist_snapshot();
-                }
-            },
-            Section::Debug => {
-                let row = workspace::settings_row_rect(&area, pages::DEBUG_TOGGLE_ROW, scale);
-                if row.contains(px, py) {
-                    let on = settings::get_bool("debug.overlay", false);
-                    settings::set("debug.overlay", (!on).into());
-                }
-            },
-        }
-        self.request_redraw();
     }
 
     /// Drain PTY wakeups coalesced since the last frame; returns true if a
@@ -4647,18 +4478,57 @@ impl Render for App {
         // sessions-only use never builds it.
         let settings_overlay = if self.page == Page::Settings {
             if self.settings_ui.is_none() {
-                let weak = cx.entity().downgrade();
-                self.settings_ui = Some(cx.new(|_| {
-                    settings_ui::SettingsUi::new(std::rc::Rc::new(move |cx: &mut GpuiApp| {
+                let on_change: std::rc::Rc<dyn Fn(&mut GpuiApp)> = {
+                    let weak = cx.entity().downgrade();
+                    std::rc::Rc::new(move |cx: &mut GpuiApp| {
                         if let Some(app) = weak.upgrade() {
                             app.update(cx, |app, cx| {
                                 app.request_redraw();
                                 cx.notify();
                             });
                         }
-                    }))
+                    })
+                };
+                let persist_snapshot: std::rc::Rc<dyn Fn(&mut GpuiApp)> = {
+                    let weak = cx.entity().downgrade();
+                    std::rc::Rc::new(move |cx: &mut GpuiApp| {
+                        if let Some(app) = weak.upgrade() {
+                            app.update(cx, |app, _| app.persist_snapshot());
+                        }
+                    })
+                };
+                self.settings_ui = Some(cx.new(|cx| {
+                    settings_ui::SettingsUi::new(
+                        settings_ui::HostHooks { on_change, persist_snapshot },
+                        cx,
+                    )
                 }));
             }
+            // Push the active section tab and fresh Debug diagnostics; the
+            // view notifies itself only when either actually changed.
+            let ui = self.settings_ui.clone().unwrap();
+            let section_ix =
+                Section::ALL.iter().position(|s| *s == self.section).unwrap_or(0);
+            let (sw, sh) = self.renderer.surface_size();
+            let diags = vec![
+                (
+                    "settings file".to_string(),
+                    settings::path().to_string_lossy().into_owned(),
+                ),
+                ("theme".to_string(), self.renderer.theme().label.to_string()),
+                ("scale".to_string(), format!("{:.2}", self.renderer.scale)),
+                ("surface".to_string(), format!("{sw}×{sh} px")),
+                (
+                    "cell".to_string(),
+                    format!("{}×{} px", self.renderer.cell_width, self.renderer.cell_height),
+                ),
+                ("workspaces".to_string(), self.workspaces.len().to_string()),
+                (
+                    "tiles (active group)".to_string(),
+                    self.workspaces[self.active].root.tiles().len().to_string(),
+                ),
+            ];
+            ui.update(cx, |u, cx| u.sync_from_host(section_ix, diags, cx));
             let sidebar = px(self.sidebar_w() / self.scale());
             Some(
                 div()
@@ -4667,7 +4537,7 @@ impl Render for App {
                     .bottom_0()
                     .right_0()
                     .left(sidebar)
-                    .child(self.settings_ui.clone().unwrap()),
+                    .child(ui),
             )
         } else {
             None
@@ -4836,8 +4706,6 @@ impl App {
             page: self.page,
             section: self.section,
             dot_anim: &self.dot_anim,
-            recording: self.recording,
-            editing_command: self.editing_command.as_deref(),
             sections: &self.sections,
             editing_section: self
                 .editing_section
@@ -5708,7 +5576,6 @@ fn main() {
                         ui_confirm_open: false,
                         ui_message_shown: None,
                         pending_primary_cmd: std::collections::HashMap::new(),
-                        editing_command: None,
                         editing_section: None,
                         // Single focus handle, minted once; focused below.
                         focus_handle: cx.focus_handle(),
@@ -5716,7 +5583,6 @@ fn main() {
                         scroll_accum: 0.0,
                         page: Page::Sessions,
                         section: Section::Keyboard,
-                        recording: None,
                         // The active page's slot starts fully glyphed.
                         dot_anim: {
                             let mut v = vec![0.0; Page::ALL.len()];

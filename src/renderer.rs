@@ -21,7 +21,7 @@ use gpui::Hsla;
 use termwiz::surface::CursorVisibility;
 use wezterm_term::color::ColorPalette;
 
-use crate::pages::{self, Action, Page, Section};
+use crate::pages::{Page, Section};
 use crate::palette::Palette;
 use crate::picker::{ForkPicker, Picker, PickerLayout, PickerRow, ProfilePicker};
 use crate::rect::char_rects;
@@ -228,17 +228,13 @@ pub struct SaveModalView<'a> {
 }
 
 /// Per-frame page/navigation state the renderer needs beyond the workspaces:
-/// which page is up, which settings section, the dot-strip animation
-/// progresses (0..1 per page), the keyboard row being rebound, sidebar
-/// sections, and any in-progress inline editors.
+/// which page is up, which settings section (sidebar tab highlight), the
+/// dot-strip animation progresses (0..1 per page), sidebar sections, and any
+/// in-progress inline editors.
 pub struct ChromeState<'a> {
     pub page: Page,
     pub section: Section,
     pub dot_anim: &'a [f32],
-    pub recording: Option<Action>,
-    /// In-progress edit buffer for the primary-command settings row, if the
-    /// row is being edited.
-    pub editing_command: Option<&'a str>,
     /// Sidebar section definitions (Sessions page). Display order is derived
     /// via [`workspace::sidebar_rows`]; empty sections append at the end.
     pub sections: &'a [workspace::Section],
@@ -658,8 +654,8 @@ impl Renderer {
         let card_r = (CARD_RADIUS * self.scale).round();
 
         if chrome.page == Page::Settings {
-            // ── Settings page: one tile-style card in the content area ──
-            self.settings_page(&area, chrome, workspaces, active, &mut bg_quads, &mut labels);
+            // ── Settings page: the content area belongs to the component
+            // Settings overlay (settings_ui.rs); nothing painted here. ──
         } else if chrome.page == Page::Cleanup {
             // ── Cleanup page: the worktree table card ──
             self.cleanup_page(&area, chrome, &mut bg_quads, &mut labels);
@@ -1073,360 +1069,6 @@ impl Renderer {
         }
     }
 
-    /// The Settings page: a single chrome-polarity card (same radius and
-    /// shadow as a terminal tile, but `card`-filled like Cleanup) filling the
-    /// content area, holding the active section's rows. Row geometry comes from
-    /// `workspace::settings_row_rect` so `main.rs` hit-tests the same pixels.
-    fn settings_page(
-        &self,
-        area: &LayoutRect,
-        chrome: &ChromeState,
-        workspaces: &[Workspace],
-        active: usize,
-        bg_quads: &mut Vec<Quad>,
-        labels: &mut Vec<LabelSpec>,
-    ) {
-        let th = self.theme();
-        let scale = self.scale;
-        let pad = (14.0 * scale).round();
-        let pill_r = (7.0 * scale).round();
-        // Like the Cleanup page, the card follows the chrome polarity (white
-        // in light themes, raised dark in dark ones) rather than the
-        // always-dark terminal fill, so it reads with ink like the sidebar.
-        bg_quads.push(self.px_rect(area, th.card, 1.0, (CARD_RADIUS * scale).round()).shadow(Shadow::Card));
-
-        let header_h = (workspace::SETTINGS_HEADER_H * scale).round();
-        labels.push(LabelSpec {
-            text: chrome.section.label().into(),
-            color: color(th.ink, 1.0),
-            left: area.x + pad,
-            top: (area.y + (header_h - self.cell_height) / 2.0).round(),
-            clip: *area,
-            size: None,
-        });
-
-        // Rows that would spill past the card bottom are dropped, not clipped
-        // mid-glyph.
-        let fits = |row: &LayoutRect| row.y + row.h <= area.y + area.h - pad;
-        let mid = |row: &LayoutRect| (row.y + (row.h - self.cell_height) / 2.0).round();
-
-        match chrome.section {
-            Section::Sessions => {
-                let row = workspace::settings_row_rect(area, 0, scale);
-                if fits(&row) {
-                    let editing = chrome.editing_command.is_some();
-                    if editing {
-                        bg_quads.push(self.px_rect(&row, th.accent, 0.18, pill_r));
-                    }
-                    labels.push(LabelSpec {
-                        text: "Primary command".into(),
-                        color: color(th.ink, 1.0),
-                        left: row.x + pad,
-                        top: mid(&row),
-                        clip: row,
-                        size: None,
-                    });
-                    let value = match chrome.editing_command {
-                        Some(buf) => buf.to_string(),
-                        None => crate::settings::primary_command(),
-                    };
-                    let caret_w = (2.0 * scale).round().max(1.0);
-                    let w = value.chars().count() as f32 * self.cell_width;
-                    let right = row.x + row.w - pad - if editing { caret_w + 2.0 } else { 0.0 };
-                    labels.push(LabelSpec {
-                        text: value,
-                        color: color(if editing { th.ink } else { th.ink_dim }, 1.0),
-                        left: (right - w).round(),
-                        top: mid(&row),
-                        clip: row,
-                        size: None,
-                    });
-                    if editing {
-                        let caret = LayoutRect {
-                            x: right.round(),
-                            y: mid(&row),
-                            w: caret_w,
-                            h: self.cell_height,
-                        };
-                        bg_quads.push(self.px_rect(&caret, th.accent, 1.0, 0.0));
-                    }
-                }
-                let hint = workspace::settings_row_rect(area, 1, scale);
-                if fits(&hint) {
-                    let text = if chrome.editing_command.is_some() {
-                        "type a command… (enter saves, esc cancels)"
-                    } else {
-                        "runs in the primary pane when a group opens"
-                    };
-                    labels.push(LabelSpec {
-                        text: text.into(),
-                        color: color(th.ink_dim, 1.0),
-                        left: hint.x + pad,
-                        top: mid(&hint),
-                        clip: hint,
-                        size: None,
-                    });
-                }
-            },
-            Section::Keyboard => {
-                for (i, action) in Action::ALL.iter().enumerate() {
-                    let row = workspace::settings_row_rect(area, i, scale);
-                    if !fits(&row) {
-                        break;
-                    }
-                    let recording = chrome.recording == Some(*action);
-                    if recording {
-                        bg_quads.push(self.px_rect(&row, th.accent, 0.18, pill_r));
-                    }
-                    labels.push(LabelSpec {
-                        text: action.label().into(),
-                        color: color(th.ink, 1.0),
-                        left: row.x + pad,
-                        top: mid(&row),
-                        clip: row,
-                        size: None,
-                    });
-                    let value = if recording {
-                        "press keys… (esc cancels)".to_string()
-                    } else {
-                        action.binding().display()
-                    };
-                    let w = value.chars().count() as f32 * self.cell_width;
-                    labels.push(LabelSpec {
-                        text: value,
-                        color: color(if recording { th.ink } else { th.ink_dim }, 1.0),
-                        left: (row.x + row.w - pad - w).round(),
-                        top: mid(&row),
-                        clip: row,
-                        size: None,
-                    });
-                }
-            },
-            Section::Appearance => {
-                let dark_now = crate::theme::dark_active();
-                let mode = crate::theme::mode();
-                for (row_i, col, item) in pages::appearance_layout() {
-                    let slot =
-                        workspace::appearance_slot_rect(area, row_i, col, item.full_width(), scale);
-                    if !fits(&slot) {
-                        break;
-                    }
-                    match item {
-                        pages::AppearanceItem::Mode => {
-                            labels.push(LabelSpec {
-                                text: "Mode".into(),
-                                color: color(th.ink, 1.0),
-                                left: slot.x + pad,
-                                top: mid(&slot),
-                                clip: slot,
-                                size: None,
-                            });
-                            for (i, m) in crate::theme::Mode::ALL.iter().enumerate() {
-                                let seg = workspace::mode_segment_rect(
-                                    &slot,
-                                    i,
-                                    self.cell_width,
-                                    scale,
-                                );
-                                let on = *m == mode;
-                                bg_quads.push(self.px_rect(
-                                    &seg,
-                                    if on { th.accent } else { th.ink },
-                                    if on { 0.9 } else { 0.06 },
-                                    seg.h / 2.0,
-                                ));
-                                let lw = m.label().chars().count() as f32 * self.cell_width;
-                                labels.push(LabelSpec {
-                                    text: m.label().into(),
-                                    color: color(if on { (255, 255, 255) } else { th.ink_dim }, 1.0),
-                                    left: (seg.x + (seg.w - lw) / 2.0).round(),
-                                    top: mid(&slot),
-                                    clip: seg,
-                                    size: None,
-                                });
-                            }
-                        },
-                        pages::AppearanceItem::Header(text) => {
-                            labels.push(LabelSpec {
-                                text: text.into(),
-                                color: color(th.ink_dim, 1.0),
-                                left: slot.x + pad,
-                                top: mid(&slot),
-                                clip: slot,
-                                size: None,
-                            });
-                        },
-                        pages::AppearanceItem::Theme(t) => {
-                            let picked = crate::theme::selected(t.dark).name == t.name;
-                            self.appearance_slot(
-                                &slot,
-                                t.label,
-                                picked,
-                                picked && t.dark == dark_now,
-                                None,
-                                bg_quads,
-                                labels,
-                            );
-                        },
-                        // Action rows, never "picked": import installs the
-                        // clipboard's token string, export copies the active
-                        // theme's.
-                        pages::AppearanceItem::ImportTheme => {
-                            self.appearance_slot(
-                                &slot,
-                                "Import from Clipboard",
-                                false,
-                                false,
-                                None,
-                                bg_quads,
-                                labels,
-                            );
-                        },
-                        pages::AppearanceItem::ExportTheme => {
-                            self.appearance_slot(
-                                &slot,
-                                "Copy Theme String",
-                                false,
-                                false,
-                                None,
-                                bg_quads,
-                                labels,
-                            );
-                        },
-                        pages::AppearanceItem::TermDefault => {
-                            let picked = crate::term_theme::selected(dark_now).is_none();
-                            self.appearance_slot(
-                                &slot, "Default", picked, picked, None, bg_quads, labels,
-                            );
-                        },
-                        pages::AppearanceItem::Term(t) => {
-                            let picked = crate::term_theme::selected(t.dark)
-                                .is_some_and(|s| s.name == t.name);
-                            self.appearance_slot(
-                                &slot,
-                                t.label,
-                                picked,
-                                picked && t.dark == dark_now,
-                                Some(&t.ansi),
-                                bg_quads,
-                                labels,
-                            );
-                        },
-                    }
-                }
-            },
-            Section::Terminal => {
-                let row = workspace::settings_row_rect(area, pages::PERSIST_TOGGLE_ROW, scale);
-                if fits(&row) {
-                    let on = crate::settings::get_bool("terminal.persist", false);
-                    labels.push(LabelSpec {
-                        text: "Persist sessions".into(),
-                        color: color(th.ink, 1.0),
-                        left: row.x + pad,
-                        top: mid(&row),
-                        clip: row,
-                        size: None,
-                    });
-                    let state = if on { "on" } else { "off" };
-                    let w = state.chars().count() as f32 * self.cell_width;
-                    let pill_pad = (10.0 * scale).round();
-                    let inset = (4.0 * scale).round();
-                    let pill = LayoutRect {
-                        x: (row.x + row.w - pad - w - 2.0 * pill_pad).round(),
-                        y: row.y + inset,
-                        w: w + 2.0 * pill_pad,
-                        h: (row.h - 2.0 * inset).max(0.0),
-                    };
-                    bg_quads.push(self.px_rect(
-                        &pill,
-                        if on { th.accent } else { th.ink },
-                        if on { 0.9 } else { 0.06 },
-                        pill.h / 2.0,
-                    ));
-                    labels.push(LabelSpec {
-                        text: state.into(),
-                        color: color(if on { (255, 255, 255) } else { th.ink_dim }, 1.0),
-                        left: (pill.x + pill_pad).round(),
-                        top: mid(&row),
-                        clip: row,
-                        size: None,
-                    });
-                }
-            },
-            Section::Debug => {
-                let diags: Vec<(&str, String)> = vec![
-                    ("settings file", crate::settings::path().to_string_lossy().into_owned()),
-                    ("theme", th.label.into()),
-                    ("scale", format!("{:.2}", self.scale)),
-                    ("surface", format!("{}×{} px", self.width, self.height)),
-                    ("cell", format!("{}×{} px", self.cell_width, self.cell_height)),
-                    ("workspaces", workspaces.len().to_string()),
-                    ("tiles (active group)", workspaces[active].root.tiles().len().to_string()),
-                ];
-                let value_col = (180.0 * scale).round();
-                for (i, (key, value)) in diags.iter().enumerate() {
-                    let row = workspace::settings_row_rect(area, i, scale);
-                    if !fits(&row) {
-                        break;
-                    }
-                    labels.push(LabelSpec {
-                        text: (*key).into(),
-                        color: color(th.ink_dim, 1.0),
-                        left: row.x + pad,
-                        top: mid(&row),
-                        clip: LayoutRect { w: (value_col - 2.0 * pad).max(0.0), ..row },
-                        size: None,
-                    });
-                    labels.push(LabelSpec {
-                        text: value.clone(),
-                        color: color(th.ink, 1.0),
-                        left: row.x + value_col,
-                        top: mid(&row),
-                        clip: row,
-                        size: None,
-                    });
-                }
-                // The one functional toggle, separated from the diagnostics.
-                let row = workspace::settings_row_rect(area, pages::DEBUG_TOGGLE_ROW, scale);
-                if fits(&row) {
-                    let on = crate::settings::get_bool("debug.overlay", false);
-                    labels.push(LabelSpec {
-                        text: "Show frame stats".into(),
-                        color: color(th.ink, 1.0),
-                        left: row.x + pad,
-                        top: mid(&row),
-                        clip: row,
-                        size: None,
-                    });
-                    let state = if on { "on" } else { "off" };
-                    let w = state.chars().count() as f32 * self.cell_width;
-                    let pill_pad = (10.0 * scale).round();
-                    let inset = (4.0 * scale).round();
-                    let pill = LayoutRect {
-                        x: (row.x + row.w - pad - w - 2.0 * pill_pad).round(),
-                        y: row.y + inset,
-                        w: w + 2.0 * pill_pad,
-                        h: (row.h - 2.0 * inset).max(0.0),
-                    };
-                    bg_quads.push(self.px_rect(
-                        &pill,
-                        if on { th.accent } else { th.ink },
-                        if on { 0.9 } else { 0.06 },
-                        pill.h / 2.0,
-                    ));
-                    labels.push(LabelSpec {
-                        text: state.into(),
-                        color: color(if on { (255, 255, 255) } else { th.ink_dim }, 1.0),
-                        left: (pill.x + pill_pad).round(),
-                        top: mid(&row),
-                        clip: row,
-                        size: None,
-                    });
-                }
-            },
-        }
-    }
-
     /// The Cleanup page: one tile-style card holding the drop-worktree table.
     /// All geometry comes from `crate::cleanup` so `main.rs` hit-tests the
     /// same pixels.
@@ -1800,70 +1442,6 @@ impl Renderer {
                 line_top,
             );
         }
-    }
-
-    /// One half-width Appearance slot: a pill with the entry's label, ANSI
-    /// preview chips for terminal schemes, and an accent dot on the entry the
-    /// resolved mode is actually applying. `picked` marks the entry its own
-    /// polarity slot points at (both slots stay visible at once).
-    #[allow(clippy::too_many_arguments)]
-    fn appearance_slot(
-        &self,
-        slot: &LayoutRect,
-        label: &str,
-        picked: bool,
-        applied: bool,
-        chips: Option<&[(u8, u8, u8); 8]>,
-        bg_quads: &mut Vec<Quad>,
-        labels: &mut Vec<LabelSpec>,
-    ) {
-        let th = self.theme();
-        let scale = self.scale;
-        let pad = (10.0 * scale).round();
-        let inset = (2.0 * scale).round();
-        let mid = (slot.y + (slot.h - self.cell_height) / 2.0).round();
-        let pill = LayoutRect {
-            y: slot.y + inset,
-            h: (slot.h - 2.0 * inset).max(0.0),
-            ..*slot
-        };
-        bg_quads.push(self.px_rect(
-            &pill,
-            if picked { th.accent } else { th.ink },
-            if picked { 0.14 } else { 0.06 },
-            (7.0 * scale).round(),
-        ));
-        // The dot column is always reserved so chips align across rows.
-        if applied {
-            labels.push(LabelSpec {
-                text: "●".into(),
-                color: color(th.accent, 1.0),
-                left: (slot.x + slot.w - pad - self.cell_width).round(),
-                top: mid,
-                clip: *slot,
-                size: None,
-            });
-        }
-        let mut right = slot.x + slot.w - pad - self.cell_width - (6.0 * scale).round();
-        if let Some(ansi) = chips {
-            let cw = (8.0 * scale).round();
-            let gap = (2.0 * scale).round();
-            let x0 = right - (8.0 * cw + 7.0 * gap);
-            let y = (slot.y + (slot.h - cw) / 2.0).round();
-            for (i, c) in ansi.iter().enumerate() {
-                let chip = LayoutRect { x: (x0 + i as f32 * (cw + gap)).round(), y, w: cw, h: cw };
-                bg_quads.push(self.px_rect(&chip, *c, 1.0, (2.0 * scale).round()));
-            }
-            right = x0 - pad;
-        }
-        labels.push(LabelSpec {
-            text: label.into(),
-            color: color(if picked { th.ink } else { th.ink_dim }, 1.0),
-            left: slot.x + pad,
-            top: mid,
-            clip: LayoutRect { w: (right - slot.x - pad).max(0.0), ..*slot },
-            size: None,
-        });
     }
 
     fn picker_overlay(
@@ -2895,8 +2473,6 @@ mod tests {
             page: Page::Cleanup,
             section: Section::ALL[0],
             dot_anim: &[0.0, 0.0, 0.0],
-            recording: None,
-            editing_command: None,
             sections: &[],
             editing_section: None,
             cleanup,
