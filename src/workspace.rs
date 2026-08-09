@@ -951,12 +951,14 @@ pub struct Divider {
     pub dir: Dir,
 }
 
-/// Which resize handle the pointer is over (sidebar edge or a tile divider).
-/// Drives the cursor style and the hover highlight painted in the renderer.
+/// Which resize handle the pointer is over (sidebar edge, a tile divider,
+/// or the tool panel's left edge). Drives the cursor style and the hover
+/// highlight painted in the renderer.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ResizeHover {
     Sidebar,
     Divider { path: Vec<u8>, dir: Dir },
+    ToolPanel,
 }
 
 /// Hit-test the sidebar edge and tile dividers at `(px, py)`.

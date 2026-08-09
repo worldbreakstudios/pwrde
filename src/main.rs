@@ -2817,6 +2817,7 @@ impl App {
                 let pgrab = (workspace::TOOL_PANEL_RESIZE_GRAB * scale).max(1.0);
                 if (px - panel.x).abs() <= pgrab && py >= panel.y && py <= panel.y + panel.h {
                     self.drag = Drag::ToolPanelResize;
+                    self.resize_hover = Some(workspace::ResizeHover::ToolPanel);
                     self.request_redraw();
                     return;
                 }
@@ -3210,22 +3211,36 @@ impl App {
                     // dividers — no resize affordance underneath it.
                     None
                 } else {
-                    let (_, h) = self.renderer.surface_size();
+                    let (w, h) = self.renderer.surface_size();
                     let sidebar_edge_x = workspace::sidebar(h, scale, self.sidebar_w()).w;
                     let grab = GRAB * scale;
                     let dividers_active =
                         self.page == Page::Sessions && !self.is_empty_state();
                     let ws = &self.workspaces[self.active];
-                    workspace::resize_hover_at(
-                        &ws.root,
-                        self.area(),
-                        scale,
-                        sidebar_edge_x,
-                        grab,
-                        dividers_active,
-                        px,
-                        py,
-                    )
+                    // Tool panel edge first: it sits over the tile area, so it
+                    // must win against the dividers behind it. Grab matches
+                    // on_mouse_down.
+                    let panel_edge = self.visible_tool().is_some() && {
+                        let panel = workspace::tool_panel(w, h, scale, self.tool_panel_w);
+                        let pgrab = (workspace::TOOL_PANEL_RESIZE_GRAB * scale).max(1.0);
+                        (px - panel.x).abs() <= pgrab
+                            && py >= panel.y
+                            && py <= panel.y + panel.h
+                    };
+                    if panel_edge {
+                        Some(workspace::ResizeHover::ToolPanel)
+                    } else {
+                        workspace::resize_hover_at(
+                            &ws.root,
+                            self.area(),
+                            scale,
+                            sidebar_edge_x,
+                            grab,
+                            dividers_active,
+                            px,
+                            py,
+                        )
+                    }
                 };
                 if hover != self.resize_hover {
                     self.resize_hover = hover;
@@ -4913,7 +4928,10 @@ impl App {
             || self.picker.is_some()
             || self.palette.is_some();
         let resize_hover = if overlay_open
-            || !matches!(self.drag, Drag::None | Drag::Sidebar | Drag::Divider { .. })
+            || !matches!(
+                self.drag,
+                Drag::None | Drag::Sidebar | Drag::Divider { .. } | Drag::ToolPanelResize
+            )
         {
             None
         } else {

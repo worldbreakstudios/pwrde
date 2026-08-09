@@ -1044,6 +1044,24 @@ impl Renderer {
                         self.push_resize_grip(&mut bg_quads, &d.rect, vertical, th.ink);
                     }
                 }
+                workspace::ResizeHover::ToolPanel => {
+                    if open_tool.is_some() {
+                        let panel = workspace::tool_panel(
+                            width,
+                            height,
+                            self.scale,
+                            chrome.tool_panel_w,
+                        );
+                        let line_w = (2.0 * self.scale).round().max(1.0);
+                        let line = LayoutRect {
+                            x: panel.x - line_w / 2.0,
+                            y: panel.y,
+                            w: line_w,
+                            h: panel.h,
+                        };
+                        self.push_resize_grip(&mut bg_quads, &line, true, th.ink);
+                    }
+                }
             }
         }
 
@@ -3543,6 +3561,33 @@ mod tests {
             "tile card fills the narrowed area"
         );
         assert!(area.x + area.w <= panel.x, "tiles stop left of the panel");
+
+        // Hovering the panel's left edge paints the same ink-line grip the
+        // sidebar edge and dividers get.
+        let frame = renderer.build_frame(
+            &wss,
+            0,
+            240.0,
+            None,
+            Some(&crate::workspace::ResizeHover::ToolPanel),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &chrome,
+        );
+        let line_w = (2.0 * scale).round();
+        assert!(
+            frame
+                .bg_quads
+                .iter()
+                .any(|q| q.w == line_w && q.h == panel.h && q.x == panel.x - line_w / 2.0),
+            "panel edge grip line renders on hover"
+        );
 
         // No tools registered (non-Sessions pages, or a group without the
         // tool's context): ribbon and panel hide — even with a stale
