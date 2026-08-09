@@ -461,6 +461,11 @@ pub fn tab_rect(index: usize, scale: f32, sidebar_w: f32) -> LayoutRect {
     }
 }
 
+/// The search-box slot at the top of the Settings sidebar (index 0 slot).
+pub fn settings_search_rect(scale: f32, sidebar_w: f32) -> LayoutRect {
+    tab_rect(0, scale, sidebar_w)
+}
+
 /// One visible row in the sidebar, derived from workspaces + sections.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SidebarRow {

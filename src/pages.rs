@@ -458,6 +458,98 @@ pub fn match_action(ks: &Keystroke) -> Option<Action> {
     Action::ALL.iter().copied().find(|a| a.binding().matches(ks))
 }
 
+// ── Settings search index ───────────────────────────────────────────────
+
+/// One searchable entry in the settings index.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SettingsEntry {
+    pub section: Section,
+    pub label: &'static str,
+    pub keywords: &'static str,
+}
+
+/// Build the full settings index, covering every setting in every section.
+/// Mirrors the single-source-of-truth pattern of [`appearance_layout`].
+pub fn settings_index() -> Vec<SettingsEntry> {
+    let mut out = Vec::new();
+
+    // Sessions
+    out.push(SettingsEntry {
+        section: Section::Sessions,
+        label: "Primary command",
+        keywords: "runs in the primary pane when a group opens",
+    });
+
+    // Keyboard — one entry per action
+    for action in &Action::ALL {
+        out.push(SettingsEntry {
+            section: Section::Keyboard,
+            label: action.label(),
+            keywords: action.name(),
+        });
+    }
+
+    // Terminal
+    out.push(SettingsEntry {
+        section: Section::Terminal,
+        label: "Persist sessions",
+        keywords: "persist sessions restore",
+    });
+
+    // Appearance
+    out.push(SettingsEntry {
+        section: Section::Appearance,
+        label: "Appearance mode",
+        keywords: "system dark light",
+    });
+    out.push(SettingsEntry {
+        section: Section::Appearance,
+        label: "Theme",
+        keywords: "theme color scheme",
+    });
+    out.push(SettingsEntry {
+        section: Section::Appearance,
+        label: "Terminal colors",
+        keywords: "terminal colors palette",
+    });
+    out.push(SettingsEntry {
+        section: Section::Appearance,
+        label: "Import theme",
+        keywords: "import theme file load",
+    });
+    out.push(SettingsEntry {
+        section: Section::Appearance,
+        label: "Export theme",
+        keywords: "export theme file save",
+    });
+
+    // Debug
+    out.push(SettingsEntry {
+        section: Section::Debug,
+        label: "Show frame stats",
+        keywords: "frame stats fps debug performance",
+    });
+
+    out
+}
+
+/// Search the settings index for entries matching `query`.
+/// Returns an empty `Vec` when `query` is empty or all whitespace.
+/// Matching is case-insensitive substring on the entry's `label` OR `keywords`.
+pub fn search_settings(query: &str) -> Vec<SettingsEntry> {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return Vec::new();
+    }
+    settings_index()
+        .into_iter()
+        .filter(|e| {
+            e.label.to_lowercase().contains(&q)
+                || e.keywords.to_lowercase().contains(&q)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -700,5 +792,45 @@ mod tests {
                 action,
             );
         }
+    }
+
+    #[test]
+    fn settings_index_covers_all_sections() {
+        let index = settings_index();
+        for section in &Section::ALL {
+            assert!(
+                index.iter().any(|e| &e.section == section),
+                "settings_index missing entries for section {:?}",
+                section,
+            );
+        }
+    }
+
+    #[test]
+    fn search_settings_finds_terminal_entry() {
+        let results = search_settings("persist");
+        assert!(
+            results.iter().any(|e| e.section == Section::Terminal),
+            "search_settings(\"persist\") should find a Terminal entry",
+        );
+    }
+
+    #[test]
+    fn search_settings_case_insensitive_keyboard() {
+        let results = search_settings("SPLIT");
+        assert!(
+            !results.is_empty(),
+            "search_settings(\"SPLIT\") should return results",
+        );
+        assert!(
+            results.iter().all(|e| e.section == Section::Keyboard),
+            "all SPLIT results should be in the Keyboard section",
+        );
+    }
+
+    #[test]
+    fn search_settings_empty_query_returns_empty() {
+        assert!(search_settings("").is_empty(), "empty query should return empty vec");
+        assert!(search_settings("   ").is_empty(), "whitespace query should return empty vec");
     }
 }
