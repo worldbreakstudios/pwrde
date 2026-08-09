@@ -1620,22 +1620,17 @@ impl Renderer {
                             size: Some(small),
                         });
                     }
-                    // Mini tile: a floating terminal card on the gradient.
-                    // Its ground and text mirror `build_frame`'s pane chrome:
-                    // with a terminal scheme selected for this polarity the
-                    // pane follows the scheme (a light profile means light
-                    // panes even under a dark-carded theme), otherwise the
-                    // chrome theme's terminal tokens apply.
-                    let (pane_bg, pane_ink, pane_dim, pane_divider) =
-                        match crate::term_theme::selected(preview_dark) {
-                            Some(t) => (t.bg, t.fg, (t.fg, 0.55), (t.fg, 0.15)),
-                            None => (
-                                pt.term_bg,
-                                pt.text_bright,
-                                (pt.text_dim, 1.0),
-                                (pt.card_divider, 1.0),
-                            ),
-                        };
+                    // Mini tile: a floating terminal card on the gradient,
+                    // grounded in the theme's own terminal tokens. This
+                    // column previews the *theme* — with a terminal profile
+                    // selected the real panes take the profile's ground
+                    // instead, which is what the terminal column previews.
+                    let (pane_bg, pane_ink, pane_dim, pane_divider) = (
+                        pt.term_bg,
+                        pt.text_bright,
+                        (pt.text_dim, 1.0),
+                        (pt.card_divider, 1.0),
+                    );
                     let tile = LayoutRect {
                         x: (body.x + sb_w).round(),
                         y: (body.y + (6.0 * scale)).round(),
