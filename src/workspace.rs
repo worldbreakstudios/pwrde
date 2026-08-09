@@ -1296,6 +1296,25 @@ pub fn tile_tab_rect(rect: &LayoutRect, i: usize, n: usize, scale: f32, has_care
     LayoutRect { x: bar.x + i as f32 * w, y: bar.y, w, h: bar.h }
 }
 
+/// Nearest insertion gap (`0..=n`) for pointer x over a tile's tab strip.
+/// Left half of a tab resolves to the gap before it, right half to the gap
+/// after — used for same-tile reorders so the drop lands where the line shows.
+pub fn tile_tab_insert_gap(rect: &LayoutRect, px: f32, n: usize, scale: f32, has_caret: bool) -> usize {
+    let t0 = tile_tab_rect(rect, 0, n, scale, has_caret);
+    if t0.w <= 0.0 {
+        return 0;
+    }
+    ((((px - t0.x) / t0.w + 0.5).floor().max(0.0)) as usize).min(n)
+}
+
+/// Thin vertical insertion-line rect at gap `gap` (`0..=n`) of a tile's strip.
+pub fn tile_tab_insert_line(rect: &LayoutRect, gap: usize, n: usize, scale: f32, has_caret: bool) -> LayoutRect {
+    let line_w = (2.0 * scale).max(1.0);
+    let tr = tile_tab_rect(rect, gap.min(n.saturating_sub(1)), n, scale, has_caret);
+    let x = if gap >= n { tr.x + tr.w } else { tr.x };
+    LayoutRect { x: x - line_w / 2.0, y: tr.y, w: line_w, h: tr.h }
+}
+
 /// The close-button hit region at the right edge of tab `i` of `n`.
 ///
 /// `has_caret` is forwarded to `tile_tab_rect` so the close button position
@@ -1617,6 +1636,46 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn tab_insert_gap_resolves_to_nearest_boundary() {
+        let rect = LayoutRect { x: 100.0, y: 50.0, w: 900.0, h: 600.0 };
+        for scale in [1.0, 2.0] {
+            for has_caret in [false, true] {
+                let n = 3;
+                let t0 = tile_tab_rect(&rect, 0, n, scale, has_caret);
+                // Left half of a tab → gap before it; right half → gap after.
+                for i in 0..n {
+                    let left = t0.x + i as f32 * t0.w + t0.w * 0.25;
+                    let right = t0.x + i as f32 * t0.w + t0.w * 0.75;
+                    assert_eq!(tile_tab_insert_gap(&rect, left, n, scale, has_caret), i);
+                    assert_eq!(tile_tab_insert_gap(&rect, right, n, scale, has_caret), i + 1);
+                }
+                // Clamped at both ends, even past the strip.
+                assert_eq!(tile_tab_insert_gap(&rect, t0.x - 50.0, n, scale, has_caret), 0);
+                assert_eq!(
+                    tile_tab_insert_gap(&rect, t0.x + 100.0 * t0.w, n, scale, has_caret),
+                    n
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tab_insert_line_sits_on_gap_boundaries() {
+        let rect = LayoutRect { x: 100.0, y: 50.0, w: 900.0, h: 600.0 };
+        let (scale, n, has_caret) = (2.0, 3, true);
+        let t0 = tile_tab_rect(&rect, 0, n, scale, has_caret);
+        for gap in 0..=n {
+            let line = tile_tab_insert_line(&rect, gap, n, scale, has_caret);
+            // Centered on the boundary between tabs gap-1 and gap.
+            let boundary = t0.x + gap as f32 * t0.w;
+            assert!((line.x + line.w / 2.0 - boundary).abs() < 0.51);
+            // Spans the tab height, no more.
+            assert_eq!(line.y, t0.y);
+            assert_eq!(line.h, t0.h);
         }
     }
 
