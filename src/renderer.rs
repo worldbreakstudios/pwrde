@@ -742,16 +742,8 @@ impl Renderer {
                         .shadow(if active { Shadow::Soft } else { Shadow::None }),
                 );
             }
-            let icon = tool.icon();
-            let gw = icon.chars().count() as f32 * self.cell_width;
-            labels.push(LabelSpec {
-                text: icon.into(),
-                color: color(if active || hov { th.ink } else { th.ink_dim }, 1.0),
-                left: (slot.x + (slot.w - gw) / 2.0).round(),
-                top: (slot.y + (slot.h - self.cell_height) / 2.0).round(),
-                clip: slot.inflate((2.0 * self.scale).round()),
-                size: None,
-            });
+            let ink = if active || hov { th.ink } else { th.ink_dim };
+            self.ribbon_icon(*tool, &slot, ink, &mut bg_quads);
             hot.push(slot);
         }
         if let Some(tool) = chrome.open_tool {
@@ -3230,6 +3222,78 @@ impl Renderer {
     }
 
     /// A quad straight from layout coordinates (already physical px).
+    /// A tool's ribbon glyph, drawn as vector quads inside a 16×16 logical-px
+    /// box centered on the slot — fonts can't be trusted to carry
+    /// octicon-style symbols, so like `rect.rs` we build them from geometry.
+    fn ribbon_icon(
+        &self,
+        tool: pages::Tool,
+        slot: &LayoutRect,
+        rgb: (u8, u8, u8),
+        quads: &mut Vec<Quad>,
+    ) {
+        let px = |v: f32| (v * self.scale).round();
+        let (ix, iy) = (
+            (slot.x + (slot.w - px(16.0)) / 2.0).round(),
+            (slot.y + (slot.h - px(16.0)) / 2.0).round(),
+        );
+        let t = px(1.5).max(1.0);
+        match tool {
+            pages::Tool::Pr => {
+                // Pull-request mark: two branch endpoints joined to a merge
+                // target — hollow circles, a spine, and an elbow.
+                let d = px(6.0);
+                let circle = |cx: f32, cy: f32| LayoutRect {
+                    x: ix + px(cx) - d / 2.0,
+                    y: iy + px(cy) - d / 2.0,
+                    w: d,
+                    h: d,
+                };
+                for (cx, cy) in [(3.5, 3.5), (3.5, 12.5), (12.5, 12.5)] {
+                    quads.push(
+                        self.px_rect(&circle(cx, cy), rgb, 0.0, d / 2.0)
+                            .border(t, color(rgb, 1.0)),
+                    );
+                }
+                // Left spine between the two branch endpoints.
+                quads.push(self.px_rect(
+                    &LayoutRect {
+                        x: ix + px(3.5) - t / 2.0,
+                        y: iy + px(6.5),
+                        w: t,
+                        h: px(3.0),
+                    },
+                    rgb,
+                    1.0,
+                    0.0,
+                ));
+                // Elbow from the top endpoint over and down into the target.
+                quads.push(self.px_rect(
+                    &LayoutRect {
+                        x: ix + px(6.5),
+                        y: iy + px(3.5) - t / 2.0,
+                        w: px(6.0) + t / 2.0,
+                        h: t,
+                    },
+                    rgb,
+                    1.0,
+                    0.0,
+                ));
+                quads.push(self.px_rect(
+                    &LayoutRect {
+                        x: ix + px(12.5) - t / 2.0,
+                        y: iy + px(3.5),
+                        w: t,
+                        h: px(6.0),
+                    },
+                    rgb,
+                    1.0,
+                    0.0,
+                ));
+            },
+        }
+    }
+
     fn px_rect(&self, r: &LayoutRect, rgb: (u8, u8, u8), alpha: f32, radius: f32) -> Quad {
         Quad {
             x: r.x,
@@ -3381,9 +3445,26 @@ mod tests {
             &wss, 0, 240.0, None, None, None, None, None, None, None, None, None, None, &chrome,
         );
         let texts: Vec<&str> = frame.labels.iter().map(|l| l.text.as_str()).collect();
-        assert!(texts.contains(&"PR"), "ribbon icon renders when closed: {texts:?}");
         assert!(!texts.contains(&"Pull Request"));
         let slot = crate::workspace::ribbon_slot_rect(0, 1600, scale);
+        // The PR mark is vector geometry: hollow (bordered, zero-alpha)
+        // circles inside the slot.
+        let d = (6.0 * scale).round();
+        assert_eq!(
+            frame
+                .bg_quads
+                .iter()
+                .filter(|q| q.w == d
+                    && q.radius == d / 2.0
+                    && q.border > 0.0
+                    && q.x >= slot.x
+                    && q.x + q.w <= slot.x + slot.w
+                    && q.y >= slot.y
+                    && q.y + q.h <= slot.y + slot.h)
+                .count(),
+            3,
+            "ribbon PR icon draws its three branch/merge circles"
+        );
         assert!(
             frame.hot.iter().any(|r| r.x == slot.x && r.y == slot.y),
             "ribbon slot is a hover target"

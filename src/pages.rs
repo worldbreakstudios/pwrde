@@ -209,12 +209,6 @@ impl Tool {
             Tool::Pr => "Pull Request",
         }
     }
-
-    pub fn icon(self) -> &'static str {
-        match self {
-            Tool::Pr => "PR",
-        }
-    }
 }
 
 // ── Rebindable actions ──────────────────────────────────────────────────
