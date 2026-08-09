@@ -14,6 +14,8 @@ pwrde — a GPU-accelerated terminal workspace for macOS, written in Rust. Group
 - `scripts/make-app.sh` — assemble `target/release/Pwrde.app` (requires `cargo build --release` first).
 - `scripts/deploy.sh` — pull main, build, bundle, install to `/Applications`. Refuses to run off the `main` branch.
 
+Builds compile through **sccache** (`.cargo/config.toml` sets `rustc-wrapper`), so a fresh worktree's first build pulls the gpui dependency tree from cache instead of recompiling it. sccache must be installed (`brew install sccache`) or cargo fails with "could not execute process `sccache`".
+
 ## Architecture
 
 **The README's "Architecture" section is stale.** It describes the original winit + wgpu + glyphon design. The code has since been ported to **gpui** (Zed's UI framework), which is now the sole windowing + rendering layer. `winit`/`wgpu`/`glyphon` still appear in `Cargo.toml` and in port-note comments but are not used by any code. Trust the module doc comments (`//!` headers in each `src/*.rs` file) over the README diagram.
