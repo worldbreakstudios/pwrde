@@ -172,7 +172,6 @@ impl App {
             .top(px(pad))
             .right(px(right))
             .bottom(px(pad))
-            .p(px(8.))
             .child(
                 // h_full/flex_1 are local additions: the card fills the page
                 // and the content band absorbs the height the header and
