@@ -254,13 +254,9 @@ impl Workspace {
             .unwrap_or_else(|| self.name.clone())
     }
 
-    /// Whether the primary tile's active tab has unread output.
-    pub fn primary_unread(&self) -> bool {
-        self.root
-            .find_tile(self.primary_tile)
-            .and_then(|t| t.active_tab())
-            .map(|tab| tab.unread)
-            .unwrap_or(false)
+    /// Whether any tab in any tile has unread output.
+    pub fn any_unread(&self) -> bool {
+        self.root.tiles().iter().any(|t| t.tabs.iter().any(|tab| tab.unread))
     }
 
     /// Ensure `focused_tile` points at an existing tile.
@@ -1684,29 +1680,32 @@ mod tests {
     }
 
     #[test]
-    fn primary_unread_false_on_placeholder_or_missing_primary() {
-        // Empty tile has no active tab → false.
+    fn any_unread_false_when_no_tabs_are_unread() {
+        // Empty tile has no tabs → false.
         let ws = Workspace::new("g".into(), Tile::empty(7), None);
-        assert!(!ws.primary_unread());
+        assert!(!ws.any_unread());
 
-        // Vanished primary tile → false, no panic.
-        let mut ws = Workspace::new("g".into(), Tile::empty(7), None);
-        ws.primary_tile = 999;
-        assert!(!ws.primary_unread());
+        // Tile with a single tab that is not unread → false.
+        use crate::term::Session;
+        let sess = Session::placeholder();
+        let tile = Tile::new(42, sess);
+        let ws = Workspace::new("g".into(), tile, None);
+        assert!(!ws.any_unread());
     }
 
     #[test]
-    fn primary_unread_true_when_active_tab_is_unread() {
+    fn any_unread_true_when_inactive_tab_is_unread() {
+        // Proves any_unread is not limited to the active tab.
         use crate::term::Session;
         let sess = Session::placeholder();
         let mut tile = Tile::new(42, sess);
-        let tile_id = tile.id;
-        if let Some(tab) = tile.active_tab_mut() {
-            tab.unread = true;
-        }
+        // Add a second tab and mark only it unread; leave active=0 (the first tab).
+        let sess2 = Session::placeholder();
+        tile.tabs.push(Tab::new(sess2));
+        tile.tabs[1].unread = true;
+        assert_eq!(tile.active, 0);
         let ws = Workspace::new("g".into(), tile, None);
-        assert_eq!(ws.primary_tile, tile_id);
-        assert!(ws.primary_unread());
+        assert!(ws.any_unread());
     }
 
     #[test]
