@@ -305,6 +305,11 @@ struct App {
     main_window: Option<gpui::AnyWindowHandle>,
     /// Who the picker/fork picker is currently targeting.
     picker_target: PickerTarget,
+    /// Polarity shown in the Appearance preview cards (independent of the
+    /// system/user mode setting); seeded from the active polarity at launch.
+    preview_dark: bool,
+    /// The appearance dropdown that currently has its option menu open, if any.
+    appearance_menu: Option<pages::AppearanceDropdown>,
 }
 
 impl App {
@@ -4003,74 +4008,103 @@ impl App {
                 self.recording = None;
             },
             Section::Appearance => {
-                for (row, col, item) in pages::appearance_layout() {
-                    let slot = workspace::appearance_slot_rect(
-                        &area,
-                        row,
-                        col,
-                        item.full_width(),
-                        scale,
-                    );
-                    if !slot.contains(px, py) {
-                        continue;
-                    }
-                    match item {
-                        pages::AppearanceItem::Mode => {
-                            for (i, m) in theme::Mode::ALL.into_iter().enumerate() {
-                                let seg = workspace::mode_segment_rect(
-                                    &slot,
+                let cw = self.renderer.cell_width;
+                // An open dropdown menu captures the click: apply the option
+                // it hit, and close either way.
+                if let Some(menu) = self.appearance_menu {
+                    let (col, field) = menu.grid();
+                    let dark = menu.dark();
+                    match menu {
+                        pages::AppearanceDropdown::ThemeLight
+                        | pages::AppearanceDropdown::ThemeDark => {
+                            let opts = pages::theme_options(dark);
+                            for (i, t) in opts.iter().enumerate() {
+                                let row = workspace::appearance_menu_item(
+                                    &area,
+                                    col,
+                                    field,
+                                    opts.len(),
                                     i,
-                                    self.renderer.cell_width,
                                     scale,
                                 );
-                                if seg.contains(px, py) {
-                                    settings::set("appearance.mode", m.name().into());
+                                if row.contains(px, py) {
+                                    settings::set(theme::setting_key(dark), t.name.into());
                                     break;
                                 }
                             }
                         },
-                        pages::AppearanceItem::Header(_) => {},
-                        pages::AppearanceItem::Theme(t) => {
-                            settings::set(theme::setting_key(t.dark), t.name.into());
-                        },
-                        // The clipboard's token string becomes its polarity's
-                        // custom theme and is selected right away; anything
-                        // unparseable changes nothing.
-                        pages::AppearanceItem::ImportTheme => {
-                            if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                                if let Some(tokens) = clipboard
-                                    .get_text()
-                                    .ok()
-                                    .as_deref()
-                                    .and_then(theme::parse_tokens)
-                                {
-                                    let dark = theme::is_dark_color(tokens[0]);
+                        pages::AppearanceDropdown::TermLight
+                        | pages::AppearanceDropdown::TermDark => {
+                            let opts = pages::term_options(dark);
+                            for (i, t) in opts.iter().enumerate() {
+                                let row = workspace::appearance_menu_item(
+                                    &area,
+                                    col,
+                                    field,
+                                    opts.len(),
+                                    i,
+                                    scale,
+                                );
+                                if row.contains(px, py) {
                                     settings::set(
-                                        theme::custom_key(dark),
-                                        theme::serialize_tokens(&tokens).into(),
+                                        term_theme::setting_key(dark),
+                                        t.map_or("default", |t| t.name).into(),
                                     );
-                                    settings::set(
-                                        theme::setting_key(dark),
-                                        theme::custom_name(dark).into(),
-                                    );
+                                    break;
                                 }
                             }
                         },
-                        pages::AppearanceItem::ExportTheme => {
-                            if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                                let _ = clipboard.set_text(theme::export_current());
-                            }
-                        },
-                        // Adaptive default applies to both polarities at once.
-                        pages::AppearanceItem::TermDefault => {
-                            settings::set(term_theme::setting_key(false), "default".into());
-                            settings::set(term_theme::setting_key(true), "default".into());
-                        },
-                        pages::AppearanceItem::Term(t) => {
-                            settings::set(term_theme::setting_key(t.dark), t.name.into());
-                        },
                     }
-                    break;
+                    self.appearance_menu = None;
+                } else {
+                    let header = workspace::appearance_header_row(&area, scale);
+                    let mode_row = workspace::appearance_mode_row(&area, cw, scale);
+                    for (i, m) in theme::Mode::ALL.into_iter().enumerate() {
+                        if workspace::mode_segment_rect(&mode_row, i, cw, scale).contains(px, py) {
+                            settings::set("appearance.mode", m.name().into());
+                        }
+                    }
+                    for i in 0..2 {
+                        if workspace::preview_segment_rect(&header, i, cw, scale).contains(px, py) {
+                            self.preview_dark = i == 1;
+                        }
+                    }
+                    for d in pages::AppearanceDropdown::ALL {
+                        let (col, field) = d.grid();
+                        if workspace::appearance_dropdown_pill(&area, col, field, scale)
+                            .contains(px, py)
+                        {
+                            self.appearance_menu = Some(d);
+                        }
+                    }
+                    // The clipboard's token string becomes its polarity's
+                    // custom theme and is selected right away; anything
+                    // unparseable changes nothing.
+                    if workspace::appearance_footer_action(&area, 0, cw, scale).contains(px, py) {
+                        if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                            if let Some(tokens) = clipboard
+                                .get_text()
+                                .ok()
+                                .as_deref()
+                                .and_then(theme::parse_tokens)
+                            {
+                                let dark = theme::is_dark_color(tokens[0]);
+                                settings::set(
+                                    theme::custom_key(dark),
+                                    theme::serialize_tokens(&tokens).into(),
+                                );
+                                settings::set(
+                                    theme::setting_key(dark),
+                                    theme::custom_name(dark).into(),
+                                );
+                            }
+                        }
+                    }
+                    if workspace::appearance_footer_action(&area, 1, cw, scale).contains(px, py) {
+                        if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                            let _ = clipboard.set_text(theme::export_current());
+                        }
+                    }
                 }
             },
             Section::Terminal => {
@@ -4854,6 +4888,8 @@ impl App {
                     None
                 }
             },
+            preview_dark: self.preview_dark,
+            appearance_menu: self.appearance_menu,
         };
         let link_hover_suppressed = if overlay_open
             || !matches!(self.drag, Drag::None)
@@ -5721,6 +5757,8 @@ fn main() {
                         flyover_window: None,
                         main_window: None,
                         picker_target: PickerTarget::Group,
+                        preview_dark: theme::dark_active(),
+                        appearance_menu: None,
                     };
                     // With persistence on, reattach to the previous session's
                     // groups; otherwise launch into the empty state — no shell
