@@ -4143,8 +4143,8 @@ mod tests {
         }
     }
 
-    /// An open dropdown menu lists exactly its polarity's options in the
-    /// overlay layers, with hit rects for each row.
+    /// An open dropdown menu lists every theme in the overlay layers — mixing
+    /// polarities is allowed — with the slot's own polarity sorted first.
     #[test]
     fn appearance_menu_lists_polarity_options_above_the_page() {
         let renderer = Renderer::new(2.0, 18.0, 1600, 1000);
@@ -4159,12 +4159,12 @@ mod tests {
             &wss, 0, 240.0, None, None, None, None, None, None, None, None, None, None, &chrome,
         );
         let menu_texts: Vec<&str> = frame.picker_labels.iter().map(|l| l.text.as_str()).collect();
-        for t in crate::theme::ALL.iter().filter(|t| t.dark) {
+        for t in crate::theme::ALL {
             assert!(menu_texts.contains(&t.label), "menu missing {:?}", t.label);
         }
-        for t in crate::theme::ALL.iter().filter(|t| !t.dark) {
-            assert!(!menu_texts.contains(&t.label), "menu leaked light theme {:?}", t.label);
-        }
+        // The dark slot's menu sorts dark themes above light ones.
+        let pos = |label: &str| menu_texts.iter().position(|t| *t == label).unwrap();
+        assert!(pos("Midnight") < pos("Arc Light"), "own polarity should sort first");
         assert!(!frame.picker_quads.is_empty(), "menu panel should paint in the overlay layer");
     }
 }

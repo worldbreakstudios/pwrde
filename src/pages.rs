@@ -128,25 +128,30 @@ impl AppearanceDropdown {
     }
 }
 
-/// All app-theme options for the given polarity: built-ins from `theme::ALL`
-/// of that polarity (in ALL order), with the imported custom theme appended
-/// when one is present.
+/// All app-theme options for the given slot: every built-in and imported
+/// custom theme — mixing polarities is allowed (a dark chrome in the light
+/// slot, or vice versa) — with the slot's own polarity sorted first for
+/// easier choosing.
 pub fn theme_options(dark: bool) -> Vec<&'static crate::theme::Theme> {
-    let mut v: Vec<&'static crate::theme::Theme> =
-        crate::theme::ALL.iter().copied().filter(|t| t.dark == dark).collect();
-    if let Some(t) = crate::theme::custom(dark) {
-        v.push(t);
+    let mut v = Vec::new();
+    for matching in [true, false] {
+        let want = if matching { dark } else { !dark };
+        v.extend(crate::theme::ALL.iter().copied().filter(|t| t.dark == want));
+        if let Some(t) = crate::theme::custom(want) {
+            v.push(t);
+        }
     }
     v
 }
 
-/// All terminal-scheme options for the given polarity: `None` (the adaptive
-/// "Default") first, then presets from `term_theme::ALL` of that polarity in
-/// ALL order.
+/// All terminal-scheme options for the given slot: `None` (the adaptive
+/// "Default") first, then every preset — mixing polarities is allowed —
+/// with the slot's own polarity sorted first for easier choosing.
 pub fn term_options(dark: bool) -> Vec<Option<&'static crate::term_theme::TermTheme>> {
     let mut v: Vec<Option<&'static crate::term_theme::TermTheme>> = vec![None];
-    for t in crate::term_theme::ALL.iter().copied().filter(|t| t.dark == dark) {
-        v.push(Some(t));
+    for matching in [true, false] {
+        let want = if matching { dark } else { !dark };
+        v.extend(crate::term_theme::ALL.iter().copied().filter(|t| t.dark == want).map(Some));
     }
     v
 }
@@ -470,27 +475,38 @@ mod tests {
         assert_eq!(AppearanceDropdown::TermDark.label(), "Dark Profile");
     }
 
+    /// Both polarities' dropdowns list every theme (mix-and-match is
+    /// allowed), with the slot's own polarity sorted to the top.
     #[test]
-    fn theme_options_non_empty_and_matching_polarity() {
+    fn theme_options_list_everything_matching_polarity_first() {
         for dark in [false, true] {
             let opts = super::theme_options(dark);
-            assert!(!opts.is_empty(), "theme_options({dark}) must be non-empty");
-            for t in &opts {
-                assert_eq!(t.dark, dark, "theme polarity mismatch in theme_options({dark})");
-            }
+            // The test store holds no custom token strings, so only presets.
+            assert_eq!(opts.len(), crate::theme::ALL.len(), "theme_options({dark}) incomplete");
+            let matching = opts.iter().take_while(|t| t.dark == dark).count();
+            assert_eq!(
+                matching,
+                crate::theme::ALL.iter().filter(|t| t.dark == dark).count(),
+                "theme_options({dark}) must sort its own polarity first"
+            );
         }
     }
 
     #[test]
-    fn term_options_starts_with_none_and_matches_polarity() {
+    fn term_options_start_with_default_then_matching_polarity() {
         for dark in [false, true] {
             let opts = super::term_options(dark);
-            assert!(!opts.is_empty(), "term_options({dark}) must be non-empty");
-            assert!(opts[0].is_none(), "term_options({dark}) must start with None");
-            for t in opts.iter().skip(1) {
-                let t = t.expect("non-first entries must be Some");
-                assert_eq!(t.dark, dark, "term polarity mismatch in term_options({dark})");
-            }
+            assert_eq!(opts.len(), crate::term_theme::ALL.len() + 1, "missing presets");
+            assert!(opts[0].is_none(), "term_options({dark}) must start with Default");
+            let matching = opts[1..]
+                .iter()
+                .take_while(|t| t.is_some_and(|t| t.dark == dark))
+                .count();
+            assert_eq!(
+                matching,
+                crate::term_theme::ALL.iter().filter(|t| t.dark == dark).count(),
+                "term_options({dark}) must sort its own polarity first"
+            );
         }
     }
 
