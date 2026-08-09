@@ -3,10 +3,13 @@
 //! Variants: Default, Secondary, Destructive, Outline, Ghost, Link.
 //! The source's `rounded-4xl` renders as a pill at badge height, so the port
 //! uses a full radius. Focus-visible and aria-invalid styles are omitted.
+//! Local addition: [`Badge::color`] renders the Destructive treatment
+//! (tinted translucent fill + full-strength text) in an arbitrary color, for
+//! status badges outside the token set.
 
 use gpui::{
-    AnyElement, App, FontWeight, InteractiveElement as _, IntoElement, ParentElement, RenderOnce,
-    Styled, Window, div, px,
+    AnyElement, App, FontWeight, Hsla, InteractiveElement as _, IntoElement, ParentElement,
+    RenderOnce, Styled, Window, div, px,
 };
 
 use crate::ui::theme::{Theme, alpha};
@@ -25,6 +28,7 @@ pub enum BadgeVariant {
 #[derive(IntoElement)]
 pub struct Badge {
     variant: BadgeVariant,
+    color: Option<Hsla>,
     children: Vec<AnyElement>,
 }
 
@@ -32,12 +36,20 @@ impl Badge {
     pub fn new() -> Self {
         Self {
             variant: BadgeVariant::default(),
+            color: None,
             children: Vec::new(),
         }
     }
 
     pub fn variant(mut self, variant: BadgeVariant) -> Self {
         self.variant = variant;
+        self
+    }
+
+    /// Local addition: tint the badge like the Destructive variant but in an
+    /// arbitrary color. Takes precedence over [`Self::variant`].
+    pub fn color(mut self, tint: Hsla) -> Self {
+        self.color = Some(tint);
         self
     }
 }
@@ -77,6 +89,13 @@ impl RenderOnce for Badge {
             .line_height(px(16.))
             .font_weight(FontWeight::MEDIUM)
             .whitespace_nowrap();
+
+        if let Some(tint) = self.color {
+            return base
+                .bg(alpha(tint, if theme.dark { 0.2 } else { 0.1 }))
+                .text_color(tint)
+                .children(self.children);
+        }
 
         match self.variant {
             BadgeVariant::Default => base.bg(theme.primary).text_color(theme.primary_foreground),

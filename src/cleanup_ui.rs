@@ -435,6 +435,13 @@ fn entry_row(
 }
 
 fn pr_cell(pr: Option<&cleanup::PrInfo>, theme: &crate::ui::theme::Theme) -> AnyElement {
+    // PR status tints (same palette the canvas table used), flipped per
+    // polarity so they read on both white and dark cards.
+    let (merged, open) = if theme.dark {
+        (gpui::rgb(0xc882dc), gpui::rgb(0x78be8c))
+    } else {
+        (gpui::rgb(0x8e44ad), gpui::rgb(0x228b54))
+    };
     match pr {
         None => div()
             .text_color(theme.muted_foreground)
@@ -442,10 +449,10 @@ fn pr_cell(pr: Option<&cleanup::PrInfo>, theme: &crate::ui::theme::Theme) -> Any
             .into_any_element(),
         Some(p) => {
             let label = cleanup::format_pr(Some(p));
-            let variant = match p.state.as_str() {
-                "merged" => BadgeVariant::Secondary,
-                "open" | "draft" => BadgeVariant::Outline,
-                _ => BadgeVariant::Destructive,
+            let badge = match p.state.as_str() {
+                "merged" => Badge::new().color(merged.into()),
+                "open" | "draft" => Badge::new().color(open.into()),
+                _ => Badge::new().variant(BadgeVariant::Destructive),
             };
             let title = truncate_chars(&p.title, 40);
             div()
@@ -454,7 +461,7 @@ fn pr_cell(pr: Option<&cleanup::PrInfo>, theme: &crate::ui::theme::Theme) -> Any
                 .items_center()
                 .gap_1()
                 .overflow_hidden()
-                .child(Badge::new().variant(variant).child(label))
+                .child(badge.child(label))
                 .child(
                     div()
                         .flex_1()
