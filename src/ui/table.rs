@@ -253,6 +253,7 @@ impl RenderOnce for TableRow {
 #[derive(IntoElement)]
 pub struct TableHead {
     width: Option<Pixels>,
+    flex: Option<f32>,
     children: Vec<AnyElement>,
 }
 
@@ -260,6 +261,7 @@ impl TableHead {
     pub fn new() -> Self {
         Self {
             width: None,
+            flex: None,
             children: Vec::new(),
         }
     }
@@ -267,6 +269,14 @@ impl TableHead {
     /// Fixed column width; unset columns share remaining space equally.
     pub fn w(mut self, width: Pixels) -> Self {
         self.width = Some(width);
+        self
+    }
+
+    /// Local addition: flex-grow weight for a flexible column, so columns
+    /// can take unequal shares of the remaining space (default 1.0). Give
+    /// the same weight to the matching [`TableCell`].
+    pub fn flex(mut self, weight: f32) -> Self {
+        self.flex = Some(weight);
         self
     }
 }
@@ -301,7 +311,13 @@ impl RenderOnce for TableHead {
                 // flex cell refuses to shrink below its nowrap content, so
                 // narrow windows resolve different column widths per row and
                 // the table stops lining up.
-                None => el.flex_1().min_w(px(0.)).overflow_hidden(),
+                None => {
+                    let mut el = el.flex_1().min_w(px(0.)).overflow_hidden();
+                    if let Some(weight) = self.flex {
+                        el.style().flex_grow = Some(weight);
+                    }
+                    el
+                }
             })
             .children(self.children)
     }
@@ -311,6 +327,7 @@ impl RenderOnce for TableHead {
 #[derive(IntoElement)]
 pub struct TableCell {
     width: Option<Pixels>,
+    flex: Option<f32>,
     children: Vec<AnyElement>,
 }
 
@@ -318,6 +335,7 @@ impl TableCell {
     pub fn new() -> Self {
         Self {
             width: None,
+            flex: None,
             children: Vec::new(),
         }
     }
@@ -325,6 +343,13 @@ impl TableCell {
     /// Fixed column width matching the corresponding [`TableHead`].
     pub fn w(mut self, width: Pixels) -> Self {
         self.width = Some(width);
+        self
+    }
+
+    /// Local addition: flex-grow weight matching the corresponding
+    /// [`TableHead::flex`].
+    pub fn flex(mut self, weight: f32) -> Self {
+        self.flex = Some(weight);
         self
     }
 }
@@ -351,9 +376,15 @@ impl RenderOnce for TableCell {
             .whitespace_nowrap()
             .map(|el| match self.width {
                 Some(width) => el.w(width).flex_shrink_0(),
-                // Same local addition as TableHead: keep flex columns
-                // shrinkable so rows stay aligned when space runs out.
-                None => el.flex_1().min_w(px(0.)).overflow_hidden(),
+                // Same local additions as TableHead: shrinkable flex columns
+                // (row alignment under pressure) with optional grow weights.
+                None => {
+                    let mut el = el.flex_1().min_w(px(0.)).overflow_hidden();
+                    if let Some(weight) = self.flex {
+                        el.style().flex_grow = Some(weight);
+                    }
+                    el
+                }
             })
             .children(self.children)
     }

@@ -257,14 +257,16 @@ fn table_body(app: &App, cx: &mut Context<App>) -> AnyElement {
     let rows = app.cleanup.rows();
     let n_rows = rows.len();
 
+    // Branch/id only need enough for a name; the pr column carries the
+    // title, so it takes the lion's share of the flexible space.
     let header = TableHeader::new().child(
         TableRow::new()
             .child(TableHead::new().w(px(28.)).child(""))
-            .child(TableHead::new().child("branch"))
-            .child(TableHead::new().child("id"))
+            .child(TableHead::new().flex(1.).child("branch"))
+            .child(TableHead::new().flex(0.5).child("id"))
             .child(TableHead::new().w(px(72.)).child("dirty"))
             .child(TableHead::new().w(px(90.)).child("parity"))
-            .child(TableHead::new().child("pr"))
+            .child(TableHead::new().flex(2.5).child("pr"))
             .child(TableHead::new().w(px(56.)).child("age")),
     );
 
@@ -421,11 +423,11 @@ fn entry_row(
         .selected(selected)
         .last(last)
         .child(TableCell::new().w(px(28.)).child(checkbox))
-        .child(TableCell::new().child(branch_el))
-        .child(TableCell::new().child(id_el))
+        .child(TableCell::new().flex(1.).child(branch_el))
+        .child(TableCell::new().flex(0.5).child(id_el))
         .child(TableCell::new().w(px(72.)).child(dirty_el))
         .child(TableCell::new().w(px(90.)).child(parity_el))
-        .child(TableCell::new().child(pr_el))
+        .child(TableCell::new().flex(2.5).child(pr_el))
         .child(TableCell::new().w(px(56.)).child(age_el));
 
     if !is_current {
@@ -454,7 +456,9 @@ fn pr_cell(pr: Option<&cleanup::PrInfo>, theme: &crate::ui::theme::Theme) -> Any
                 "open" | "draft" => Badge::new().color(open.into()),
                 _ => Badge::new().variant(BadgeVariant::Destructive),
             };
-            let title = truncate_chars(&p.title, 40);
+            // No pre-truncation: the cell's ellipsis clips to whatever room
+            // the pr column actually has.
+            let title = p.title.clone();
             div()
                 .flex()
                 .flex_row()
@@ -529,15 +533,4 @@ fn dirty_hover_content(files: &[DirtyFile], cx: &mut GpuiApp) -> AnyElement {
     }
 
     div().flex().flex_col().gap_1().children(lines).into_any_element()
-}
-
-fn truncate_chars(s: &str, max: usize) -> String {
-    let count = s.chars().count();
-    if count <= max {
-        s.to_string()
-    } else {
-        let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
-        out.push('…');
-        out
-    }
 }
