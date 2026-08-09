@@ -1154,6 +1154,23 @@ impl Renderer {
                             clip: LayoutRect { w: rect.w - group_pad, ..rect },
                             size: Some(header_size),
                         });
+                        // Group unread bubbles up: if any member workspace has
+                        // an unread tab, light an accent dot on the section
+                        // header (regardless of collapsed/expanded state).
+                        let section_has_unread = workspaces
+                            .iter()
+                            .filter(|w| w.section == Some(sec.id))
+                            .any(|w| w.any_unread());
+                        if section_has_unread {
+                            let ds = (7.0 * self.scale).round();
+                            let dot = LayoutRect {
+                                x: (rect.x + (group_pad - ds) / 2.0).round(),
+                                y: (rect.y + (rect.h - ds) / 2.0).round(),
+                                w: ds,
+                                h: ds,
+                            };
+                            bg_quads.push(self.px_rect(&dot, th.accent, 1.0, ds / 2.0));
+                        }
                     }
                 }
                 workspace::SidebarRow::Group { ws_idx } => {
@@ -1170,10 +1187,10 @@ impl Renderer {
                     let clip_w = rect.w - group_pad;
                     let inset =
                         ((rect.h - (self.cell_height + cwd_line_h)) / 2.0).max(0.0);
-                    // Unread (mirrors the title: the primary pane's active
-                    // tab): an accent dot in the left padding gutter, on the
-                    // title line; text stays put so rows keep alignment.
-                    if ws_item.primary_unread() {
+                    // Unread (any unread tab in the group lights the dot):
+                    // accent dot in the left padding gutter, on the title
+                    // line; text stays put so rows keep alignment.
+                    if ws_item.any_unread() {
                         let ds = (7.0 * self.scale).round();
                         let dot = LayoutRect {
                             x: (rect.x + (group_pad - ds) / 2.0).round(),
@@ -3317,6 +3334,61 @@ mod tests {
                 && q.y + q.h <= row.y + row.h),
             "unread dot should sit in the left gutter of the group row"
         );
+    }
+
+    /// The section-header unread dot sits in the left gutter when any member
+    /// workspace has an unread tab — for both collapsed and expanded sections.
+    #[test]
+    fn sidebar_section_header_unread_dot_sits_in_left_gutter() {
+        let scale = 2.0;
+        let renderer = Renderer::new(scale, 18.0, 1600, 1000);
+        let state = Cleanup::default();
+
+        let section_id: u64 = 42;
+
+        for &collapsed in &[false, true] {
+            let mut chrome = cleanup_chrome(&state);
+            chrome.page = Page::Sessions;
+
+            // Build a workspace assigned to the section with an unread tab.
+            let mut tile = crate::workspace::Tile::new(1, crate::term::Session::placeholder());
+            if let Some(tab) = tile.active_tab_mut() {
+                tab.unread = true;
+            }
+            let mut ws = crate::workspace::Workspace::new("g".into(), tile, None);
+            ws.section = Some(section_id);
+            let wss = [ws];
+
+            let sections = [crate::workspace::Section {
+                id: section_id,
+                name: "MySection".into(),
+                emoji: "🔥".into(),
+                collapsed,
+            }];
+            chrome.sections = &sections;
+
+            let sidebar_w = 240.0;
+            let frame = renderer.build_frame(
+                &wss, 0, sidebar_w, None, None, None, None, None, None, None, None, None, None, &chrome,
+            );
+
+            // The section header is always row 0.
+            let rows = crate::workspace::sidebar_rows(&wss, &sections);
+            let header_row = crate::workspace::sidebar_row_rect(&rows, 0, &wss, scale, sidebar_w);
+            let group_pad = (12.0 * scale).round();
+            let ds = (7.0 * scale).round();
+            let expected_x = (header_row.x + (group_pad - ds) / 2.0).round();
+
+            assert!(
+                frame.bg_quads.iter().any(|q| q.w == ds
+                    && q.h == ds
+                    && q.radius == ds / 2.0
+                    && q.x == expected_x
+                    && q.y >= header_row.y
+                    && q.y + q.h <= header_row.y + header_row.h),
+                "unread dot should sit in the left gutter of the section header row (collapsed={collapsed})"
+            );
+        }
     }
 
     /// Hovering the "+ group" button brightens it and adds the soft shadow;
