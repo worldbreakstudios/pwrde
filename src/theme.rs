@@ -356,14 +356,18 @@ pub fn resolve_slot(dark: bool, slot: Option<&str>, legacy: Option<&str>) -> &'s
 }
 
 /// The theme configured for a polarity slot (used by the Appearance page to
-/// mark both slots' selections).
+/// mark both slots' selections). Slots accept any theme name — mixing
+/// polarities (a dark chrome in the light slot) is deliberate.
 pub fn selected(dark: bool) -> &'static Theme {
     let slot = crate::settings::get_str(setting_key(dark));
-    // The custom slot resolves through its stored token string; a missing or
-    // invalid string falls through the normal chain to the built-in default.
-    if slot.as_deref() == Some(custom_name(dark)) {
-        if let Some(t) = custom(dark) {
-            return t;
+    // Custom names resolve through their own polarity's stored token string
+    // (either custom may sit in either slot); a missing or invalid string
+    // falls through the normal chain to the built-in default.
+    for custom_dark in [false, true] {
+        if slot.as_deref() == Some(custom_name(custom_dark)) {
+            if let Some(t) = custom(custom_dark) {
+                return t;
+            }
         }
     }
     resolve_slot(dark, slot.as_deref(), crate::settings::get_str("theme").as_deref())
@@ -458,6 +462,14 @@ mod tests {
     fn custom_names_fall_back_until_a_string_is_stored() {
         assert_eq!(resolve_slot(true, Some("custom-dark"), None).name, "midnight");
         assert_eq!(resolve_slot(false, Some("custom-light"), None).name, "arc-light");
+    }
+
+    /// Slots accept cross-polarity picks: a dark chrome may be chosen for
+    /// the light slot (and vice versa) — mix-and-match is deliberate.
+    #[test]
+    fn slots_accept_cross_polarity_themes() {
+        assert_eq!(resolve_slot(false, Some("midnight"), None).name, "midnight");
+        assert_eq!(resolve_slot(true, Some("arc-light"), None).name, "arc-light");
     }
 
     #[test]

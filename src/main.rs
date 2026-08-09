@@ -243,6 +243,10 @@ struct App {
     /// In-progress edit buffer for the Settings → Sessions primary-command
     /// row, or `None` when not editing.
     editing_command: Option<String>,
+    /// Search query in the Settings sidebar search box.
+    settings_query: String,
+    /// Whether the Settings sidebar search box has keyboard focus.
+    settings_search_focus: bool,
     /// In-progress sidebar section rename: `(section_id, buffer)`, or `None`
     /// when not editing. Enter commits via `apply_section_rename`, Esc cancels.
     editing_section: Option<(u64, String)>,
@@ -307,6 +311,11 @@ struct App {
     main_window: Option<gpui::AnyWindowHandle>,
     /// Who the picker/fork picker is currently targeting.
     picker_target: PickerTarget,
+    /// Polarity shown in the Appearance preview cards (independent of the
+    /// system/user mode setting); seeded from the active polarity at launch.
+    preview_dark: bool,
+    /// The appearance dropdown that currently has its option menu open, if any.
+    appearance_menu: Option<pages::AppearanceDropdown>,
     // ── Right-side tool ribbon / panel ────────────────────────────────────
     /// Which tool panel is currently open, if any. Kept even while the tool
     /// is unregistered (wrong page / non-git group) so it reappears when its
@@ -2876,10 +2885,19 @@ impl App {
                 return;
             }
             if self.page == Page::Settings {
-                // Settings sections sit in the group rows' slots.
+                // Search box in the top slot; sections in the rows below it.
+                if workspace::settings_search_rect(scale, self.sidebar_w()).contains(px, py) {
+                    self.settings_search_focus = true;
+                    self.recording = None;
+                    self.editing_command = None;
+                    self.request_redraw();
+                    return;
+                }
+                self.settings_search_focus = false;
                 for (i, section) in Section::ALL.iter().enumerate() {
-                    if workspace::tab_rect(i, scale, self.sidebar_w()).contains(px, py) {
+                    if workspace::tab_rect(i + 1, scale, self.sidebar_w()).contains(px, py) {
                         self.section = *section;
+                        self.settings_query.clear();
                         self.recording = None;
                         self.editing_command = None;
                         self.request_redraw();
@@ -3798,6 +3816,38 @@ impl App {
     /// row captures the next ⌘ chord as its new binding; otherwise ⌘
     /// shortcuts still dispatch and plain typing is swallowed.
     fn handle_settings_key(&mut self, ev: &KeyDownEvent) {
+        // A focused sidebar search box captures typing: chars filter, Enter
+        // jumps to the first match's section, Escape cancels.
+        if self.settings_search_focus {
+            match ev.keystroke.key.as_str() {
+                "escape" => {
+                    self.settings_query.clear();
+                    self.settings_search_focus = false;
+                },
+                "enter" => {
+                    if let Some(entry) = pages::search_settings(&self.settings_query).first() {
+                        self.section = entry.section;
+                    }
+                    self.settings_query.clear();
+                    self.settings_search_focus = false;
+                },
+                "backspace" => {
+                    self.settings_query.pop();
+                },
+                _ => {
+                    if !ev.keystroke.modifiers.control
+                        && !ev.keystroke.modifiers.platform
+                        && let Some(text) = ev.keystroke.key_char.as_deref()
+                    {
+                        for ch in text.chars().filter(|c| !c.is_control()) {
+                            self.settings_query.push(ch);
+                        }
+                    }
+                },
+            }
+            self.request_redraw();
+            return;
+        }
         // An editing primary-command row captures typing: chars append, Enter
         // saves, Escape cancels.
         if self.editing_command.is_some() {
@@ -3999,6 +4049,8 @@ impl App {
             self.page = page;
             self.recording = None;
             self.editing_command = None;
+            self.settings_query.clear();
+            self.settings_search_focus = false;
             // Grids may have gone stale while the Settings page was up.
             if page == Page::Sessions {
                 self.sync_layout();
@@ -4137,6 +4189,22 @@ impl App {
     fn settings_click(&mut self, px: f32, py: f32) {
         let area = self.area();
         let scale = self.scale();
+        // A click in the card leaves the search box (the query, and with it
+        // the results list, survives until a result or section is chosen).
+        self.settings_search_focus = false;
+        // Search-results mode: a click on a result row jumps to its section.
+        if !self.settings_query.is_empty() {
+            for (i, entry) in pages::search_settings(&self.settings_query).iter().enumerate() {
+                if workspace::settings_row_rect(&area, i, scale).contains(px, py) {
+                    self.section = entry.section;
+                    self.settings_query.clear();
+                    self.settings_search_focus = false;
+                    break;
+                }
+            }
+            self.request_redraw();
+            return;
+        }
         match self.section {
             Section::Sessions => {
                 if workspace::settings_row_rect(&area, 0, scale).contains(px, py) {
@@ -4159,74 +4227,103 @@ impl App {
                 self.recording = None;
             },
             Section::Appearance => {
-                for (row, col, item) in pages::appearance_layout() {
-                    let slot = workspace::appearance_slot_rect(
-                        &area,
-                        row,
-                        col,
-                        item.full_width(),
-                        scale,
-                    );
-                    if !slot.contains(px, py) {
-                        continue;
-                    }
-                    match item {
-                        pages::AppearanceItem::Mode => {
-                            for (i, m) in theme::Mode::ALL.into_iter().enumerate() {
-                                let seg = workspace::mode_segment_rect(
-                                    &slot,
+                let cw = self.renderer.cell_width;
+                // An open dropdown menu captures the click: apply the option
+                // it hit, and close either way.
+                if let Some(menu) = self.appearance_menu {
+                    let (col, field) = menu.grid();
+                    let dark = menu.dark();
+                    match menu {
+                        pages::AppearanceDropdown::ThemeLight
+                        | pages::AppearanceDropdown::ThemeDark => {
+                            let opts = pages::theme_options(dark);
+                            for (i, t) in opts.iter().enumerate() {
+                                let row = workspace::appearance_menu_item(
+                                    &area,
+                                    col,
+                                    field,
+                                    opts.len(),
                                     i,
-                                    self.renderer.cell_width,
                                     scale,
                                 );
-                                if seg.contains(px, py) {
-                                    settings::set("appearance.mode", m.name().into());
+                                if row.contains(px, py) {
+                                    settings::set(theme::setting_key(dark), t.name.into());
                                     break;
                                 }
                             }
                         },
-                        pages::AppearanceItem::Header(_) => {},
-                        pages::AppearanceItem::Theme(t) => {
-                            settings::set(theme::setting_key(t.dark), t.name.into());
-                        },
-                        // The clipboard's token string becomes its polarity's
-                        // custom theme and is selected right away; anything
-                        // unparseable changes nothing.
-                        pages::AppearanceItem::ImportTheme => {
-                            if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                                if let Some(tokens) = clipboard
-                                    .get_text()
-                                    .ok()
-                                    .as_deref()
-                                    .and_then(theme::parse_tokens)
-                                {
-                                    let dark = theme::is_dark_color(tokens[0]);
+                        pages::AppearanceDropdown::TermLight
+                        | pages::AppearanceDropdown::TermDark => {
+                            let opts = pages::term_options(dark);
+                            for (i, t) in opts.iter().enumerate() {
+                                let row = workspace::appearance_menu_item(
+                                    &area,
+                                    col,
+                                    field,
+                                    opts.len(),
+                                    i,
+                                    scale,
+                                );
+                                if row.contains(px, py) {
                                     settings::set(
-                                        theme::custom_key(dark),
-                                        theme::serialize_tokens(&tokens).into(),
+                                        term_theme::setting_key(dark),
+                                        t.map_or("default", |t| t.name).into(),
                                     );
-                                    settings::set(
-                                        theme::setting_key(dark),
-                                        theme::custom_name(dark).into(),
-                                    );
+                                    break;
                                 }
                             }
                         },
-                        pages::AppearanceItem::ExportTheme => {
-                            if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                                let _ = clipboard.set_text(theme::export_current());
-                            }
-                        },
-                        // Adaptive default applies to both polarities at once.
-                        pages::AppearanceItem::TermDefault => {
-                            settings::set(term_theme::setting_key(false), "default".into());
-                            settings::set(term_theme::setting_key(true), "default".into());
-                        },
-                        pages::AppearanceItem::Term(t) => {
-                            settings::set(term_theme::setting_key(t.dark), t.name.into());
-                        },
                     }
-                    break;
+                    self.appearance_menu = None;
+                } else {
+                    let header = workspace::appearance_header_row(&area, scale);
+                    let mode_row = workspace::appearance_mode_row(&area, cw, scale);
+                    for (i, m) in theme::Mode::ALL.into_iter().enumerate() {
+                        if workspace::mode_segment_rect(&mode_row, i, cw, scale).contains(px, py) {
+                            settings::set("appearance.mode", m.name().into());
+                        }
+                    }
+                    for i in 0..2 {
+                        if workspace::preview_segment_rect(&header, i, cw, scale).contains(px, py) {
+                            self.preview_dark = i == 1;
+                        }
+                    }
+                    for d in pages::AppearanceDropdown::ALL {
+                        let (col, field) = d.grid();
+                        if workspace::appearance_dropdown_pill(&area, col, field, scale)
+                            .contains(px, py)
+                        {
+                            self.appearance_menu = Some(d);
+                        }
+                    }
+                    // The clipboard's token string becomes its polarity's
+                    // custom theme and is selected right away; anything
+                    // unparseable changes nothing.
+                    if workspace::appearance_footer_action(&area, 0, cw, scale).contains(px, py) {
+                        if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                            if let Some(tokens) = clipboard
+                                .get_text()
+                                .ok()
+                                .as_deref()
+                                .and_then(theme::parse_tokens)
+                            {
+                                let dark = theme::is_dark_color(tokens[0]);
+                                settings::set(
+                                    theme::custom_key(dark),
+                                    theme::serialize_tokens(&tokens).into(),
+                                );
+                                settings::set(
+                                    theme::setting_key(dark),
+                                    theme::custom_name(dark).into(),
+                                );
+                            }
+                        }
+                    }
+                    if workspace::appearance_footer_action(&area, 1, cw, scale).contains(px, py) {
+                        if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                            let _ = clipboard.set_text(theme::export_current());
+                        }
+                    }
                 }
             },
             Section::Terminal => {
@@ -4996,6 +5093,8 @@ impl App {
                 .as_ref()
                 .map(|(id, buf)| (*id, buf.as_str())),
             cleanup: &self.cleanup,
+            settings_query: &self.settings_query,
+            settings_search_focus: self.settings_search_focus,
             ribbon_tools: &ribbon_tools,
             open_tool: self.open_tool,
             tool_panel_w: self.tool_panel_w,
@@ -5017,6 +5116,8 @@ impl App {
                     None
                 }
             },
+            preview_dark: self.preview_dark,
+            appearance_menu: self.appearance_menu,
         };
         let link_hover_suppressed = if overlay_open
             || !matches!(self.drag, Drag::None)
@@ -5844,6 +5945,8 @@ fn main() {
                         confirm: None,
                         pending_primary_cmd: std::collections::HashMap::new(),
                         editing_command: None,
+                        settings_query: String::new(),
+                        settings_search_focus: false,
                         editing_section: None,
                         // Single focus handle, minted once; focused below.
                         focus_handle: cx.focus_handle(),
@@ -5884,6 +5987,8 @@ fn main() {
                         flyover_window: None,
                         main_window: None,
                         picker_target: PickerTarget::Group,
+                        preview_dark: theme::dark_active(),
+                        appearance_menu: None,
                         open_tool: settings::get_str("toolpanel.tool").and_then(|s| {
                             pages::Tool::ALL.iter().copied().find(|t| t.name() == s)
                         }),

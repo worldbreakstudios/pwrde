@@ -265,6 +265,14 @@ pub struct ChromeState<'a> {
     /// Physical-pixel cursor position for hover painting. `None` while any
     /// drag is active so hover highlights are suppressed mid-drag.
     pub cursor: Option<(f32, f32)>,
+    /// Which polarity the Appearance preview cards show (false=light, true=dark).
+    pub preview_dark: bool,
+    /// Which dropdown menu is currently open on the Appearance page, if any.
+    pub appearance_menu: Option<crate::pages::AppearanceDropdown>,
+    /// In-progress search query for the settings sidebar search box.
+    pub settings_query: &'a str,
+    /// Whether the settings search box has keyboard focus.
+    pub settings_search_focus: bool,
 }
 
 /// Everything `main.rs`'s terminal `Element` needs to paint one frame — all
@@ -632,10 +640,45 @@ impl Renderer {
             },
             Page::Settings if collapsed => {},
             Page::Settings => {
-                // Settings sections as sidebar tabs, in the same rows the
-                // groups occupy on Sessions so the chrome reads as one.
+                // Search box in the top slot: typing filters every section's
+                // settings (the content card lists the matches). Focused it
+                // takes the active-tab treatment; a quad caret trails the
+                // query like the primary-command editor's.
+                let search = workspace::settings_search_rect(self.scale, sidebar_w);
+                let focused = chrome.settings_search_focus;
+                if focused {
+                    bg_quads.push(self.px_rect(&search, th.card, 0.78, row_r).shadow(Shadow::Soft));
+                } else {
+                    bg_quads.push(self.px_rect(&search, th.card, 0.40, row_r));
+                }
+                hot.push(search);
+                let empty = chrome.settings_query.is_empty();
+                let text_top = (search.y + (search.h - self.cell_height) / 2.0).round();
+                if !empty || !focused {
+                    labels.push(LabelSpec {
+                        text: if empty { "Search settings".into() } else { chrome.settings_query.to_string() },
+                        color: color(if empty { th.ink_dim } else { th.ink }, 1.0),
+                        left: search.x + group_pad,
+                        top: text_top,
+                        clip: LayoutRect { w: search.w - group_pad, ..search },
+                        size: None,
+                    });
+                }
+                if focused {
+                    let w = chrome.settings_query.chars().count() as f32 * self.cell_width;
+                    let caret = LayoutRect {
+                        x: (search.x + group_pad + w + if empty { 0.0 } else { 2.0 }).round(),
+                        y: text_top,
+                        w: (2.0 * self.scale).round().max(1.0),
+                        h: self.cell_height,
+                    };
+                    bg_quads.push(self.px_rect(&caret, th.accent, 1.0, 0.0));
+                }
+
+                // Settings sections as sidebar tabs, shifted to slot i+1 to
+                // make room for the search box at slot 0.
                 for (i, section) in Section::ALL.iter().enumerate() {
-                    let tab = workspace::tab_rect(i, self.scale, sidebar_w);
+                    let tab = workspace::tab_rect(i + 1, self.scale, sidebar_w);
                     let active_row = *section == chrome.section;
                     if active_row {
                         bg_quads.push(self.px_rect(&tab, th.card, 0.78, row_r).shadow(Shadow::Soft));
@@ -1119,6 +1162,18 @@ impl Renderer {
                 self.palette_overlay(pal, &layout, chrome.cursor, &mut picker_quads, &mut hot);
         } else if let Some((text, _)) = message {
             picker_labels = self.message_overlay(text, &mut picker_quads);
+        } else if chrome.page == Page::Settings && chrome.section == Section::Appearance {
+            // The Appearance dropdown menu floats over the settings card in
+            // the picker layers, but is not modal — the page stays live.
+            if let Some(menu) = chrome.appearance_menu {
+                picker_labels = self.appearance_menu_overlay(
+                    &area,
+                    menu,
+                    chrome.cursor,
+                    &mut picker_quads,
+                    &mut hot,
+                );
+            }
         } else if chrome.page == Page::Cleanup {
             // Dirty-files popover floats over the table while its cell is
             // hovered (never alongside a modal overlay).
@@ -1331,8 +1386,9 @@ impl Renderer {
         bg_quads.push(self.px_rect(area, th.card, 1.0, (CARD_RADIUS * scale).round()).shadow(Shadow::Card));
 
         let header_h = (workspace::SETTINGS_HEADER_H * scale).round();
+        let searching = !chrome.settings_query.is_empty();
         labels.push(LabelSpec {
-            text: chrome.section.label().into(),
+            text: if searching { "Search results" } else { chrome.section.label() }.into(),
             color: color(th.ink, 1.0),
             left: area.x + pad,
             top: (area.y + (header_h - self.cell_height) / 2.0).round(),
@@ -1345,6 +1401,54 @@ impl Renderer {
         let fits = |row: &LayoutRect| row.y + row.h <= area.y + area.h - pad;
         let mid = |row: &LayoutRect| (row.y + (row.h - self.cell_height) / 2.0).round();
 
+        if searching {
+            // Search results replace the section content: one row per match,
+            // the owning section dim on the right; a click jumps there.
+            let results = pages::search_settings(chrome.settings_query);
+            if results.is_empty() {
+                let row = workspace::settings_row_rect(area, 0, scale);
+                if fits(&row) {
+                    labels.push(LabelSpec {
+                        text: "no settings match".into(),
+                        color: color(th.ink_dim, 1.0),
+                        left: row.x + pad,
+                        top: mid(&row),
+                        clip: row,
+                        size: None,
+                    });
+                }
+                return;
+            }
+            for (i, entry) in results.iter().enumerate() {
+                let row = workspace::settings_row_rect(area, i, scale);
+                if !fits(&row) {
+                    break;
+                }
+                if hover(cur, &row) {
+                    bg_quads.push(self.px_rect(&row, th.ink, 0.06, pill_r));
+                }
+                hot.push(row);
+                labels.push(LabelSpec {
+                    text: entry.label.into(),
+                    color: color(th.ink, 1.0),
+                    left: row.x + pad,
+                    top: mid(&row),
+                    clip: row,
+                    size: None,
+                });
+                let sec = entry.section.label();
+                let sec_w = sec.chars().count() as f32 * self.cell_width;
+                labels.push(LabelSpec {
+                    text: sec.into(),
+                    color: color(th.ink_dim, 1.0),
+                    left: (row.x + row.w - pad - sec_w).round(),
+                    top: mid(&row),
+                    clip: row,
+                    size: None,
+                });
+            }
+            return;
+        }
         match chrome.section {
             Section::Sessions => {
                 let row = workspace::settings_row_rect(area, 0, scale);
@@ -1444,140 +1548,553 @@ impl Renderer {
                 }
             },
             Section::Appearance => {
-                let dark_now = crate::theme::dark_active();
                 let mode = crate::theme::mode();
-                for (row_i, col, item) in pages::appearance_layout() {
-                    let slot =
-                        workspace::appearance_slot_rect(area, row_i, col, item.full_width(), scale);
-                    if !fits(&slot) {
-                        break;
+                let preview_dark = chrome.preview_dark;
+                let small = self.font_size() * 0.85;
+                let small_cw = self.cell_width * 0.85;
+                let chip = (9.0 * scale).round();
+                let chip_gap = (3.0 * scale).round();
+                let ipad = (10.0 * scale).round();
+
+                // ── Header: mode segments + preview polarity toggle ──
+                let header = workspace::appearance_header_row(area, scale);
+                if fits(&header) {
+                    labels.push(LabelSpec {
+                        text: "Mode".into(),
+                        color: color(th.ink, 1.0),
+                        left: header.x,
+                        top: mid(&header),
+                        clip: header,
+                        size: None,
+                    });
+                    let mode_row = workspace::appearance_mode_row(area, self.cell_width, scale);
+                    for (i, m) in crate::theme::Mode::ALL.iter().enumerate() {
+                        let seg = workspace::mode_segment_rect(&mode_row, i, self.cell_width, scale);
+                        let on = *m == mode;
+                        let hov = !on && hover(cur, &seg);
+                        bg_quads.push(self.px_rect(
+                            &seg,
+                            if on { th.accent } else { th.ink },
+                            if on {
+                                0.9
+                            } else if hov {
+                                0.12
+                            } else {
+                                0.06
+                            },
+                            seg.h / 2.0,
+                        ));
+                        hot.push(seg);
+                        let lw = m.label().chars().count() as f32 * self.cell_width;
+                        labels.push(LabelSpec {
+                            text: m.label().into(),
+                            color: color(if on { (255, 255, 255) } else { th.ink_dim }, 1.0),
+                            left: (seg.x + (seg.w - lw) / 2.0).round(),
+                            top: mid(&header),
+                            clip: seg,
+                            size: None,
+                        });
                     }
-                    match item {
-                        pages::AppearanceItem::Mode => {
-                            labels.push(LabelSpec {
-                                text: "Mode".into(),
-                                color: color(th.ink, 1.0),
-                                left: slot.x + pad,
-                                top: mid(&slot),
-                                clip: slot,
-                                size: None,
-                            });
-                            for (i, m) in crate::theme::Mode::ALL.iter().enumerate() {
-                                let seg = workspace::mode_segment_rect(
-                                    &slot,
-                                    i,
-                                    self.cell_width,
-                                    scale,
-                                );
-                                let on = *m == mode;
-                                let hov = !on && hover(cur, &seg);
-                                bg_quads.push(self.px_rect(
-                                    &seg,
-                                    if on { th.accent } else { th.ink },
-                                    if on {
-                                        0.9
-                                    } else if hov {
-                                        0.12
-                                    } else {
-                                        0.06
-                                    },
-                                    seg.h / 2.0,
-                                ));
-                                hot.push(seg);
-                                let lw = m.label().chars().count() as f32 * self.cell_width;
-                                labels.push(LabelSpec {
-                                    text: m.label().into(),
-                                    color: color(if on { (255, 255, 255) } else { th.ink_dim }, 1.0),
-                                    left: (seg.x + (seg.w - lw) / 2.0).round(),
-                                    top: mid(&slot),
-                                    clip: seg,
-                                    size: None,
-                                });
-                            }
+                    // "Preview" caption + the Light/Dark toggle it names,
+                    // controlling which polarity the cards below show.
+                    let seg0 = workspace::preview_segment_rect(&header, 0, self.cell_width, scale);
+                    let cap_w = "Preview".chars().count() as f32 * self.cell_width;
+                    labels.push(LabelSpec {
+                        text: "Preview".into(),
+                        color: color(th.ink_dim, 1.0),
+                        left: (seg0.x - cap_w - (14.0 * scale).round()).round(),
+                        top: mid(&header),
+                        clip: header,
+                        size: None,
+                    });
+                    for (i, name) in ["Light", "Dark"].iter().enumerate() {
+                        let seg = workspace::preview_segment_rect(&header, i, self.cell_width, scale);
+                        let on = (i == 1) == preview_dark;
+                        let hov = !on && hover(cur, &seg);
+                        bg_quads.push(self.px_rect(
+                            &seg,
+                            if on { th.accent } else { th.ink },
+                            if on {
+                                0.9
+                            } else if hov {
+                                0.12
+                            } else {
+                                0.06
+                            },
+                            seg.h / 2.0,
+                        ));
+                        hot.push(seg);
+                        let lw = name.chars().count() as f32 * self.cell_width;
+                        labels.push(LabelSpec {
+                            text: (*name).into(),
+                            color: color(if on { (255, 255, 255) } else { th.ink_dim }, 1.0),
+                            left: (seg.x + (seg.w - lw) / 2.0).round(),
+                            top: mid(&header),
+                            clip: seg,
+                            size: None,
+                        });
+                    }
+                }
+
+                // ── Column captions ──
+                for (col, caption) in [(0usize, "App Theme"), (1, "Terminal Colors")] {
+                    let column = workspace::appearance_column(area, col, scale);
+                    let cap = LayoutRect {
+                        h: (workspace::APPEARANCE_CAPTION_H * scale).round(),
+                        ..column
+                    };
+                    if fits(&cap) {
+                        labels.push(LabelSpec {
+                            text: caption.into(),
+                            color: color(th.accent, 1.0),
+                            left: column.x,
+                            top: (cap.y + (cap.h - self.cell_height) / 2.0).round(),
+                            clip: cap,
+                            size: Some(small),
+                        });
+                    }
+                }
+
+                // ── The four dropdown fields ──
+                for d in pages::AppearanceDropdown::ALL {
+                    let (col, field) = d.grid();
+                    let frect = workspace::appearance_dropdown_rect(area, col, field, scale);
+                    let pill = workspace::appearance_dropdown_pill(area, col, field, scale);
+                    if !fits(&pill) {
+                        continue;
+                    }
+                    labels.push(LabelSpec {
+                        text: d.label().into(),
+                        color: color(th.ink_dim, 1.0),
+                        left: frect.x + (2.0 * scale).round(),
+                        top: frect.y,
+                        clip: frect,
+                        size: Some(small),
+                    });
+                    // The slot the preview currently reflects carries the
+                    // accent tint, mirroring the picked style elsewhere.
+                    let live = d.dark() == preview_dark;
+                    let hov = hover(cur, &pill);
+                    bg_quads.push(self.px_rect(
+                        &pill,
+                        if live { th.accent } else { th.ink },
+                        if live { 0.14 } else { 0.06 } + if hov { 0.06 } else { 0.0 },
+                        (7.0 * scale).round(),
+                    ));
+                    hot.push(pill);
+                    let (swatches, name): ([(u8, u8, u8); 3], &str) = match d {
+                        pages::AppearanceDropdown::ThemeLight
+                        | pages::AppearanceDropdown::ThemeDark => {
+                            let t = crate::theme::selected(d.dark());
+                            ([t.gradient_from, t.card, t.accent], t.label)
                         },
-                        pages::AppearanceItem::Header(text) => {
+                        pages::AppearanceDropdown::TermLight
+                        | pages::AppearanceDropdown::TermDark => {
+                            let sel = crate::term_theme::selected(d.dark());
+                            let (_, _, ansi) = crate::term_theme::preview_colors(sel, th.term_bg);
+                            ([ansi[1], ansi[2], ansi[4]], sel.map_or("Default", |t| t.label))
+                        },
+                    };
+                    let cy = (pill.y + (pill.h - chip) / 2.0).round();
+                    for (i, c) in swatches.iter().enumerate() {
+                        let r = LayoutRect {
+                            x: (pill.x + ipad + i as f32 * (chip + chip_gap)).round(),
+                            y: cy,
+                            w: chip,
+                            h: chip,
+                        };
+                        bg_quads.push(self.px_rect(&r, *c, 1.0, (3.0 * scale).round()));
+                    }
+                    let text_left =
+                        (pill.x + ipad + 3.0 * (chip + chip_gap) + (6.0 * scale)).round();
+                    let pmid = (pill.y + (pill.h - self.cell_height) / 2.0).round();
+                    labels.push(LabelSpec {
+                        text: name.into(),
+                        color: color(th.ink, 1.0),
+                        left: text_left,
+                        top: pmid,
+                        clip: LayoutRect {
+                            x: text_left,
+                            w: (pill.x + pill.w - ipad - self.cell_width - text_left).max(0.0),
+                            ..pill
+                        },
+                        size: None,
+                    });
+                    labels.push(LabelSpec {
+                        text: "▾".into(),
+                        color: color(th.ink_dim, 1.0),
+                        left: (pill.x + pill.w - ipad - self.cell_width).round(),
+                        top: pmid,
+                        clip: pill,
+                        size: None,
+                    });
+                }
+
+                // ── App preview: a miniature of the chrome under the
+                // previewed polarity's selected theme ──
+                let pt = crate::theme::selected(preview_dark);
+                let pv = workspace::appearance_preview_card(area, 0, scale);
+                if fits(&pv) && pv.h > 80.0 * scale {
+                    let r = (10.0 * scale).round();
+                    bg_quads.push(self.px_rect(&pv, pt.gradient_from, 1.0, r).shadow(Shadow::Soft));
+                    // Title row: traffic dots + theme name.
+                    let dot = (8.0 * scale).round();
+                    let dgap = (5.0 * scale).round();
+                    let title_h = (24.0 * scale).round();
+                    for i in 0..3 {
+                        let drect = LayoutRect {
+                            x: (pv.x + ipad + i as f32 * (dot + dgap)).round(),
+                            y: (pv.y + (title_h - dot) / 2.0).round(),
+                            w: dot,
+                            h: dot,
+                        };
+                        bg_quads.push(self.px_rect(&drect, pt.ink, 0.25, dot / 2.0));
+                    }
+                    labels.push(LabelSpec {
+                        text: format!("{} · Preview", pt.label),
+                        color: color(pt.ink_dim, 1.0),
+                        left: (pv.x + ipad + 3.0 * (dot + dgap) + (6.0 * scale)).round(),
+                        top: (pv.y + (title_h - self.cell_height) / 2.0).round(),
+                        clip: pv,
+                        size: Some(small),
+                    });
+                    // Mini sidebar: three group rows, the first raised.
+                    let body = LayoutRect {
+                        x: pv.x,
+                        y: pv.y + title_h,
+                        w: pv.w,
+                        h: (pv.h - title_h).max(0.0),
+                    };
+                    let sb_w = (110.0 * scale).round().min((body.w * 0.35).round());
+                    let row_h = (22.0 * scale).round();
+                    for (i, name) in ["flaky tests", "stripe v4", "docs pass"].iter().enumerate() {
+                        let rrect = LayoutRect {
+                            x: (body.x + ipad).round(),
+                            y: (body.y + (6.0 * scale) + i as f32 * (row_h + (4.0 * scale)))
+                                .round(),
+                            w: (sb_w - 1.5 * ipad).max(0.0),
+                            h: row_h,
+                        };
+                        if rrect.y + rrect.h > pv.y + pv.h - ipad {
+                            break;
+                        }
+                        if i == 0 {
+                            bg_quads.push(self.px_rect(&rrect, pt.card, 0.9, (6.0 * scale).round()));
+                        }
+                        labels.push(LabelSpec {
+                            text: (*name).into(),
+                            color: color(if i == 0 { pt.ink } else { pt.ink_dim }, 1.0),
+                            left: rrect.x + (7.0 * scale).round(),
+                            top: (rrect.y + (rrect.h - self.cell_height) / 2.0).round(),
+                            clip: rrect,
+                            size: Some(small),
+                        });
+                    }
+                    // Mini tile: the floating terminal card, deliberately a
+                    // small element like in the real layout — the theme's
+                    // polarity reads from the gradient + surface ground. The
+                    // pane itself mirrors `build_frame`'s chrome: the
+                    // selected profile's ground/text when one is set, the
+                    // theme's terminal tokens for the adaptive Default.
+                    let (pane_bg, pane_ink, pane_dim, pane_divider) =
+                        match crate::term_theme::selected(preview_dark) {
+                            Some(t) => (t.bg, t.fg, (t.fg, 0.55), (t.fg, 0.15)),
+                            None => (
+                                pt.term_bg,
+                                pt.text_bright,
+                                (pt.text_dim, 1.0),
+                                (pt.card_divider, 1.0),
+                            ),
+                        };
+                    let tile = LayoutRect {
+                        x: (body.x + sb_w).round(),
+                        y: (body.y + (6.0 * scale)).round(),
+                        w: (body.w - sb_w - ipad).max(0.0),
+                        h: (body.h * 0.42).round().max(0.0),
+                    };
+                    bg_quads.push(
+                        self.px_rect(&tile, pane_bg, 1.0, (8.0 * scale).round())
+                            .shadow(Shadow::Soft),
+                    );
+                    let strip_h = (20.0 * scale).round();
+                    for (i, (tab, on)) in [("zsh", true), ("cargo", false)].iter().enumerate() {
+                        labels.push(LabelSpec {
+                            text: (*tab).into(),
+                            color: if *on {
+                                color(pane_ink, 1.0)
+                            } else {
+                                color(pane_dim.0, pane_dim.1)
+                            },
+                            left: (tile.x + ipad + i as f32 * (46.0 * scale)).round(),
+                            top: (tile.y + (strip_h - self.cell_height) / 2.0).round(),
+                            clip: tile,
+                            size: Some(small),
+                        });
+                    }
+                    let hairline = LayoutRect {
+                        x: tile.x,
+                        y: (tile.y + strip_h).round(),
+                        w: tile.w,
+                        h: (1.0 * scale).round().max(1.0),
+                    };
+                    bg_quads.push(self.px_rect(&hairline, pane_divider.0, pane_divider.1, 0.0));
+                    // A couple of pane lines in the pane's text colors.
+                    for (i, (line, (c, a))) in [
+                        ("$ cargo run", (pane_ink, 1.0)),
+                        ("   Compiling pwrde", pane_dim),
+                    ]
+                    .iter()
+                    .enumerate()
+                    {
+                        let top = (tile.y
+                            + strip_h
+                            + (8.0 * scale)
+                            + i as f32 * (self.cell_height + (4.0 * scale)))
+                            .round();
+                        if top + self.cell_height > tile.y + tile.h - (6.0 * scale) {
+                            break;
+                        }
+                        labels.push(LabelSpec {
+                            text: (*line).into(),
+                            color: color(*c, *a),
+                            left: (tile.x + ipad).round(),
+                            top,
+                            clip: tile,
+                            size: Some(small),
+                        });
+                    }
+                    let body_bottom = body.y + body.h - ipad;
+                    // Surface card on the gradient (popover / panel chrome).
+                    let sc = LayoutRect {
+                        x: tile.x,
+                        y: (tile.y + tile.h + (10.0 * scale)).round(),
+                        w: tile.w,
+                        h: (46.0 * scale).round(),
+                    };
+                    if sc.y + sc.h < body_bottom {
+                        bg_quads.push(
+                            self.px_rect(&sc, pt.card, 1.0, (7.0 * scale).round())
+                                .shadow(Shadow::Soft),
+                        );
+                        labels.push(LabelSpec {
+                            text: "Surface card".into(),
+                            color: color(pt.ink, 1.0),
+                            left: (sc.x + (8.0 * scale)).round(),
+                            top: (sc.y + (6.0 * scale)).round(),
+                            clip: sc,
+                            size: Some(small),
+                        });
+                        let sub = "Secondary text on surface · ";
+                        labels.push(LabelSpec {
+                            text: sub.into(),
+                            color: color(pt.ink_dim, 1.0),
+                            left: (sc.x + (8.0 * scale)).round(),
+                            top: (sc.y + (24.0 * scale)).round(),
+                            clip: sc,
+                            size: Some(small),
+                        });
+                        labels.push(LabelSpec {
+                            text: "a link".into(),
+                            color: color(pt.accent, 1.0),
+                            left: (sc.x + (8.0 * scale) + sub.chars().count() as f32 * small_cw)
+                                .round(),
+                            top: (sc.y + (24.0 * scale)).round(),
+                            clip: sc,
+                            size: Some(small),
+                        });
+                    }
+                    // Primary / secondary buttons on the gradient.
+                    let btn_h = (20.0 * scale).round();
+                    let by = (sc.y + sc.h + (10.0 * scale)).round();
+                    if by + btn_h < body_bottom {
+                        let bw1 = ("Primary".len() as f32 * small_cw + 2.0 * ipad).round();
+                        let b1 = LayoutRect { x: tile.x, y: by, w: bw1, h: btn_h };
+                        bg_quads.push(self.px_rect(&b1, pt.accent, 1.0, (6.0 * scale).round()));
+                        labels.push(LabelSpec {
+                            text: "Primary".into(),
+                            color: color((255, 255, 255), 1.0),
+                            left: (b1.x + ipad).round(),
+                            top: (b1.y + (b1.h - self.cell_height) / 2.0).round(),
+                            clip: b1,
+                            size: Some(small),
+                        });
+                        let bw2 = ("Secondary".len() as f32 * small_cw + 2.0 * ipad).round();
+                        let b2 = LayoutRect {
+                            x: (b1.x + b1.w + (8.0 * scale)).round(),
+                            y: by,
+                            w: bw2,
+                            h: btn_h,
+                        };
+                        bg_quads.push(self.px_rect(&b2, pt.ink, 0.08, (6.0 * scale).round()));
+                        labels.push(LabelSpec {
+                            text: "Secondary".into(),
+                            color: color(pt.ink, 1.0),
+                            left: (b2.x + ipad).round(),
+                            top: (b2.y + (b2.h - self.cell_height) / 2.0).round(),
+                            clip: b2,
+                            size: Some(small),
+                        });
+                    }
+                    // Token swatch strip, ink-ringed on the gradient.
+                    let chy = (by + btn_h + (12.0 * scale)).round();
+                    if chy + chip < body_bottom {
+                        let tokens = [pt.gradient_from, pt.card, pt.term_bg, pt.accent, pt.ink];
+                        for (i, c) in tokens.iter().enumerate() {
+                            let r = LayoutRect {
+                                x: (tile.x + i as f32 * (chip + chip_gap)).round(),
+                                y: chy,
+                                w: chip,
+                                h: chip,
+                            };
+                            // A faint ink ring keeps chips visible when a
+                            // token matches the gradient ground.
+                            let ring = (1.0 * scale).round().max(1.0);
+                            bg_quads.push(self.px_rect(
+                                &r.inflate(ring),
+                                pt.ink,
+                                0.25,
+                                (3.0 * scale).round() + ring,
+                            ));
+                            bg_quads.push(self.px_rect(&r, *c, 1.0, (3.0 * scale).round()));
+                        }
+                        labels.push(LabelSpec {
+                            text: "bg · surface · pane · accent · ink".into(),
+                            color: color(pt.ink_dim, 1.0),
+                            left: (tile.x + 5.0 * (chip + chip_gap) + (6.0 * scale)).round(),
+                            top: (chy + (chip - self.cell_height) / 2.0).round(),
+                            clip: *area,
+                            size: Some(small),
+                        });
+                    }
+                }
+
+                // ── Terminal preview: a fake shell session in the previewed
+                // polarity's selected scheme ──
+                let sel = crate::term_theme::selected(preview_dark);
+                let (tfg, tbg, ansi) = crate::term_theme::preview_colors(sel, pt.term_bg);
+                let pv = workspace::appearance_preview_card(area, 1, scale);
+                if fits(&pv) && pv.h > 80.0 * scale {
+                    let r = (10.0 * scale).round();
+                    bg_quads.push(self.px_rect(&pv, tbg, 1.0, r).shadow(Shadow::Soft));
+                    let strip_h = (24.0 * scale).round();
+                    let strip = LayoutRect { h: strip_h, ..pv };
+                    bg_quads.push(self.px_rect(&strip, (0, 0, 0), 0.18, r));
+                    labels.push(LabelSpec {
+                        text: format!("{} · Preview", sel.map_or("Default", |t| t.label)),
+                        color: color(tfg, 0.7),
+                        left: (pv.x + ipad).round(),
+                        top: (pv.y + (strip_h - self.cell_height) / 2.0).round(),
+                        clip: strip,
+                        size: Some(small),
+                    });
+                    // The full ANSI table, right-aligned in the strip.
+                    let c8 = (8.0 * scale).round();
+                    let cgap = (3.0 * scale).round();
+                    let x0 = pv.x + pv.w - ipad - (8.0 * c8 + 7.0 * cgap);
+                    for (i, c) in ansi.iter().enumerate() {
+                        let chip_r = LayoutRect {
+                            x: (x0 + i as f32 * (c8 + cgap)).round(),
+                            y: (pv.y + (strip_h - c8) / 2.0).round(),
+                            w: c8,
+                            h: c8,
+                        };
+                        bg_quads.push(self.px_rect(&chip_r, *c, 1.0, (2.0 * scale).round()));
+                    }
+                    // Fake session exercising fg, dim fg, and the accents.
+                    let fgc = color(tfg, 1.0);
+                    let dimc = color(tfg, 0.55);
+                    let red = color(ansi[1], 1.0);
+                    let green = color(ansi[2], 1.0);
+                    let yellow = color(ansi[3], 1.0);
+                    let magenta = color(ansi[5], 1.0);
+                    let cyan = color(ansi[6], 1.0);
+                    let lines: Vec<Vec<(&str, gpui::Hsla)>> = vec![
+                        vec![("you@dev", green), (":~/checkout$", dimc), (" git status", fgc)],
+                        vec![("On branch ", dimc), ("fix/flaky-capture", cyan)],
+                        vec![("  modified:  ", red), ("tests/conftest.py", fgc)],
+                        vec![("  new file:  ", green), ("tests/test_clock.py", fgc)],
+                        vec![("you@dev", green), (":~$", dimc), (" pytest -q", fgc)],
+                        vec![("warning: ", yellow), ("2 deprecation warnings", fgc)],
+                        vec![
+                            ("400 passed ", green),
+                            ("0 failed", red),
+                            (" in ", fgc),
+                            ("41.2s", magenta),
+                        ],
+                        vec![("❯ ", magenta), ("agent watching e2e ", fgc)],
+                    ];
+                    let lh = (self.cell_height + (4.0 * scale)).round();
+                    let mut y = (pv.y + strip_h + (8.0 * scale)).round();
+                    let mut cursor_pos = None;
+                    for spans in lines {
+                        if y + self.cell_height > pv.y + pv.h - ipad {
+                            break;
+                        }
+                        let mut x = (pv.x + ipad).round();
+                        for (text, c) in spans {
+                            let w = text.chars().count() as f32 * self.cell_width;
                             labels.push(LabelSpec {
                                 text: text.into(),
-                                color: color(th.ink_dim, 1.0),
-                                left: slot.x + pad,
-                                top: mid(&slot),
-                                clip: slot,
+                                color: c,
+                                left: x,
+                                top: y,
+                                clip: pv,
                                 size: None,
                             });
-                        },
-                        pages::AppearanceItem::Theme(t) => {
-                            let picked = crate::theme::selected(t.dark).name == t.name;
-                            self.appearance_slot(
-                                &slot,
-                                t.label,
-                                picked,
-                                picked && t.dark == dark_now,
-                                hover(cur, &slot),
-                                None,
-                                bg_quads,
-                                labels,
-                            );
-                            hot.push(slot);
-                        },
-                        // Action rows, never "picked": import installs the
-                        // clipboard's token string, export copies the active
-                        // theme's.
-                        pages::AppearanceItem::ImportTheme => {
-                            self.appearance_slot(
-                                &slot,
-                                "Import from Clipboard",
-                                false,
-                                false,
-                                hover(cur, &slot),
-                                None,
-                                bg_quads,
-                                labels,
-                            );
-                            hot.push(slot);
-                        },
-                        pages::AppearanceItem::ExportTheme => {
-                            self.appearance_slot(
-                                &slot,
-                                "Copy Theme String",
-                                false,
-                                false,
-                                hover(cur, &slot),
-                                None,
-                                bg_quads,
-                                labels,
-                            );
-                            hot.push(slot);
-                        },
-                        pages::AppearanceItem::TermDefault => {
-                            let picked = crate::term_theme::selected(dark_now).is_none();
-                            self.appearance_slot(
-                                &slot,
-                                "Default",
-                                picked,
-                                picked,
-                                hover(cur, &slot),
-                                None,
-                                bg_quads,
-                                labels,
-                            );
-                            hot.push(slot);
-                        },
-                        pages::AppearanceItem::Term(t) => {
-                            let picked = crate::term_theme::selected(t.dark)
-                                .is_some_and(|s| s.name == t.name);
-                            self.appearance_slot(
-                                &slot,
-                                t.label,
-                                picked,
-                                picked && t.dark == dark_now,
-                                hover(cur, &slot),
-                                Some(&t.ansi),
-                                bg_quads,
-                                labels,
-                            );
-                            hot.push(slot);
-                        },
+                            x = (x + w).round();
+                        }
+                        cursor_pos = Some((x, y));
+                        y += lh;
                     }
+                    // Block cursor trailing the last line.
+                    if let Some((cx, cy)) = cursor_pos {
+                        let cur_r = LayoutRect {
+                            x: cx,
+                            y: cy,
+                            w: (self.cell_width * 0.6).round().max(1.0),
+                            h: self.cell_height,
+                        };
+                        bg_quads.push(self.px_rect(&cur_r, tfg, 0.9, 0.0));
+                    }
+                }
+
+                // ── Footer: theme sharing actions + live-apply note ──
+                // (`fits` excludes the card's own bottom band, so gate on the
+                // footer clearing the header instead.)
+                let footer = workspace::appearance_footer_row(area, scale);
+                if footer.y > header.y + header.h {
+                    for (i, name) in
+                        ["Import from Clipboard", "Copy Theme String"].iter().enumerate()
+                    {
+                        let b = workspace::appearance_footer_action(area, i, self.cell_width, scale);
+                        let hov = hover(cur, &b);
+                        bg_quads.push(self.px_rect(
+                            &b,
+                            th.ink,
+                            if hov { 0.12 } else { 0.06 },
+                            b.h / 2.0,
+                        ));
+                        hot.push(b);
+                        let lw = name.chars().count() as f32 * self.cell_width;
+                        labels.push(LabelSpec {
+                            text: (*name).into(),
+                            color: color(th.ink, 1.0),
+                            left: (b.x + (b.w - lw) / 2.0).round(),
+                            top: (b.y + (b.h - self.cell_height) / 2.0).round(),
+                            clip: b,
+                            size: None,
+                        });
+                    }
+                    let note = "changes apply live";
+                    let w = note.chars().count() as f32 * self.cell_width;
+                    labels.push(LabelSpec {
+                        text: note.into(),
+                        color: color(th.ink_dim, 1.0),
+                        left: (footer.x + footer.w - w).round(),
+                        top: mid(&footer),
+                        clip: footer,
+                        size: None,
+                    });
                 }
             },
             Section::Terminal => {
@@ -2115,65 +2632,102 @@ impl Renderer {
     /// resolved mode is actually applying. `picked` marks the entry its own
     /// polarity slot points at (both slots stay visible at once).
     #[allow(clippy::too_many_arguments)]
-    fn appearance_slot(
+    /// The Appearance page's open dropdown menu: a floating card listing the
+    /// slot's options, drawn in the picker layers so it paints above the page.
+    /// Not a modal overlay — the page stays interactive; menu rects are simply
+    /// pushed after the page's so reverse hit-order favors them.
+    fn appearance_menu_overlay(
         &self,
-        slot: &LayoutRect,
-        label: &str,
-        picked: bool,
-        applied: bool,
-        hovered: bool,
-        chips: Option<&[(u8, u8, u8); 8]>,
-        bg_quads: &mut Vec<Quad>,
-        labels: &mut Vec<LabelSpec>,
-    ) {
+        area: &LayoutRect,
+        menu: crate::pages::AppearanceDropdown,
+        cursor: Option<(f32, f32)>,
+        quads: &mut Vec<Quad>,
+        hot: &mut Vec<LayoutRect>,
+    ) -> Vec<LabelSpec> {
         let th = self.theme();
         let scale = self.scale;
-        let pad = (10.0 * scale).round();
-        let inset = (2.0 * scale).round();
-        let mid = (slot.y + (slot.h - self.cell_height) / 2.0).round();
-        let pill = LayoutRect {
-            y: slot.y + inset,
-            h: (slot.h - 2.0 * inset).max(0.0),
-            ..*slot
+        let mut labels = Vec::new();
+        let (col, field) = menu.grid();
+        let dark = menu.dark();
+        // Each option as (swatches, label, selected), resolved once.
+        let rows: Vec<([(u8, u8, u8); 3], &'static str, bool)> = match menu {
+            crate::pages::AppearanceDropdown::ThemeLight
+            | crate::pages::AppearanceDropdown::ThemeDark => {
+                let sel = crate::theme::selected(dark).name;
+                crate::pages::theme_options(dark)
+                    .iter()
+                    .map(|t| ([t.gradient_from, t.card, t.accent], t.label, t.name == sel))
+                    .collect()
+            },
+            crate::pages::AppearanceDropdown::TermLight
+            | crate::pages::AppearanceDropdown::TermDark => {
+                let sel = crate::term_theme::selected(dark).map(|t| t.name);
+                crate::pages::term_options(dark)
+                    .iter()
+                    .map(|o| match o {
+                        Some(t) => {
+                            ([t.ansi[1], t.ansi[2], t.ansi[4]], t.label, sel == Some(t.name))
+                        },
+                        None => {
+                            let (_, _, ansi) =
+                                crate::term_theme::preview_colors(None, th.term_bg);
+                            ([ansi[1], ansi[2], ansi[4]], "Default", sel.is_none())
+                        },
+                    })
+                    .collect()
+            },
         };
-        // Hover deepens the pill one notch in whichever color it already has.
-        bg_quads.push(self.px_rect(
-            &pill,
-            if picked { th.accent } else { th.ink },
-            if picked { 0.14 } else { 0.06 } + if hovered { 0.06 } else { 0.0 },
-            (7.0 * scale).round(),
-        ));
-        // The dot column is always reserved so chips align across rows.
-        if applied {
+        let panel = workspace::appearance_menu_panel(area, col, field, rows.len(), scale);
+        quads.push(self.px_rect(&panel, th.card, 0.98, (9.0 * scale).round()).shadow(Shadow::Card));
+        hot.push(panel);
+        let ipad = (10.0 * scale).round();
+        let chip = (9.0 * scale).round();
+        let cgap = (3.0 * scale).round();
+        for (i, (chips, name, selected)) in rows.iter().enumerate() {
+            let row = workspace::appearance_menu_item(area, col, field, rows.len(), i, scale);
+            let inner = LayoutRect {
+                x: row.x + (4.0 * scale).round(),
+                w: (row.w - (8.0 * scale).round()).max(0.0),
+                ..row
+            };
+            if *selected {
+                quads.push(self.px_rect(&inner, th.accent, 0.14, (6.0 * scale).round()));
+            } else if hover(cursor, &row) {
+                quads.push(self.px_rect(&inner, th.ink, 0.08, (6.0 * scale).round()));
+            }
+            hot.push(row);
+            let cy = (row.y + (row.h - chip) / 2.0).round();
+            for (j, c) in chips.iter().enumerate() {
+                let r = LayoutRect {
+                    x: (inner.x + ipad + j as f32 * (chip + cgap)).round(),
+                    y: cy,
+                    w: chip,
+                    h: chip,
+                };
+                quads.push(self.px_rect(&r, *c, 1.0, (3.0 * scale).round()));
+            }
+            let text_left = (inner.x + ipad + 3.0 * (chip + cgap) + (6.0 * scale)).round();
+            let top = (row.y + (row.h - self.cell_height) / 2.0).round();
             labels.push(LabelSpec {
-                text: "●".into(),
-                color: color(th.accent, 1.0),
-                left: (slot.x + slot.w - pad - self.cell_width).round(),
-                top: mid,
-                clip: *slot,
+                text: (*name).into(),
+                color: color(if *selected { th.ink } else { th.ink_dim }, 1.0),
+                left: text_left,
+                top,
+                clip: inner,
                 size: None,
             });
-        }
-        let mut right = slot.x + slot.w - pad - self.cell_width - (6.0 * scale).round();
-        if let Some(ansi) = chips {
-            let cw = (8.0 * scale).round();
-            let gap = (2.0 * scale).round();
-            let x0 = right - (8.0 * cw + 7.0 * gap);
-            let y = (slot.y + (slot.h - cw) / 2.0).round();
-            for (i, c) in ansi.iter().enumerate() {
-                let chip = LayoutRect { x: (x0 + i as f32 * (cw + gap)).round(), y, w: cw, h: cw };
-                bg_quads.push(self.px_rect(&chip, *c, 1.0, (2.0 * scale).round()));
+            if *selected {
+                labels.push(LabelSpec {
+                    text: "\u{25cf}".into(),
+                    color: color(th.accent, 1.0),
+                    left: (inner.x + inner.w - ipad - self.cell_width).round(),
+                    top,
+                    clip: inner,
+                    size: None,
+                });
             }
-            right = x0 - pad;
         }
-        labels.push(LabelSpec {
-            text: label.into(),
-            color: color(if picked { th.ink } else { th.ink_dim }, 1.0),
-            left: slot.x + pad,
-            top: mid,
-            clip: LayoutRect { w: (right - slot.x - pad).max(0.0), ..*slot },
-            size: None,
-        });
+        labels
     }
 
     fn picker_overlay(
@@ -3423,6 +3977,10 @@ mod tests {
             open_tool: None,
             tool_panel_w: 0.0,
             cursor: None,
+            preview_dark: false,
+            appearance_menu: None,
+            settings_query: "",
+            settings_search_focus: false,
         }
     }
 
@@ -3609,6 +4167,69 @@ mod tests {
         assert!(
             frame.bg_quads.iter().any(|q| q.x == full.x && q.w == full.w),
             "tile card reclaims the ribbon's width"
+        );
+    }
+
+    /// The Settings sidebar renders the search box's placeholder in the top
+    /// slot and the section tabs one slot down, off the same rect helpers
+    /// main.rs hit-tests.
+    #[test]
+    fn settings_sidebar_shows_search_placeholder_above_tabs() {
+        let scale = 2.0;
+        let renderer = Renderer::new(scale, 18.0, 1600, 1000);
+        let state = Cleanup::default();
+        let mut chrome = cleanup_chrome(&state);
+        chrome.page = Page::Settings;
+        let ws = crate::workspace::Workspace::new(
+            "g".into(),
+            crate::workspace::Tile::empty(1),
+            None,
+        );
+        let sidebar_w = 240.0;
+        let frame = renderer.build_frame(
+            &[ws], 0, sidebar_w, None, None, None, None, None, None, None, None, None, None, &chrome,
+        );
+        let search = crate::workspace::settings_search_rect(scale, sidebar_w);
+        let search_y = (search.y + (search.h - renderer.cell_height) / 2.0).round();
+        assert!(
+            frame.labels.iter().any(|l| l.text == "Search settings" && l.top == search_y),
+            "placeholder sits in the top sidebar slot"
+        );
+        let tab = crate::workspace::tab_rect(1, scale, sidebar_w);
+        let tab_y = (tab.y + (tab.h - renderer.cell_height) / 2.0).round();
+        assert!(
+            frame.labels.iter().any(|l| l.text == "Sessions" && l.top == tab_y),
+            "first section tab shifts down one slot below the search box"
+        );
+    }
+
+    /// An active query replaces the section content with matching rows, each
+    /// naming its owning section, and echoes the query in the search box.
+    #[test]
+    fn settings_search_query_renders_result_rows() {
+        let renderer = Renderer::new(2.0, 18.0, 1600, 1000);
+        let state = Cleanup::default();
+        let mut chrome = cleanup_chrome(&state);
+        chrome.page = Page::Settings;
+        chrome.settings_query = "persist";
+        chrome.settings_search_focus = true;
+        let ws = crate::workspace::Workspace::new(
+            "g".into(),
+            crate::workspace::Tile::empty(1),
+            None,
+        );
+        let frame = renderer.build_frame(
+            &[ws], 0, 240.0, None, None, None, None, None, None, None, None, None, None, &chrome,
+        );
+        let texts: Vec<&str> = frame.labels.iter().map(|l| l.text.as_str()).collect();
+        assert!(texts.contains(&"persist"), "query echoes in the search box: {texts:?}");
+        assert!(texts.contains(&"Search results"), "card header switches to results");
+        assert!(texts.contains(&"Persist sessions"), "the Terminal match lists as a row");
+        // "Terminal" appears as a sidebar tab already; the result row's
+        // section tag makes it at least twice.
+        assert!(
+            texts.iter().filter(|t| **t == "Terminal").count() >= 2,
+            "result row names its owning section: {texts:?}"
         );
     }
 
@@ -3954,5 +4575,92 @@ mod tests {
         let texts: Vec<&str> = frame.labels.iter().map(|l| l.text.as_str()).collect();
         assert!(texts.contains(&"Delete 1 selected"));
         assert!(texts.contains(&"2 worktrees · 1 selected"));
+    }
+
+    /// One frame of the reworked Appearance page: header controls, the four
+    /// dropdown fields, both preview cards, and the footer actions all land
+    /// in the label stream.
+    #[test]
+    fn appearance_page_draws_dropdowns_previews_and_footer() {
+        let renderer = Renderer::new(2.0, 18.0, 1600, 1000);
+        let state = Cleanup::default();
+        let mut chrome = cleanup_chrome(&state);
+        chrome.page = Page::Settings;
+        chrome.section = Section::Appearance;
+        let tile = crate::workspace::Tile::new(1, crate::term::Session::placeholder());
+        let wss = [crate::workspace::Workspace::new("g".into(), tile, None)];
+        let frame = renderer.build_frame(
+            &wss, 0, 240.0, None, None, None, None, None, None, None, None, None, None, &chrome,
+        );
+        let texts: Vec<&str> = frame.labels.iter().map(|l| l.text.as_str()).collect();
+        for expected in [
+            "Mode",
+            "Preview",
+            "App Theme",
+            "Terminal Colors",
+            "Light Theme",
+            "Dark Theme",
+            "Light Profile",
+            "Dark Profile",
+            "Import from Clipboard",
+            "Copy Theme String",
+            "changes apply live",
+        ] {
+            assert!(texts.contains(&expected), "missing label {expected:?}");
+        }
+        // Both preview cards announce the scheme they render.
+        assert!(
+            texts.iter().filter(|t| t.ends_with("· Preview")).count() >= 2,
+            "expected two preview captions, got {texts:?}"
+        );
+    }
+
+    /// The preview polarity toggle switches which slot's theme the app
+    /// preview card renders (defaults: Arc Light / Midnight).
+    #[test]
+    fn appearance_preview_toggle_switches_polarity() {
+        let renderer = Renderer::new(2.0, 18.0, 1600, 1000);
+        let state = Cleanup::default();
+        let tile = crate::workspace::Tile::new(1, crate::term::Session::placeholder());
+        let wss = [crate::workspace::Workspace::new("g".into(), tile, None)];
+        for (dark, label) in [(false, "Arc Light · Preview"), (true, "Midnight · Preview")] {
+            let mut chrome = cleanup_chrome(&state);
+            chrome.page = Page::Settings;
+            chrome.section = Section::Appearance;
+            chrome.preview_dark = dark;
+            let frame = renderer.build_frame(
+                &wss, 0, 240.0, None, None, None, None, None, None, None, None, None, None,
+                &chrome,
+            );
+            assert!(
+                frame.labels.iter().any(|l| l.text == label),
+                "preview_dark={dark} should render {label:?}"
+            );
+        }
+    }
+
+    /// An open dropdown menu lists every theme in the overlay layers — mixing
+    /// polarities is allowed — with the slot's own polarity sorted first.
+    #[test]
+    fn appearance_menu_lists_polarity_options_above_the_page() {
+        let renderer = Renderer::new(2.0, 18.0, 1600, 1000);
+        let state = Cleanup::default();
+        let mut chrome = cleanup_chrome(&state);
+        chrome.page = Page::Settings;
+        chrome.section = Section::Appearance;
+        chrome.appearance_menu = Some(crate::pages::AppearanceDropdown::ThemeDark);
+        let tile = crate::workspace::Tile::new(1, crate::term::Session::placeholder());
+        let wss = [crate::workspace::Workspace::new("g".into(), tile, None)];
+        let frame = renderer.build_frame(
+            &wss, 0, 240.0, None, None, None, None, None, None, None, None, None, None, &chrome,
+        );
+        let menu_texts: Vec<&str> = frame.picker_labels.iter().map(|l| l.text.as_str()).collect();
+        for t in crate::theme::ALL {
+            assert!(menu_texts.contains(&t.label), "menu missing {:?}", t.label);
+        }
+        // The dark slot's menu sorts dark themes above light ones.
+        let pos = |label: &str| menu_texts.iter().position(|t| *t == label).unwrap();
+        assert!(pos("Midnight") < pos("Arc Light"), "own polarity should sort first");
+        assert!(!frame.picker_quads.is_empty(), "menu panel should paint in the overlay layer");
     }
 }
