@@ -425,8 +425,8 @@ pub fn new_section_button(scale: f32, sidebar_w: f32) -> LayoutRect {
 }
 
 /// Centered CTA used by the empty-state launch view.
-pub fn empty_state_cta(width: u32, height: u32, scale: f32, sidebar_w: f32) -> LayoutRect {
-    let area = terminal_area(width, height, scale, sidebar_w);
+pub fn empty_state_cta(width: u32, height: u32, scale: f32, sidebar_w: f32, right_w: f32) -> LayoutRect {
+    let area = terminal_area(width, height, scale, sidebar_w, right_w);
     let w = (180.0 * scale).round();
     let h = (52.0 * scale).round();
     LayoutRect {
@@ -437,8 +437,8 @@ pub fn empty_state_cta(width: u32, height: u32, scale: f32, sidebar_w: f32) -> L
     }
 }
 
-pub fn empty_state_hint(width: u32, height: u32, scale: f32, sidebar_w: f32) -> LayoutRect {
-    let cta = empty_state_cta(width, height, scale, sidebar_w);
+pub fn empty_state_hint(width: u32, height: u32, scale: f32, sidebar_w: f32, right_w: f32) -> LayoutRect {
+    let cta = empty_state_cta(width, height, scale, sidebar_w, right_w);
     LayoutRect { x: cta.x, y: cta.y + cta.h + (14.0 * scale).round(), w: cta.w, h: (22.0 * scale).round() }
 }
 
@@ -1109,14 +1109,15 @@ pub fn appearance_menu_item(
 /// keeps the full window height and just gains the thin left inset; the
 /// native traffic lights instead carve into the top-left tile's tab strip
 /// via [`tab_strip_rect`].
-pub fn terminal_area(width: u32, height: u32, scale: f32, sidebar_w: f32) -> LayoutRect {
+pub fn terminal_area(width: u32, height: u32, scale: f32, sidebar_w: f32, right_w: f32) -> LayoutRect {
     let sb = (sidebar_w * scale).round();
     let pad = (AREA_PAD * scale).round();
     let x = if sidebar_w == 0.0 { pad } else { sb };
+    let right_edge = (width as f32 - right_w * scale - pad).max(x);
     LayoutRect {
         x,
         y: pad,
-        w: (width as f32 - x - pad).max(0.0),
+        w: (right_edge - x).max(0.0),
         h: (height as f32 - 2.0 * pad).max(0.0),
     }
 }
@@ -1127,12 +1128,14 @@ pub struct Divider {
     pub dir: Dir,
 }
 
-/// Which resize handle the pointer is over (sidebar edge or a tile divider).
-/// Drives the cursor style and the hover highlight painted in the renderer.
+/// Which resize handle the pointer is over (sidebar edge, a tile divider,
+/// or the tool panel's left edge). Drives the cursor style and the hover
+/// highlight painted in the renderer.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ResizeHover {
     Sidebar,
     Divider { path: Vec<u8>, dir: Dir },
+    ToolPanel,
 }
 
 /// Hit-test the sidebar edge and tile dividers at `(px, py)`.
@@ -1525,6 +1528,17 @@ pub const FLYOVER_MAX_FRAC: f32 = 0.90;
 /// drag-resizing.
 pub const FLYOVER_RESIZE_GRAB: f32 = 4.0;
 
+/// Width (logical px) of the always-visible tool ribbon on the right window edge.
+pub const RIBBON_W: f32 = 36.0;
+/// Default width (logical px) of the tool panel when opened.
+pub const TOOL_PANEL_DEFAULT_W: f32 = 380.0;
+/// Minimum width (logical px) of the tool panel (drag-resize lower bound).
+pub const TOOL_PANEL_MIN_W: f32 = 260.0;
+/// Maximum width (logical px) of the tool panel (drag-resize upper bound).
+pub const TOOL_PANEL_MAX_W: f32 = 640.0;
+/// Half-width (logical px) of the grab zone on the panel's left edge for drag-resizing.
+pub const TOOL_PANEL_RESIZE_GRAB: f32 = 4.0;
+
 /// Resting rect of the flyover panel in physical pixels, interpolated by
 /// `anim` (0.0 = fully off-screen below, 1.0 = fully visible).
 ///
@@ -1624,6 +1638,82 @@ pub fn flyover_minimize_rect(rect: &LayoutRect, scale: f32) -> LayoutRect {
 pub fn flyover_maximize_rect(rect: &LayoutRect, scale: f32) -> LayoutRect {
     let bar = flyover_tab_bar(rect, scale);
     LayoutRect { x: bar.x + bar.w - bar.h, y: bar.y, w: bar.h, h: bar.h }
+}
+
+// ── Right-side tool ribbon ────────────────────────────────────────────────────
+
+/// The slim vertical icon strip along the right window edge.
+pub fn ribbon(width: u32, height: u32, scale: f32) -> LayoutRect {
+    let w = (RIBBON_W * scale).round();
+    LayoutRect {
+        x: width as f32 - w,
+        y: 0.0,
+        w,
+        h: height as f32,
+    }
+}
+
+/// A square icon slot inside the ribbon, stacked from the top (0-indexed).
+pub fn ribbon_slot_rect(i: usize, width: u32, scale: f32) -> LayoutRect {
+    let w = (RIBBON_W * scale).round();
+    let side = w; // square
+    LayoutRect {
+        x: width as f32 - w,
+        y: i as f32 * side,
+        w: side,
+        h: side,
+    }
+}
+
+/// The tool panel card, immediately left of the ribbon, vertically padded like
+/// `terminal_area` (i.e. inset by `AREA_PAD` top and bottom).
+pub fn tool_panel(width: u32, height: u32, scale: f32, panel_w: f32) -> LayoutRect {
+    let ribbon_w = (RIBBON_W * scale).round();
+    let pw = (panel_w * scale).round();
+    let pad = (AREA_PAD * scale).round();
+    LayoutRect {
+        x: width as f32 - ribbon_w - pw,
+        y: pad,
+        w: pw,
+        h: (height as f32 - 2.0 * pad).max(0.0),
+    }
+}
+
+#[cfg(test)]
+mod ribbon_tests {
+    use super::*;
+
+    #[test]
+    fn area_panel_and_ribbon_do_not_overlap() {
+        let (w, h, scale) = (1600, 1000, 2.0);
+        let panel_w = TOOL_PANEL_DEFAULT_W;
+        let area = terminal_area(w, h, scale, SIDEBAR_DEFAULT_W, RIBBON_W + panel_w);
+        let panel = tool_panel(w, h, scale, panel_w);
+        let rib = ribbon(w, h, scale);
+        assert!(area.x + area.w <= panel.x);
+        assert!(panel.x + panel.w <= rib.x);
+        assert_eq!(rib.x + rib.w, w as f32);
+    }
+
+    #[test]
+    fn area_narrows_by_exactly_the_panel_width() {
+        let (w, h, scale) = (1600, 1000, 2.0);
+        let closed = terminal_area(w, h, scale, SIDEBAR_DEFAULT_W, RIBBON_W);
+        let open = terminal_area(w, h, scale, SIDEBAR_DEFAULT_W, RIBBON_W + 380.0);
+        assert_eq!(closed.w - open.w, 380.0 * scale);
+        assert_eq!(closed.h, open.h);
+    }
+
+    #[test]
+    fn ribbon_slots_sit_inside_the_ribbon() {
+        let (w, h, scale) = (1600, 1000, 2.0);
+        let rib = ribbon(w, h, scale);
+        for i in 0..3 {
+            let slot = ribbon_slot_rect(i, w, scale);
+            assert!(slot.x >= rib.x && slot.x + slot.w <= rib.x + rib.w);
+            assert!(slot.y >= rib.y && slot.y + slot.h <= rib.y + rib.h);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1910,8 +2000,8 @@ mod tests {
     #[test]
     fn empty_state_cta_centered_in_terminal_area() {
         let (w, h, scale, sidebar_w) = (1600, 1000, 2.0, SIDEBAR_DEFAULT_W);
-        let area = terminal_area(w, h, scale, sidebar_w);
-        let cta = empty_state_cta(w, h, scale, sidebar_w);
+        let area = terminal_area(w, h, scale, sidebar_w, 0.0);
+        let cta = empty_state_cta(w, h, scale, sidebar_w, 0.0);
         assert!(cta.x >= area.x && cta.x + cta.w <= area.x + area.w);
         assert!(cta.y >= area.y && cta.y + cta.h <= area.y + area.h);
         // Horizontally centered.
@@ -1925,7 +2015,7 @@ mod tests {
         // sidebar_w == 0 (collapsed): full height, thin insets all around —
         // the traffic lights carve into the tab strip, not the area.
         let (w, h, scale) = (1600, 1000, 2.0);
-        let area = terminal_area(w, h, scale, 0.0);
+        let area = terminal_area(w, h, scale, 0.0, 0.0);
         let pad = (AREA_PAD * scale).round();
         assert_eq!(area.x, pad);
         assert_eq!(area.y, pad);
@@ -1936,7 +2026,7 @@ mod tests {
     #[test]
     fn tab_strip_inset_only_hits_the_top_left_tile_while_collapsed() {
         let (w, h, scale) = (1600, 1000, 2.0);
-        let area = terminal_area(w, h, scale, 0.0);
+        let area = terminal_area(w, h, scale, 0.0, 0.0);
         let safe = (TRAFFIC_LIGHT_SAFE_W * scale).round();
 
         // Top-left tile: strip starts right of the traffic lights, same span
@@ -1954,7 +2044,7 @@ mod tests {
         assert_eq!(tab_strip_rect(area, &below, scale, 0.0), below);
 
         // Expanded, even the top-left tile keeps its rect.
-        let ex_area = terminal_area(w, h, scale, SIDEBAR_DEFAULT_W);
+        let ex_area = terminal_area(w, h, scale, SIDEBAR_DEFAULT_W, 0.0);
         let ex_tile = LayoutRect { x: ex_area.x, y: ex_area.y, w: 800.0, h: 400.0 };
         assert_eq!(tab_strip_rect(ex_area, &ex_tile, scale, SIDEBAR_DEFAULT_W), ex_tile);
 
@@ -1971,7 +2061,7 @@ mod tests {
         // sidebar edge, inset only by the thin pad on top.
         let (w, h, scale) = (1600, 1000, 2.0);
         for sidebar_w in [SIDEBAR_MIN_W, SIDEBAR_DEFAULT_W, SIDEBAR_MAX_W] {
-            let area = terminal_area(w, h, scale, sidebar_w);
+            let area = terminal_area(w, h, scale, sidebar_w, 0.0);
             let pad = (AREA_PAD * scale).round();
             assert_eq!(area.x, (sidebar_w * scale).round());
             assert_eq!(area.y, pad);
@@ -1984,7 +2074,7 @@ mod tests {
         // With the sidebar collapsed the edge sits at x=0; a pointer near the
         // window's left edge must not read as a sidebar-resize grab.
         let node = Node::Leaf(Tile::empty(1));
-        let area = terminal_area(1600, 1000, 2.0, 0.0);
+        let area = terminal_area(1600, 1000, 2.0, 0.0, 0.0);
         assert_eq!(resize_hover_at(&node, area, 2.0, 0.0, 12.0, false, 4.0, 500.0), None);
     }
 
@@ -1993,7 +2083,7 @@ mod tests {
         // The outer border around the tile area should read exactly as thin
         // as the dividers between tiles.
         let (w, h, scale, sidebar_w) = (1600, 1000, 2.0, SIDEBAR_DEFAULT_W);
-        let area = terminal_area(w, h, scale, sidebar_w);
+        let area = terminal_area(w, h, scale, sidebar_w, 0.0);
         let gap = (TILE_GAP * scale).round();
         assert_eq!(area.y, gap);
         assert_eq!((w as f32) - (area.x + area.w), gap);
@@ -2003,8 +2093,8 @@ mod tests {
     #[test]
     fn empty_state_hint_sits_below_cta() {
         let (w, h, scale, sidebar_w) = (1600, 1000, 2.0, SIDEBAR_DEFAULT_W);
-        let cta = empty_state_cta(w, h, scale, sidebar_w);
-        let hint = empty_state_hint(w, h, scale, sidebar_w);
+        let cta = empty_state_cta(w, h, scale, sidebar_w, 0.0);
+        let hint = empty_state_hint(w, h, scale, sidebar_w, 0.0);
         assert!(hint.y >= cta.y + cta.h);
         assert_eq!(hint.x, cta.x);
     }

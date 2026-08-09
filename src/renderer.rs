@@ -254,6 +254,14 @@ pub struct ChromeState<'a> {
     pub editing_section: Option<(u64, &'a str)>,
     /// Cleanup page state (worktree table, selection, filter, scroll).
     pub cleanup: &'a crate::cleanup::Cleanup,
+    /// Tools registered for this page/group, in ribbon slot order (resolved
+    /// by `App::tools_for`). Empty hides the ribbon and its inset entirely.
+    pub ribbon_tools: &'a [pages::Tool],
+    /// Which right-side tool panel is open, if any (ribbon slot highlighted).
+    /// Only painted while it appears in `ribbon_tools`.
+    pub open_tool: Option<pages::Tool>,
+    /// Width of the open tool panel in logical px.
+    pub tool_panel_w: f32,
     /// Physical-pixel cursor position for hover painting. `None` while any
     /// drag is active so hover highlights are suppressed mid-drag.
     pub cursor: Option<(f32, f32)>,
@@ -493,7 +501,16 @@ impl Renderer {
         };
         let ws = &workspaces[active];
         let (width, height) = (self.width, self.height);
-        let area = workspace::terminal_area(width, height, self.scale, sidebar_w);
+        // Right inset: the ribbon (when this page/group registers tools)
+        // plus the open tool panel. Must match `App::right_w()` so painting
+        // and hit-testing agree on the tile area.
+        let open_tool = chrome.open_tool.filter(|t| chrome.ribbon_tools.contains(t));
+        let right_w = if chrome.ribbon_tools.is_empty() {
+            0.0
+        } else {
+            workspace::RIBBON_W + if open_tool.is_some() { chrome.tool_panel_w } else { 0.0 }
+        };
+        let area = workspace::terminal_area(width, height, self.scale, sidebar_w, right_w);
         let empty = workspaces.len() == 1 && workspaces[0].is_empty();
         // Dividers aren't painted (the gap between cards shows the gradient);
         // they remain drag handles for hit-testing in `main.rs`. The empty
@@ -574,8 +591,8 @@ impl Renderer {
                 if empty {
                     // Empty state: a centered CTA instead of group rows.
                     // Empty sections (if any) still render below the buttons.
-                    let cta = workspace::empty_state_cta(width, height, self.scale, sidebar_w);
-                    let hint = workspace::empty_state_hint(width, height, self.scale, sidebar_w);
+                    let cta = workspace::empty_state_cta(width, height, self.scale, sidebar_w, right_w);
+                    let hint = workspace::empty_state_hint(width, height, self.scale, sidebar_w, right_w);
                     let hov = hover(cur, &cta);
                     bg_quads.push(
                         self.px_rect(&cta, th.card, if hov { 0.85 } else { 0.62 }, row_r)
@@ -755,6 +772,53 @@ impl Renderer {
         }
 
         let card_r = (CARD_RADIUS * self.scale).round();
+
+        // ── Tool ribbon + panel (right edge, when tools are registered) ──
+        // Like the sidebar, the ribbon strip is transparent on the window
+        // gradient: only the slot pills and the panel card paint.
+        for (i, tool) in chrome.ribbon_tools.iter().enumerate() {
+            let slot = workspace::ribbon_slot_rect(i, width, self.scale);
+            let active = open_tool == Some(*tool);
+            let hov = hover(cur, &slot);
+            if active || hov {
+                let m = (4.0 * self.scale).round();
+                let pill = LayoutRect {
+                    x: slot.x + m,
+                    y: slot.y + m,
+                    w: (slot.w - 2.0 * m).max(0.0),
+                    h: (slot.h - 2.0 * m).max(0.0),
+                };
+                bg_quads.push(
+                    self.px_rect(&pill, th.card, if active { 0.85 } else { 0.40 }, row_r)
+                        .shadow(if active { Shadow::Soft } else { Shadow::None }),
+                );
+            }
+            let ink = if active || hov { th.ink } else { th.ink_dim };
+            self.ribbon_icon(*tool, &slot, ink, &mut bg_quads, &mut carets);
+            hot.push(slot);
+        }
+        if let Some(tool) = open_tool {
+            let panel = workspace::tool_panel(width, height, self.scale, chrome.tool_panel_w);
+            let pad = (14.0 * self.scale).round();
+            // Chrome-polarity card like Settings/Cleanup, not a dark tile.
+            bg_quads.push(self.px_rect(&panel, th.card, 1.0, card_r).shadow(Shadow::Card));
+            labels.push(LabelSpec {
+                text: tool.title().into(),
+                color: color(th.ink, 1.0),
+                left: panel.x + pad,
+                top: panel.y + pad,
+                clip: panel,
+                size: None,
+            });
+            labels.push(LabelSpec {
+                text: format!("{} view coming soon", tool.title()),
+                color: color(th.ink_dim, 1.0),
+                left: panel.x + pad,
+                top: (panel.y + pad + 2.0 * self.cell_height).round(),
+                clip: panel,
+                size: None,
+            });
+        }
 
         if chrome.page == Page::Settings {
             // ── Settings page: one tile-style card in the content area ──
@@ -1021,6 +1085,24 @@ impl Renderer {
                     if let Some(d) = dividers.iter().find(|d| d.path == *path) {
                         let vertical = d.dir == workspace::Dir::Row;
                         self.push_resize_grip(&mut bg_quads, &d.rect, vertical, th.ink);
+                    }
+                }
+                workspace::ResizeHover::ToolPanel => {
+                    if open_tool.is_some() {
+                        let panel = workspace::tool_panel(
+                            width,
+                            height,
+                            self.scale,
+                            chrome.tool_panel_w,
+                        );
+                        let line_w = (2.0 * self.scale).round().max(1.0);
+                        let line = LayoutRect {
+                            x: panel.x - line_w / 2.0,
+                            y: panel.y,
+                            w: line_w,
+                            h: panel.h,
+                        };
+                        self.push_resize_grip(&mut bg_quads, &line, true, th.ink);
                     }
                 }
             }
@@ -3720,6 +3802,100 @@ impl Renderer {
     }
 
     /// A quad straight from layout coordinates (already physical px).
+    /// A tool's ribbon glyph, drawn as vector quads inside a 16×16 logical-px
+    /// box centered on the slot — fonts can't be trusted to carry
+    /// octicon-style symbols, so like `rect.rs` we build them from geometry.
+    fn ribbon_icon(
+        &self,
+        tool: pages::Tool,
+        slot: &LayoutRect,
+        rgb: (u8, u8, u8),
+        quads: &mut Vec<Quad>,
+        carets: &mut Vec<CaretSpec>,
+    ) {
+        let px = |v: f32| (v * self.scale).round();
+        let (ix, iy) = (
+            (slot.x + (slot.w - px(16.0)) / 2.0).round(),
+            (slot.y + (slot.h - px(16.0)) / 2.0).round(),
+        );
+        let t = px(1.5).max(1.0);
+        match tool {
+            pages::Tool::Pr => {
+                // Pull-request mark: two branch endpoints joined to a merge
+                // target — hollow circles, a spine, and an elbow.
+                let d = px(6.0);
+                let circle = |cx: f32, cy: f32| LayoutRect {
+                    x: ix + px(cx) - d / 2.0,
+                    y: iy + px(cy) - d / 2.0,
+                    w: d,
+                    h: d,
+                };
+                for (cx, cy) in [(3.5, 3.5), (3.5, 12.5), (12.5, 12.5)] {
+                    quads.push(
+                        self.px_rect(&circle(cx, cy), rgb, 0.0, d / 2.0)
+                            .border(t, color(rgb, 1.0)),
+                    );
+                }
+                // Left spine between the two branch endpoints.
+                quads.push(self.px_rect(
+                    &LayoutRect {
+                        x: ix + px(3.5) - t / 2.0,
+                        y: iy + px(6.5),
+                        w: t,
+                        h: px(3.0),
+                    },
+                    rgb,
+                    1.0,
+                    0.0,
+                ));
+                // Elbow from the top endpoint over and down into the target.
+                quads.push(self.px_rect(
+                    &LayoutRect {
+                        x: ix + px(6.5),
+                        y: iy + px(3.5) - t / 2.0,
+                        w: px(6.0) + t / 2.0,
+                        h: t,
+                    },
+                    rgb,
+                    1.0,
+                    0.0,
+                ));
+                quads.push(self.px_rect(
+                    &LayoutRect {
+                        x: ix + px(12.5) - t / 2.0,
+                        y: iy + px(3.5),
+                        w: t,
+                        h: px(6.0),
+                    },
+                    rgb,
+                    1.0,
+                    0.0,
+                ));
+            },
+            pages::Tool::Launch => {
+                // Terminal-prompt mark (>_): launch runs a command in a shell.
+                carets.push(CaretSpec {
+                    cx: ix + px(4.5),
+                    cy: iy + px(8.0),
+                    size: px(3.5),
+                    angle: -std::f32::consts::FRAC_PI_2,
+                    color: color(rgb, 1.0),
+                });
+                quads.push(self.px_rect(
+                    &LayoutRect {
+                        x: ix + px(9.5),
+                        y: iy + px(12.5) - t / 2.0,
+                        w: px(5.0),
+                        h: t,
+                    },
+                    rgb,
+                    1.0,
+                    0.0,
+                ));
+            },
+        }
+    }
+
     fn px_rect(&self, r: &LayoutRect, rgb: (u8, u8, u8), alpha: f32, radius: f32) -> Quad {
         Quad {
             x: r.x,
@@ -3797,6 +3973,9 @@ mod tests {
             sections: &[],
             editing_section: None,
             cleanup,
+            ribbon_tools: &[],
+            open_tool: None,
+            tool_panel_w: 0.0,
             cursor: None,
             preview_dark: false,
             appearance_menu: None,
@@ -3854,6 +4033,141 @@ mod tests {
         assert!(texts.contains(&"3±"));
         assert!(texts.contains(&"Delete 0 selected"));
         assert!(!frame.bg_quads.is_empty());
+    }
+
+    /// The tool ribbon renders on every frame; opening a tool adds the panel
+    /// card (header + placeholder) and narrows the tile area to make room.
+    #[test]
+    fn tool_ribbon_and_panel_render() {
+        let scale = 2.0;
+        let renderer = Renderer::new(scale, 18.0, 1600, 1000);
+        let state = Cleanup::default();
+        let tile = crate::workspace::Tile::new(1, crate::term::Session::placeholder());
+        let wss = [crate::workspace::Workspace::new("g".into(), tile, None)];
+
+        // Closed: the ribbon icon is there, the panel is not.
+        let mut chrome = cleanup_chrome(&state);
+        chrome.page = Page::Sessions;
+        chrome.ribbon_tools = &pages::Tool::ALL;
+        let frame = renderer.build_frame(
+            &wss, 0, 240.0, None, None, None, None, None, None, None, None, None, None, &chrome,
+        );
+        let texts: Vec<&str> = frame.labels.iter().map(|l| l.text.as_str()).collect();
+        assert!(!texts.contains(&"Pull Request"));
+        let slot = crate::workspace::ribbon_slot_rect(0, 1600, scale);
+        // The PR mark is vector geometry: hollow (bordered, zero-alpha)
+        // circles inside the slot.
+        let d = (6.0 * scale).round();
+        assert_eq!(
+            frame
+                .bg_quads
+                .iter()
+                .filter(|q| q.w == d
+                    && q.radius == d / 2.0
+                    && q.border > 0.0
+                    && q.x >= slot.x
+                    && q.x + q.w <= slot.x + slot.w
+                    && q.y >= slot.y
+                    && q.y + q.h <= slot.y + slot.h)
+                .count(),
+            3,
+            "ribbon PR icon draws its three branch/merge circles"
+        );
+        assert!(
+            frame.hot.iter().any(|r| r.x == slot.x && r.y == slot.y),
+            "ribbon slot is a hover target"
+        );
+        // The Launch stub stacks below: its prompt chevron sits in slot 1.
+        let slot1 = crate::workspace::ribbon_slot_rect(1, 1600, scale);
+        assert!(frame.hot.iter().any(|r| r.x == slot1.x && r.y == slot1.y));
+        assert!(
+            frame.carets.iter().any(|c| c.cx >= slot1.x
+                && c.cx <= slot1.x + slot1.w
+                && c.cy >= slot1.y
+                && c.cy <= slot1.y + slot1.h),
+            "launch icon chevron renders in the second slot"
+        );
+
+        // Open: the panel card paints with header + placeholder, and the tile
+        // card stops left of the panel.
+        let mut chrome = cleanup_chrome(&state);
+        chrome.page = Page::Sessions;
+        chrome.ribbon_tools = &pages::Tool::ALL;
+        chrome.open_tool = Some(pages::Tool::Pr);
+        chrome.tool_panel_w = crate::workspace::TOOL_PANEL_DEFAULT_W;
+        let frame = renderer.build_frame(
+            &wss, 0, 240.0, None, None, None, None, None, None, None, None, None, None, &chrome,
+        );
+        let texts: Vec<&str> = frame.labels.iter().map(|l| l.text.as_str()).collect();
+        assert!(texts.contains(&"Pull Request"));
+        assert!(texts.contains(&"Pull Request view coming soon"));
+        let panel =
+            crate::workspace::tool_panel(1600, 1000, scale, crate::workspace::TOOL_PANEL_DEFAULT_W);
+        assert!(
+            frame.bg_quads.iter().any(|q| q.x == panel.x && q.w == panel.w),
+            "panel card quad renders"
+        );
+        let area = crate::workspace::terminal_area(
+            1600,
+            1000,
+            scale,
+            240.0,
+            crate::workspace::RIBBON_W + crate::workspace::TOOL_PANEL_DEFAULT_W,
+        );
+        assert!(
+            frame.bg_quads.iter().any(|q| q.x == area.x && q.w == area.w),
+            "tile card fills the narrowed area"
+        );
+        assert!(area.x + area.w <= panel.x, "tiles stop left of the panel");
+
+        // Hovering the panel's left edge paints the same ink-line grip the
+        // sidebar edge and dividers get.
+        let frame = renderer.build_frame(
+            &wss,
+            0,
+            240.0,
+            None,
+            Some(&crate::workspace::ResizeHover::ToolPanel),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &chrome,
+        );
+        let line_w = (2.0 * scale).round();
+        assert!(
+            frame
+                .bg_quads
+                .iter()
+                .any(|q| q.w == line_w && q.h == panel.h && q.x == panel.x - line_w / 2.0),
+            "panel edge grip line renders on hover"
+        );
+
+        // No tools registered (non-Sessions pages, or a group without the
+        // tool's context): ribbon and panel hide — even with a stale
+        // open_tool — and the tiles reclaim the full width.
+        let mut chrome = cleanup_chrome(&state);
+        chrome.page = Page::Sessions;
+        chrome.open_tool = Some(pages::Tool::Pr);
+        chrome.tool_panel_w = crate::workspace::TOOL_PANEL_DEFAULT_W;
+        let frame = renderer.build_frame(
+            &wss, 0, 240.0, None, None, None, None, None, None, None, None, None, None, &chrome,
+        );
+        let texts: Vec<&str> = frame.labels.iter().map(|l| l.text.as_str()).collect();
+        assert!(!texts.contains(&"Pull Request"));
+        assert!(
+            !frame.bg_quads.iter().any(|q| q.w == d && q.radius == d / 2.0 && q.border > 0.0),
+            "no ribbon icons without registered tools"
+        );
+        let full = crate::workspace::terminal_area(1600, 1000, scale, 240.0, 0.0);
+        assert!(
+            frame.bg_quads.iter().any(|q| q.x == full.x && q.w == full.w),
+            "tile card reclaims the ribbon's width"
+        );
     }
 
     /// The Settings sidebar renders the search box's placeholder in the top

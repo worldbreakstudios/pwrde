@@ -164,6 +164,33 @@ pub const DEBUG_TOGGLE_ROW: usize = 8;
 /// Row index of the "Persist sessions" toggle on the Terminal page.
 pub const PERSIST_TOGGLE_ROW: usize = 0;
 
+// ── Tool ribbon ─────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tool {
+    Pr,
+    Launch,
+}
+
+impl Tool {
+    pub const ALL: [Tool; 2] = [Tool::Pr, Tool::Launch];
+
+    /// Stable identifier used in the settings key (`toolpanel.tool`).
+    pub fn name(self) -> &'static str {
+        match self {
+            Tool::Pr => "pr",
+            Tool::Launch => "launch",
+        }
+    }
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Tool::Pr => "Pull Request",
+            Tool::Launch => "Launch",
+        }
+    }
+}
+
 // ── Rebindable actions ──────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -197,11 +224,12 @@ pub enum Action {
     ToggleFlyover,
     FlyoverPopout,
     SaveWorkspace,
+    ToggleToolPanel,
 }
 
 impl Action {
     /// Keyboard-page row order.
-    pub const ALL: [Action; 29] = [
+    pub const ALL: [Action; 30] = [
         Action::SplitRight,
         Action::SplitDown,
         Action::NewTab,
@@ -231,6 +259,7 @@ impl Action {
         Action::ToggleFlyover,
         Action::FlyoverPopout,
         Action::SaveWorkspace,
+        Action::ToggleToolPanel,
     ];
 
     /// Stable identifier used in the settings key (`keyboard.<name>`).
@@ -265,6 +294,7 @@ impl Action {
             Action::ToggleFlyover => "toggle_flyover",
             Action::FlyoverPopout => "flyover_popout",
             Action::SaveWorkspace => "save_workspace",
+            Action::ToggleToolPanel => "toggle_tool_panel",
         }
     }
 
@@ -299,6 +329,7 @@ impl Action {
             Action::ToggleFlyover => "Toggle Flyover Terminal",
             Action::FlyoverPopout => "Flyover: panel ↔ window",
             Action::SaveWorkspace => "Save as workspace",
+            Action::ToggleToolPanel => "Toggle tool panel",
         }
     }
 
@@ -337,6 +368,7 @@ impl Action {
             Action::ToggleFlyover => (false, "`"),
             Action::FlyoverPopout => (true, "`"),
             Action::SaveWorkspace => (true, "s"),
+            Action::ToggleToolPanel => (true, "g"),
         };
         Binding { shift, alt: false, ctrl: false, key: key.into() }
     }

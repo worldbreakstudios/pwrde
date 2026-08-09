@@ -172,6 +172,8 @@ enum Drag {
     FlyoverSelect,
     /// The flyover panel's top edge is being dragged to resize it.
     FlyoverResize,
+    /// The tool panel's left edge is being dragged to resize it.
+    ToolPanelResize,
     /// Sidebar group row pressed; may become a group drag past threshold.
     GroupPress { ws: usize, start: (f64, f64) },
     /// Dragging a sidebar workspace group tab.
@@ -314,6 +316,16 @@ struct App {
     preview_dark: bool,
     /// The appearance dropdown that currently has its option menu open, if any.
     appearance_menu: Option<pages::AppearanceDropdown>,
+    // ── Right-side tool ribbon / panel ────────────────────────────────────
+    /// Which tool panel is currently open, if any. Kept even while the tool
+    /// is unregistered (wrong page / non-git group) so it reappears when its
+    /// context returns.
+    open_tool: Option<pages::Tool>,
+    /// Width of the open tool panel in logical px (drag-resizable).
+    tool_panel_w: f32,
+    /// Whether a group cwd sits inside a git checkout, memoized per path —
+    /// ribbon registration probes this on every frame and hit-test.
+    git_cwd_cache: std::cell::RefCell<std::collections::HashMap<std::path::PathBuf, bool>>,
 }
 
 impl App {
@@ -325,6 +337,61 @@ impl App {
     /// (`workspace` geometry treats 0 as collapsed), else the user's width.
     fn sidebar_w(&self) -> f32 {
         if self.sidebar_collapsed { 0.0 } else { self.sidebar_expanded_w }
+    }
+
+    /// Tools registered for `page`, resolved against the active group.
+    /// Sessions tools are contextual per group: PR only when the group's cwd
+    /// sits in a git checkout (its content is branch-scoped), Launch always.
+    /// Other pages register none, which hides the ribbon entirely.
+    fn tools_for(&self, page: Page) -> Vec<pages::Tool> {
+        if page != Page::Sessions {
+            return Vec::new();
+        }
+        let mut tools = Vec::new();
+        if self.active_cwd_is_git() {
+            tools.push(pages::Tool::Pr);
+        }
+        tools.push(pages::Tool::Launch);
+        tools
+    }
+
+    /// Whether the active group's cwd (or an ancestor) is a git checkout.
+    fn active_cwd_is_git(&self) -> bool {
+        let cwd = match &self.workspaces[self.active].cwd {
+            Some(p) => p.clone(),
+            // `None` inherits the directory pwrde was launched from.
+            None => match std::env::current_dir() {
+                Ok(p) => p,
+                Err(_) => return false,
+            },
+        };
+        if let Some(&hit) = self.git_cwd_cache.borrow().get(&cwd) {
+            return hit;
+        }
+        let hit = cwd.ancestors().any(|a| a.join(".git").exists());
+        self.git_cwd_cache.borrow_mut().insert(cwd, hit);
+        hit
+    }
+
+    /// The open tool, if it's registered in the current page/group context.
+    fn visible_tool(&self) -> Option<pages::Tool> {
+        self.open_tool.filter(|t| self.tools_for(self.page).contains(t))
+    }
+
+    fn right_w(&self) -> f32 {
+        self.right_w_for(self.page)
+    }
+
+    fn right_w_for(&self, page: Page) -> f32 {
+        let tools = self.tools_for(page);
+        if tools.is_empty() {
+            return 0.0;
+        }
+        let panel = match self.open_tool {
+            Some(t) if tools.contains(&t) => self.tool_panel_w,
+            _ => 0.0,
+        };
+        workspace::RIBBON_W + panel
     }
 
     fn dpi(&self) -> u32 {
@@ -486,7 +553,7 @@ impl App {
     /// Physical-pixel terminal area (excludes the sidebar).
     fn area(&self) -> workspace::LayoutRect {
         let (w, h) = self.renderer.surface_size();
-        workspace::terminal_area(w, h, self.scale(), self.sidebar_w())
+        workspace::terminal_area(w, h, self.scale(), self.sidebar_w(), self.right_w())
     }
 
     /// The screen-space rect of a tile in the active workspace, if present.
@@ -510,7 +577,17 @@ impl App {
         let scale = self.scale();
         let (cw, ch) = self.cell_px();
         let dpi = self.dpi();
-        let area = self.area();
+        // Pin PTY sizing to Sessions geometry: pages without tools drop the
+        // ribbon inset from `area()`, and shells must not get resized just
+        // because the user flipped to Settings and back.
+        let (w, h) = self.renderer.surface_size();
+        let area = workspace::terminal_area(
+            w,
+            h,
+            scale,
+            self.sidebar_w(),
+            self.right_w_for(Page::Sessions),
+        );
         let ws = &mut self.workspaces[self.active];
         let (tiles, _) = workspace::layout_tiles(&ws.root, area, scale);
         let axes = workspace::tile_collapse_axis(&ws.root);
@@ -2739,11 +2816,41 @@ impl App {
             return;
         }
 
+        // Tool ribbon / panel (right edge, pages/groups with registered
+        // tools). Panel edge resizes, ribbon slots toggle their tool; both
+        // consume the click so it never falls through to the tiles behind.
+        let ribbon_tools = self.tools_for(self.page);
+        if !ribbon_tools.is_empty() {
+            if self.visible_tool().is_some() {
+                let panel = workspace::tool_panel(w, h, scale, self.tool_panel_w);
+                let pgrab = (workspace::TOOL_PANEL_RESIZE_GRAB * scale).max(1.0);
+                if (px - panel.x).abs() <= pgrab && py >= panel.y && py <= panel.y + panel.h {
+                    self.drag = Drag::ToolPanelResize;
+                    self.resize_hover = Some(workspace::ResizeHover::ToolPanel);
+                    self.request_redraw();
+                    return;
+                }
+                if panel.contains(px, py) {
+                    // Placeholder body: nothing interactive yet.
+                    return;
+                }
+            }
+            if workspace::ribbon(w, h, scale).contains(px, py) {
+                for (i, tool) in ribbon_tools.iter().enumerate() {
+                    if workspace::ribbon_slot_rect(i, w, scale).contains(px, py) {
+                        self.toggle_tool(*tool);
+                        break;
+                    }
+                }
+                return;
+            }
+        }
+
         // Empty state (Sessions only): the centered CTA is the only
         // interactive element in the content area (the placeholder tile must
         // not arm tab drags). The Settings page keeps its own hit-testing.
         if self.page == Page::Sessions && self.is_empty_state() && !sidebar.contains(px, py) {
-            if workspace::empty_state_cta(w, h, scale, self.sidebar_w()).contains(px, py) {
+            if workspace::empty_state_cta(w, h, scale, self.sidebar_w(), self.right_w()).contains(px, py) {
                 self.open_picker();
             }
             return;
@@ -2999,6 +3106,14 @@ impl App {
                 self.sync_layout();
                 self.request_redraw();
             },
+            Drag::ToolPanelResize => {
+                let (w, _) = self.renderer.surface_size();
+                let from_right = (w as f32 - px) / scale - workspace::RIBBON_W;
+                self.tool_panel_w = from_right
+                    .clamp(workspace::TOOL_PANEL_MIN_W, workspace::TOOL_PANEL_MAX_W);
+                self.sync_layout();
+                self.request_redraw();
+            },
             Drag::CleanupColumn { boundary } => {
                 let fracs = cleanup::drag_boundary(
                     &self.area(),
@@ -3114,22 +3229,36 @@ impl App {
                     // dividers — no resize affordance underneath it.
                     None
                 } else {
-                    let (_, h) = self.renderer.surface_size();
+                    let (w, h) = self.renderer.surface_size();
                     let sidebar_edge_x = workspace::sidebar(h, scale, self.sidebar_w()).w;
                     let grab = GRAB * scale;
                     let dividers_active =
                         self.page == Page::Sessions && !self.is_empty_state();
                     let ws = &self.workspaces[self.active];
-                    workspace::resize_hover_at(
-                        &ws.root,
-                        self.area(),
-                        scale,
-                        sidebar_edge_x,
-                        grab,
-                        dividers_active,
-                        px,
-                        py,
-                    )
+                    // Tool panel edge first: it sits over the tile area, so it
+                    // must win against the dividers behind it. Grab matches
+                    // on_mouse_down.
+                    let panel_edge = self.visible_tool().is_some() && {
+                        let panel = workspace::tool_panel(w, h, scale, self.tool_panel_w);
+                        let pgrab = (workspace::TOOL_PANEL_RESIZE_GRAB * scale).max(1.0);
+                        (px - panel.x).abs() <= pgrab
+                            && py >= panel.y
+                            && py <= panel.y + panel.h
+                    };
+                    if panel_edge {
+                        Some(workspace::ResizeHover::ToolPanel)
+                    } else {
+                        workspace::resize_hover_at(
+                            &ws.root,
+                            self.area(),
+                            scale,
+                            sidebar_edge_x,
+                            grab,
+                            dividers_active,
+                            px,
+                            py,
+                        )
+                    }
                 };
                 if hover != self.resize_hover {
                     self.resize_hover = hover;
@@ -3233,6 +3362,11 @@ impl App {
                 if let Some(target) = self.resolve_drop(px, py, tile) {
                     self.apply_drop(tile, tab, target);
                 }
+                self.request_redraw();
+            },
+            // Panel resize released: keep the width for future launches.
+            Drag::ToolPanelResize => {
+                settings::set("toolpanel.width", format!("{:.1}", self.tool_panel_w).into());
                 self.request_redraw();
             },
             // Resize released: fit the PTYs to the final height and keep it
@@ -3837,6 +3971,15 @@ impl App {
             | Action::CommandPalette => {},
             Action::ToggleFlyover => self.toggle_flyover(),
             Action::FlyoverPopout => self.flyover_toggle_windowed(),
+            // Closes whichever tool is open; opens the first registered tool
+            // when closed. No-op on pages/groups without tools.
+            Action::ToggleToolPanel => {
+                let tools = self.tools_for(self.page);
+                if let Some(&first) = tools.first() {
+                    let t = self.visible_tool().unwrap_or(first);
+                    self.toggle_tool(t);
+                }
+            },
         }
     }
 
@@ -3844,6 +3987,19 @@ impl App {
     /// the reclaimed (or surrendered) width immediately.
     fn toggle_sidebar(&mut self) {
         self.sidebar_collapsed = !self.sidebar_collapsed;
+        self.sync_layout();
+        self.request_redraw();
+    }
+
+    /// Toggle the given tool panel open/closed (clicking the active tool closes it).
+    fn toggle_tool(&mut self, tool: pages::Tool) {
+        if self.open_tool == Some(tool) {
+            self.open_tool = None;
+            settings::set("toolpanel.tool", "".into());
+        } else {
+            self.open_tool = Some(tool);
+            settings::set("toolpanel.tool", tool.name().into());
+        }
         self.sync_layout();
         self.request_redraw();
     }
@@ -4869,7 +5025,10 @@ impl App {
             || self.picker.is_some()
             || self.palette.is_some();
         let resize_hover = if overlay_open
-            || !matches!(self.drag, Drag::None | Drag::Sidebar | Drag::Divider { .. })
+            || !matches!(
+                self.drag,
+                Drag::None | Drag::Sidebar | Drag::Divider { .. } | Drag::ToolPanelResize
+            )
         {
             None
         } else {
@@ -4921,6 +5080,7 @@ impl App {
             _ => None,
         };
 
+        let ribbon_tools = self.tools_for(self.page);
         let chrome = renderer::ChromeState {
             page: self.page,
             section: self.section,
@@ -4935,6 +5095,9 @@ impl App {
             cleanup: &self.cleanup,
             settings_query: &self.settings_query,
             settings_search_focus: self.settings_search_focus,
+            ribbon_tools: &ribbon_tools,
+            open_tool: self.open_tool,
+            tool_panel_w: self.tool_panel_w,
             // Overlay scoping happens in the renderer (only overlay elements
             // hover while one is up). Here we suppress hover mid-drag, and
             // for the chrome under an open flyover panel — clicks inside the
@@ -5826,6 +5989,17 @@ fn main() {
                         picker_target: PickerTarget::Group,
                         preview_dark: theme::dark_active(),
                         appearance_menu: None,
+                        open_tool: settings::get_str("toolpanel.tool").and_then(|s| {
+                            pages::Tool::ALL.iter().copied().find(|t| t.name() == s)
+                        }),
+                        tool_panel_w: settings::get_str("toolpanel.width")
+                            .and_then(|s| s.parse::<f32>().ok())
+                            .map(|w| w.clamp(
+                                workspace::TOOL_PANEL_MIN_W,
+                                workspace::TOOL_PANEL_MAX_W,
+                            ))
+                            .unwrap_or(workspace::TOOL_PANEL_DEFAULT_W),
+                        git_cwd_cache: Default::default(),
                     };
                     // With persistence on, reattach to the previous session's
                     // groups; otherwise launch into the empty state — no shell
