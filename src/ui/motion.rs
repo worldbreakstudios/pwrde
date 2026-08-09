@@ -35,11 +35,15 @@ pub fn ease_out() -> impl Fn(f32) -> f32 {
 }
 
 /// Tailwind's default transition curve — cubic-bezier(0.4, 0, 0.2, 1).
+// Part of the motion primitive set; no component uses it yet.
+#[allow(dead_code)]
 pub fn ease_transition() -> impl Fn(f32) -> f32 {
     cubic_bezier(0.4, 0., 0.2, 1.)
 }
 
 /// `animate-in` (tw-animate-css enter keyframes): 150ms `ease`.
+// Part of the motion primitive set; no component uses it yet.
+#[allow(dead_code)]
 pub fn enter() -> Animation {
     Animation::new(Duration::from_millis(150)).with_easing(ease())
 }
@@ -49,9 +53,12 @@ pub fn enter_fast() -> Animation {
     Animation::new(Duration::from_millis(100)).with_easing(ease())
 }
 
+/// Clock shared by [`expand`] and the accordion's post-animation settle timer.
+pub const EXPAND_DURATION: Duration = Duration::from_millis(200);
+
 /// `accordion-down` / `collapsible-down`: 200ms `ease-out`.
 pub fn expand() -> Animation {
-    Animation::new(Duration::from_millis(200)).with_easing(ease_out())
+    Animation::new(EXPAND_DURATION).with_easing(ease_out())
 }
 
 /// Wrap an overlay panel with the popover family's enter animation —
@@ -69,6 +76,8 @@ pub fn pop_in<E: IntoElement + Styled + 'static>(
 
 /// Tailwind `animate-pulse`: opacity breathing 1 → 0.5 → 1 over 2s,
 /// repeating.
+// For the skeleton component; not yet ported.
+#[allow(dead_code)]
 pub fn pulse<E: IntoElement + Styled + 'static>(
     id: impl Into<ElementId>,
     element: E,
