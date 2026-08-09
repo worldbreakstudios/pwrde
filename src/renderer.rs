@@ -254,6 +254,10 @@ pub struct ChromeState<'a> {
     pub editing_section: Option<(u64, &'a str)>,
     /// Cleanup page state (worktree table, selection, filter, scroll).
     pub cleanup: &'a crate::cleanup::Cleanup,
+    /// Which right-side tool panel is open, if any (ribbon slot highlighted).
+    pub open_tool: Option<pages::Tool>,
+    /// Width of the open tool panel in logical px.
+    pub tool_panel_w: f32,
     /// Physical-pixel cursor position for hover painting. `None` while any
     /// drag is active so hover highlights are suppressed mid-drag.
     pub cursor: Option<(f32, f32)>,
@@ -485,7 +489,12 @@ impl Renderer {
         };
         let ws = &workspaces[active];
         let (width, height) = (self.width, self.height);
-        let area = workspace::terminal_area(width, height, self.scale, sidebar_w);
+        // Right inset: the always-visible ribbon plus the open tool panel.
+        // Must match `App::right_w()` so painting, hit-testing, and PTY
+        // sizing agree on the tile area.
+        let right_w = workspace::RIBBON_W
+            + if chrome.open_tool.is_some() { chrome.tool_panel_w } else { 0.0 };
+        let area = workspace::terminal_area(width, height, self.scale, sidebar_w, right_w);
         let empty = workspaces.len() == 1 && workspaces[0].is_empty();
         // Dividers aren't painted (the gap between cards shows the gradient);
         // they remain drag handles for hit-testing in `main.rs`. The empty
@@ -566,8 +575,8 @@ impl Renderer {
                 if empty {
                     // Empty state: a centered CTA instead of group rows.
                     // Empty sections (if any) still render below the buttons.
-                    let cta = workspace::empty_state_cta(width, height, self.scale, sidebar_w);
-                    let hint = workspace::empty_state_hint(width, height, self.scale, sidebar_w);
+                    let cta = workspace::empty_state_cta(width, height, self.scale, sidebar_w, right_w);
+                    let hint = workspace::empty_state_hint(width, height, self.scale, sidebar_w, right_w);
                     let hov = hover(cur, &cta);
                     bg_quads.push(
                         self.px_rect(&cta, th.card, if hov { 0.85 } else { 0.62 }, row_r)
@@ -712,6 +721,61 @@ impl Renderer {
         }
 
         let card_r = (CARD_RADIUS * self.scale).round();
+
+        // ── Tool ribbon + panel (right edge, identical on every page) ──
+        // Like the sidebar, the ribbon strip is transparent on the window
+        // gradient: only the slot pills and the panel card paint.
+        for (i, tool) in pages::Tool::ALL.iter().enumerate() {
+            let slot = workspace::ribbon_slot_rect(i, width, self.scale);
+            let active = chrome.open_tool == Some(*tool);
+            let hov = hover(cur, &slot);
+            if active || hov {
+                let m = (4.0 * self.scale).round();
+                let pill = LayoutRect {
+                    x: slot.x + m,
+                    y: slot.y + m,
+                    w: (slot.w - 2.0 * m).max(0.0),
+                    h: (slot.h - 2.0 * m).max(0.0),
+                };
+                bg_quads.push(
+                    self.px_rect(&pill, th.card, if active { 0.85 } else { 0.40 }, row_r)
+                        .shadow(if active { Shadow::Soft } else { Shadow::None }),
+                );
+            }
+            let icon = tool.icon();
+            let gw = icon.chars().count() as f32 * self.cell_width;
+            labels.push(LabelSpec {
+                text: icon.into(),
+                color: color(if active || hov { th.ink } else { th.ink_dim }, 1.0),
+                left: (slot.x + (slot.w - gw) / 2.0).round(),
+                top: (slot.y + (slot.h - self.cell_height) / 2.0).round(),
+                clip: slot.inflate((2.0 * self.scale).round()),
+                size: None,
+            });
+            hot.push(slot);
+        }
+        if let Some(tool) = chrome.open_tool {
+            let panel = workspace::tool_panel(width, height, self.scale, chrome.tool_panel_w);
+            let pad = (14.0 * self.scale).round();
+            // Chrome-polarity card like Settings/Cleanup, not a dark tile.
+            bg_quads.push(self.px_rect(&panel, th.card, 1.0, card_r).shadow(Shadow::Card));
+            labels.push(LabelSpec {
+                text: tool.title().into(),
+                color: color(th.ink, 1.0),
+                left: panel.x + pad,
+                top: panel.y + pad,
+                clip: panel,
+                size: None,
+            });
+            labels.push(LabelSpec {
+                text: "Pull request view coming soon".into(),
+                color: color(th.ink_dim, 1.0),
+                left: panel.x + pad,
+                top: (panel.y + pad + 2.0 * self.cell_height).round(),
+                clip: panel,
+                size: None,
+            });
+        }
 
         if chrome.page == Page::Settings {
             // ── Settings page: one tile-style card in the content area ──
@@ -3243,6 +3307,8 @@ mod tests {
             sections: &[],
             editing_section: None,
             cleanup,
+            open_tool: None,
+            tool_panel_w: 0.0,
             cursor: None,
         }
     }
@@ -3296,6 +3362,63 @@ mod tests {
         assert!(texts.contains(&"3±"));
         assert!(texts.contains(&"Delete 0 selected"));
         assert!(!frame.bg_quads.is_empty());
+    }
+
+    /// The tool ribbon renders on every frame; opening a tool adds the panel
+    /// card (header + placeholder) and narrows the tile area to make room.
+    #[test]
+    fn tool_ribbon_and_panel_render() {
+        let scale = 2.0;
+        let renderer = Renderer::new(scale, 18.0, 1600, 1000);
+        let state = Cleanup::default();
+        let tile = crate::workspace::Tile::new(1, crate::term::Session::placeholder());
+        let wss = [crate::workspace::Workspace::new("g".into(), tile, None)];
+
+        // Closed: the ribbon icon is there, the panel is not.
+        let mut chrome = cleanup_chrome(&state);
+        chrome.page = Page::Sessions;
+        let frame = renderer.build_frame(
+            &wss, 0, 240.0, None, None, None, None, None, None, None, None, None, None, &chrome,
+        );
+        let texts: Vec<&str> = frame.labels.iter().map(|l| l.text.as_str()).collect();
+        assert!(texts.contains(&"PR"), "ribbon icon renders when closed: {texts:?}");
+        assert!(!texts.contains(&"Pull Request"));
+        let slot = crate::workspace::ribbon_slot_rect(0, 1600, scale);
+        assert!(
+            frame.hot.iter().any(|r| r.x == slot.x && r.y == slot.y),
+            "ribbon slot is a hover target"
+        );
+
+        // Open: the panel card paints with header + placeholder, and the tile
+        // card stops left of the panel.
+        let mut chrome = cleanup_chrome(&state);
+        chrome.page = Page::Sessions;
+        chrome.open_tool = Some(pages::Tool::Pr);
+        chrome.tool_panel_w = crate::workspace::TOOL_PANEL_DEFAULT_W;
+        let frame = renderer.build_frame(
+            &wss, 0, 240.0, None, None, None, None, None, None, None, None, None, None, &chrome,
+        );
+        let texts: Vec<&str> = frame.labels.iter().map(|l| l.text.as_str()).collect();
+        assert!(texts.contains(&"Pull Request"));
+        assert!(texts.contains(&"Pull request view coming soon"));
+        let panel =
+            crate::workspace::tool_panel(1600, 1000, scale, crate::workspace::TOOL_PANEL_DEFAULT_W);
+        assert!(
+            frame.bg_quads.iter().any(|q| q.x == panel.x && q.w == panel.w),
+            "panel card quad renders"
+        );
+        let area = crate::workspace::terminal_area(
+            1600,
+            1000,
+            scale,
+            240.0,
+            crate::workspace::RIBBON_W + crate::workspace::TOOL_PANEL_DEFAULT_W,
+        );
+        assert!(
+            frame.bg_quads.iter().any(|q| q.x == area.x && q.w == area.w),
+            "tile card fills the narrowed area"
+        );
+        assert!(area.x + area.w <= panel.x, "tiles stop left of the panel");
     }
 
     /// The sidebar unread dot sits in the row's left padding gutter, not at
