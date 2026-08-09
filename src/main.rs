@@ -18,6 +18,7 @@
 
 mod claude_hooks;
 mod cleanup;
+mod cleanup_ui;
 mod git;
 mod links;
 mod pages;
@@ -31,6 +32,11 @@ mod settings;
 mod term;
 mod term_theme;
 mod theme;
+// Vendored shadcn-style component copies (see ui/mod.rs). Kept faithful to
+// their rcn source rather than pruned to current usage, so the unused parts
+// of the library surface are expected dead code in this bin crate.
+#[allow(dead_code)]
+mod ui;
 mod workspace;
 
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -43,6 +49,7 @@ use gpui::{
     ModifiersChangedEvent, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
     Point, QuitMode, Render, ShapedLine,
     Size, Styled, TextAlign, TextRun, Window, WindowBounds, WindowOptions,
+    prelude::FluentBuilder,
 };
 
 use pages::{Action, Binding, Page, Section};
@@ -158,8 +165,6 @@ enum Drag {
     None,
     /// Resizing the sidebar.
     Sidebar,
-    /// Resizing a Cleanup-table column boundary.
-    CleanupColumn { boundary: usize },
     /// Resizing a split divider at `path`.
     Divider { path: Vec<u8> },
     /// A tab was pressed; may become a drag past the threshold.
@@ -259,7 +264,7 @@ struct App {
     /// Sub-notch wheel travel carried between scroll events so tiny deltas
     /// accumulate into whole scroll steps instead of being lost.
     scroll_accum: f64,
-    /// Cleanup page state (worktree listing, selection, filter, scroll).
+    /// Cleanup page state (worktree listing, selection, filter).
     cleanup: cleanup::Cleanup,
     /// The active top-level page (Sessions / Settings).
     page: Page,
@@ -964,27 +969,9 @@ impl App {
                 return;
             }
         }
-        // Only the Sessions page has terminals to scroll; Cleanup has its own
-        // scroll handling below.
-        if self.page != Page::Sessions && self.page != Page::Cleanup {
-            return;
-        }
-        // Cleanup page: scroll the worktree table.
-        if self.page == Page::Cleanup {
-            let scale = self.scale();
-            let area = self.area();
-            let notches = match delta {
-                gpui::ScrollDelta::Lines(p) => p.y as f64,
-                gpui::ScrollDelta::Pixels(p) => f32::from(p.y) as f64 / (cell_height as f64 * 3.0),
-            };
-            let steps = scroll_steps(&mut self.scroll_accum, notches);
-            if steps != 0 {
-                let fit = cleanup::rows_that_fit(&area, scale);
-                let max_scroll = self.cleanup.rows().len().saturating_sub(fit);
-                let offset = self.cleanup.scroll as i64 - steps as i64;
-                self.cleanup.scroll = offset.clamp(0, max_scroll as i64) as usize;
-                self.request_redraw();
-            }
+        // Only the Sessions page has terminals to scroll; the Cleanup
+        // overlay's gpui scroll container handles its own wheel events.
+        if self.page != Page::Sessions {
             return;
         }
         let scale = self.scale();
@@ -2912,14 +2899,12 @@ impl App {
                 // "All" tab at index 0.
                 if workspace::tab_rect(0, scale, self.sidebar_w()).contains(px, py) {
                     self.cleanup.repo_filter = None;
-                    self.cleanup.scroll = 0;
                     self.request_redraw();
                     return;
                 }
                 for (i, repo) in repos.iter().enumerate() {
                     if workspace::tab_rect(i + 1, scale, self.sidebar_w()).contains(px, py) {
                         self.cleanup.repo_filter = Some(repo.root.clone());
-                        self.cleanup.scroll = 0;
                         self.request_redraw();
                         return;
                     }
@@ -2987,22 +2972,8 @@ impl App {
             self.settings_click(px, py);
             return;
         }
-        // Cleanup page: the content area is the cleanup card. A press on a
-        // column boundary starts a resize drag; anything else is a click.
+        // Cleanup page: the gpui overlay owns all content-area clicks.
         if self.page == Page::Cleanup {
-            if let Some(boundary) = cleanup::boundary_at(
-                &self.area(),
-                scale,
-                &self.cleanup.col_fracs,
-                px,
-                py,
-                GRAB * scale,
-            ) {
-                self.cleanup.hover = None;
-                self.drag = Drag::CleanupColumn { boundary };
-                return;
-            }
-            self.cleanup_click(px, py);
             return;
         }
         let area = self.area();
@@ -3113,19 +3084,6 @@ impl App {
                     .clamp(workspace::TOOL_PANEL_MIN_W, workspace::TOOL_PANEL_MAX_W);
                 self.sync_layout();
                 self.request_redraw();
-            },
-            Drag::CleanupColumn { boundary } => {
-                let fracs = cleanup::drag_boundary(
-                    &self.area(),
-                    scale,
-                    &self.cleanup.col_fracs,
-                    *boundary,
-                    px,
-                );
-                if fracs != self.cleanup.col_fracs {
-                    self.cleanup.col_fracs = fracs;
-                    self.request_redraw();
-                }
             },
             Drag::Divider { path } => {
                 let path = path.clone();
@@ -3264,19 +3222,6 @@ impl App {
                     self.resize_hover = hover;
                     self.request_redraw();
                 }
-                // Dirty-cell hover on the Cleanup page drives the file popover.
-                let cleanup_hover = if self.page == Page::Cleanup
-                    && self.confirm.is_none()
-                    && self.message.is_none()
-                {
-                    self.cleanup_dirty_hover_at(px, py)
-                } else {
-                    None
-                };
-                if cleanup_hover != self.cleanup.hover {
-                    self.cleanup.hover = cleanup_hover;
-                    self.request_redraw();
-                }
                 // Link hover: suppress when any overlay is open or not in Sessions page.
                 let link_hover = if self.page != Page::Sessions
                     || self.confirm.is_some()
@@ -3323,40 +3268,9 @@ impl App {
         }
     }
 
-    /// The id of the dirty worktree whose dirty cell is under the cursor.
-    fn cleanup_dirty_hover_at(&self, px: f32, py: f32) -> Option<String> {
-        let area = self.area();
-        let scale = self.scale();
-        let cols = cleanup::column_offsets(&area, scale, &self.cleanup.col_fracs);
-        if px < cols.dirty || px >= cols.parity {
-            return None;
-        }
-        let fit = cleanup::rows_that_fit(&area, scale);
-        for vi in 0..fit {
-            let row = cleanup::row_rect(&area, vi, scale)?;
-            if !row.contains(px, py) {
-                continue;
-            }
-            let idx = self.cleanup.scroll + vi;
-            return match self.cleanup.rows().get(idx) {
-                Some(cleanup::Row::Entry(w)) if w.dirty_count > 0 => Some(w.id.clone()),
-                _ => None,
-            };
-        }
-        None
-    }
-
     fn on_mouse_up(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let _ = (window, cx);
         match std::mem::replace(&mut self.drag, Drag::None) {
-            // Column resize released: keep the layout for future sessions.
-            Drag::CleanupColumn { .. } => {
-                settings::set(
-                    "cleanup.columns",
-                    cleanup::format_col_fracs(&self.cleanup.col_fracs).into(),
-                );
-                self.request_redraw();
-            },
             Drag::Tab { tile, tab } => {
                 let (px, py) = (self.cursor.0 as f32, self.cursor.1 as f32);
                 if let Some(target) = self.resolve_drop(px, py, tile) {
@@ -4038,7 +3952,6 @@ impl App {
                 } else {
                     repos.get(next - 1).map(|r| r.root.clone())
                 };
-                self.cleanup.scroll = 0;
                 self.request_redraw();
             },
         }
@@ -4077,71 +3990,6 @@ impl App {
         })
     }
 
-    /// Route a click inside the cleanup card to the row or button it hit.
-    fn cleanup_click(&mut self, px: f32, py: f32) {
-        let area = self.area();
-        let scale = self.scale();
-        let cell_w = self.renderer.cell_width;
-        // Refresh button.
-        if cleanup::refresh_button_rect(&area, scale, cell_w).contains(px, py) {
-            self.spawn_cleanup_scan();
-            return;
-        }
-        // Delete button — only active when selection is non-empty.
-        let delete = cleanup::delete_button_rect(&area, scale, cell_w);
-        if delete.contains(px, py) && !self.cleanup.selected.is_empty() {
-            let targets = self.cleanup.selected_by_repo();
-            let count: usize = targets.iter().map(|(_, ids)| ids.len()).sum();
-            let dirty = self.cleanup.selected_dirty_count();
-            let plural = if count == 1 { "" } else { "s" };
-            let text = if dirty > 0 {
-                format!(
-                    "Delete {count} worktree{plural}? {dirty} ha{} uncommitted changes — those are discarded.",
-                    if dirty == 1 { "s" } else { "ve" }
-                )
-            } else {
-                format!("Delete {count} worktree{plural}? Unmerged branches are kept.")
-            };
-            self.confirm = Some(ConfirmClose {
-                text,
-                action: ConfirmAction::CleanupDelete { targets },
-            });
-            self.request_redraw();
-            return;
-        }
-        // Row clicks: toggle an entry's selection, or filter to a header's
-        // repo (row_rect is None past the footer).
-        enum Hit {
-            Toggle(String),
-            Filter(String),
-        }
-        let fit = cleanup::rows_that_fit(&area, scale);
-        let mut hit: Option<Hit> = None;
-        for vi in 0..fit {
-            let Some(row) = cleanup::row_rect(&area, vi, scale) else { break };
-            if !row.contains(px, py) {
-                continue;
-            }
-            let idx = self.cleanup.scroll + vi;
-            hit = self.cleanup.rows().get(idx).map(|r| match r {
-                cleanup::Row::Entry(w) => Hit::Toggle(w.id.clone()),
-                cleanup::Row::Header { root, .. } => Hit::Filter(root.to_string()),
-            });
-            break;
-        }
-        match hit {
-            Some(Hit::Toggle(id)) => {
-                self.cleanup.toggle(&id);
-                self.request_redraw();
-            },
-            Some(Hit::Filter(root)) => {
-                self.cleanup.repo_filter = Some(root);
-                self.cleanup.scroll = 0;
-                self.request_redraw();
-            },
-            None => {},
-        }
-    }
 
     /// Kick off a background `drop -d --json` sweep and show the scanning
     /// state until its `TermEvent` lands.
@@ -4987,6 +4835,12 @@ impl Render for App {
                 // the terminal never paints.
                 .size_full(),
             )
+            // Cleanup page overlay: real gpui element tree above the canvas.
+            // Skip while a confirm dialog is open so the canvas-painted scrim
+            // owns the screen (v1 tradeoff).
+            .when(self.page == Page::Cleanup && self.confirm.is_none(), |el| {
+                el.child(self.render_cleanup(cx))
+            })
     }
 }
 
@@ -5882,8 +5736,13 @@ fn main() {
     let platform = gpui_platform::current_platform(false);
     // macOS's default keeps the process alive after the last window closes
     // (document-app convention); a single-window terminal should just quit.
-    let app = Application::with_platform(platform).with_quit_mode(QuitMode::LastWindowClosed);
+    let app = Application::with_platform(platform)
+        .with_assets(ui::assets::Assets)
+        .with_quit_mode(QuitMode::LastWindowClosed);
     app.run(|cx: &mut GpuiApp| {
+        // Seed the rcn Theme global before any window opens so Theme::of
+        // never panics; Cleanup re-syncs it each frame from chrome tokens.
+        cx.set_global(ui::theme::Theme::from_chrome(crate::theme::current()));
         let bounds = Bounds::centered(None, gpui::size(px(1200.0), px(720.0)), cx);
         let (events_tx, events_rx) = mpsc::channel::<TermEvent>();
 
@@ -5963,13 +5822,7 @@ fn main() {
                         },
                         dot_hover: None,
                         resize_hover: None,
-                        cleanup: {
-                            let mut c = cleanup::Cleanup::default();
-                            if let Some(s) = settings::get_str("cleanup.columns") {
-                                c.col_fracs = cleanup::parse_col_fracs(&s);
-                            }
-                            c
-                        },
+                        cleanup: cleanup::Cleanup::default(),
                         link_hover: None,
                         hot_rects: Vec::new(),
                         ui_hover: None,

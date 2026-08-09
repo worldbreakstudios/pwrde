@@ -351,7 +351,10 @@ const TILE_TAB_H: f32 = 28.0;
 const TILE_GAP: f32 = 3.0;
 /// Padding between the tile cards and the window edges (top/right/bottom).
 /// Matches TILE_GAP so the outer border reads as thin as the inner dividers.
-const AREA_PAD: f32 = TILE_GAP;
+/// Public so the Cleanup overlay can mirror [`terminal_area`]'s insets in
+/// gpui layout (edge insets track live window resizes; a computed w/h from
+/// the last-painted surface size would lag).
+pub const AREA_PAD: f32 = TILE_GAP;
 const TILE_TAB_MAX_W: f32 = 180.0;
 
 /// `sidebar_w` is the user-adjustable sidebar width in logical px.

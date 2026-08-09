@@ -1,8 +1,8 @@
 //! Cleanup page: lists and deletes drop-managed git worktrees.
 //!
-//! This module owns all cleanup-specific data structures, state, helper
-//! methods, and pure geometry functions.  Nothing here touches gpui or
-//! spawns threads; side-effects live in `main.rs`.
+//! This module owns all cleanup-specific data structures, state, and
+//! format helpers.  Nothing here touches gpui or spawns threads;
+//! the gpui element tree lives in `cleanup_ui.rs`; side-effects in `main.rs`.
 //!
 //! # External tool
 //! `drop -d --json` (run from any non-repo directory, e.g. the home dir)
@@ -12,8 +12,6 @@
 use std::collections::HashSet;
 
 use serde::Deserialize;
-
-use crate::workspace::LayoutRect;
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -80,14 +78,6 @@ pub enum ScanState {
     Failed(String),
 }
 
-/// Resizable column widths as fractions of the table's usable width, in
-/// order: branch, id, dirty, parity, pr. Age takes the remainder.
-pub const COL_COUNT: usize = 5;
-pub const DEFAULT_COL_FRACS: [f32; COL_COUNT] = [0.28, 0.18, 0.10, 0.14, 0.18];
-/// No column may shrink below this fraction; the age remainder keeps at
-/// least one minimum too.
-pub const MIN_COL_FRAC: f32 = 0.05;
-
 /// All mutable state for the Cleanup page.
 #[derive(Debug)]
 pub struct Cleanup {
@@ -97,13 +87,6 @@ pub struct Cleanup {
     pub selected: HashSet<String>,
     /// `None` = show all repos; `Some(repo_root)` = filter to that repo.
     pub repo_filter: Option<String>,
-    /// Vertical scroll position in table-row units (headers included).
-    pub scroll: usize,
-    /// Worktree id whose dirty cell the cursor is over (drives the
-    /// dirty-files popover).
-    pub hover: Option<String>,
-    /// User-resizable column fractions (persisted under `cleanup.columns`).
-    pub col_fracs: [f32; COL_COUNT],
 }
 
 impl Default for Cleanup {
@@ -112,9 +95,6 @@ impl Default for Cleanup {
             scan: None,
             selected: HashSet::new(),
             repo_filter: None,
-            scroll: 0,
-            hover: None,
-            col_fracs: DEFAULT_COL_FRACS,
         }
     }
 }
@@ -145,12 +125,10 @@ pub struct RepoEntry {
 }
 
 impl Cleanup {
-    /// Transition to Scanning state (clears selection/scroll/hover).
+    /// Transition to Scanning state (clears selection).
     pub fn set_scanning(&mut self) {
         self.scan = Some(ScanState::Scanning);
         self.selected.clear();
-        self.scroll = 0;
-        self.hover = None;
     }
 
     /// Transition to Ready state with the scanned worktrees.
@@ -230,15 +208,6 @@ impl Cleanup {
         rows
     }
 
-    /// The hovered worktree, if it is dirty and has file details to show.
-    pub fn hover_entry(&self) -> Option<&WorktreeInfo> {
-        let id = self.hover.as_deref()?;
-        let worktrees = match &self.scan {
-            Some(ScanState::Ready(v)) => v,
-            _ => return None,
-        };
-        worktrees.iter().find(|w| w.id == id && !w.dirty_files.is_empty())
-    }
 
     /// Toggle selection for `id` (no-op if `isCurrent`).
     pub fn toggle(&mut self, id: &str) {
@@ -406,203 +375,6 @@ pub fn dirty_totals(files: &[DirtyFile]) -> (u32, u32) {
     })
 }
 
-// ---------------------------------------------------------------------------
-// Table geometry (pure, shared by renderer and hit-testing)
-// ---------------------------------------------------------------------------
-
-/// Vertical rhythm constants (logical px, multiplied by scale at call sites).
-pub const CLEANUP_HEADER_H: f32 = 52.0;
-pub const CLEANUP_COL_HEADER_H: f32 = 28.0;
-pub const CLEANUP_ROW_H: f32 = 32.0;
-pub const CLEANUP_FOOTER_H: f32 = 44.0;
-pub const CLEANUP_CARD_PAD: f32 = 14.0;
-
-/// Column x-offsets inside the card (logical px fractions of card width).
-/// Caller must multiply by scale after resolving card width.
-/// Layout: [checkbox | branch | id | dirty | parity | pr | age]
-pub struct ColumnOffsets {
-    pub branch: f32,
-    pub id: f32,
-    pub dirty: f32,
-    pub parity: f32,
-    pub pr: f32,
-    pub age: f32,
-}
-
-/// The x where the branch column starts (after the checkbox gutter) and the
-/// width the fraction-sized columns divide up.
-fn columns_origin(card: &LayoutRect, scale: f32) -> (f32, f32) {
-    let pad = (CLEANUP_CARD_PAD * scale).round();
-    let checkbox_w = (20.0 * scale).round();
-    let x = card.x + pad + checkbox_w + (6.0 * scale).round();
-    let usable = (card.x + card.w - pad - x).max(0.0);
-    (x, usable)
-}
-
-/// Compute column x-offsets in physical px from the user-resizable fractions
-/// (see [`DEFAULT_COL_FRACS`]); age takes whatever the five leave over.
-pub fn column_offsets(card: &LayoutRect, scale: f32, fracs: &[f32; COL_COUNT]) -> ColumnOffsets {
-    let (x, usable) = columns_origin(card, scale);
-    let mut edges = [0.0f32; COL_COUNT];
-    let mut sum = 0.0;
-    for (i, f) in fracs.iter().enumerate() {
-        sum += f;
-        edges[i] = x + (usable * sum).round();
-    }
-    ColumnOffsets {
-        branch: x,
-        id: edges[0],
-        dirty: edges[1],
-        parity: edges[2],
-        pr: edges[3],
-        age: edges[4],
-    }
-}
-
-/// The x positions of the five draggable column boundaries (the left edge of
-/// id, dirty, parity, pr, and age).
-pub fn column_boundaries(card: &LayoutRect, scale: f32, fracs: &[f32; COL_COUNT]) -> [f32; COL_COUNT] {
-    let cols = column_offsets(card, scale, fracs);
-    [cols.id, cols.dirty, cols.parity, cols.pr, cols.age]
-}
-
-/// The boundary under the cursor, if any: within `grab` px horizontally and
-/// vertically inside the table band (column headers through the footer).
-pub fn boundary_at(
-    card: &LayoutRect,
-    scale: f32,
-    fracs: &[f32; COL_COUNT],
-    px: f32,
-    py: f32,
-    grab: f32,
-) -> Option<usize> {
-    let top = col_header_rect(card, scale).y;
-    let bottom = footer_origin_y(card, scale);
-    if py < top || py > bottom {
-        return None;
-    }
-    column_boundaries(card, scale, fracs)
-        .iter()
-        .position(|x| (px - x).abs() <= grab)
-}
-
-/// New fractions with boundary `b` dragged to `px`: the column left of the
-/// boundary resizes, everything to the right shifts. Each column keeps
-/// [`MIN_COL_FRAC`], including the age remainder.
-pub fn drag_boundary(
-    card: &LayoutRect,
-    scale: f32,
-    fracs: &[f32; COL_COUNT],
-    b: usize,
-    px: f32,
-) -> [f32; COL_COUNT] {
-    let (x, usable) = columns_origin(card, scale);
-    let mut out = *fracs;
-    if usable <= 0.0 || b >= COL_COUNT {
-        return out;
-    }
-    let before: f32 = fracs[..b].iter().sum();
-    let after: f32 = fracs[b + 1..].iter().sum();
-    let target = (px - x) / usable - before;
-    // Leave room for every later column plus the age remainder.
-    let max = 1.0 - before - after - MIN_COL_FRAC;
-    out[b] = target.clamp(MIN_COL_FRAC, max.max(MIN_COL_FRAC));
-    out
-}
-
-/// Serialize fractions for the settings store ("0.28,0.18,…").
-pub fn format_col_fracs(fracs: &[f32; COL_COUNT]) -> String {
-    fracs.map(|f| format!("{f:.3}")).join(",")
-}
-
-/// Parse a stored fraction list; anything malformed falls back to defaults.
-pub fn parse_col_fracs(s: &str) -> [f32; COL_COUNT] {
-    let vals: Vec<f32> = s.split(',').filter_map(|p| p.trim().parse().ok()).collect();
-    let ok = vals.len() == COL_COUNT
-        && vals.iter().all(|f| (MIN_COL_FRAC..=1.0).contains(f))
-        && vals.iter().sum::<f32>() <= 1.0 - MIN_COL_FRAC;
-    if ok { [vals[0], vals[1], vals[2], vals[3], vals[4]] } else { DEFAULT_COL_FRACS }
-}
-
-/// The header row of the cleanup card (title + refresh button).
-pub fn header_rect(card: &LayoutRect, scale: f32) -> LayoutRect {
-    let h = (CLEANUP_HEADER_H * scale).round();
-    LayoutRect { x: card.x, y: card.y, w: card.w, h }
-}
-
-/// The column-header (dim label) row below the card header.
-pub fn col_header_rect(card: &LayoutRect, scale: f32) -> LayoutRect {
-    let header_h = (CLEANUP_HEADER_H * scale).round();
-    let h = (CLEANUP_COL_HEADER_H * scale).round();
-    LayoutRect { x: card.x, y: card.y + header_h, w: card.w, h }
-}
-
-/// The first y-coordinate of data rows (physical px).
-fn rows_origin_y(card: &LayoutRect, scale: f32) -> f32 {
-    let header_h = (CLEANUP_HEADER_H * scale).round();
-    let col_h = (CLEANUP_COL_HEADER_H * scale).round();
-    card.y + header_h + col_h
-}
-
-/// The y-coordinate of the footer.
-fn footer_origin_y(card: &LayoutRect, scale: f32) -> f32 {
-    let footer_h = (CLEANUP_FOOTER_H * scale).round();
-    card.y + card.h - footer_h
-}
-
-/// How many data rows fit between the column-header band and the footer.
-pub fn rows_that_fit(card: &LayoutRect, scale: f32) -> usize {
-    let available = (footer_origin_y(card, scale) - rows_origin_y(card, scale)).max(0.0);
-    let row_h = (CLEANUP_ROW_H * scale).round();
-    if row_h <= 0.0 {
-        return 0;
-    }
-    (available / row_h).floor() as usize
-}
-
-/// Row rect for the visible row at index `vis_idx` (0 = first on screen),
-/// honoring `scroll_offset`.  Returns `None` if the row would overflow the
-/// card.
-pub fn row_rect(card: &LayoutRect, vis_idx: usize, scale: f32) -> Option<LayoutRect> {
-    let pad = (CLEANUP_CARD_PAD * scale).round();
-    let row_h = (CLEANUP_ROW_H * scale).round();
-    let origin_y = rows_origin_y(card, scale);
-    let y = origin_y + vis_idx as f32 * row_h;
-    if y + row_h > footer_origin_y(card, scale) {
-        return None;
-    }
-    Some(LayoutRect { x: card.x + pad, y, w: (card.w - 2.0 * pad).max(0.0), h: row_h })
-}
-
-/// The checkbox sub-rect inside the given data row.
-pub fn checkbox_rect(row: &LayoutRect, scale: f32) -> LayoutRect {
-    let size = (16.0 * scale).round();
-    let mid_y = (row.y + (row.h - size) / 2.0).round();
-    LayoutRect { x: row.x, y: mid_y, w: size, h: size }
-}
-
-/// The "Delete N selected" button rect, right-aligned in the footer.
-pub fn delete_button_rect(card: &LayoutRect, scale: f32, cell_width: f32) -> LayoutRect {
-    let pad = (CLEANUP_CARD_PAD * scale).round();
-    let footer_y = footer_origin_y(card, scale);
-    let footer_h = (CLEANUP_FOOTER_H * scale).round();
-    let btn_w = (22.0 * cell_width).round(); // fits "Delete 99 selected"
-    let btn_h = (28.0 * scale).round();
-    let x = card.x + card.w - pad - btn_w;
-    let y = (footer_y + (footer_h - btn_h) / 2.0).round();
-    LayoutRect { x, y, w: btn_w, h: btn_h }
-}
-
-/// The "Refresh" button rect, right-aligned in the card header.
-pub fn refresh_button_rect(card: &LayoutRect, scale: f32, cell_width: f32) -> LayoutRect {
-    let pad = (CLEANUP_CARD_PAD * scale).round();
-    let header_h = (CLEANUP_HEADER_H * scale).round();
-    let btn_w = (9.0 * cell_width).round(); // fits "Refresh"
-    let btn_h = (28.0 * scale).round();
-    let x = card.x + card.w - pad - btn_w;
-    let y = (card.y + (header_h - btn_h) / 2.0).round();
-    LayoutRect { x, y, w: btn_w, h: btn_h }
-}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -855,22 +627,6 @@ mod tests {
         assert_eq!(dirty_totals(&files), (12, 10));
     }
 
-    #[test]
-    fn test_hover_entry_requires_dirty_files() {
-        let mut wts = sample_worktrees();
-        wts[1].dirty_files = vec![DirtyFile {
-            path: "a.rs".into(),
-            added: Some(1),
-            removed: Some(0),
-            untracked: false,
-        }];
-        let mut c = make_cleanup(wts);
-        // wt-1 is clean (no file details) — hover shows nothing.
-        c.hover = Some("wt-1".to_string());
-        assert!(c.hover_entry().is_none());
-        c.hover = Some("wt-2".to_string());
-        assert_eq!(c.hover_entry().map(|w| w.id.as_str()), Some("wt-2"));
-    }
 
     #[test]
     fn test_selected_dirty_count() {
@@ -951,140 +707,5 @@ mod tests {
     // Geometry
     // -----------------------------------------------------------------------
 
-    fn test_card() -> LayoutRect {
-        LayoutRect { x: 100.0, y: 50.0, w: 800.0, h: 600.0 }
-    }
 
-    #[test]
-    fn test_header_rect_height() {
-        let card = test_card();
-        let h = header_rect(&card, 1.0);
-        assert_eq!(h.h, CLEANUP_HEADER_H);
-        assert_eq!(h.x, card.x);
-        assert_eq!(h.y, card.y);
-    }
-
-    #[test]
-    fn test_col_header_below_header() {
-        let card = test_card();
-        let ch = col_header_rect(&card, 1.0);
-        let h = header_rect(&card, 1.0);
-        assert_eq!(ch.y, h.y + h.h);
-        assert_eq!(ch.h, CLEANUP_COL_HEADER_H);
-    }
-
-    #[test]
-    fn test_rows_do_not_overlap() {
-        let card = test_card();
-        let scale = 1.0;
-        let n = rows_that_fit(&card, scale);
-        assert!(n > 0, "should fit at least one row");
-        for i in 0..n {
-            let r0 = row_rect(&card, i, scale).expect("should be Some for rows that fit");
-            if i + 1 < n {
-                let r1 = row_rect(&card, i + 1, scale).expect("row i+1 should fit");
-                // rows touch but do not overlap: r0.y + r0.h == r1.y
-                assert_eq!(r0.y + r0.h, r1.y, "rows {i} and {} overlap", i + 1);
-            }
-        }
-    }
-
-    #[test]
-    fn test_row_rect_none_beyond_fit() {
-        let card = test_card();
-        let n = rows_that_fit(&card, 1.0);
-        // One past the last fitting row should be None
-        assert!(row_rect(&card, n, 1.0).is_none());
-    }
-
-    #[test]
-    fn test_row_rect_scroll_offset_shifts_y() {
-        // The scroll offset is applied by the renderer (it passes vis_idx =
-        // logical_idx - scroll), so row_rect(card, 0) always produces the
-        // top-most visible position.  Verify two consecutive calls differ by
-        // exactly CLEANUP_ROW_H * scale.
-        let card = test_card();
-        let r0 = row_rect(&card, 0, 1.0).unwrap();
-        let r1 = row_rect(&card, 1, 1.0).unwrap();
-        assert_eq!(r1.y - r0.y, CLEANUP_ROW_H);
-    }
-
-    #[test]
-    fn test_footer_inside_card() {
-        let card = test_card();
-        let footer_y = footer_origin_y(&card, 1.0);
-        assert!(footer_y >= card.y);
-        assert!(footer_y + CLEANUP_FOOTER_H <= card.y + card.h + 0.5); // within card
-    }
-
-    #[test]
-    fn test_delete_button_inside_card() {
-        let card = test_card();
-        let btn = delete_button_rect(&card, 1.0, 8.0);
-        assert!(btn.x >= card.x);
-        assert!(btn.x + btn.w <= card.x + card.w + 0.5);
-    }
-
-    #[test]
-    fn test_column_offsets_follow_fracs() {
-        let card = test_card();
-        let a = column_offsets(&card, 1.0, &DEFAULT_COL_FRACS);
-        let mut wider_branch = DEFAULT_COL_FRACS;
-        wider_branch[0] += 0.10;
-        let b = column_offsets(&card, 1.0, &wider_branch);
-        assert!(b.id > a.id, "wider branch pushes id right");
-        assert_eq!(a.branch, b.branch, "branch origin is fixed");
-        assert!(a.age < card.x + card.w, "age stays inside the card");
-    }
-
-    #[test]
-    fn test_boundary_at_hits_and_misses() {
-        let card = test_card();
-        let bounds = column_boundaries(&card, 1.0, &DEFAULT_COL_FRACS);
-        let y = col_header_rect(&card, 1.0).y + 5.0;
-        assert_eq!(boundary_at(&card, 1.0, &DEFAULT_COL_FRACS, bounds[0], y, 4.0), Some(0));
-        assert_eq!(boundary_at(&card, 1.0, &DEFAULT_COL_FRACS, bounds[3] + 3.0, y, 4.0), Some(3));
-        // Between boundaries: no hit. Above the table band: no hit.
-        assert_eq!(boundary_at(&card, 1.0, &DEFAULT_COL_FRACS, bounds[0] + 40.0, y, 4.0), None);
-        assert_eq!(boundary_at(&card, 1.0, &DEFAULT_COL_FRACS, bounds[0], card.y + 2.0, 4.0), None);
-    }
-
-    #[test]
-    fn test_drag_boundary_resizes_and_clamps() {
-        let card = test_card();
-        let bounds = column_boundaries(&card, 1.0, &DEFAULT_COL_FRACS);
-        // Drag the branch/id boundary 50px left: branch shrinks, others keep.
-        let fracs = drag_boundary(&card, 1.0, &DEFAULT_COL_FRACS, 0, bounds[0] - 50.0);
-        assert!(fracs[0] < DEFAULT_COL_FRACS[0]);
-        assert_eq!(fracs[1..], DEFAULT_COL_FRACS[1..]);
-        // Drag far past the left edge: clamped to the minimum.
-        let fracs = drag_boundary(&card, 1.0, &DEFAULT_COL_FRACS, 0, card.x - 100.0);
-        assert_eq!(fracs[0], MIN_COL_FRAC);
-        // Drag far right: every later column and the age remainder keep room.
-        let fracs = drag_boundary(&card, 1.0, &DEFAULT_COL_FRACS, 4, card.x + card.w + 100.0);
-        assert!(fracs.iter().sum::<f32>() <= 1.0 - MIN_COL_FRAC + 1e-4);
-    }
-
-    #[test]
-    fn test_col_fracs_roundtrip_and_rejects_garbage() {
-        let mut fracs = DEFAULT_COL_FRACS;
-        fracs[0] = 0.2;
-        fracs[4] = 0.25;
-        assert_eq!(parse_col_fracs(&format_col_fracs(&fracs)), fracs);
-        assert_eq!(parse_col_fracs(""), DEFAULT_COL_FRACS);
-        assert_eq!(parse_col_fracs("0.5,0.5"), DEFAULT_COL_FRACS);
-        // Sum leaves no room for the age column.
-        assert_eq!(parse_col_fracs("0.3,0.3,0.3,0.05,0.05"), DEFAULT_COL_FRACS);
-        assert_eq!(parse_col_fracs("a,b,c,d,e"), DEFAULT_COL_FRACS);
-    }
-
-    #[test]
-    fn test_checkbox_rect_inside_row() {
-        let card = test_card();
-        let row = row_rect(&card, 0, 1.0).unwrap();
-        let cb = checkbox_rect(&row, 1.0);
-        assert!(cb.y >= row.y);
-        assert!(cb.y + cb.h <= row.y + row.h + 0.5);
-        assert!(cb.x >= row.x);
-    }
 }
