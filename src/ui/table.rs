@@ -21,14 +21,23 @@ use crate::ui::theme::{Theme, alpha};
 /// w-full text-sm — the outer table container.
 #[derive(IntoElement)]
 pub struct Table {
+    full: bool,
     children: Vec<AnyElement>,
 }
 
 impl Table {
     pub fn new() -> Self {
         Self {
+            full: false,
             children: Vec::new(),
         }
+    }
+
+    /// Local addition: fill the parent's height so a scrollable body
+    /// (`flex-1` child) stays bounded instead of sizing to its rows.
+    pub fn h_full(mut self) -> Self {
+        self.full = true;
+        self
     }
 }
 
@@ -50,6 +59,7 @@ impl RenderOnce for Table {
             .flex()
             .flex_col()
             .w_full()
+            .when(self.full, |el| el.h_full())
             .text_size(px(14.))
             .line_height(px(20.))
             .children(self.children)

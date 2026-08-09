@@ -3,10 +3,11 @@
 //! These are faithful copies (not a Cargo dependency), pinned to the same gpui
 //! git rev as this app so they compile unchanged. Tokens live in [`theme`];
 //! bridge them from pwrde chrome via [`theme::Theme::from_chrome`] (added
-//! locally). Deliberate local extensions in [`table`] (`TableRow::on_click`;
+//! locally). Deliberate local extensions: [`table`] (`TableRow::on_click`;
 //! shrinkable flex cells with optional grow weights, so columns stay aligned
-//! at narrow widths and can take unequal shares) and [`badge`]
-//! (`Badge::color` status tints).
+//! at narrow widths and can take unequal shares; `Table::h_full`), [`badge`]
+//! (`Badge::color` status tints), and [`card`] (`Card::h_full` /
+//! `CardContent::flex_1` for page-filling cards).
 
 pub mod assets;
 pub mod badge;

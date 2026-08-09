@@ -166,7 +166,6 @@ impl App {
                 .child(delete),
         );
 
-        // Card/CardContent are not Styled — wrap for flex fill/height.
         div()
             .absolute()
             .left(px(left))
@@ -175,25 +174,14 @@ impl App {
             .bottom(px(pad))
             .p(px(8.))
             .child(
-                div()
+                // h_full/flex_1 are local additions: the card fills the page
+                // and the content band absorbs the height the header and
+                // footer leave over, keeping the row scroller bounded.
+                Card::new()
                     .h_full()
-                    .flex()
-                    .flex_col()
-                    .child(
-                        Card::new()
-                            .child(header)
-                            .child(
-                                CardContent::new().child(
-                                    div()
-                                        .flex_1()
-                                        .min_h(px(0.))
-                                        .overflow_hidden()
-                                        .w_full()
-                                        .child(body),
-                                ),
-                            )
-                            .child(footer),
-                    ),
+                    .child(header)
+                    .child(CardContent::new().flex_1().child(body))
+                    .child(footer),
             )
             .into_any_element()
     }
@@ -312,6 +300,7 @@ fn table_body(app: &App, cx: &mut Context<App>) -> AnyElement {
     }
 
     Table::new()
+        .h_full()
         .child(header)
         .child(
             div()

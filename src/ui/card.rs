@@ -12,6 +12,10 @@
 //! - first/last child image rounding (`*: [img:first-child]:rounded-t-xl`, etc.)
 //! - `group-data-[size=sm]/card:text-sm` title size shrink
 //! - `[.border-b]:pb-(--card-spacing)` / `[.border-t]:pt-(--card-spacing)` utilities
+//!
+//! Local additions over the rcn source: [`Card::h_full`] and
+//! [`CardContent::flex_1`], so a card can fill a page-sized region with the
+//! content band absorbing the leftover height.
 
 use gpui::{
     AnyElement, App, FontWeight, IntoElement, ParentElement, RenderOnce, Styled, Window, div,
@@ -45,6 +49,7 @@ impl CardSize {
 #[derive(IntoElement)]
 pub struct Card {
     size: CardSize,
+    full: bool,
     children: Vec<AnyElement>,
 }
 
@@ -52,12 +57,20 @@ impl Card {
     pub fn new() -> Self {
         Self {
             size: CardSize::Default,
+            full: false,
             children: Vec::new(),
         }
     }
 
     pub fn size(mut self, size: CardSize) -> Self {
         self.size = size;
+        self
+    }
+
+    /// Local addition: fill the parent's height instead of sizing to
+    /// content, for page-filling cards. Pair with [`CardContent::flex_1`].
+    pub fn h_full(mut self) -> Self {
+        self.full = true;
         self
     }
 }
@@ -82,6 +95,7 @@ impl RenderOnce for Card {
         div()
             .flex()
             .flex_col()
+            .when(self.full, |el| el.h_full())
             .gap(spacing)
             .overflow_hidden()
             .rounded(theme.radius_xl())
@@ -258,6 +272,7 @@ impl RenderOnce for CardAction {
 #[derive(IntoElement)]
 pub struct CardContent {
     size: CardSize,
+    grow: bool,
     children: Vec<AnyElement>,
 }
 
@@ -265,12 +280,20 @@ impl CardContent {
     pub fn new() -> Self {
         Self {
             size: CardSize::Default,
+            grow: false,
             children: Vec::new(),
         }
     }
 
     pub fn size(mut self, size: CardSize) -> Self {
         self.size = size;
+        self
+    }
+
+    /// Local addition: grow to take the card's remaining height (shrinkable,
+    /// so a scrollable child inside stays bounded). See [`Card::h_full`].
+    pub fn flex_1(mut self) -> Self {
+        self.grow = true;
         self
     }
 }
@@ -292,6 +315,7 @@ impl RenderOnce for CardContent {
         div()
             .flex()
             .flex_col()
+            .when(self.grow, |el| el.flex_1().min_h(px(0.)))
             .gap(px(12.))
             .px(px(self.size.spacing()))
             .children(self.children)
