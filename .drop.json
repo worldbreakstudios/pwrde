@@ -1,0 +1,4 @@
+{
+  "provision": ["cargo build"],
+  "autoProvision": true
+}
