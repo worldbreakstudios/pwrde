@@ -257,6 +257,10 @@ pub struct ChromeState<'a> {
     /// Physical-pixel cursor position for hover painting. `None` while any
     /// drag is active so hover highlights are suppressed mid-drag.
     pub cursor: Option<(f32, f32)>,
+    /// In-progress search query for the settings sidebar search box.
+    pub settings_query: &'a str,
+    /// Whether the settings search box has keyboard focus.
+    pub settings_search_focus: bool,
 }
 
 /// Everything `main.rs`'s terminal `Element` needs to paint one frame — all
@@ -615,10 +619,45 @@ impl Renderer {
             },
             Page::Settings if collapsed => {},
             Page::Settings => {
-                // Settings sections as sidebar tabs, in the same rows the
-                // groups occupy on Sessions so the chrome reads as one.
+                // Search box in the top slot: typing filters every section's
+                // settings (the content card lists the matches). Focused it
+                // takes the active-tab treatment; a quad caret trails the
+                // query like the primary-command editor's.
+                let search = workspace::settings_search_rect(self.scale, sidebar_w);
+                let focused = chrome.settings_search_focus;
+                if focused {
+                    bg_quads.push(self.px_rect(&search, th.card, 0.78, row_r).shadow(Shadow::Soft));
+                } else {
+                    bg_quads.push(self.px_rect(&search, th.card, 0.40, row_r));
+                }
+                hot.push(search);
+                let empty = chrome.settings_query.is_empty();
+                let text_top = (search.y + (search.h - self.cell_height) / 2.0).round();
+                if !empty || !focused {
+                    labels.push(LabelSpec {
+                        text: if empty { "Search settings".into() } else { chrome.settings_query.to_string() },
+                        color: color(if empty { th.ink_dim } else { th.ink }, 1.0),
+                        left: search.x + group_pad,
+                        top: text_top,
+                        clip: LayoutRect { w: search.w - group_pad, ..search },
+                        size: None,
+                    });
+                }
+                if focused {
+                    let w = chrome.settings_query.chars().count() as f32 * self.cell_width;
+                    let caret = LayoutRect {
+                        x: (search.x + group_pad + w + if empty { 0.0 } else { 2.0 }).round(),
+                        y: text_top,
+                        w: (2.0 * self.scale).round().max(1.0),
+                        h: self.cell_height,
+                    };
+                    bg_quads.push(self.px_rect(&caret, th.accent, 1.0, 0.0));
+                }
+
+                // Settings sections as sidebar tabs, shifted to slot i+1 to
+                // make room for the search box at slot 0.
                 for (i, section) in Section::ALL.iter().enumerate() {
-                    let tab = workspace::tab_rect(i, self.scale, sidebar_w);
+                    let tab = workspace::tab_rect(i + 1, self.scale, sidebar_w);
                     let active_row = *section == chrome.section;
                     if active_row {
                         bg_quads.push(self.px_rect(&tab, th.card, 0.78, row_r).shadow(Shadow::Soft));
@@ -1249,8 +1288,9 @@ impl Renderer {
         bg_quads.push(self.px_rect(area, th.card, 1.0, (CARD_RADIUS * scale).round()).shadow(Shadow::Card));
 
         let header_h = (workspace::SETTINGS_HEADER_H * scale).round();
+        let searching = !chrome.settings_query.is_empty();
         labels.push(LabelSpec {
-            text: chrome.section.label().into(),
+            text: if searching { "Search results" } else { chrome.section.label() }.into(),
             color: color(th.ink, 1.0),
             left: area.x + pad,
             top: (area.y + (header_h - self.cell_height) / 2.0).round(),
@@ -1263,6 +1303,54 @@ impl Renderer {
         let fits = |row: &LayoutRect| row.y + row.h <= area.y + area.h - pad;
         let mid = |row: &LayoutRect| (row.y + (row.h - self.cell_height) / 2.0).round();
 
+        if searching {
+            // Search results replace the section content: one row per match,
+            // the owning section dim on the right; a click jumps there.
+            let results = pages::search_settings(chrome.settings_query);
+            if results.is_empty() {
+                let row = workspace::settings_row_rect(area, 0, scale);
+                if fits(&row) {
+                    labels.push(LabelSpec {
+                        text: "no settings match".into(),
+                        color: color(th.ink_dim, 1.0),
+                        left: row.x + pad,
+                        top: mid(&row),
+                        clip: row,
+                        size: None,
+                    });
+                }
+                return;
+            }
+            for (i, entry) in results.iter().enumerate() {
+                let row = workspace::settings_row_rect(area, i, scale);
+                if !fits(&row) {
+                    break;
+                }
+                if hover(cur, &row) {
+                    bg_quads.push(self.px_rect(&row, th.ink, 0.06, pill_r));
+                }
+                hot.push(row);
+                labels.push(LabelSpec {
+                    text: entry.label.into(),
+                    color: color(th.ink, 1.0),
+                    left: row.x + pad,
+                    top: mid(&row),
+                    clip: row,
+                    size: None,
+                });
+                let sec = entry.section.label();
+                let sec_w = sec.chars().count() as f32 * self.cell_width;
+                labels.push(LabelSpec {
+                    text: sec.into(),
+                    color: color(th.ink_dim, 1.0),
+                    left: (row.x + row.w - pad - sec_w).round(),
+                    top: mid(&row),
+                    clip: row,
+                    size: None,
+                });
+            }
+            return;
+        }
         match chrome.section {
             Section::Sessions => {
                 let row = workspace::settings_row_rect(area, 0, scale);
@@ -3244,6 +3332,8 @@ mod tests {
             editing_section: None,
             cleanup,
             cursor: None,
+            settings_query: "",
+            settings_search_focus: false,
         }
     }
 
@@ -3296,6 +3386,69 @@ mod tests {
         assert!(texts.contains(&"3±"));
         assert!(texts.contains(&"Delete 0 selected"));
         assert!(!frame.bg_quads.is_empty());
+    }
+
+    /// The Settings sidebar renders the search box's placeholder in the top
+    /// slot and the section tabs one slot down, off the same rect helpers
+    /// main.rs hit-tests.
+    #[test]
+    fn settings_sidebar_shows_search_placeholder_above_tabs() {
+        let scale = 2.0;
+        let renderer = Renderer::new(scale, 18.0, 1600, 1000);
+        let state = Cleanup::default();
+        let mut chrome = cleanup_chrome(&state);
+        chrome.page = Page::Settings;
+        let ws = crate::workspace::Workspace::new(
+            "g".into(),
+            crate::workspace::Tile::empty(1),
+            None,
+        );
+        let sidebar_w = 240.0;
+        let frame = renderer.build_frame(
+            &[ws], 0, sidebar_w, None, None, None, None, None, None, None, None, None, None, &chrome,
+        );
+        let search = crate::workspace::settings_search_rect(scale, sidebar_w);
+        let search_y = (search.y + (search.h - renderer.cell_height) / 2.0).round();
+        assert!(
+            frame.labels.iter().any(|l| l.text == "Search settings" && l.top == search_y),
+            "placeholder sits in the top sidebar slot"
+        );
+        let tab = crate::workspace::tab_rect(1, scale, sidebar_w);
+        let tab_y = (tab.y + (tab.h - renderer.cell_height) / 2.0).round();
+        assert!(
+            frame.labels.iter().any(|l| l.text == "Sessions" && l.top == tab_y),
+            "first section tab shifts down one slot below the search box"
+        );
+    }
+
+    /// An active query replaces the section content with matching rows, each
+    /// naming its owning section, and echoes the query in the search box.
+    #[test]
+    fn settings_search_query_renders_result_rows() {
+        let renderer = Renderer::new(2.0, 18.0, 1600, 1000);
+        let state = Cleanup::default();
+        let mut chrome = cleanup_chrome(&state);
+        chrome.page = Page::Settings;
+        chrome.settings_query = "persist";
+        chrome.settings_search_focus = true;
+        let ws = crate::workspace::Workspace::new(
+            "g".into(),
+            crate::workspace::Tile::empty(1),
+            None,
+        );
+        let frame = renderer.build_frame(
+            &[ws], 0, 240.0, None, None, None, None, None, None, None, None, None, None, &chrome,
+        );
+        let texts: Vec<&str> = frame.labels.iter().map(|l| l.text.as_str()).collect();
+        assert!(texts.contains(&"persist"), "query echoes in the search box: {texts:?}");
+        assert!(texts.contains(&"Search results"), "card header switches to results");
+        assert!(texts.contains(&"Persist sessions"), "the Terminal match lists as a row");
+        // "Terminal" appears as a sidebar tab already; the result row's
+        // section tag makes it at least twice.
+        assert!(
+            texts.iter().filter(|t| **t == "Terminal").count() >= 2,
+            "result row names its owning section: {texts:?}"
+        );
     }
 
     /// The sidebar unread dot sits in the row's left padding gutter, not at
