@@ -2,6 +2,7 @@
 //!
 //! Variants: Default, Outline, Secondary, Ghost, Destructive, Link.
 //! Sizes: Default, Xs, Sm, Lg and the square Icon, IconXs, IconSm, IconLg.
+//! Builders: `rounded_full`, `icon_inline_start`, `icon_inline_end`.
 //!
 //! Omitted from the source (no gpui equivalent yet): focus-visible ring,
 //! aria-invalid styles.
@@ -26,7 +27,7 @@ pub enum ButtonVariant {
     Link,
 }
 
-/// Position of a button inside a button group:
+/// Position of a button inside a [`crate::components::ButtonGroup`]:
 /// ends keep their outer rounding, middles go square, and non-first
 /// buttons collapse their left border.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -58,6 +59,9 @@ pub struct Button {
     variant: ButtonVariant,
     size: ButtonSize,
     disabled: bool,
+    rounded_full: bool,
+    icon_inline_start: bool,
+    icon_inline_end: bool,
     group_position: Option<GroupPosition>,
     on_click: Option<ClickHandler>,
     children: Vec<AnyElement>,
@@ -70,6 +74,9 @@ impl Button {
             variant: ButtonVariant::default(),
             size: ButtonSize::default(),
             disabled: false,
+            rounded_full: false,
+            icon_inline_start: false,
+            icon_inline_end: false,
             group_position: None,
             on_click: None,
             children: Vec::new(),
@@ -96,6 +103,28 @@ impl Button {
         handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     ) -> Self {
         self.on_click = Some(Box::new(handler));
+        self
+    }
+
+    /// `rounded-full` — pill corners (px(9999.)).
+    pub fn rounded_full(mut self) -> Self {
+        self.rounded_full = true;
+        self
+    }
+
+    /// Child `data-icon="inline-start"` — trim start padding
+    /// (`has-data-[icon=inline-start]:pl-2` / `pl-1.5` for Xs/Sm).
+    pub fn icon_inline_start(mut self) -> Self {
+        self.icon_inline_start = true;
+        self
+    }
+
+    /// Child `data-icon="inline-end"` — trim end padding
+    /// (`has-data-[icon=inline-end]:pr-2` / `pr-1.5` for Xs/Sm).
+    // Mirrors icon_inline_start; not yet exercised by the storybook.
+    #[allow(dead_code)]
+    pub fn icon_inline_end(mut self) -> Self {
+        self.icon_inline_end = true;
         self
     }
 
@@ -160,6 +189,39 @@ impl RenderOnce for Button {
                 .rounded(radius_md.min(px(8.))),
             ButtonSize::IconSm => base.size(px(32.)).rounded(radius_md.min(px(10.))),
             ButtonSize::IconLg => base.size(px(40.)).rounded(radius_md),
+        };
+
+        // has-data-[icon=inline-start]:pl-2 / inline-end:pr-2 (Default/Lg);
+        // pl-1.5 / pr-1.5 (Xs/Sm). No effect on Icon* sizes.
+        let base = match self.size {
+            ButtonSize::Default | ButtonSize::Lg => {
+                let mut b = base;
+                if self.icon_inline_start {
+                    b = b.pl(px(8.));
+                }
+                if self.icon_inline_end {
+                    b = b.pr(px(8.));
+                }
+                b
+            }
+            ButtonSize::Xs | ButtonSize::Sm => {
+                let mut b = base;
+                if self.icon_inline_start {
+                    b = b.pl(px(6.));
+                }
+                if self.icon_inline_end {
+                    b = b.pr(px(6.));
+                }
+                b
+            }
+            ButtonSize::Icon | ButtonSize::IconXs | ButtonSize::IconSm | ButtonSize::IconLg => base,
+        };
+
+        // rounded-full — applied after size-based rounding, before group_position.
+        let base = if self.rounded_full {
+            base.rounded(px(9999.))
+        } else {
+            base
         };
 
         let dark = theme.dark;

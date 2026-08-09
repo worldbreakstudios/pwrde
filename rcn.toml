@@ -1,0 +1,9 @@
+[source]
+repo = "a1re1/rcn"
+ref = "main"
+
+[paths]
+components = "src/ui"
+theme = "src/ui/theme.rs"
+motion = "src/ui/motion.rs"
+assets = "src/ui/assets.rs"
