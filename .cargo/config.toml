@@ -1,0 +1,4 @@
+[build]
+# Compile through sccache so fresh worktrees reuse cached artifacts instead of
+# rebuilding the full gpui dependency tree. Install with: brew install sccache
+rustc-wrapper = "sccache"
