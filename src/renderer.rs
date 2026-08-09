@@ -1620,33 +1620,27 @@ impl Renderer {
                             size: Some(small),
                         });
                     }
-                    // Mini tile: a floating terminal card on the gradient,
-                    // grounded in the theme's own terminal tokens. This
-                    // column previews the *theme* — with a terminal profile
-                    // selected the real panes take the profile's ground
-                    // instead, which is what the terminal column previews.
-                    let (pane_bg, pane_ink, pane_dim, pane_divider) = (
-                        pt.term_bg,
-                        pt.text_bright,
-                        (pt.text_dim, 1.0),
-                        (pt.card_divider, 1.0),
-                    );
+                    // Mini tile: the floating terminal card, deliberately a
+                    // small element like in the real layout — the theme's
+                    // polarity reads from the gradient + surface ground,
+                    // while term_bg shows honestly as the pane card. (With a
+                    // terminal profile selected the real panes take the
+                    // profile's ground; that's the terminal column's job.)
                     let tile = LayoutRect {
                         x: (body.x + sb_w).round(),
                         y: (body.y + (6.0 * scale)).round(),
                         w: (body.w - sb_w - ipad).max(0.0),
-                        h: (body.h - (6.0 * scale) - ipad).max(0.0),
+                        h: (body.h * 0.42).round().max(0.0),
                     };
-                    bg_quads.push(self.px_rect(&tile, pane_bg, 1.0, (8.0 * scale).round()));
+                    bg_quads.push(
+                        self.px_rect(&tile, pt.term_bg, 1.0, (8.0 * scale).round())
+                            .shadow(Shadow::Soft),
+                    );
                     let strip_h = (20.0 * scale).round();
                     for (i, (tab, on)) in [("zsh", true), ("cargo", false)].iter().enumerate() {
                         labels.push(LabelSpec {
                             text: (*tab).into(),
-                            color: if *on {
-                                color(pane_ink, 1.0)
-                            } else {
-                                color(pane_dim.0, pane_dim.1)
-                            },
+                            color: color(if *on { pt.text_bright } else { pt.text_dim }, 1.0),
                             left: (tile.x + ipad + i as f32 * (46.0 * scale)).round(),
                             top: (tile.y + (strip_h - self.cell_height) / 2.0).round(),
                             clip: tile,
@@ -1659,14 +1653,78 @@ impl Renderer {
                         w: tile.w,
                         h: (1.0 * scale).round().max(1.0),
                     };
-                    bg_quads.push(self.px_rect(&hairline, pane_divider.0, pane_divider.1, 0.0));
-                    // Primary / secondary buttons.
+                    bg_quads.push(self.px_rect(&hairline, pt.card_divider, 1.0, 0.0));
+                    // A couple of pane lines in the theme's terminal text.
+                    for (i, (line, c)) in [
+                        ("$ cargo run", pt.text_bright),
+                        ("   Compiling pwrde", pt.text_dim),
+                    ]
+                    .iter()
+                    .enumerate()
+                    {
+                        let top = (tile.y
+                            + strip_h
+                            + (8.0 * scale)
+                            + i as f32 * (self.cell_height + (4.0 * scale)))
+                            .round();
+                        if top + self.cell_height > tile.y + tile.h - (6.0 * scale) {
+                            break;
+                        }
+                        labels.push(LabelSpec {
+                            text: (*line).into(),
+                            color: color(*c, 1.0),
+                            left: (tile.x + ipad).round(),
+                            top,
+                            clip: tile,
+                            size: Some(small),
+                        });
+                    }
+                    let body_bottom = body.y + body.h - ipad;
+                    // Surface card on the gradient (popover / panel chrome).
+                    let sc = LayoutRect {
+                        x: tile.x,
+                        y: (tile.y + tile.h + (10.0 * scale)).round(),
+                        w: tile.w,
+                        h: (46.0 * scale).round(),
+                    };
+                    if sc.y + sc.h < body_bottom {
+                        bg_quads.push(
+                            self.px_rect(&sc, pt.card, 1.0, (7.0 * scale).round())
+                                .shadow(Shadow::Soft),
+                        );
+                        labels.push(LabelSpec {
+                            text: "Surface card".into(),
+                            color: color(pt.ink, 1.0),
+                            left: (sc.x + (8.0 * scale)).round(),
+                            top: (sc.y + (6.0 * scale)).round(),
+                            clip: sc,
+                            size: Some(small),
+                        });
+                        let sub = "Secondary text on surface · ";
+                        labels.push(LabelSpec {
+                            text: sub.into(),
+                            color: color(pt.ink_dim, 1.0),
+                            left: (sc.x + (8.0 * scale)).round(),
+                            top: (sc.y + (24.0 * scale)).round(),
+                            clip: sc,
+                            size: Some(small),
+                        });
+                        labels.push(LabelSpec {
+                            text: "a link".into(),
+                            color: color(pt.accent, 1.0),
+                            left: (sc.x + (8.0 * scale) + sub.chars().count() as f32 * small_cw)
+                                .round(),
+                            top: (sc.y + (24.0 * scale)).round(),
+                            clip: sc,
+                            size: Some(small),
+                        });
+                    }
+                    // Primary / secondary buttons on the gradient.
                     let btn_h = (20.0 * scale).round();
-                    let by = (tile.y + strip_h + (10.0 * scale)).round();
-                    let tile_bottom = tile.y + tile.h - ipad;
-                    if by + btn_h < tile_bottom {
+                    let by = (sc.y + sc.h + (10.0 * scale)).round();
+                    if by + btn_h < body_bottom {
                         let bw1 = ("Primary".len() as f32 * small_cw + 2.0 * ipad).round();
-                        let b1 = LayoutRect { x: (tile.x + ipad).round(), y: by, w: bw1, h: btn_h };
+                        let b1 = LayoutRect { x: tile.x, y: by, w: bw1, h: btn_h };
                         bg_quads.push(self.px_rect(&b1, pt.accent, 1.0, (6.0 * scale).round()));
                         labels.push(LabelSpec {
                             text: "Primary".into(),
@@ -1683,82 +1741,44 @@ impl Renderer {
                             w: bw2,
                             h: btn_h,
                         };
-                        bg_quads.push(self.px_rect(&b2, pane_ink, 0.12, (6.0 * scale).round()));
+                        bg_quads.push(self.px_rect(&b2, pt.ink, 0.08, (6.0 * scale).round()));
                         labels.push(LabelSpec {
                             text: "Secondary".into(),
-                            color: color(pane_ink, 1.0),
+                            color: color(pt.ink, 1.0),
                             left: (b2.x + ipad).round(),
                             top: (b2.y + (b2.h - self.cell_height) / 2.0).round(),
                             clip: b2,
                             size: Some(small),
                         });
                     }
-                    // Surface card with dim text and an accent link.
-                    let sc = LayoutRect {
-                        x: (tile.x + ipad).round(),
-                        y: (by + btn_h + (10.0 * scale)).round(),
-                        w: (tile.w - 2.0 * ipad).max(0.0),
-                        h: (46.0 * scale).round(),
-                    };
-                    if sc.y + sc.h < tile_bottom {
-                        bg_quads.push(self.px_rect(&sc, pane_ink, 0.06, (7.0 * scale).round()));
-                        labels.push(LabelSpec {
-                            text: "Surface card".into(),
-                            color: color(pane_ink, 1.0),
-                            left: (sc.x + (8.0 * scale)).round(),
-                            top: (sc.y + (6.0 * scale)).round(),
-                            clip: sc,
-                            size: Some(small),
-                        });
-                        let sub = "Secondary text on surface · ";
-                        labels.push(LabelSpec {
-                            text: sub.into(),
-                            color: color(pane_dim.0, pane_dim.1),
-                            left: (sc.x + (8.0 * scale)).round(),
-                            top: (sc.y + (24.0 * scale)).round(),
-                            clip: sc,
-                            size: Some(small),
-                        });
-                        labels.push(LabelSpec {
-                            text: "a link".into(),
-                            color: color(pt.accent, 1.0),
-                            left: (sc.x + (8.0 * scale) + sub.chars().count() as f32 * small_cw)
-                                .round(),
-                            top: (sc.y + (24.0 * scale)).round(),
-                            clip: sc,
-                            size: Some(small),
-                        });
-                    }
-                    // Swatch strip: the theme's key tokens, labeled.
-                    let chy = (sc.y + sc.h + (10.0 * scale)).round();
-                    if chy + chip < tile_bottom {
-                        let tokens =
-                            [pt.gradient_from, pt.card, pt.accent, pt.text_bright, pt.ink_dim];
+                    // Token swatch strip, ink-ringed on the gradient.
+                    let chy = (by + btn_h + (12.0 * scale)).round();
+                    if chy + chip < body_bottom {
+                        let tokens = [pt.gradient_from, pt.card, pt.term_bg, pt.accent, pt.ink];
                         for (i, c) in tokens.iter().enumerate() {
                             let r = LayoutRect {
-                                x: (tile.x + ipad + i as f32 * (chip + chip_gap)).round(),
+                                x: (tile.x + i as f32 * (chip + chip_gap)).round(),
                                 y: chy,
                                 w: chip,
                                 h: chip,
                             };
                             // A faint ink ring keeps chips visible when a
-                            // token matches the pane ground (white on white).
+                            // token matches the gradient ground.
                             let ring = (1.0 * scale).round().max(1.0);
                             bg_quads.push(self.px_rect(
                                 &r.inflate(ring),
-                                pane_ink,
+                                pt.ink,
                                 0.25,
                                 (3.0 * scale).round() + ring,
                             ));
                             bg_quads.push(self.px_rect(&r, *c, 1.0, (3.0 * scale).round()));
                         }
                         labels.push(LabelSpec {
-                            text: "bg · surface · accent · text · dim".into(),
-                            color: color(pane_dim.0, pane_dim.1),
-                            left: (tile.x + ipad + 5.0 * (chip + chip_gap) + (6.0 * scale))
-                                .round(),
+                            text: "bg · surface · pane · accent · ink".into(),
+                            color: color(pt.ink_dim, 1.0),
+                            left: (tile.x + 5.0 * (chip + chip_gap) + (6.0 * scale)).round(),
                             top: (chy + (chip - self.cell_height) / 2.0).round(),
-                            clip: tile,
+                            clip: *area,
                             size: Some(small),
                         });
                     }
