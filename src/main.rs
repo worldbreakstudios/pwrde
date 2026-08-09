@@ -308,10 +308,15 @@ struct App {
     /// Who the picker/fork picker is currently targeting.
     picker_target: PickerTarget,
     // ── Right-side tool ribbon / panel ────────────────────────────────────
-    /// Which tool panel is currently open, if any.
+    /// Which tool panel is currently open, if any. Kept even while the tool
+    /// is unregistered (wrong page / non-git group) so it reappears when its
+    /// context returns.
     open_tool: Option<pages::Tool>,
     /// Width of the open tool panel in logical px (drag-resizable).
     tool_panel_w: f32,
+    /// Whether a group cwd sits inside a git checkout, memoized per path —
+    /// ribbon registration probes this on every frame and hit-test.
+    git_cwd_cache: std::cell::RefCell<std::collections::HashMap<std::path::PathBuf, bool>>,
 }
 
 impl App {
@@ -325,8 +330,58 @@ impl App {
         if self.sidebar_collapsed { 0.0 } else { self.sidebar_expanded_w }
     }
 
+    /// Tools registered for `page`, resolved against the active group.
+    /// Sessions tools are contextual per group: PR only when the group's cwd
+    /// sits in a git checkout (its content is branch-scoped), Launch always.
+    /// Other pages register none, which hides the ribbon entirely.
+    fn tools_for(&self, page: Page) -> Vec<pages::Tool> {
+        if page != Page::Sessions {
+            return Vec::new();
+        }
+        let mut tools = Vec::new();
+        if self.active_cwd_is_git() {
+            tools.push(pages::Tool::Pr);
+        }
+        tools.push(pages::Tool::Launch);
+        tools
+    }
+
+    /// Whether the active group's cwd (or an ancestor) is a git checkout.
+    fn active_cwd_is_git(&self) -> bool {
+        let cwd = match &self.workspaces[self.active].cwd {
+            Some(p) => p.clone(),
+            // `None` inherits the directory pwrde was launched from.
+            None => match std::env::current_dir() {
+                Ok(p) => p,
+                Err(_) => return false,
+            },
+        };
+        if let Some(&hit) = self.git_cwd_cache.borrow().get(&cwd) {
+            return hit;
+        }
+        let hit = cwd.ancestors().any(|a| a.join(".git").exists());
+        self.git_cwd_cache.borrow_mut().insert(cwd, hit);
+        hit
+    }
+
+    /// The open tool, if it's registered in the current page/group context.
+    fn visible_tool(&self) -> Option<pages::Tool> {
+        self.open_tool.filter(|t| self.tools_for(self.page).contains(t))
+    }
+
     fn right_w(&self) -> f32 {
-        let panel = if self.open_tool.is_some() { self.tool_panel_w } else { 0.0 };
+        self.right_w_for(self.page)
+    }
+
+    fn right_w_for(&self, page: Page) -> f32 {
+        let tools = self.tools_for(page);
+        if tools.is_empty() {
+            return 0.0;
+        }
+        let panel = match self.open_tool {
+            Some(t) if tools.contains(&t) => self.tool_panel_w,
+            _ => 0.0,
+        };
         workspace::RIBBON_W + panel
     }
 
@@ -513,7 +568,17 @@ impl App {
         let scale = self.scale();
         let (cw, ch) = self.cell_px();
         let dpi = self.dpi();
-        let area = self.area();
+        // Pin PTY sizing to Sessions geometry: pages without tools drop the
+        // ribbon inset from `area()`, and shells must not get resized just
+        // because the user flipped to Settings and back.
+        let (w, h) = self.renderer.surface_size();
+        let area = workspace::terminal_area(
+            w,
+            h,
+            scale,
+            self.sidebar_w(),
+            self.right_w_for(Page::Sessions),
+        );
         let ws = &mut self.workspaces[self.active];
         let (tiles, _) = workspace::layout_tiles(&ws.root, area, scale);
         let axes = workspace::tile_collapse_axis(&ws.root);
@@ -2742,30 +2807,33 @@ impl App {
             return;
         }
 
-        // Tool ribbon / panel (right edge, every page). Panel edge resizes,
-        // ribbon slots toggle their tool; both consume the click so it never
-        // falls through to the tiles behind.
-        if self.open_tool.is_some() {
-            let panel = workspace::tool_panel(w, h, scale, self.tool_panel_w);
-            let pgrab = (workspace::TOOL_PANEL_RESIZE_GRAB * scale).max(1.0);
-            if (px - panel.x).abs() <= pgrab && py >= panel.y && py <= panel.y + panel.h {
-                self.drag = Drag::ToolPanelResize;
-                self.request_redraw();
-                return;
-            }
-            if panel.contains(px, py) {
-                // Placeholder body: nothing interactive yet.
-                return;
-            }
-        }
-        if workspace::ribbon(w, h, scale).contains(px, py) {
-            for (i, tool) in pages::Tool::ALL.iter().enumerate() {
-                if workspace::ribbon_slot_rect(i, w, scale).contains(px, py) {
-                    self.toggle_tool(*tool);
-                    break;
+        // Tool ribbon / panel (right edge, pages/groups with registered
+        // tools). Panel edge resizes, ribbon slots toggle their tool; both
+        // consume the click so it never falls through to the tiles behind.
+        let ribbon_tools = self.tools_for(self.page);
+        if !ribbon_tools.is_empty() {
+            if self.visible_tool().is_some() {
+                let panel = workspace::tool_panel(w, h, scale, self.tool_panel_w);
+                let pgrab = (workspace::TOOL_PANEL_RESIZE_GRAB * scale).max(1.0);
+                if (px - panel.x).abs() <= pgrab && py >= panel.y && py <= panel.y + panel.h {
+                    self.drag = Drag::ToolPanelResize;
+                    self.request_redraw();
+                    return;
+                }
+                if panel.contains(px, py) {
+                    // Placeholder body: nothing interactive yet.
+                    return;
                 }
             }
-            return;
+            if workspace::ribbon(w, h, scale).contains(px, py) {
+                for (i, tool) in ribbon_tools.iter().enumerate() {
+                    if workspace::ribbon_slot_rect(i, w, scale).contains(px, py) {
+                        self.toggle_tool(*tool);
+                        break;
+                    }
+                }
+                return;
+            }
         }
 
         // Empty state (Sessions only): the centered CTA is the only
@@ -3838,9 +3906,14 @@ impl App {
             | Action::CommandPalette => {},
             Action::ToggleFlyover => self.toggle_flyover(),
             Action::FlyoverPopout => self.flyover_toggle_windowed(),
-            // Closes whichever tool is open; opens the first tool when closed.
+            // Closes whichever tool is open; opens the first registered tool
+            // when closed. No-op on pages/groups without tools.
             Action::ToggleToolPanel => {
-                self.toggle_tool(self.open_tool.unwrap_or(pages::Tool::ALL[0]))
+                let tools = self.tools_for(self.page);
+                if let Some(&first) = tools.first() {
+                    let t = self.visible_tool().unwrap_or(first);
+                    self.toggle_tool(t);
+                }
             },
         }
     }
@@ -4892,6 +4965,7 @@ impl App {
             _ => None,
         };
 
+        let ribbon_tools = self.tools_for(self.page);
         let chrome = renderer::ChromeState {
             page: self.page,
             section: self.section,
@@ -4904,6 +4978,7 @@ impl App {
                 .as_ref()
                 .map(|(id, buf)| (*id, buf.as_str())),
             cleanup: &self.cleanup,
+            ribbon_tools: &ribbon_tools,
             open_tool: self.open_tool,
             tool_panel_w: self.tool_panel_w,
             // Overlay scoping happens in the renderer (only overlay elements
@@ -5801,6 +5876,7 @@ fn main() {
                                 workspace::TOOL_PANEL_MAX_W,
                             ))
                             .unwrap_or(workspace::TOOL_PANEL_DEFAULT_W),
+                        git_cwd_cache: Default::default(),
                     };
                     // With persistence on, reattach to the previous session's
                     // groups; otherwise launch into the empty state — no shell

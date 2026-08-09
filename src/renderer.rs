@@ -254,7 +254,11 @@ pub struct ChromeState<'a> {
     pub editing_section: Option<(u64, &'a str)>,
     /// Cleanup page state (worktree table, selection, filter, scroll).
     pub cleanup: &'a crate::cleanup::Cleanup,
+    /// Tools registered for this page/group, in ribbon slot order (resolved
+    /// by `App::tools_for`). Empty hides the ribbon and its inset entirely.
+    pub ribbon_tools: &'a [pages::Tool],
     /// Which right-side tool panel is open, if any (ribbon slot highlighted).
+    /// Only painted while it appears in `ribbon_tools`.
     pub open_tool: Option<pages::Tool>,
     /// Width of the open tool panel in logical px.
     pub tool_panel_w: f32,
@@ -489,11 +493,15 @@ impl Renderer {
         };
         let ws = &workspaces[active];
         let (width, height) = (self.width, self.height);
-        // Right inset: the always-visible ribbon plus the open tool panel.
-        // Must match `App::right_w()` so painting, hit-testing, and PTY
-        // sizing agree on the tile area.
-        let right_w = workspace::RIBBON_W
-            + if chrome.open_tool.is_some() { chrome.tool_panel_w } else { 0.0 };
+        // Right inset: the ribbon (when this page/group registers tools)
+        // plus the open tool panel. Must match `App::right_w()` so painting
+        // and hit-testing agree on the tile area.
+        let open_tool = chrome.open_tool.filter(|t| chrome.ribbon_tools.contains(t));
+        let right_w = if chrome.ribbon_tools.is_empty() {
+            0.0
+        } else {
+            workspace::RIBBON_W + if open_tool.is_some() { chrome.tool_panel_w } else { 0.0 }
+        };
         let area = workspace::terminal_area(width, height, self.scale, sidebar_w, right_w);
         let empty = workspaces.len() == 1 && workspaces[0].is_empty();
         // Dividers aren't painted (the gap between cards shows the gradient);
@@ -722,12 +730,12 @@ impl Renderer {
 
         let card_r = (CARD_RADIUS * self.scale).round();
 
-        // ── Tool ribbon + panel (right edge, identical on every page) ──
+        // ── Tool ribbon + panel (right edge, when tools are registered) ──
         // Like the sidebar, the ribbon strip is transparent on the window
         // gradient: only the slot pills and the panel card paint.
-        for (i, tool) in pages::Tool::ALL.iter().enumerate() {
+        for (i, tool) in chrome.ribbon_tools.iter().enumerate() {
             let slot = workspace::ribbon_slot_rect(i, width, self.scale);
-            let active = chrome.open_tool == Some(*tool);
+            let active = open_tool == Some(*tool);
             let hov = hover(cur, &slot);
             if active || hov {
                 let m = (4.0 * self.scale).round();
@@ -746,7 +754,7 @@ impl Renderer {
             self.ribbon_icon(*tool, &slot, ink, &mut bg_quads, &mut carets);
             hot.push(slot);
         }
-        if let Some(tool) = chrome.open_tool {
+        if let Some(tool) = open_tool {
             let panel = workspace::tool_panel(width, height, self.scale, chrome.tool_panel_w);
             let pad = (14.0 * self.scale).round();
             // Chrome-polarity card like Settings/Cleanup, not a dark tile.
@@ -3393,6 +3401,7 @@ mod tests {
             sections: &[],
             editing_section: None,
             cleanup,
+            ribbon_tools: &[],
             open_tool: None,
             tool_panel_w: 0.0,
             cursor: None,
@@ -3463,6 +3472,7 @@ mod tests {
         // Closed: the ribbon icon is there, the panel is not.
         let mut chrome = cleanup_chrome(&state);
         chrome.page = Page::Sessions;
+        chrome.ribbon_tools = &pages::Tool::ALL;
         let frame = renderer.build_frame(
             &wss, 0, 240.0, None, None, None, None, None, None, None, None, None, None, &chrome,
         );
@@ -3506,6 +3516,7 @@ mod tests {
         // card stops left of the panel.
         let mut chrome = cleanup_chrome(&state);
         chrome.page = Page::Sessions;
+        chrome.ribbon_tools = &pages::Tool::ALL;
         chrome.open_tool = Some(pages::Tool::Pr);
         chrome.tool_panel_w = crate::workspace::TOOL_PANEL_DEFAULT_W;
         let frame = renderer.build_frame(
@@ -3532,6 +3543,28 @@ mod tests {
             "tile card fills the narrowed area"
         );
         assert!(area.x + area.w <= panel.x, "tiles stop left of the panel");
+
+        // No tools registered (non-Sessions pages, or a group without the
+        // tool's context): ribbon and panel hide — even with a stale
+        // open_tool — and the tiles reclaim the full width.
+        let mut chrome = cleanup_chrome(&state);
+        chrome.page = Page::Sessions;
+        chrome.open_tool = Some(pages::Tool::Pr);
+        chrome.tool_panel_w = crate::workspace::TOOL_PANEL_DEFAULT_W;
+        let frame = renderer.build_frame(
+            &wss, 0, 240.0, None, None, None, None, None, None, None, None, None, None, &chrome,
+        );
+        let texts: Vec<&str> = frame.labels.iter().map(|l| l.text.as_str()).collect();
+        assert!(!texts.contains(&"Pull Request"));
+        assert!(
+            !frame.bg_quads.iter().any(|q| q.w == d && q.radius == d / 2.0 && q.border > 0.0),
+            "no ribbon icons without registered tools"
+        );
+        let full = crate::workspace::terminal_area(1600, 1000, scale, 240.0, 0.0);
+        assert!(
+            frame.bg_quads.iter().any(|q| q.x == full.x && q.w == full.w),
+            "tile card reclaims the ribbon's width"
+        );
     }
 
     /// The sidebar unread dot sits in the row's left padding gutter, not at
