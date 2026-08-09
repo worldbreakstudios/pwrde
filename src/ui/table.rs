@@ -5,6 +5,10 @@
 //! take an optional fixed `.w(px)` — give the same widths to matching
 //! header/body cells to keep columns aligned. Selected/hover row states
 //! mirror the source's `data-[state=selected]` and `hover:` styles.
+//!
+//! Local additions over the rcn source: `TableRow::on_click`, and flex cells
+//! carry `min-w: 0` + hidden overflow so columns shrink uniformly (and stay
+//! aligned across rows) when the table runs out of width.
 
 use gpui::{
     AnyElement, App, ClickEvent, FontWeight, InteractiveElement as _, IntoElement, ParentElement,
@@ -293,7 +297,11 @@ impl RenderOnce for TableHead {
             .text_color(theme.foreground)
             .map(|el| match self.width {
                 Some(width) => el.w(width).flex_shrink_0(),
-                None => el.flex_1(),
+                // min-w 0 + hidden overflow (local addition): without them a
+                // flex cell refuses to shrink below its nowrap content, so
+                // narrow windows resolve different column widths per row and
+                // the table stops lining up.
+                None => el.flex_1().min_w(px(0.)).overflow_hidden(),
             })
             .children(self.children)
     }
@@ -343,7 +351,9 @@ impl RenderOnce for TableCell {
             .whitespace_nowrap()
             .map(|el| match self.width {
                 Some(width) => el.w(width).flex_shrink_0(),
-                None => el.flex_1(),
+                // Same local addition as TableHead: keep flex columns
+                // shrinkable so rows stay aligned when space runs out.
+                None => el.flex_1().min_w(px(0.)).overflow_hidden(),
             })
             .children(self.children)
     }

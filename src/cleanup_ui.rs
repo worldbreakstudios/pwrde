@@ -28,12 +28,14 @@ impl App {
         // Keep the rcn Theme global in sync with live chrome tokens.
         cx.set_global(crate::ui::theme::Theme::from_chrome(crate::theme::current()));
 
-        let area = self.area();
-        let scale = self.scale().max(0.001);
-        let x = area.x / scale;
-        let y = area.y / scale;
-        let w = area.w / scale;
-        let h = area.h / scale;
+        // Mirror workspace::terminal_area as logical edge insets rather than
+        // computing w/h from the renderer's surface size: insets re-resolve
+        // in gpui layout every frame, so the overlay tracks a live window
+        // resize instead of waiting for the next entity notify.
+        let pad = crate::workspace::AREA_PAD;
+        let sidebar = self.sidebar_w();
+        let left = if sidebar == 0.0 { pad } else { sidebar };
+        let right = self.right_w() + pad;
 
         let entity = cx.entity().downgrade();
         let theme = crate::ui::theme::Theme::of(cx).clone();
@@ -167,10 +169,10 @@ impl App {
         // Card/CardContent are not Styled — wrap for flex fill/height.
         div()
             .absolute()
-            .left(px(x))
-            .top(px(y))
-            .w(px(w))
-            .h(px(h))
+            .left(px(left))
+            .top(px(pad))
+            .right(px(right))
+            .bottom(px(pad))
             .p(px(8.))
             .child(
                 div()
@@ -371,10 +373,12 @@ fn entry_row(
         branch.push_str(" (current)");
     }
     let branch_el = div()
+        .truncate()
         .when(is_current, |el| el.text_color(theme.muted_foreground))
         .child(branch);
 
     let id_el = div()
+        .truncate()
         .text_color(theme.muted_foreground)
         .child(w.id.clone());
 
@@ -454,7 +458,7 @@ fn pr_cell(pr: Option<&cleanup::PrInfo>, theme: &crate::ui::theme::Theme) -> Any
                 .child(
                     div()
                         .flex_1()
-                        .overflow_hidden()
+                        .truncate()
                         .text_color(theme.muted_foreground)
                         .child(title),
                 )

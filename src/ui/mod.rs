@@ -3,7 +3,8 @@
 //! These are faithful copies (not a Cargo dependency), pinned to the same gpui
 //! git rev as this app so they compile unchanged. Tokens live in [`theme`];
 //! bridge them from pwrde chrome via [`theme::Theme::from_chrome`] (added
-//! locally). One deliberate local extension: [`table::TableRow::on_click`].
+//! locally). Deliberate local extensions, both in [`table`]: `TableRow::on_click`,
+//! and shrinkable flex cells so columns stay aligned at narrow widths.
 
 pub mod assets;
 pub mod badge;
