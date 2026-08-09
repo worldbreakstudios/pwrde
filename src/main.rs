@@ -689,6 +689,17 @@ impl App {
         self.persist_snapshot();
     }
 
+    /// ⌘⇧W: close the active group from any focused pane, through the same
+    /// confirm dialog as ⌘W on the primary pane's last tab.
+    fn close_focused_group(&mut self) {
+        let primary_tile = self.workspaces[self.active].primary_tile;
+        self.confirm = Some(ConfirmClose {
+            text: "Closing this group closes all of its panes.".into(),
+            action: ConfirmAction::CloseGroup { primary_tile },
+        });
+        self.request_redraw();
+    }
+
     /// Toggle collapse/expand all panes *other than* the focused one (the ⌘⇧F
     /// action). If any other tile is expanded, collapse them all; otherwise
     /// expand them all. A single-tile workspace is left alone.
@@ -3729,6 +3740,7 @@ impl App {
             Action::Copy => self.copy(),
             Action::Paste => self.paste(),
             Action::CloseTab => self.close_active_tab(),
+            Action::CloseGroup => self.close_focused_group(),
             Action::PrevTile => self.cycle_tile(-1),
             Action::NextTile => self.cycle_tile(1),
             Action::PrevTab => self.cycle_tab(-1),

@@ -198,6 +198,7 @@ pub enum Action {
     Copy,
     Paste,
     CloseTab,
+    CloseGroup,
     Quit,
     PrevTile,
     NextTile,
@@ -223,7 +224,7 @@ pub enum Action {
 
 impl Action {
     /// Keyboard-page row order.
-    pub const ALL: [Action; 28] = [
+    pub const ALL: [Action; 29] = [
         Action::SplitRight,
         Action::SplitDown,
         Action::NewTab,
@@ -231,6 +232,7 @@ impl Action {
         Action::Copy,
         Action::Paste,
         Action::CloseTab,
+        Action::CloseGroup,
         Action::Quit,
         Action::PrevTile,
         Action::NextTile,
@@ -264,6 +266,7 @@ impl Action {
             Action::Copy => "copy",
             Action::Paste => "paste",
             Action::CloseTab => "close_tab",
+            Action::CloseGroup => "close_group",
             Action::Quit => "quit",
             Action::PrevTile => "prev_tile",
             Action::NextTile => "next_tile",
@@ -297,6 +300,7 @@ impl Action {
             Action::Copy => "Copy selection",
             Action::Paste => "Paste",
             Action::CloseTab => "Close tab",
+            Action::CloseGroup => "Close group",
             Action::Quit => "Quit",
             Action::PrevTile => "Focus previous tile",
             Action::NextTile => "Focus next tile",
@@ -334,6 +338,7 @@ impl Action {
             Action::Copy => (false, "c"),
             Action::Paste => (false, "v"),
             Action::CloseTab => (false, "w"),
+            Action::CloseGroup => (true, "w"),
             Action::Quit => (false, "q"),
             Action::PrevTile => (false, "["),
             Action::NextTile => (false, "]"),
@@ -597,6 +602,22 @@ mod tests {
         };
         assert_eq!(match_action(&ks("up")), Some(Action::PrevSidebarTab));
         assert_eq!(match_action(&ks("down")), Some(Action::NextSidebarTab));
+    }
+
+    #[test]
+    fn close_group_binding_resolves() {
+        let ks = Keystroke {
+            modifiers: Modifiers {
+                platform: true,
+                shift: true,
+                control: false,
+                alt: false,
+                function: false,
+            },
+            key: "w".into(),
+            key_char: None,
+        };
+        assert_eq!(match_action(&ks), Some(Action::CloseGroup));
     }
 
     /// ⌘S must reach the sidebar toggle through the same lookup every hotkey
