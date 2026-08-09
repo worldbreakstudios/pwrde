@@ -241,6 +241,10 @@ struct App {
     /// In-progress edit buffer for the Settings → Sessions primary-command
     /// row, or `None` when not editing.
     editing_command: Option<String>,
+    /// Search query in the Settings sidebar search box.
+    settings_query: String,
+    /// Whether the Settings sidebar search box has keyboard focus.
+    settings_search_focus: bool,
     /// In-progress sidebar section rename: `(section_id, buffer)`, or `None`
     /// when not editing. Enter commits via `apply_section_rename`, Esc cancels.
     editing_section: Option<(u64, String)>,
@@ -2769,10 +2773,19 @@ impl App {
                 return;
             }
             if self.page == Page::Settings {
-                // Settings sections sit in the group rows' slots.
+                // Search box in the top slot; sections in the rows below it.
+                if workspace::settings_search_rect(scale, self.sidebar_w()).contains(px, py) {
+                    self.settings_search_focus = true;
+                    self.recording = None;
+                    self.editing_command = None;
+                    self.request_redraw();
+                    return;
+                }
+                self.settings_search_focus = false;
                 for (i, section) in Section::ALL.iter().enumerate() {
-                    if workspace::tab_rect(i, scale, self.sidebar_w()).contains(px, py) {
+                    if workspace::tab_rect(i + 1, scale, self.sidebar_w()).contains(px, py) {
                         self.section = *section;
+                        self.settings_query.clear();
                         self.recording = None;
                         self.editing_command = None;
                         self.request_redraw();
@@ -3664,6 +3677,38 @@ impl App {
     /// row captures the next ⌘ chord as its new binding; otherwise ⌘
     /// shortcuts still dispatch and plain typing is swallowed.
     fn handle_settings_key(&mut self, ev: &KeyDownEvent) {
+        // A focused sidebar search box captures typing: chars filter, Enter
+        // jumps to the first match's section, Escape cancels.
+        if self.settings_search_focus {
+            match ev.keystroke.key.as_str() {
+                "escape" => {
+                    self.settings_query.clear();
+                    self.settings_search_focus = false;
+                },
+                "enter" => {
+                    if let Some(entry) = pages::search_settings(&self.settings_query).first() {
+                        self.section = entry.section;
+                    }
+                    self.settings_query.clear();
+                    self.settings_search_focus = false;
+                },
+                "backspace" => {
+                    self.settings_query.pop();
+                },
+                _ => {
+                    if !ev.keystroke.modifiers.control
+                        && !ev.keystroke.modifiers.platform
+                        && let Some(text) = ev.keystroke.key_char.as_deref()
+                    {
+                        for ch in text.chars().filter(|c| !c.is_control()) {
+                            self.settings_query.push(ch);
+                        }
+                    }
+                },
+            }
+            self.request_redraw();
+            return;
+        }
         // An editing primary-command row captures typing: chars append, Enter
         // saves, Escape cancels.
         if self.editing_command.is_some() {
@@ -3843,6 +3888,8 @@ impl App {
             self.page = page;
             self.recording = None;
             self.editing_command = None;
+            self.settings_query.clear();
+            self.settings_search_focus = false;
             // Grids may have gone stale while the Settings page was up.
             if page == Page::Sessions {
                 self.sync_layout();
@@ -3981,6 +4028,22 @@ impl App {
     fn settings_click(&mut self, px: f32, py: f32) {
         let area = self.area();
         let scale = self.scale();
+        // A click in the card leaves the search box (the query, and with it
+        // the results list, survives until a result or section is chosen).
+        self.settings_search_focus = false;
+        // Search-results mode: a click on a result row jumps to its section.
+        if !self.settings_query.is_empty() {
+            for (i, entry) in pages::search_settings(&self.settings_query).iter().enumerate() {
+                if workspace::settings_row_rect(&area, i, scale).contains(px, py) {
+                    self.section = entry.section;
+                    self.settings_query.clear();
+                    self.settings_search_focus = false;
+                    break;
+                }
+            }
+            self.request_redraw();
+            return;
+        }
         match self.section {
             Section::Sessions => {
                 if workspace::settings_row_rect(&area, 0, scale).contains(px, py) {
@@ -4836,6 +4899,8 @@ impl App {
                 .as_ref()
                 .map(|(id, buf)| (*id, buf.as_str())),
             cleanup: &self.cleanup,
+            settings_query: &self.settings_query,
+            settings_search_focus: self.settings_search_focus,
             // Overlay scoping happens in the renderer (only overlay elements
             // hover while one is up). Here we suppress hover mid-drag, and
             // for the chrome under an open flyover panel — clicks inside the
@@ -5681,6 +5746,8 @@ fn main() {
                         confirm: None,
                         pending_primary_cmd: std::collections::HashMap::new(),
                         editing_command: None,
+                        settings_query: String::new(),
+                        settings_search_focus: false,
                         editing_section: None,
                         // Single focus handle, minted once; focused below.
                         focus_handle: cx.focus_handle(),
