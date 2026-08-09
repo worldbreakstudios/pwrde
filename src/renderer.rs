@@ -1621,18 +1621,37 @@ impl Renderer {
                         });
                     }
                     // Mini tile: a floating terminal card on the gradient.
+                    // Its ground and text mirror `build_frame`'s pane chrome:
+                    // with a terminal scheme selected for this polarity the
+                    // pane follows the scheme (a light profile means light
+                    // panes even under a dark-carded theme), otherwise the
+                    // chrome theme's terminal tokens apply.
+                    let (pane_bg, pane_ink, pane_dim, pane_divider) =
+                        match crate::term_theme::selected(preview_dark) {
+                            Some(t) => (t.bg, t.fg, (t.fg, 0.55), (t.fg, 0.15)),
+                            None => (
+                                pt.term_bg,
+                                pt.text_bright,
+                                (pt.text_dim, 1.0),
+                                (pt.card_divider, 1.0),
+                            ),
+                        };
                     let tile = LayoutRect {
                         x: (body.x + sb_w).round(),
                         y: (body.y + (6.0 * scale)).round(),
                         w: (body.w - sb_w - ipad).max(0.0),
                         h: (body.h - (6.0 * scale) - ipad).max(0.0),
                     };
-                    bg_quads.push(self.px_rect(&tile, pt.term_bg, 1.0, (8.0 * scale).round()));
+                    bg_quads.push(self.px_rect(&tile, pane_bg, 1.0, (8.0 * scale).round()));
                     let strip_h = (20.0 * scale).round();
                     for (i, (tab, on)) in [("zsh", true), ("cargo", false)].iter().enumerate() {
                         labels.push(LabelSpec {
                             text: (*tab).into(),
-                            color: color(if *on { pt.text_bright } else { pt.text_dim }, 1.0),
+                            color: if *on {
+                                color(pane_ink, 1.0)
+                            } else {
+                                color(pane_dim.0, pane_dim.1)
+                            },
                             left: (tile.x + ipad + i as f32 * (46.0 * scale)).round(),
                             top: (tile.y + (strip_h - self.cell_height) / 2.0).round(),
                             clip: tile,
@@ -1645,7 +1664,7 @@ impl Renderer {
                         w: tile.w,
                         h: (1.0 * scale).round().max(1.0),
                     };
-                    bg_quads.push(self.px_rect(&hairline, pt.card_divider, 1.0, 0.0));
+                    bg_quads.push(self.px_rect(&hairline, pane_divider.0, pane_divider.1, 0.0));
                     // Primary / secondary buttons.
                     let btn_h = (20.0 * scale).round();
                     let by = (tile.y + strip_h + (10.0 * scale)).round();
@@ -1669,10 +1688,10 @@ impl Renderer {
                             w: bw2,
                             h: btn_h,
                         };
-                        bg_quads.push(self.px_rect(&b2, pt.text_bright, 0.12, (6.0 * scale).round()));
+                        bg_quads.push(self.px_rect(&b2, pane_ink, 0.12, (6.0 * scale).round()));
                         labels.push(LabelSpec {
                             text: "Secondary".into(),
-                            color: color(pt.text_bright, 1.0),
+                            color: color(pane_ink, 1.0),
                             left: (b2.x + ipad).round(),
                             top: (b2.y + (b2.h - self.cell_height) / 2.0).round(),
                             clip: b2,
@@ -1687,10 +1706,10 @@ impl Renderer {
                         h: (46.0 * scale).round(),
                     };
                     if sc.y + sc.h < tile_bottom {
-                        bg_quads.push(self.px_rect(&sc, pt.text_bright, 0.06, (7.0 * scale).round()));
+                        bg_quads.push(self.px_rect(&sc, pane_ink, 0.06, (7.0 * scale).round()));
                         labels.push(LabelSpec {
                             text: "Surface card".into(),
-                            color: color(pt.text_bright, 1.0),
+                            color: color(pane_ink, 1.0),
                             left: (sc.x + (8.0 * scale)).round(),
                             top: (sc.y + (6.0 * scale)).round(),
                             clip: sc,
@@ -1699,7 +1718,7 @@ impl Renderer {
                         let sub = "Secondary text on surface · ";
                         labels.push(LabelSpec {
                             text: sub.into(),
-                            color: color(pt.text_dim, 1.0),
+                            color: color(pane_dim.0, pane_dim.1),
                             left: (sc.x + (8.0 * scale)).round(),
                             top: (sc.y + (24.0 * scale)).round(),
                             clip: sc,
@@ -1727,11 +1746,20 @@ impl Renderer {
                                 w: chip,
                                 h: chip,
                             };
+                            // A faint ink ring keeps chips visible when a
+                            // token matches the pane ground (white on white).
+                            let ring = (1.0 * scale).round().max(1.0);
+                            bg_quads.push(self.px_rect(
+                                &r.inflate(ring),
+                                pane_ink,
+                                0.25,
+                                (3.0 * scale).round() + ring,
+                            ));
                             bg_quads.push(self.px_rect(&r, *c, 1.0, (3.0 * scale).round()));
                         }
                         labels.push(LabelSpec {
                             text: "bg · surface · accent · text · dim".into(),
-                            color: color(pt.text_dim, 1.0),
+                            color: color(pane_dim.0, pane_dim.1),
                             left: (tile.x + ipad + 5.0 * (chip + chip_gap) + (6.0 * scale))
                                 .round(),
                             top: (chy + (chip - self.cell_height) / 2.0).round(),
