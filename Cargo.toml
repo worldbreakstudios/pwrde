@@ -31,6 +31,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dirs = "6"
 rusqlite = { version = "0.32", features = ["bundled"] }
+unicode-segmentation = "1"
 
 # objc 0.2's msg_send! probes `feature = "cargo-clippy"` inside its expansion,
 # which rustc's check-cfg would flag at every call site. Registering the value

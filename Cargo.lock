@@ -4803,6 +4803,7 @@ dependencies = [
  "serde",
  "serde_json",
  "termwiz",
+ "unicode-segmentation",
  "wezterm-term",
  "wgpu 30.0.0",
  "winit",
