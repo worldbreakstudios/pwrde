@@ -1622,10 +1622,20 @@ impl Renderer {
                     }
                     // Mini tile: the floating terminal card, deliberately a
                     // small element like in the real layout — the theme's
-                    // polarity reads from the gradient + surface ground,
-                    // while term_bg shows honestly as the pane card. (With a
-                    // terminal profile selected the real panes take the
-                    // profile's ground; that's the terminal column's job.)
+                    // polarity reads from the gradient + surface ground. The
+                    // pane itself mirrors `build_frame`'s chrome: the
+                    // selected profile's ground/text when one is set, the
+                    // theme's terminal tokens for the adaptive Default.
+                    let (pane_bg, pane_ink, pane_dim, pane_divider) =
+                        match crate::term_theme::selected(preview_dark) {
+                            Some(t) => (t.bg, t.fg, (t.fg, 0.55), (t.fg, 0.15)),
+                            None => (
+                                pt.term_bg,
+                                pt.text_bright,
+                                (pt.text_dim, 1.0),
+                                (pt.card_divider, 1.0),
+                            ),
+                        };
                     let tile = LayoutRect {
                         x: (body.x + sb_w).round(),
                         y: (body.y + (6.0 * scale)).round(),
@@ -1633,14 +1643,18 @@ impl Renderer {
                         h: (body.h * 0.42).round().max(0.0),
                     };
                     bg_quads.push(
-                        self.px_rect(&tile, pt.term_bg, 1.0, (8.0 * scale).round())
+                        self.px_rect(&tile, pane_bg, 1.0, (8.0 * scale).round())
                             .shadow(Shadow::Soft),
                     );
                     let strip_h = (20.0 * scale).round();
                     for (i, (tab, on)) in [("zsh", true), ("cargo", false)].iter().enumerate() {
                         labels.push(LabelSpec {
                             text: (*tab).into(),
-                            color: color(if *on { pt.text_bright } else { pt.text_dim }, 1.0),
+                            color: if *on {
+                                color(pane_ink, 1.0)
+                            } else {
+                                color(pane_dim.0, pane_dim.1)
+                            },
                             left: (tile.x + ipad + i as f32 * (46.0 * scale)).round(),
                             top: (tile.y + (strip_h - self.cell_height) / 2.0).round(),
                             clip: tile,
@@ -1653,11 +1667,11 @@ impl Renderer {
                         w: tile.w,
                         h: (1.0 * scale).round().max(1.0),
                     };
-                    bg_quads.push(self.px_rect(&hairline, pt.card_divider, 1.0, 0.0));
-                    // A couple of pane lines in the theme's terminal text.
-                    for (i, (line, c)) in [
-                        ("$ cargo run", pt.text_bright),
-                        ("   Compiling pwrde", pt.text_dim),
+                    bg_quads.push(self.px_rect(&hairline, pane_divider.0, pane_divider.1, 0.0));
+                    // A couple of pane lines in the pane's text colors.
+                    for (i, (line, (c, a))) in [
+                        ("$ cargo run", (pane_ink, 1.0)),
+                        ("   Compiling pwrde", pane_dim),
                     ]
                     .iter()
                     .enumerate()
@@ -1672,7 +1686,7 @@ impl Renderer {
                         }
                         labels.push(LabelSpec {
                             text: (*line).into(),
-                            color: color(*c, 1.0),
+                            color: color(*c, *a),
                             left: (tile.x + ipad).round(),
                             top,
                             clip: tile,
