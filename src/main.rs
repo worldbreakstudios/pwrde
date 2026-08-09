@@ -1747,7 +1747,10 @@ impl App {
         Some(tab)
     }
 
-    fn resolve_drop(&self, px: f32, py: f32) -> Option<DropTarget> {
+    /// Resolve a terminal-tab drag (whose source is `src_tile`) to a landing
+    /// zone. Taken as a parameter — not read from `self.drag` — because
+    /// mouse-up clears the drag before resolving the drop.
+    fn resolve_drop(&self, px: f32, py: f32, src_tile: u64) -> Option<DropTarget> {
         let scale = self.scale();
         let area = self.area();
         let ws = &self.workspaces[self.active];
@@ -1762,8 +1765,14 @@ impl App {
             if bar.contains(px, py) {
                 let has_caret = axes.iter().any(|(tid, a)| tid == id && a.is_some());
                 let n = ws.root.find_tile(*id).map_or(1, |t| t.tabs.len()).max(1);
-                let t0 = workspace::tile_tab_rect(&strip, 0, n, scale, has_caret);
-                let index = ((((px - t0.x).max(0.0)) / t0.w).floor() as usize).min(n);
+                // Same-tile reorder resolves to the nearest gap (matching the
+                // insertion-line preview); cross-tile keeps the hovered cell.
+                let index = if src_tile == *id {
+                    workspace::tile_tab_insert_gap(&strip, px, n, scale, has_caret)
+                } else {
+                    let t0 = workspace::tile_tab_rect(&strip, 0, n, scale, has_caret);
+                    ((((px - t0.x).max(0.0)) / t0.w).floor() as usize).min(n)
+                };
                 return Some(DropTarget::TabBar { tile: *id, index });
             }
             let content = workspace::tile_content(rect, scale);
@@ -2162,6 +2171,19 @@ impl App {
                 let (tiles, _) = workspace::layout_tiles(&wsp.root, area, scale);
                 let (_, rect) = tiles.into_iter().find(|(id, _)| *id == tile)?;
                 Some(match target {
+                    // Same-tile reorder previews as a thin insertion line at
+                    // the landing gap; cross-tile keeps the whole-bar hint.
+                    DropTarget::TabBar { index, .. }
+                        if matches!(self.drag, Drag::Tab { tile: src, .. } if src == tile) =>
+                    {
+                        let strip =
+                            workspace::tab_strip_rect(area, &rect, scale, self.sidebar_w());
+                        let axes = workspace::tile_collapse_axis(&wsp.root);
+                        let has_caret =
+                            axes.iter().any(|(tid, a)| *tid == tile && a.is_some());
+                        let n = wsp.root.find_tile(tile).map_or(1, |t| t.tabs.len()).max(1);
+                        workspace::tile_tab_insert_line(&strip, index, n, scale, has_caret)
+                    },
                     DropTarget::TabBar { .. } => workspace::tile_tab_bar(
                         &workspace::tab_strip_rect(area, &rect, scale, self.sidebar_w()),
                         scale,
@@ -2290,6 +2312,9 @@ impl App {
         match target {
             DropTarget::TabBar { tile, index } => {
                 if let Some(t) = self.workspaces[self.active].root.find_tile_mut(tile) {
+                    // Same-tile reorder: the source tab is already removed, so
+                    // gaps past it shift down one to land where the line showed.
+                    let index = if tile == src_tile && index > src_tab { index - 1 } else { index };
                     let index = index.min(t.tabs.len());
                     t.tabs.insert(index, tab);
                     t.active = index;
@@ -3187,7 +3212,7 @@ impl App {
             },
             Drag::Tab { tile, tab } => {
                 let (px, py) = (self.cursor.0 as f32, self.cursor.1 as f32);
-                if let Some(target) = self.resolve_drop(px, py) {
+                if let Some(target) = self.resolve_drop(px, py, tile) {
                     self.apply_drop(tile, tab, target);
                 }
                 self.request_redraw();
@@ -4786,8 +4811,8 @@ impl App {
         // scale² and made it disagree with the drop resolved on mouse-up.
         let (cursor_x, cursor_y) = self.cursor;
         let drop_hint = match self.drag {
-            Drag::Tab { .. } => {
-                self.resolve_drop(cursor_x as f32, cursor_y as f32)
+            Drag::Tab { tile, .. } => {
+                self.resolve_drop(cursor_x as f32, cursor_y as f32, tile)
                     .and_then(|t| self.drop_hint(t))
             },
             Drag::Group { .. } => self
