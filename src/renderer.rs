@@ -743,7 +743,7 @@ impl Renderer {
                 );
             }
             let ink = if active || hov { th.ink } else { th.ink_dim };
-            self.ribbon_icon(*tool, &slot, ink, &mut bg_quads);
+            self.ribbon_icon(*tool, &slot, ink, &mut bg_quads, &mut carets);
             hot.push(slot);
         }
         if let Some(tool) = chrome.open_tool {
@@ -760,7 +760,7 @@ impl Renderer {
                 size: None,
             });
             labels.push(LabelSpec {
-                text: "Pull request view coming soon".into(),
+                text: format!("{} view coming soon", tool.title()),
                 color: color(th.ink_dim, 1.0),
                 left: panel.x + pad,
                 top: (panel.y + pad + 2.0 * self.cell_height).round(),
@@ -3231,6 +3231,7 @@ impl Renderer {
         slot: &LayoutRect,
         rgb: (u8, u8, u8),
         quads: &mut Vec<Quad>,
+        carets: &mut Vec<CaretSpec>,
     ) {
         let px = |v: f32| (v * self.scale).round();
         let (ix, iy) = (
@@ -3285,6 +3286,27 @@ impl Renderer {
                         y: iy + px(3.5),
                         w: t,
                         h: px(6.0),
+                    },
+                    rgb,
+                    1.0,
+                    0.0,
+                ));
+            },
+            pages::Tool::Launch => {
+                // Terminal-prompt mark (>_): launch runs a command in a shell.
+                carets.push(CaretSpec {
+                    cx: ix + px(4.5),
+                    cy: iy + px(8.0),
+                    size: px(3.5),
+                    angle: -std::f32::consts::FRAC_PI_2,
+                    color: color(rgb, 1.0),
+                });
+                quads.push(self.px_rect(
+                    &LayoutRect {
+                        x: ix + px(9.5),
+                        y: iy + px(12.5) - t / 2.0,
+                        w: px(5.0),
+                        h: t,
                     },
                     rgb,
                     1.0,
@@ -3469,6 +3491,16 @@ mod tests {
             frame.hot.iter().any(|r| r.x == slot.x && r.y == slot.y),
             "ribbon slot is a hover target"
         );
+        // The Launch stub stacks below: its prompt chevron sits in slot 1.
+        let slot1 = crate::workspace::ribbon_slot_rect(1, 1600, scale);
+        assert!(frame.hot.iter().any(|r| r.x == slot1.x && r.y == slot1.y));
+        assert!(
+            frame.carets.iter().any(|c| c.cx >= slot1.x
+                && c.cx <= slot1.x + slot1.w
+                && c.cy >= slot1.y
+                && c.cy <= slot1.y + slot1.h),
+            "launch icon chevron renders in the second slot"
+        );
 
         // Open: the panel card paints with header + placeholder, and the tile
         // card stops left of the panel.
@@ -3481,7 +3513,7 @@ mod tests {
         );
         let texts: Vec<&str> = frame.labels.iter().map(|l| l.text.as_str()).collect();
         assert!(texts.contains(&"Pull Request"));
-        assert!(texts.contains(&"Pull request view coming soon"));
+        assert!(texts.contains(&"Pull Request view coming soon"));
         let panel =
             crate::workspace::tool_panel(1600, 1000, scale, crate::workspace::TOOL_PANEL_DEFAULT_W);
         assert!(

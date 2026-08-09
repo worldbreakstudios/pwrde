@@ -3838,7 +3838,10 @@ impl App {
             | Action::CommandPalette => {},
             Action::ToggleFlyover => self.toggle_flyover(),
             Action::FlyoverPopout => self.flyover_toggle_windowed(),
-            Action::ToggleToolPanel => self.toggle_tool(pages::Tool::Pr),
+            // Closes whichever tool is open; opens the first tool when closed.
+            Action::ToggleToolPanel => {
+                self.toggle_tool(self.open_tool.unwrap_or(pages::Tool::ALL[0]))
+            },
         }
     }
 

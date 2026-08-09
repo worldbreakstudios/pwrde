@@ -192,21 +192,24 @@ pub const PERSIST_TOGGLE_ROW: usize = 0;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tool {
     Pr,
+    Launch,
 }
 
 impl Tool {
-    pub const ALL: [Tool; 1] = [Tool::Pr];
+    pub const ALL: [Tool; 2] = [Tool::Pr, Tool::Launch];
 
     /// Stable identifier used in the settings key (`toolpanel.tool`).
     pub fn name(self) -> &'static str {
         match self {
             Tool::Pr => "pr",
+            Tool::Launch => "launch",
         }
     }
 
     pub fn title(self) -> &'static str {
         match self {
             Tool::Pr => "Pull Request",
+            Tool::Launch => "Launch",
         }
     }
 }
