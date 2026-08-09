@@ -1188,14 +1188,13 @@ impl Renderer {
                     let inset =
                         ((rect.h - (self.cell_height + cwd_line_h)) / 2.0).max(0.0);
                     // Unread (any unread tab in the group lights the dot):
-                    // accent dot in the left padding gutter, on the title
-                    // line; text stays put so rows keep alignment.
+                    // accent dot in the left padding gutter, centered on the
+                    // row; text stays put so rows keep alignment.
                     if ws_item.any_unread() {
                         let ds = (7.0 * self.scale).round();
                         let dot = LayoutRect {
                             x: (rect.x + (group_pad - ds) / 2.0).round(),
-                            y: (rect.y + inset + (self.cell_height - ds) / 2.0)
-                                .round(),
+                            y: (rect.y + (rect.h - ds) / 2.0).round(),
                             w: ds,
                             h: ds,
                         };
@@ -3325,14 +3324,14 @@ mod tests {
         let group_pad = (12.0 * scale).round();
         let ds = (7.0 * scale).round();
         let expected_x = (row.x + (group_pad - ds) / 2.0).round();
+        let expected_y = (row.y + (row.h - ds) / 2.0).round();
         assert!(
             frame.bg_quads.iter().any(|q| q.w == ds
                 && q.h == ds
                 && q.radius == ds / 2.0
                 && q.x == expected_x
-                && q.y >= row.y
-                && q.y + q.h <= row.y + row.h),
-            "unread dot should sit in the left gutter of the group row"
+                && q.y == expected_y),
+            "unread dot should sit in the left gutter, centered on the group row"
         );
     }
 
