@@ -473,6 +473,33 @@ pub fn palette(chrome: &crate::theme::Theme) -> ColorPalette {
     build(selected(crate::theme::dark_active()), chrome.term_bg)
 }
 
+/// Preview colors for a slot as u8 triples — `(fg, bg, ansi)` — resolving the
+/// adaptive default (stock ANSI table on the chrome background) the same way
+/// [`build`] does, so the Appearance page previews what panes actually get.
+pub fn preview_colors(
+    scheme: Option<&TermTheme>,
+    chrome_bg: (u8, u8, u8),
+) -> ((u8, u8, u8), (u8, u8, u8), [(u8, u8, u8); 8]) {
+    match scheme {
+        Some(t) => (t.fg, t.bg, t.ansi),
+        None => {
+            let p = ColorPalette::default();
+            let to_u8 = |c: wezterm_term::color::SrgbaTuple| {
+                (
+                    (c.0 * 255.0).round().clamp(0.0, 255.0) as u8,
+                    (c.1 * 255.0).round().clamp(0.0, 255.0) as u8,
+                    (c.2 * 255.0).round().clamp(0.0, 255.0) as u8,
+                )
+            };
+            let mut ansi = [(0u8, 0u8, 0u8); 8];
+            for (i, slot) in ansi.iter_mut().enumerate() {
+                *slot = to_u8(p.colors.0[i]);
+            }
+            (to_u8(p.foreground), chrome_bg, ansi)
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -505,6 +532,21 @@ mod tests {
         assert_eq!(p.background, srgba(DRACULA.bg));
         // Extended entries stay stock (index 21 is pure blue in the cube).
         assert_eq!(p.colors.0[16..], ColorPalette::default().colors.0[16..]);
+    }
+
+    #[test]
+    fn preview_colors_match_build_semantics() {
+        // Presets preview their own colors verbatim.
+        let (fg, bg, ansi) = preview_colors(Some(&DRACULA), (0, 0, 0));
+        assert_eq!((fg, bg), (DRACULA.fg, DRACULA.bg));
+        assert_eq!(ansi, DRACULA.ansi);
+        // The adaptive default previews stock ANSI on the chrome ground.
+        let chrome_bg = (32, 30, 29);
+        let (fg, bg, ansi) = preview_colors(None, chrome_bg);
+        assert_eq!(bg, chrome_bg);
+        let stock = build(None, chrome_bg);
+        assert_eq!(srgba(fg), stock.foreground);
+        assert_eq!(srgba(ansi[1]), stock.colors.0[1], "red");
     }
 
     #[test]

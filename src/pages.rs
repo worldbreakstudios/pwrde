@@ -83,100 +83,77 @@ impl Section {
 
 // ── Appearance page layout ──────────────────────────────────────────────
 
-/// One interactive (or header) item on the Appearance page.
-#[derive(Clone, Copy)]
-pub enum AppearanceItem {
-    /// The System/Dark/Light segmented control.
-    Mode,
-    /// A section header ("Theme", "Terminal Colors").
-    Header(&'static str),
-    /// A chrome theme slot; clicking assigns it to its polarity's slot.
-    Theme(&'static crate::theme::Theme),
-    /// Reads a token string from the clipboard into a custom theme slot.
-    ImportTheme,
-    /// Copies the active theme's token string to the clipboard.
-    ExportTheme,
-    /// The adaptive terminal scheme; clicking resets both polarity slots.
-    TermDefault,
-    /// A terminal scheme slot; clicking assigns it to its polarity's slot.
-    Term(&'static crate::term_theme::TermTheme),
+/// The four dropdown selectors on the Appearance page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppearanceDropdown {
+    ThemeLight,
+    ThemeDark,
+    TermLight,
+    TermDark,
 }
 
-impl AppearanceItem {
-    /// Mode and headers own their whole row; theme/scheme slots pack in halves.
-    pub fn full_width(self) -> bool {
-        matches!(self, AppearanceItem::Mode | AppearanceItem::Header(_))
-    }
-}
+impl AppearanceDropdown {
+    pub const ALL: [AppearanceDropdown; 4] = [
+        AppearanceDropdown::ThemeLight,
+        AppearanceDropdown::ThemeDark,
+        AppearanceDropdown::TermLight,
+        AppearanceDropdown::TermDark,
+    ];
 
-/// The Appearance page as `(row, col, item)` triples — the single source of
-/// truth walked by both the renderer (drawing) and main.rs (hit-testing), so
-/// clicks always agree with pixels. `col` is 0 (left half) or 1 (right half);
-/// full-width items sit alone in col 0. Slots pack two per row, light-
-/// polarity entries before dark ones (mirroring the light/dark slot model).
-pub fn appearance_layout() -> Vec<(usize, usize, AppearanceItem)> {
-    struct Packer {
-        out: Vec<(usize, usize, AppearanceItem)>,
-        row: usize,
-        col: usize,
+    /// Whether this dropdown controls the dark-polarity slot.
+    pub fn dark(self) -> bool {
+        matches!(self, AppearanceDropdown::ThemeDark | AppearanceDropdown::TermDark)
     }
-    impl Packer {
-        /// Finish a half-filled row so the next item starts on a fresh one.
-        fn settle(&mut self) {
-            if self.col == 1 {
-                self.row += 1;
-                self.col = 0;
-            }
-        }
-        fn push(&mut self, item: AppearanceItem) {
-            if item.full_width() {
-                self.settle();
-                self.out.push((self.row, 0, item));
-                self.row += 1;
-            } else {
-                self.out.push((self.row, self.col, item));
-                if self.col == 1 {
-                    self.row += 1;
-                }
-                self.col ^= 1;
-            }
+
+    /// Human-readable label shown above / inside the dropdown field.
+    pub fn label(self) -> &'static str {
+        match self {
+            AppearanceDropdown::ThemeLight => "Light Theme",
+            AppearanceDropdown::ThemeDark => "Dark Theme",
+            AppearanceDropdown::TermLight => "Light Profile",
+            AppearanceDropdown::TermDark => "Dark Profile",
         }
     }
 
-    let mut p = Packer { out: vec![(0, 0, AppearanceItem::Mode)], row: 2, col: 0 };
+    /// Grid position as `(column, field)`: themes in column 0, terminal
+    /// profiles in column 1; the light slot before the dark one. Shared by
+    /// the renderer and main.rs so drawing and hit-testing agree.
+    pub fn grid(self) -> (usize, usize) {
+        match self {
+            AppearanceDropdown::ThemeLight => (0, 0),
+            AppearanceDropdown::ThemeDark => (0, 1),
+            AppearanceDropdown::TermLight => (1, 0),
+            AppearanceDropdown::TermDark => (1, 1),
+        }
+    }
+}
 
-    p.push(AppearanceItem::Header("Theme"));
-    for t in crate::theme::ALL.iter().filter(|t| !t.dark) {
-        p.push(AppearanceItem::Theme(t));
+/// All app-theme options for the given slot: every built-in and imported
+/// custom theme — mixing polarities is allowed (a dark chrome in the light
+/// slot, or vice versa) — with the slot's own polarity sorted first for
+/// easier choosing.
+pub fn theme_options(dark: bool) -> Vec<&'static crate::theme::Theme> {
+    let mut v = Vec::new();
+    for matching in [true, false] {
+        let want = if matching { dark } else { !dark };
+        v.extend(crate::theme::ALL.iter().copied().filter(|t| t.dark == want));
+        if let Some(t) = crate::theme::custom(want) {
+            v.push(t);
+        }
     }
-    // Imported custom themes join their polarity's tiles when defined.
-    if let Some(t) = crate::theme::custom(false) {
-        p.push(AppearanceItem::Theme(t));
-    }
-    for t in crate::theme::ALL.iter().filter(|t| t.dark) {
-        p.push(AppearanceItem::Theme(t));
-    }
-    if let Some(t) = crate::theme::custom(true) {
-        p.push(AppearanceItem::Theme(t));
-    }
-    // The import/export actions share a fresh row under the tiles.
-    p.settle();
-    p.push(AppearanceItem::ImportTheme);
-    p.push(AppearanceItem::ExportTheme);
+    v
+}
 
-    // A blank row between the sections.
-    p.settle();
-    p.row += 1;
-
-    p.push(AppearanceItem::Header("Terminal Colors"));
-    p.push(AppearanceItem::TermDefault);
-    for t in crate::term_theme::ALL.iter().filter(|t| !t.dark) {
-        p.push(AppearanceItem::Term(t));
+/// All terminal-scheme options for the given slot: `None` (the adaptive
+/// "Default") first, then every preset — mixing polarities is allowed —
+/// with the slot's own polarity sorted first for easier choosing.
+pub fn term_options(dark: bool) -> Vec<Option<&'static crate::term_theme::TermTheme>> {
+    let mut v: Vec<Option<&'static crate::term_theme::TermTheme>> = vec![None];
+    for matching in [true, false] {
+        let want = if matching { dark } else { !dark };
+        v.extend(crate::term_theme::ALL.iter().copied().filter(|t| t.dark == want).map(Some));
     }
-    for t in crate::term_theme::ALL.iter().filter(|t| t.dark) {
-        p.push(AppearanceItem::Term(t));
-    }
-    p.out
+    v
 }
 
 /// Row index of the "Show frame stats" toggle on the Debug page. Rows 0..N
@@ -579,33 +556,50 @@ mod tests {
     use gpui::Modifiers;
 
     #[test]
-    fn appearance_layout_covers_everything_once_without_collisions() {
-        let layout = appearance_layout();
-        let mut themes = 0;
-        let mut terms = 0;
-        let mut defaults = 0;
-        let mut imports = 0;
-        let mut exports = 0;
-        let mut slots: Vec<(usize, usize)> = Vec::new();
-        for (row, col, item) in layout {
-            assert!(col < 2, "col out of range");
-            assert!(!(item.full_width() && col != 0), "full-width items sit in col 0");
-            assert!(!slots.contains(&(row, col)), "slot ({row},{col}) used twice");
-            slots.push((row, col));
-            match item {
-                AppearanceItem::Theme(_) => themes += 1,
-                AppearanceItem::Term(_) => terms += 1,
-                AppearanceItem::TermDefault => defaults += 1,
-                AppearanceItem::ImportTheme => imports += 1,
-                AppearanceItem::ExportTheme => exports += 1,
-                _ => {},
-            }
+    fn appearance_dropdown_dark_matches_label() {
+        assert!(!AppearanceDropdown::ThemeLight.dark());
+        assert!(AppearanceDropdown::ThemeDark.dark());
+        assert!(!AppearanceDropdown::TermLight.dark());
+        assert!(AppearanceDropdown::TermDark.dark());
+        assert_eq!(AppearanceDropdown::ThemeLight.label(), "Light Theme");
+        assert_eq!(AppearanceDropdown::ThemeDark.label(), "Dark Theme");
+        assert_eq!(AppearanceDropdown::TermLight.label(), "Light Profile");
+        assert_eq!(AppearanceDropdown::TermDark.label(), "Dark Profile");
+    }
+
+    /// Both polarities' dropdowns list every theme (mix-and-match is
+    /// allowed), with the slot's own polarity sorted to the top.
+    #[test]
+    fn theme_options_list_everything_matching_polarity_first() {
+        for dark in [false, true] {
+            let opts = super::theme_options(dark);
+            // The test store holds no custom token strings, so only presets.
+            assert_eq!(opts.len(), crate::theme::ALL.len(), "theme_options({dark}) incomplete");
+            let matching = opts.iter().take_while(|t| t.dark == dark).count();
+            assert_eq!(
+                matching,
+                crate::theme::ALL.iter().filter(|t| t.dark == dark).count(),
+                "theme_options({dark}) must sort its own polarity first"
+            );
         }
-        // The test store holds no custom token strings, so only presets show.
-        assert_eq!(themes, crate::theme::ALL.len());
-        assert_eq!(terms, crate::term_theme::ALL.len());
-        assert_eq!(defaults, 1);
-        assert_eq!((imports, exports), (1, 1));
+    }
+
+    #[test]
+    fn term_options_start_with_default_then_matching_polarity() {
+        for dark in [false, true] {
+            let opts = super::term_options(dark);
+            assert_eq!(opts.len(), crate::term_theme::ALL.len() + 1, "missing presets");
+            assert!(opts[0].is_none(), "term_options({dark}) must start with Default");
+            let matching = opts[1..]
+                .iter()
+                .take_while(|t| t.is_some_and(|t| t.dark == dark))
+                .count();
+            assert_eq!(
+                matching,
+                crate::term_theme::ALL.iter().filter(|t| t.dark == dark).count(),
+                "term_options({dark}) must sort its own polarity first"
+            );
+        }
     }
 
     #[test]
