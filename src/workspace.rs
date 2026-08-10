@@ -870,27 +870,11 @@ pub fn page_slot_rect(i: usize, n: usize, height: u32, scale: f32, sidebar_w: f3
     }
 }
 
+
 /// Header band inside the settings card (the section title).
 pub const SETTINGS_HEADER_H: f32 = 52.0;
-/// One settings row inside the card.
-pub const SETTINGS_ROW_H: f32 = 36.0;
-/// Inset of settings rows from the card edges.
+/// Inset of the settings card's content from its edges.
 const SETTINGS_PAD: f32 = 14.0;
-
-/// Row `i` of the settings card `card` (which is the whole terminal area —
-/// the settings page renders as one tile-style card). Shared by the renderer
-/// (drawing) and main.rs (hit-testing) so clicks always agree with pixels.
-pub fn settings_row_rect(card: &LayoutRect, i: usize, scale: f32) -> LayoutRect {
-    let pad = (SETTINGS_PAD * scale).round();
-    let header = (SETTINGS_HEADER_H * scale).round();
-    let h = (SETTINGS_ROW_H * scale).round();
-    LayoutRect {
-        x: card.x + pad,
-        y: card.y + header + i as f32 * h,
-        w: (card.w - 2.0 * pad).max(0.0),
-        h,
-    }
-}
 
 /// The `i`-th of the three mode segments (System/Dark/Light), right-aligned
 /// inside the Appearance page's mode row. Sized from the label text so the

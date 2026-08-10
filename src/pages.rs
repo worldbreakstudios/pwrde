@@ -156,14 +156,6 @@ pub fn term_options(dark: bool) -> Vec<Option<&'static crate::term_theme::TermTh
     v
 }
 
-/// Row index of the "Show frame stats" toggle on the Debug page. Rows 0..N
-/// are read-only diagnostics; one blank row separates them from the toggle.
-/// Shared by the renderer (drawing) and main.rs (hit-testing).
-pub const DEBUG_TOGGLE_ROW: usize = 8;
-
-/// Row index of the "Persist sessions" toggle on the Terminal page.
-pub const PERSIST_TOGGLE_ROW: usize = 0;
-
 // ── Tool ribbon ─────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
