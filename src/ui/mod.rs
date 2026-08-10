@@ -19,12 +19,17 @@
 
 pub use badge::{Badge, BadgeVariant};
 pub use button::{Button, ButtonSize, ButtonVariant};
+pub use button_group::ButtonGroup;
 pub use card::{
     Card, CardAction, CardContent, CardDescription, CardFooter, CardHeader, CardTitle,
 };
 pub use checkbox::Checkbox;
 pub use hover_card::HoverCard;
+pub use input::Input;
+pub use kbd::Kbd;
+pub use label::Label;
 pub use skeleton::Skeleton;
+pub use switch::Switch;
 pub use table::{Table, TableBody, TableCell, TableHead, TableHeader, TableRow};
 
 pub mod assets;

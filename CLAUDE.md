@@ -35,7 +35,7 @@ Same shape as iTerm2: a PTY reader thread per session (`term.rs`) reads output i
 
 Painting happens inside a single custom gpui `Element`'s `paint()` in `main.rs`. `renderer.rs` is deliberately **stateless and GPU-free**: `build_frame` walks the workspace tree + terminal grids and produces a `Frame` of plain data (quads, text runs, labels) that the Element then paints via `window.paint_quad` / `shape_line`. Keep geometry/color logic in `renderer.rs` and actual painting in `main.rs`.
 
-**Exception: the Cleanup page** is a real gpui element tree (`cleanup_ui.rs`, built from the vendored rcn components below) absolutely positioned over the canvas content area — not canvas-painted. Its confirm dialogs stay on the canvas path.
+**Exception: the Cleanup and Settings pages** are real gpui element trees (`cleanup_ui.rs` / `settings_ui.rs`, built from the vendored rcn components below) absolutely positioned over the canvas content area — not canvas-painted. Confirm dialogs and the Settings sidebar (search box + section tabs) stay on the canvas path. The Appearance section's WYSIWYG preview cards are plain gpui divs with explicit colors from the previewed theme, deliberately not rcn theme tokens.
 
 ### UI components (rcn, vendored in `src/ui/`)
 
@@ -58,6 +58,7 @@ Painting happens inside a single custom gpui `Element`'s `paint()` in `main.rs`.
 - `picker.rs` — directory picker for new groups (scans `~`, `~/src`, and its subdirs; git detection; pins/recents persisted to `groups.json` in the data dir) and the fork-source picker.
 - `git.rs` — shells out to git for the fork-source picker (default branch, branch lists), mirroring what the `drop` worktree tool runs. Also `worktree_scope`, which settings/persist use to give each linked git worktree its own config/DB.
 - `cleanup.rs` / `cleanup_ui.rs` — Cleanup page. `cleanup.rs` is the pure model (data structures, state, format helpers) over the external `drop` CLI (`drop -d --json` to list, `drop rm <id>... --json` to delete); `cleanup_ui.rs` builds the gpui element tree from the rcn components; side-effects live in `main.rs`.
+- `settings_ui.rs` — Settings page content as an rcn element tree (all five sections + search-results mode), same overlay pattern as `cleanup_ui.rs`. Keyboard capture (search typing, primary-command Input save/cancel, ⌘-chord recording) stays in `main.rs`'s `handle_settings_key`.
 - `persist.rs` — session persistence to SQLite (`<data_dir>/pwrde/state.db`, worktree-scoped like settings): group layouts, sidebar sections, shpool sessions. Additive schema migrations in `open_db`.
 - `pwrspace.rs` — workspace profiles: saved group layouts in `.pwrspace.json` files, offered when creating a new group.
 - `settings.rs` — flat key-value store at `~/.pwrde/settings.json` (worktree-scoped variant under `~/.pwrde/worktrees/<slug>/`); read once at startup, `set` rewrites the file. Load/save are pure functions over an explicit path so tests use temp dirs. A missing/corrupt file must never prevent launch.

@@ -20,6 +20,7 @@ mod claude_hooks;
 mod cleanup;
 mod cleanup_ui;
 mod git;
+mod settings_ui;
 mod links;
 mod pages;
 mod palette;
@@ -44,7 +45,7 @@ use std::time::Duration;
 
 use gpui::{
     canvas, div, px, App as GpuiApp, AppContext, Application, Bounds, Context, CursorStyle,
-    FocusHandle,
+    FocusHandle, Focusable,
     InteractiveElement, IntoElement, KeyDownEvent, Keystroke, Modifiers, MouseButton,
     ModifiersChangedEvent, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
     Point, QuitMode, Render, ShapedLine,
@@ -245,9 +246,9 @@ struct App {
     /// id. The command is written on the session's first wakeup (the shell has
     /// printed its prompt by then, so startup files can't eat the input).
     pending_primary_cmd: std::collections::HashMap<u64, String>,
-    /// In-progress edit buffer for the Settings → Sessions primary-command
-    /// row, or `None` when not editing.
-    editing_command: Option<String>,
+    /// rcn Input entity for the Settings → Sessions primary-command row,
+    /// created at App construction and seeded from settings.
+    command_input: gpui::Entity<crate::ui::Input>,
     /// Search query in the Settings sidebar search box.
     settings_query: String,
     /// Whether the Settings sidebar search box has keyboard focus.
@@ -2876,7 +2877,6 @@ impl App {
                 if workspace::settings_search_rect(scale, self.sidebar_w()).contains(px, py) {
                     self.settings_search_focus = true;
                     self.recording = None;
-                    self.editing_command = None;
                     self.request_redraw();
                     return;
                 }
@@ -2886,7 +2886,6 @@ impl App {
                         self.section = *section;
                         self.settings_query.clear();
                         self.recording = None;
-                        self.editing_command = None;
                         self.request_redraw();
                         return;
                     }
@@ -2967,9 +2966,8 @@ impl App {
             return;
         }
 
-        // Settings page: the content area is the settings card.
+        // Settings page: the gpui overlay owns all content-area clicks.
         if self.page == Page::Settings {
-            self.settings_click(px, py);
             return;
         }
         // Cleanup page: the gpui overlay owns all content-area clicks.
@@ -3344,7 +3342,7 @@ impl App {
 
     // ── Keyboard ────────────────────────────────────────────────────────
 
-    fn on_key_down(&mut self, ev: &KeyDownEvent) {
+    fn on_key_down(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.modifiers = ev.keystroke.modifiers;
         // cmd+` toggles the flyover panel from ANY state (overlays, pages, etc.).
         if ev.keystroke.modifiers.platform
@@ -3394,7 +3392,7 @@ impl App {
         }
         // The Settings page owns the keyboard: no PTY to type into.
         if self.page == Page::Settings {
-            self.handle_settings_key(ev);
+            self.handle_settings_key(ev, window, cx);
             return;
         }
         // The Cleanup page owns the keyboard too (no terminal underneath).
@@ -3729,10 +3727,21 @@ impl App {
     /// Keyboard routing while the Settings page is up. A recording keyboard
     /// row captures the next ⌘ chord as its new binding; otherwise ⌘
     /// shortcuts still dispatch and plain typing is swallowed.
-    fn handle_settings_key(&mut self, ev: &KeyDownEvent) {
+    fn handle_settings_key(
+        &mut self,
+        ev: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // A focused sidebar search box captures typing: chars filter, Enter
-        // jumps to the first match's section, Escape cancels.
+        // jumps to the first match's section, Escape cancels. It also wins
+        // over a still-focused primary-command Input (clicking the search box
+        // doesn't blur the Input's own focus handle), so typing can't land in
+        // both.
         if self.settings_search_focus {
+            if self.command_input.read(cx).focus_handle(cx).is_focused(window) {
+                window.focus(&self.focus_handle, cx);
+            }
             match ev.keystroke.key.as_str() {
                 "escape" => {
                     self.settings_query.clear();
@@ -3762,31 +3771,26 @@ impl App {
             self.request_redraw();
             return;
         }
-        // An editing primary-command row captures typing: chars append, Enter
-        // saves, Escape cancels.
-        if self.editing_command.is_some() {
+        // Focused primary-command Input: enter saves, escape resets + blurs.
+        // Character editing is handled by the Input entity itself; other keys
+        // fall through to it (this handler doesn't stop propagation).
+        if self.command_input.read(cx).focus_handle(cx).is_focused(window) {
+            let input = self.command_input.clone();
             match ev.keystroke.key.as_str() {
-                "escape" => self.editing_command = None,
                 "enter" => {
-                    let value = self.editing_command.take().unwrap_or_default();
-                    settings::set("session.primary_command", value.trim().into());
+                    let value = input.read(cx).text().trim().to_string();
+                    settings::set("session.primary_command", value.into());
+                    // Move focus back to the app handle (Input has no blur()).
+                    window.focus(&self.focus_handle, cx);
                 },
-                "backspace" => {
-                    if let Some(buf) = self.editing_command.as_mut() {
-                        buf.pop();
-                    }
+                "escape" => {
+                    let reset = settings::primary_command();
+                    input.update(cx, |input, cx| {
+                        input.set_text(reset, cx);
+                    });
+                    window.focus(&self.focus_handle, cx);
                 },
-                _ => {
-                    if !ev.keystroke.modifiers.control
-                        && !ev.keystroke.modifiers.platform
-                        && let Some(text) = ev.keystroke.key_char.as_deref()
-                        && let Some(buf) = self.editing_command.as_mut()
-                    {
-                        for ch in text.chars().filter(|c| !c.is_control()) {
-                            buf.push(ch);
-                        }
-                    }
-                },
+                _ => {},
             }
             self.request_redraw();
             return;
@@ -3961,7 +3965,6 @@ impl App {
         if self.page != page {
             self.page = page;
             self.recording = None;
-            self.editing_command = None;
             self.settings_query.clear();
             self.settings_search_focus = false;
             // Grids may have gone stale while the Settings page was up.
@@ -4031,168 +4034,6 @@ impl App {
             },
             _ => {},
         }
-    }
-
-    /// Route a click inside the settings card to the row it hit.
-    fn settings_click(&mut self, px: f32, py: f32) {
-        let area = self.area();
-        let scale = self.scale();
-        // A click in the card leaves the search box (the query, and with it
-        // the results list, survives until a result or section is chosen).
-        self.settings_search_focus = false;
-        // Search-results mode: a click on a result row jumps to its section.
-        if !self.settings_query.is_empty() {
-            for (i, entry) in pages::search_settings(&self.settings_query).iter().enumerate() {
-                if workspace::settings_row_rect(&area, i, scale).contains(px, py) {
-                    self.section = entry.section;
-                    self.settings_query.clear();
-                    self.settings_search_focus = false;
-                    break;
-                }
-            }
-            self.request_redraw();
-            return;
-        }
-        match self.section {
-            Section::Sessions => {
-                if workspace::settings_row_rect(&area, 0, scale).contains(px, py) {
-                    // Edit in place, starting from the current value.
-                    self.editing_command = Some(settings::primary_command());
-                } else {
-                    // A click anywhere else cancels an in-progress edit.
-                    self.editing_command = None;
-                }
-            },
-            Section::Keyboard => {
-                for (i, action) in Action::ALL.iter().enumerate() {
-                    if workspace::settings_row_rect(&area, i, scale).contains(px, py) {
-                        self.recording = Some(*action);
-                        self.request_redraw();
-                        return;
-                    }
-                }
-                // A click anywhere else cancels an armed recording.
-                self.recording = None;
-            },
-            Section::Appearance => {
-                let cw = self.renderer.cell_width;
-                // An open dropdown menu captures the click: apply the option
-                // it hit, and close either way.
-                if let Some(menu) = self.appearance_menu {
-                    let (col, field) = menu.grid();
-                    let dark = menu.dark();
-                    match menu {
-                        pages::AppearanceDropdown::ThemeLight
-                        | pages::AppearanceDropdown::ThemeDark => {
-                            let opts = pages::theme_options(dark);
-                            for (i, t) in opts.iter().enumerate() {
-                                let row = workspace::appearance_menu_item(
-                                    &area,
-                                    col,
-                                    field,
-                                    opts.len(),
-                                    i,
-                                    scale,
-                                );
-                                if row.contains(px, py) {
-                                    settings::set(theme::setting_key(dark), t.name.into());
-                                    break;
-                                }
-                            }
-                        },
-                        pages::AppearanceDropdown::TermLight
-                        | pages::AppearanceDropdown::TermDark => {
-                            let opts = pages::term_options(dark);
-                            for (i, t) in opts.iter().enumerate() {
-                                let row = workspace::appearance_menu_item(
-                                    &area,
-                                    col,
-                                    field,
-                                    opts.len(),
-                                    i,
-                                    scale,
-                                );
-                                if row.contains(px, py) {
-                                    settings::set(
-                                        term_theme::setting_key(dark),
-                                        t.map_or("default", |t| t.name).into(),
-                                    );
-                                    break;
-                                }
-                            }
-                        },
-                    }
-                    self.appearance_menu = None;
-                } else {
-                    let header = workspace::appearance_header_row(&area, scale);
-                    let mode_row = workspace::appearance_mode_row(&area, cw, scale);
-                    for (i, m) in theme::Mode::ALL.into_iter().enumerate() {
-                        if workspace::mode_segment_rect(&mode_row, i, cw, scale).contains(px, py) {
-                            settings::set("appearance.mode", m.name().into());
-                        }
-                    }
-                    for i in 0..2 {
-                        if workspace::preview_segment_rect(&header, i, cw, scale).contains(px, py) {
-                            self.preview_dark = i == 1;
-                        }
-                    }
-                    for d in pages::AppearanceDropdown::ALL {
-                        let (col, field) = d.grid();
-                        if workspace::appearance_dropdown_pill(&area, col, field, scale)
-                            .contains(px, py)
-                        {
-                            self.appearance_menu = Some(d);
-                        }
-                    }
-                    // The clipboard's token string becomes its polarity's
-                    // custom theme and is selected right away; anything
-                    // unparseable changes nothing.
-                    if workspace::appearance_footer_action(&area, 0, cw, scale).contains(px, py) {
-                        if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                            if let Some(tokens) = clipboard
-                                .get_text()
-                                .ok()
-                                .as_deref()
-                                .and_then(theme::parse_tokens)
-                            {
-                                let dark = theme::is_dark_color(tokens[0]);
-                                settings::set(
-                                    theme::custom_key(dark),
-                                    theme::serialize_tokens(&tokens).into(),
-                                );
-                                settings::set(
-                                    theme::setting_key(dark),
-                                    theme::custom_name(dark).into(),
-                                );
-                            }
-                        }
-                    }
-                    if workspace::appearance_footer_action(&area, 1, cw, scale).contains(px, py) {
-                        if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                            let _ = clipboard.set_text(theme::export_current());
-                        }
-                    }
-                }
-            },
-            Section::Terminal => {
-                let row = workspace::settings_row_rect(&area, pages::PERSIST_TOGGLE_ROW, scale);
-                if row.contains(px, py) {
-                    let on = settings::get_bool("terminal.persist", false);
-                    settings::set("terminal.persist", (!on).into());
-                    // Snapshot right away so enabling then restarting (with no
-                    // further mutations) still restores the current groups.
-                    self.persist_snapshot();
-                }
-            },
-            Section::Debug => {
-                let row = workspace::settings_row_rect(&area, pages::DEBUG_TOGGLE_ROW, scale);
-                if row.contains(px, py) {
-                    let on = settings::get_bool("debug.overlay", false);
-                    settings::set("debug.overlay", (!on).into());
-                }
-            },
-        }
-        self.request_redraw();
     }
 
     /// Drain PTY wakeups coalesced since the last frame; returns true if a
@@ -4775,8 +4616,8 @@ impl Render for App {
             .size_full()
             .track_focus(&self.focus_handle)
             .key_context("Terminal")
-            .on_key_down(cx.listener(|app, ev: &KeyDownEvent, _win, cx| {
-                app.on_key_down(ev);
+            .on_key_down(cx.listener(|app, ev: &KeyDownEvent, window, cx| {
+                app.on_key_down(ev, window, cx);
                 cx.notify();
             }))
             .on_mouse_move(cx.listener(|app, ev: &MouseMoveEvent, window, cx| {
@@ -4840,6 +4681,11 @@ impl Render for App {
             // owns the screen (v1 tradeoff).
             .when(self.page == Page::Cleanup && self.confirm.is_none(), |el| {
                 el.child(self.render_cleanup(cx))
+            })
+            // Settings page overlay: same pattern as Cleanup. Sidebar search +
+            // section tabs stay canvas-painted; the content card is elements.
+            .when(self.page == Page::Settings && self.confirm.is_none(), |el| {
+                el.child(self.render_settings(cx))
             })
     }
 }
@@ -4939,8 +4785,6 @@ impl App {
             page: self.page,
             section: self.section,
             dot_anim: &self.dot_anim,
-            recording: self.recording,
-            editing_command: self.editing_command.as_deref(),
             sections: &self.sections,
             editing_section: self
                 .editing_section
@@ -4970,8 +4814,6 @@ impl App {
                     None
                 }
             },
-            preview_dark: self.preview_dark,
-            appearance_menu: self.appearance_menu,
         };
         let link_hover_suppressed = if overlay_open
             || !matches!(self.drag, Drag::None)
@@ -5743,6 +5585,7 @@ fn main() {
         // Seed the rcn Theme global before any window opens so Theme::of
         // never panics; Cleanup re-syncs it each frame from chrome tokens.
         cx.set_global(ui::theme::Theme::from_chrome(crate::theme::current()));
+        crate::ui::Input::register_key_bindings(cx);
         let bounds = Bounds::centered(None, gpui::size(px(1200.0), px(720.0)), cx);
         let (events_tx, events_rx) = mpsc::channel::<TermEvent>();
 
@@ -5803,7 +5646,14 @@ fn main() {
                         message: None,
                         confirm: None,
                         pending_primary_cmd: std::collections::HashMap::new(),
-                        editing_command: None,
+                        command_input: {
+                            let seed = settings::primary_command();
+                            cx.new(|cx| {
+                                let mut input = crate::ui::Input::new(cx);
+                                input.set_text(seed, cx);
+                                input
+                            })
+                        },
                         settings_query: String::new(),
                         settings_search_focus: false,
                         editing_section: None,

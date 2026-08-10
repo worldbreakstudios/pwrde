@@ -115,17 +115,6 @@ impl AppearanceDropdown {
         }
     }
 
-    /// Grid position as `(column, field)`: themes in column 0, terminal
-    /// profiles in column 1; the light slot before the dark one. Shared by
-    /// the renderer and main.rs so drawing and hit-testing agree.
-    pub fn grid(self) -> (usize, usize) {
-        match self {
-            AppearanceDropdown::ThemeLight => (0, 0),
-            AppearanceDropdown::ThemeDark => (0, 1),
-            AppearanceDropdown::TermLight => (1, 0),
-            AppearanceDropdown::TermDark => (1, 1),
-        }
-    }
 }
 
 /// All app-theme options for the given slot: every built-in and imported
@@ -155,14 +144,6 @@ pub fn term_options(dark: bool) -> Vec<Option<&'static crate::term_theme::TermTh
     }
     v
 }
-
-/// Row index of the "Show frame stats" toggle on the Debug page. Rows 0..N
-/// are read-only diagnostics; one blank row separates them from the toggle.
-/// Shared by the renderer (drawing) and main.rs (hit-testing).
-pub const DEBUG_TOGGLE_ROW: usize = 8;
-
-/// Row index of the "Persist sessions" toggle on the Terminal page.
-pub const PERSIST_TOGGLE_ROW: usize = 0;
 
 // ── Tool ribbon ─────────────────────────────────────────────────────────
 
