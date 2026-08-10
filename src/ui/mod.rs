@@ -19,7 +19,6 @@
 
 pub use badge::{Badge, BadgeVariant};
 pub use button::{Button, ButtonSize, ButtonVariant};
-pub use button_group::ButtonGroup;
 pub use card::{
     Card, CardAction, CardContent, CardDescription, CardFooter, CardHeader, CardTitle,
 };

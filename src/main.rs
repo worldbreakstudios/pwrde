@@ -2966,8 +2966,12 @@ impl App {
             return;
         }
 
-        // Settings page: the gpui overlay owns all content-area clicks.
+        // Settings page: the gpui overlay owns all content-area clicks,
+        // except the canvas-painted Appearance section.
         if self.page == Page::Settings {
+            if self.section == Section::Appearance && self.settings_query.is_empty() {
+                self.appearance_click(px, py);
+            }
             return;
         }
         // Cleanup page: the gpui overlay owns all content-area clicks.
@@ -4036,6 +4040,117 @@ impl App {
         }
     }
 
+    /// Route a click inside the Settings → Appearance card (the one
+    /// canvas-painted Settings section — see `Renderer::appearance_page`).
+    /// The other sections are the gpui overlay in `settings_ui` and never
+    /// reach this.
+    fn appearance_click(&mut self, px: f32, py: f32) {
+        let area = self.area();
+        let scale = self.scale();
+        // A click in the card leaves the sidebar search box, like the rcn
+        // overlay's background mouse-down does for the other sections.
+        self.settings_search_focus = false;
+        let cw = self.renderer.cell_width;
+        // An open dropdown menu captures the click: apply the option
+        // it hit, and close either way.
+        if let Some(menu) = self.appearance_menu {
+            let (col, field) = menu.grid();
+            let dark = menu.dark();
+            match menu {
+                pages::AppearanceDropdown::ThemeLight
+                | pages::AppearanceDropdown::ThemeDark => {
+                    let opts = pages::theme_options(dark);
+                    for (i, t) in opts.iter().enumerate() {
+                        let row = workspace::appearance_menu_item(
+                            &area,
+                            col,
+                            field,
+                            opts.len(),
+                            i,
+                            scale,
+                        );
+                        if row.contains(px, py) {
+                            settings::set(theme::setting_key(dark), t.name.into());
+                            break;
+                        }
+                    }
+                },
+                pages::AppearanceDropdown::TermLight
+                | pages::AppearanceDropdown::TermDark => {
+                    let opts = pages::term_options(dark);
+                    for (i, t) in opts.iter().enumerate() {
+                        let row = workspace::appearance_menu_item(
+                            &area,
+                            col,
+                            field,
+                            opts.len(),
+                            i,
+                            scale,
+                        );
+                        if row.contains(px, py) {
+                            settings::set(
+                                term_theme::setting_key(dark),
+                                t.map_or("default", |t| t.name).into(),
+                            );
+                            break;
+                        }
+                    }
+                },
+            }
+            self.appearance_menu = None;
+        } else {
+            let header = workspace::appearance_header_row(&area, scale);
+            let mode_row = workspace::appearance_mode_row(&area, cw, scale);
+            for (i, m) in theme::Mode::ALL.into_iter().enumerate() {
+                if workspace::mode_segment_rect(&mode_row, i, cw, scale).contains(px, py) {
+                    settings::set("appearance.mode", m.name().into());
+                }
+            }
+            for i in 0..2 {
+                if workspace::preview_segment_rect(&header, i, cw, scale).contains(px, py) {
+                    self.preview_dark = i == 1;
+                }
+            }
+            for d in pages::AppearanceDropdown::ALL {
+                let (col, field) = d.grid();
+                if workspace::appearance_dropdown_pill(&area, col, field, scale)
+                    .contains(px, py)
+                {
+                    self.appearance_menu = Some(d);
+                }
+            }
+            // The clipboard's token string becomes its polarity's
+            // custom theme and is selected right away; anything
+            // unparseable changes nothing.
+            if workspace::appearance_footer_action(&area, 0, cw, scale).contains(px, py) {
+                if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                    if let Some(tokens) = clipboard
+                        .get_text()
+                        .ok()
+                        .as_deref()
+                        .and_then(theme::parse_tokens)
+                    {
+                        let dark = theme::is_dark_color(tokens[0]);
+                        settings::set(
+                            theme::custom_key(dark),
+                            theme::serialize_tokens(&tokens).into(),
+                        );
+                        settings::set(
+                            theme::setting_key(dark),
+                            theme::custom_name(dark).into(),
+                        );
+                    }
+                }
+            }
+            if workspace::appearance_footer_action(&area, 1, cw, scale).contains(px, py) {
+                if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                    let _ = clipboard.set_text(theme::export_current());
+                }
+            }
+        }
+        self.request_redraw();
+    }
+
     /// Drain PTY wakeups coalesced since the last frame; returns true if a
     /// redraw is needed.
     fn drain_events(&mut self) -> bool {
@@ -4683,10 +4798,17 @@ impl Render for App {
                 el.child(self.render_cleanup(cx))
             })
             // Settings page overlay: same pattern as Cleanup. Sidebar search +
-            // section tabs stay canvas-painted; the content card is elements.
-            .when(self.page == Page::Settings && self.confirm.is_none(), |el| {
-                el.child(self.render_settings(cx))
-            })
+            // section tabs stay canvas-painted; the content card is elements —
+            // except the Appearance section, which stays fully canvas-painted
+            // for its WYSIWYG previews (search-results mode is still the
+            // overlay, whatever section it was opened from).
+            .when(
+                self.page == Page::Settings
+                    && self.confirm.is_none()
+                    && (self.section != Section::Appearance
+                        || !self.settings_query.is_empty()),
+                |el| el.child(self.render_settings(cx)),
+            )
     }
 }
 
@@ -4785,6 +4907,8 @@ impl App {
             page: self.page,
             section: self.section,
             dot_anim: &self.dot_anim,
+            preview_dark: self.preview_dark,
+            appearance_menu: self.appearance_menu,
             sections: &self.sections,
             editing_section: self
                 .editing_section
