@@ -105,6 +105,7 @@ impl App {
                                 .min_h(px(0.))
                                 .w_full()
                                 .max_w(px(CONTENT_MAX_W))
+                                .mx_auto()
                                 .child(body),
                         ),
                     ),
