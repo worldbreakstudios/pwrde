@@ -16,12 +16,20 @@ termwiz = { git = "https://github.com/wezterm/wezterm", branch = "main" }
 bytemuck = { version = "1.25.2", features = ["derive"] }
 # gpui — Zed's UI framework — is the sole renderer + windowing layer. Not on
 # crates.io; pull it from the zed repo pinned to a rev for reproducibility.
-gpui = { git = "https://github.com/zed-industries/zed", rev = "027cf0def75e5c027504f402a6a6c0dcac11f178", package = "gpui" }
+# NB: no `rev` here on purpose. gpui-component depends on gpui with a *bare*
+# (default-branch) git spec; a `rev` here would be a different SourceId and give
+# us two incompatible copies of gpui (whose Window/App types wouldn't unify
+# across the crate boundary). Leaving both bare collapses them onto one graph
+# node, and Cargo.lock pins the exact commit reproducibly — see the pinned rev
+# in Cargo.lock (kept at zed cc053a4, ~90 min from the old 027cf0d pin, so the
+# gpui API still matches this codebase). Re-pin with:
+#   cargo update -p gpui --precise <sha> && cargo update -p gpui_platform --precise <sha>
+gpui = { git = "https://github.com/zed-industries/zed", package = "gpui" }
 # The platform layer was split into gpui_platform; current_platform() builds the
 # real macOS platform to hand to Application::with_platform (as in zed's own main).
 # `font-kit` is REQUIRED: without it gpui_macos installs gpui::NoopTextSystem and
 # NO glyphs render (quads still do). With it we get the real CoreText MacTextSystem.
-gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "027cf0def75e5c027504f402a6a6c0dcac11f178", package = "gpui_platform", features = ["font-kit"] }
+gpui_platform = { git = "https://github.com/zed-industries/zed", package = "gpui_platform", features = ["font-kit"] }
 arboard = "3.6.1"
 # Both already in gpui's dependency tree at these versions; used to reach the
 # NSWindow and hide AppKit's titlebar top-highlight hairline (see main.rs).
@@ -32,6 +40,22 @@ serde_json = "1"
 dirs = "6"
 rusqlite = { version = "0.32", features = ["bundled"] }
 unicode-segmentation = "1"
+# Syntax highlighting for the PR / local-diff viewers. Pure-Rust regex engine
+# (fancy-regex) so there's no C `onig` build under sccache; `default-fancy`
+# bundles the default syntax + theme sets.
+syntect = { version = "5.2", default-features = false, features = ["default-fancy"] }
+# CommonMark parser for rendering PR / comment markdown. default-features off
+# drops the HTML renderer and CLI getopts we don't use — we walk events directly.
+pulldown-cmark = { version = "0.12", default-features = false }
+# gpui-component (longbridge) — shadcn-ish gpui widget library, used by the
+# experimental Notes page for markdown rendering (`text::markdown` -> TextView)
+# and the note editor (`input::{InputState, TextInput}` in multi-line mode).
+# Pinned to a commit whose Cargo.lock locks gpui at rev cc053a4 — ~90 minutes
+# before pwrde's old 027cf0d pin, so the gpui API lines up. The `[patch]` below
+# forces gpui-component's *bare* (default-branch) gpui dep onto the same rev so
+# the whole graph resolves to ONE gpui — otherwise gpui's Window/App types would
+# not unify across the crate boundary and nothing would compile.
+gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "f3ba893bd6a996ab0699266ba774b5bbb7f0ca1c" }
 
 # objc 0.2's msg_send! probes `feature = "cargo-clippy"` inside its expansion,
 # which rustc's check-cfg would flag at every call site. Registering the value

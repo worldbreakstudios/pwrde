@@ -22,6 +22,7 @@ use crate::ui::theme::{Theme, alpha};
 #[derive(IntoElement)]
 pub struct Table {
     full: bool,
+    auto_width: bool,
     children: Vec<AnyElement>,
 }
 
@@ -29,6 +30,7 @@ impl Table {
     pub fn new() -> Self {
         Self {
             full: false,
+            auto_width: false,
             children: Vec::new(),
         }
     }
@@ -37,6 +39,14 @@ impl Table {
     /// (`flex-1` child) stays bounded instead of sizing to its rows.
     pub fn h_full(mut self) -> Self {
         self.full = true;
+        self
+    }
+
+    /// Local addition: size to content width instead of `w-full`, so a table
+    /// of fixed-width columns can exceed its container and be placed in a
+    /// horizontal scroll area (markdown tables) rather than clipping to fit.
+    pub fn w_auto(mut self) -> Self {
+        self.auto_width = true;
         self
     }
 }
@@ -58,7 +68,7 @@ impl RenderOnce for Table {
         div()
             .flex()
             .flex_col()
-            .w_full()
+            .when(!self.auto_width, |el| el.w_full())
             .when(self.full, |el| el.h_full())
             .text_size(px(14.))
             .line_height(px(20.))

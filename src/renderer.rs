@@ -29,7 +29,7 @@ use crate::term::Session;
 use crate::theme::Theme;
 use crate::workspace::{self, LayoutRect, Workspace};
 
-const FONT_SIZE: f32 = 15.0;
+pub const FONT_SIZE: f32 = 15.0;
 const LINE_HEIGHT_FACTOR: f32 = 1.25;
 /// Concrete monospace family. Naming a real installed font (not the generic
 /// `Family::Monospace`) skips per-word font-fallback resolution, and the Nerd
@@ -216,6 +216,17 @@ pub struct ChromeState<'a> {
     pub editing_section: Option<(u64, &'a str)>,
     /// Cleanup page state (sidebar repo list; table is gpui-overlaid).
     pub cleanup: &'a crate::cleanup::Cleanup,
+    /// Whether the experimental `features.notes` flag is on. Gates the Notes
+    /// page out of the dot strip entirely when off.
+    pub notes_enabled: bool,
+    /// Registered notes vault names, in registration order (sidebar tabs).
+    pub notes_vaults: &'a [String],
+    /// Index into `notes_vaults` of the vault the Notes page is showing.
+    pub notes_active_vault: usize,
+    /// The active vault's markdown docs, as sidebar-row labels (relative paths).
+    pub notes_doc_rels: &'a [String],
+    /// Index into `notes_doc_rels` of the open doc, if any.
+    pub notes_selected_doc: Option<usize>,
     /// Tools registered for this page/group, in ribbon slot order (resolved
     /// by `App::tools_for`). Empty hides the ribbon and its inset entirely.
     pub ribbon_tools: &'a [pages::Tool],
@@ -224,6 +235,8 @@ pub struct ChromeState<'a> {
     pub open_tool: Option<pages::Tool>,
     /// Width of the open tool panel in logical px.
     pub tool_panel_w: f32,
+    /// Whether the tool panel floats over the tiles (vs. docking the edge).
+    pub tool_panel_floating: bool,
     /// Physical-pixel cursor position for hover painting. `None` while any
     /// drag is active so hover highlights are suppressed mid-drag.
     pub cursor: Option<(f32, f32)>,
@@ -281,14 +294,51 @@ pub struct Renderer {
     height: u32,
 
     pub scale: f32,
+    /// Terminal grid cell metrics (from the `terminal.font_size` setting).
     pub cell_width: f32,
     pub cell_height: f32,
+    /// Chrome/UI text cell metrics (from the `appearance.font_size` setting),
+    /// used to lay out and vertically-center chrome labels. Independent of the
+    /// terminal cell so the app text can zoom without touching the grid.
+    pub chrome_cell_width: f32,
+    pub chrome_cell_height: f32,
+    /// Logical (pre-scale) font sizes, retained so `main.rs`'s paint can detect
+    /// a settings change and re-measure/reflow without re-reading every frame.
+    term_font: f32,
+    chrome_font: f32,
+}
+
+/// Smallest / largest / step for the user-adjustable font sizes (logical px).
+pub const MIN_FONT_SIZE: f32 = 8.0;
+pub const MAX_FONT_SIZE: f32 = 40.0;
+pub const FONT_SIZE_STEP: f32 = 1.0;
+
+/// The configured terminal-grid font size (logical px), clamped to the allowed
+/// range. Defaults to [`FONT_SIZE`] when unset.
+pub fn terminal_font() -> f32 {
+    crate::settings::get_f32("terminal.font_size", FONT_SIZE).clamp(MIN_FONT_SIZE, MAX_FONT_SIZE)
+}
+
+/// The configured chrome/UI font size (logical px), clamped to the allowed
+/// range. Defaults to [`FONT_SIZE`] when unset.
+pub fn chrome_font() -> f32 {
+    crate::settings::get_f32("appearance.font_size", FONT_SIZE).clamp(MIN_FONT_SIZE, MAX_FONT_SIZE)
+}
+
+/// Nudge a font-size setting by `delta`, clamping to the allowed range, and
+/// persist it. Used by the ⌘= / ⌘- zoom actions and the Accessibility
+/// settings steppers.
+pub fn bump_font(key: &str, delta: f32) {
+    let cur = crate::settings::get_f32(key, FONT_SIZE).clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
+    let next = (cur + delta).clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
+    crate::settings::set(key, (f64::from(next)).into());
 }
 
 /// Measure the advance width of a monospace cell (physical px) by shaping a
-/// representative glyph at the current font size in gpui's text system.
-pub fn measure_cell_width(window: &mut gpui::Window, scale: f32) -> f32 {
-    let font_size = gpui::px(FONT_SIZE * scale);
+/// representative glyph at `font_size` (logical px) × `scale` in gpui's text
+/// system.
+pub fn measure_cell_width(window: &mut gpui::Window, scale: f32, font_size: f32) -> f32 {
+    let font_size = gpui::px(font_size * scale);
     let run = gpui::TextRun {
         len: 1,
         font: gpui::font(FONT_FAMILY),
@@ -311,23 +361,53 @@ impl Renderer {
             scale,
             cell_width: 0.0,
             cell_height: 0.0,
+            chrome_cell_width: 0.0,
+            chrome_cell_height: 0.0,
+            term_font: FONT_SIZE,
+            chrome_font: FONT_SIZE,
         };
-        renderer.update_scale(scale, cell_width);
+        // Seed both metrics from the measured width at the default font; the
+        // first paint re-measures against the live settings if they differ.
+        renderer.update_metrics(scale, FONT_SIZE, cell_width, FONT_SIZE, cell_width);
         renderer
     }
 
-    /// Recompute cell metrics for a new display scale (the window moved to a
-    /// monitor with a different backing scale factor). `cell_width` must be
-    /// re-measured by the caller at the new scale via [`measure_cell_width`].
-    pub fn update_scale(&mut self, scale: f32, cell_width: f32) {
+    /// Recompute terminal and chrome cell metrics for a new display scale or a
+    /// changed font-size setting. The caller re-measures each cell width at the
+    /// matching logical font via [`measure_cell_width`].
+    pub fn update_metrics(
+        &mut self,
+        scale: f32,
+        term_font: f32,
+        term_cell_width: f32,
+        chrome_font: f32,
+        chrome_cell_width: f32,
+    ) {
         self.scale = scale;
-        self.cell_width = cell_width.round();
-        self.cell_height = (FONT_SIZE * scale * LINE_HEIGHT_FACTOR).round();
+        self.term_font = term_font;
+        self.chrome_font = chrome_font;
+        self.cell_width = term_cell_width.round();
+        self.cell_height = (term_font * scale * LINE_HEIGHT_FACTOR).round();
+        self.chrome_cell_width = chrome_cell_width.round();
+        self.chrome_cell_height = (chrome_font * scale * LINE_HEIGHT_FACTOR).round();
     }
 
-    /// Physical-px font size for shaping (logical size × scale).
+    /// The logical (pre-scale) terminal / chrome font sizes currently in effect.
+    pub fn term_font(&self) -> f32 {
+        self.term_font
+    }
+    pub fn chrome_font_logical(&self) -> f32 {
+        self.chrome_font
+    }
+
+    /// Physical-px font size for shaping the terminal grid (logical × scale).
     pub fn font_size(&self) -> f32 {
-        FONT_SIZE * self.scale
+        self.term_font * self.scale
+    }
+
+    /// Physical-px font size for shaping chrome/UI labels (logical × scale).
+    pub fn chrome_font_size(&self) -> f32 {
+        self.chrome_font * self.scale
     }
 
     /// The active theme, re-read from the settings store each call so a
@@ -464,14 +544,21 @@ impl Renderer {
         };
         let ws = &workspaces[active];
         let (width, height) = (self.width, self.height);
-        // Right inset: the ribbon (when this page/group registers tools)
-        // plus the open tool panel. Must match `App::right_w()` so painting
-        // and hit-testing agree on the tile area.
+        // Right inset: the ribbon (when this page/group registers tools) plus
+        // the open tool panel — but only when docked. A floating panel reserves
+        // no tile width (it overlays the tiles), so the terminal fills the full
+        // width behind it. Must match `App::right_w_for` so painting, PTY
+        // sizing, and hit-testing agree on the tile area.
         let open_tool = chrome.open_tool.filter(|t| chrome.ribbon_tools.contains(t));
+        let panel_w = if open_tool.is_some() && !chrome.tool_panel_floating {
+            chrome.tool_panel_w
+        } else {
+            0.0
+        };
         let right_w = if chrome.ribbon_tools.is_empty() {
             0.0
         } else {
-            workspace::RIBBON_W + if open_tool.is_some() { chrome.tool_panel_w } else { 0.0 }
+            workspace::RIBBON_W + panel_w
         };
         let area = workspace::terminal_area(width, height, self.scale, sidebar_w, right_w);
         let empty = workspaces.len() == 1 && workspaces[0].is_empty();
@@ -517,7 +604,52 @@ impl Renderer {
         // Traffic lights are the native macOS buttons now (transparent titlebar),
         // so we no longer draw our own here.
         match chrome.page {
-            Page::Sessions => {
+            Page::Notes if collapsed => {},
+            Page::Notes => {
+                // One combined sidebar, stacked top-to-bottom in the same rows
+                // groups occupy on Sessions:
+                //   [0, V)         vault rows (active highlighted)
+                //   [V, V+D)       the active vault's doc rows (indented)
+                //   V+D            an "＋ Add vault…" row
+                // The hit-test in main.rs (`Page::Notes` mouse branch) walks the
+                // same index ranges, so paint and clicks stay in lock-step.
+                let n_vaults = chrome.notes_vaults.len();
+                let n_docs = chrome.notes_doc_rels.len();
+
+                // (row index, label, active?, indent?, dim-when-inactive?)
+                let mut rows: Vec<(usize, String, bool, bool, bool)> = Vec::new();
+                for (i, name) in chrome.notes_vaults.iter().enumerate() {
+                    rows.push((i, name.clone(), i == chrome.notes_active_vault, false, false));
+                }
+                for (k, rel) in chrome.notes_doc_rels.iter().enumerate() {
+                    let selected = chrome.notes_selected_doc == Some(k);
+                    rows.push((n_vaults + k, rel.clone(), selected, true, true));
+                }
+                rows.push((n_vaults + n_docs, "+ Add vault".to_string(), false, false, true));
+
+                for (i, text, active, indent, dim) in rows {
+                    let tab = workspace::tab_rect(i, self.scale, sidebar_w);
+                    if active {
+                        bg_quads.push(self.px_rect(&tab, th.card, 0.78, row_r).shadow(Shadow::Soft));
+                    } else if hover(cur, &tab) {
+                        bg_quads.push(self.px_rect(&tab, th.card, 0.40, row_r));
+                    }
+                    hot.push(tab);
+                    let indent_px = if indent { (14.0 * self.scale).round() } else { 0.0 };
+                    let ink = if active || !dim { th.ink } else { th.ink_dim };
+                    labels.push(LabelSpec {
+                        text,
+                        color: color(ink, 1.0),
+                        left: tab.x + group_pad + indent_px,
+                        top: (tab.y + (tab.h - self.chrome_cell_height) / 2.0).round(),
+                        clip: LayoutRect { w: tab.w - group_pad - indent_px, ..tab },
+                        size: None,
+                    });
+                }
+            },
+            // The Pull Requests page shares the Sessions sidebar (its list is
+            // scoped to the active group's repo, so group switching applies).
+            Page::Sessions | Page::PullRequests => {
                 if !collapsed {
                     // Side-by-side "+ group" / "+ section" buttons below the titlebar.
                     let new_group = workspace::new_group_button(self.scale, sidebar_w);
@@ -531,7 +663,7 @@ impl Renderer {
                         text: "+ group".into(),
                         color: color(th.ink_dim, 1.0),
                         left: (new_group.x + group_pad).round(),
-                        top: (new_group.y + (new_group.h - self.cell_height) / 2.0).round(),
+                        top: (new_group.y + (new_group.h - self.chrome_cell_height) / 2.0).round(),
                         clip: new_group,
                         size: None,
                     });
@@ -546,7 +678,7 @@ impl Renderer {
                         text: "+ section".into(),
                         color: color(th.ink_dim, 1.0),
                         left: (new_section.x + group_pad).round(),
-                        top: (new_section.y + (new_section.h - self.cell_height) / 2.0).round(),
+                        top: (new_section.y + (new_section.h - self.chrome_cell_height) / 2.0).round(),
                         clip: new_section,
                         size: None,
                     });
@@ -563,22 +695,22 @@ impl Renderer {
                     );
                     hot.push(cta);
                     let cta_text = "New group";
-                    let cta_w = cta_text.chars().count() as f32 * self.cell_width;
+                    let cta_w = cta_text.chars().count() as f32 * self.chrome_cell_width;
                     labels.push(LabelSpec {
                         text: cta_text.into(),
                         color: color(th.ink, 1.0),
                         left: (cta.x + ((cta.w - cta_w) / 2.0).max(0.0)).round(),
-                        top: (cta.y + (cta.h - self.cell_height) / 2.0).round(),
+                        top: (cta.y + (cta.h - self.chrome_cell_height) / 2.0).round(),
                         clip: cta,
                         size: None,
                     });
                     let hint_text = "press ⇧⌘T";
-                    let hint_w = hint_text.chars().count() as f32 * self.cell_width;
+                    let hint_w = hint_text.chars().count() as f32 * self.chrome_cell_width;
                     labels.push(LabelSpec {
                         text: hint_text.into(),
                         color: color(th.ink_dim, 0.9),
                         left: (hint.x + ((hint.w - hint_w) / 2.0).max(0.0)).round(),
-                        top: (hint.y + (hint.h - self.cell_height) / 2.0).round(),
+                        top: (hint.y + (hint.h - self.chrome_cell_height) / 2.0).round(),
                         clip: hint,
                         size: None,
                     });
@@ -616,7 +748,7 @@ impl Renderer {
                 }
                 hot.push(search);
                 let empty = chrome.settings_query.is_empty();
-                let text_top = (search.y + (search.h - self.cell_height) / 2.0).round();
+                let text_top = (search.y + (search.h - self.chrome_cell_height) / 2.0).round();
                 if !empty || !focused {
                     labels.push(LabelSpec {
                         text: if empty { "Search settings".into() } else { chrome.settings_query.to_string() },
@@ -628,12 +760,12 @@ impl Renderer {
                     });
                 }
                 if focused {
-                    let w = chrome.settings_query.chars().count() as f32 * self.cell_width;
+                    let w = chrome.settings_query.chars().count() as f32 * self.chrome_cell_width;
                     let caret = LayoutRect {
                         x: (search.x + group_pad + w + if empty { 0.0 } else { 2.0 }).round(),
                         y: text_top,
                         w: (2.0 * self.scale).round().max(1.0),
-                        h: self.cell_height,
+                        h: self.chrome_cell_height,
                     };
                     bg_quads.push(self.px_rect(&caret, th.accent, 1.0, 0.0));
                 }
@@ -656,7 +788,7 @@ impl Renderer {
                         text: section.label().into(),
                         color: color(if active_row { th.ink } else { th.ink_dim }, 1.0),
                         left: tab.x + group_pad,
-                        top: (tab.y + (tab.h - self.cell_height) / 2.0).round(),
+                        top: (tab.y + (tab.h - self.chrome_cell_height) / 2.0).round(),
                         clip: LayoutRect { w: tab.w - group_pad, ..tab },
                         size: None,
                     });
@@ -688,7 +820,7 @@ impl Renderer {
                         text: label.clone(),
                         color: color(if *active_row { th.ink } else { th.ink_dim }, 1.0),
                         left: tab.x + group_pad,
-                        top: (tab.y + (tab.h - self.cell_height) / 2.0).round(),
+                        top: (tab.y + (tab.h - self.chrome_cell_height) / 2.0).round(),
                         clip: LayoutRect { w: tab.w - group_pad, ..tab },
                         size: None,
                     });
@@ -700,13 +832,22 @@ impl Renderer {
         // Each slot crossfades between a subtle dot and the page's glyph as
         // its animation progress moves 0 → 1 (hovered or active page).
         if !collapsed {
-            let n_pages = Page::ALL.len();
-            for (i, page) in Page::ALL.iter().enumerate() {
+            // Flag-gated pages (Notes) drop out of the strip entirely, so the
+            // slots stay contiguous; the animation array is still indexed by
+            // the page's stable global index.
+            let pages = Page::visible(chrome.notes_enabled);
+            let n_pages = pages.len();
+            for (i, page) in pages.iter().enumerate() {
                 let slot = workspace::page_slot_rect(i, n_pages, height, self.scale, sidebar_w);
                 // The dot→glyph crossfade is the hover treatment here; hot
                 // registration just adds the pointing hand.
                 hot.push(slot);
-                let p = chrome.dot_anim.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                let p = chrome
+                    .dot_anim
+                    .get(page.index())
+                    .copied()
+                    .unwrap_or(0.0)
+                    .clamp(0.0, 1.0);
                 if p < 1.0 {
                     let d = (5.0 * self.scale).round().max(2.0);
                     let dot = LayoutRect {
@@ -719,14 +860,14 @@ impl Renderer {
                 }
                 if p > 0.0 {
                     let glyph = page.glyph();
-                    let gw = glyph.chars().count() as f32 * self.cell_width;
+                    let gw = glyph.chars().count() as f32 * self.chrome_cell_width;
                     labels.push(LabelSpec {
                         text: glyph.into(),
                         color: color(th.ink, p),
                         left: (slot.x + (slot.w - gw) / 2.0).round(),
                         // Glyphs may be a hair wider than the slot ("<>"): allow
                         // a small clip overhang so they aren't shaved.
-                        top: (slot.y + (slot.h - self.cell_height) / 2.0).round(),
+                        top: (slot.y + (slot.h - self.chrome_cell_height) / 2.0).round(),
                         clip: slot.inflate((4.0 * self.scale).round()),
                         size: None,
                     });
@@ -760,8 +901,12 @@ impl Renderer {
             self.ribbon_icon(*tool, &slot, ink, &mut bg_quads, &mut carets);
             hot.push(slot);
         }
-        if let Some(tool) = open_tool {
-            let panel = workspace::tool_panel(width, height, self.scale, chrome.tool_panel_w);
+        // The PR and Local-diff panels are real gpui element trees drawn over
+        // the canvas (see `pr_ui` / `local_diff_ui`), so nothing is painted for
+        // them here. Launch has no element overlay yet, so it keeps the
+        // canvas-painted "coming soon" placeholder card.
+        if let Some(tool @ pages::Tool::Launch) = open_tool {
+            let panel = workspace::tool_panel(width, height, self.scale, chrome.tool_panel_w, chrome.tool_panel_floating);
             let pad = (14.0 * self.scale).round();
             // Chrome-polarity card like Settings/Cleanup, not a dark tile.
             bg_quads.push(self.px_rect(&panel, th.card, 1.0, card_r).shadow(Shadow::Card));
@@ -777,7 +922,7 @@ impl Renderer {
                 text: format!("{} view coming soon", tool.title()),
                 color: color(th.ink_dim, 1.0),
                 left: panel.x + pad,
-                top: (panel.y + pad + 2.0 * self.cell_height).round(),
+                top: (panel.y + pad + 2.0 * self.chrome_cell_height).round(),
                 clip: panel,
                 size: None,
             });
@@ -791,9 +936,13 @@ impl Renderer {
             // previews; every other Settings section is the gpui overlay in
             // settings_ui (which also owns search-results mode).
             self.appearance_page(&area, chrome, cur, &mut bg_quads, &mut labels, &mut hot);
-        } else if chrome.page == Page::Cleanup || chrome.page == Page::Settings {
-            // Content is a gpui overlay (cleanup_ui / settings_ui) — the
-            // canvas paints the sidebar only.
+        } else if chrome.page == Page::Cleanup
+            || chrome.page == Page::Settings
+            || chrome.page == Page::PullRequests
+            || chrome.page == Page::Notes
+        {
+            // Content is a gpui overlay (cleanup_ui / settings_ui / pr_ui) —
+            // the canvas paints the sidebar only.
         } else {
             let hair = (1.0 * self.scale).round().max(1.0);
             for (id, rect) in &tiles {
@@ -991,7 +1140,7 @@ impl Renderer {
                             color(pane_ink_dim.0, pane_ink_dim.1)
                         },
                         left: text_left,
-                        top: (tr.y + (tr.h - self.cell_height) / 2.0).round(),
+                        top: (tr.y + (tr.h - self.chrome_cell_height) / 2.0).round(),
                         clip: LayoutRect {
                             w: (close.x - tr.x - tab_text_pad).max(0.0),
                             ..tr
@@ -1005,8 +1154,8 @@ impl Renderer {
                         } else {
                             color(pane_ink_dim.0, pane_ink_dim.1)
                         },
-                        left: close.x + ((close.w - self.cell_width) / 2.0).round(),
-                        top: (tr.y + (tr.h - self.cell_height) / 2.0).round(),
+                        left: close.x + ((close.w - self.chrome_cell_width) / 2.0).round(),
+                        top: (tr.y + (tr.h - self.chrome_cell_height) / 2.0).round(),
                         clip: tr,
                         size: None,
                     });
@@ -1062,6 +1211,7 @@ impl Renderer {
                             height,
                             self.scale,
                             chrome.tool_panel_w,
+                            chrome.tool_panel_floating,
                         );
                         let line_w = (2.0 * self.scale).round().max(1.0);
                         let line = LayoutRect {
@@ -1086,7 +1236,7 @@ impl Renderer {
             let text =
                 format!("{width}×{height} px · {:.2}x · grid {cols}×{rows}", self.scale);
             let pad = (14.0 * self.scale).round();
-            let w = text.chars().count() as f32 * self.cell_width;
+            let w = text.chars().count() as f32 * self.chrome_cell_width;
             labels.push(LabelSpec {
                 text,
                 color: color(th.text_dim, 0.9),
@@ -1179,9 +1329,9 @@ impl Renderer {
     ) {
         let rows = workspace::sidebar_rows(workspaces, chrome.sections);
         let active_row = workspace::active_row_index(&rows, workspaces, chrome.sections, active);
-        let cwd_size = self.font_size() * 0.85;
-        let cwd_line_h = self.cell_height * 0.85;
-        let header_size = self.font_size() * 0.9;
+        let cwd_size = self.chrome_font_size() * 0.85;
+        let cwd_line_h = self.chrome_cell_height * 0.85;
+        let header_size = self.chrome_font_size() * 0.9;
 
         for (i, row) in rows.iter().enumerate() {
             let rect = workspace::sidebar_row_rect(&rows, i, workspaces, self.scale, sidebar_w);
@@ -1207,7 +1357,7 @@ impl Renderer {
                         let caret_w = (2.0 * self.scale).round().max(1.0);
                         let text_left = (rect.x + group_pad).round();
                         let top =
-                            (rect.y + (rect.h - self.cell_height) / 2.0).round();
+                            (rect.y + (rect.h - self.chrome_cell_height) / 2.0).round();
                         labels.push(LabelSpec {
                             text: buf.to_string(),
                             color: color(th.ink, 1.0),
@@ -1219,12 +1369,12 @@ impl Renderer {
                             },
                             size: Some(header_size),
                         });
-                        let w = buf.chars().count() as f32 * self.cell_width * 0.9;
+                        let w = buf.chars().count() as f32 * self.chrome_cell_width * 0.9;
                         let caret = LayoutRect {
                             x: (text_left + w).round(),
                             y: top,
                             w: caret_w,
-                            h: self.cell_height,
+                            h: self.chrome_cell_height,
                         };
                         bg_quads.push(self.px_rect(&caret, th.accent, 1.0, 0.0));
                     } else {
@@ -1244,6 +1394,10 @@ impl Renderer {
                         if sec.collapsed && member_count > 0 {
                             text.push_str(&format!(" · {member_count}"));
                         }
+                        // Reserve the right gutter for the delete-section
+                        // button so the label never reflows when it appears.
+                        let del = workspace::section_delete_rect(&rect, self.scale);
+                        let gap = (4.0 * self.scale).round();
                         labels.push(LabelSpec {
                             text,
                             color: color(
@@ -1251,10 +1405,44 @@ impl Renderer {
                                 1.0,
                             ),
                             left: (rect.x + group_pad).round(),
-                            top: (rect.y + (rect.h - self.cell_height) / 2.0).round(),
-                            clip: LayoutRect { w: rect.w - group_pad, ..rect },
+                            top: (rect.y + (rect.h - self.chrome_cell_height) / 2.0).round(),
+                            clip: LayoutRect {
+                                w: (del.x - rect.x - gap).max(0.0),
+                                ..rect
+                            },
                             size: Some(header_size),
                         });
+                        // Delete-section button, revealed on row hover: a
+                        // rounded chip behind an × (mirrors the tab close).
+                        if hover(cur, &rect) {
+                            let del_hov = hover(cur, &del);
+                            let inset = (3.0 * self.scale).round();
+                            let chip = LayoutRect {
+                                x: del.x + inset,
+                                y: del.y + inset,
+                                w: (del.w - 2.0 * inset).max(0.0),
+                                h: (del.h - 2.0 * inset).max(0.0),
+                            };
+                            bg_quads.push(self.px_rect(
+                                &chip,
+                                th.card,
+                                if del_hov { 1.0 } else { 0.5 },
+                                (4.0 * self.scale).round(),
+                            ));
+                            labels.push(LabelSpec {
+                                text: "×".to_string(),
+                                color: color(
+                                    if del_hov { th.ink } else { th.ink_dim },
+                                    1.0,
+                                ),
+                                left: del.x
+                                    + ((del.w - self.chrome_cell_width) / 2.0).round(),
+                                top: (rect.y + (rect.h - self.chrome_cell_height) / 2.0)
+                                    .round(),
+                                clip: rect,
+                                size: Some(header_size),
+                            });
+                        }
                         // Group unread bubbles up: if any member workspace has
                         // an unread tab, light an accent dot on the section
                         // header (regardless of collapsed/expanded state).
@@ -1287,7 +1475,7 @@ impl Renderer {
                     hot.push(rect);
                     let clip_w = rect.w - group_pad;
                     let inset =
-                        ((rect.h - (self.cell_height + cwd_line_h)) / 2.0).max(0.0);
+                        ((rect.h - (self.chrome_cell_height + cwd_line_h)) / 2.0).max(0.0);
                     // Unread (any unread tab in the group lights the dot):
                     // accent dot in the left padding gutter, centered on the
                     // row; text stays put so rows keep alignment.
@@ -1316,7 +1504,7 @@ impl Renderer {
                         text: workspace::display_cwd(ws_item.cwd.as_deref()),
                         color: color(th.ink_dim, 0.8),
                         left: rect.x + group_pad,
-                        top: (rect.y + inset + self.cell_height).round(),
+                        top: (rect.y + inset + self.chrome_cell_height).round(),
                         clip: LayoutRect { w: clip_w, ..rect },
                         size: Some(cwd_size),
                     });
@@ -1353,7 +1541,7 @@ impl Renderer {
             text: chrome.section.label().into(),
             color: color(th.ink, 1.0),
             left: area.x + pad,
-            top: (area.y + (header_h - self.cell_height) / 2.0).round(),
+            top: (area.y + (header_h - self.chrome_cell_height) / 2.0).round(),
             clip: *area,
             size: None,
         });
@@ -1361,12 +1549,12 @@ impl Renderer {
         // Rows that would spill past the card bottom are dropped, not clipped
         // mid-glyph.
         let fits = |row: &LayoutRect| row.y + row.h <= area.y + area.h - pad;
-        let mid = |row: &LayoutRect| (row.y + (row.h - self.cell_height) / 2.0).round();
+        let mid = |row: &LayoutRect| (row.y + (row.h - self.chrome_cell_height) / 2.0).round();
 
         let mode = crate::theme::mode();
         let preview_dark = chrome.preview_dark;
-        let small = self.font_size() * 0.85;
-        let small_cw = self.cell_width * 0.85;
+        let small = self.chrome_font_size() * 0.85;
+        let small_cw = self.chrome_cell_width * 0.85;
         let chip = (9.0 * scale).round();
         let chip_gap = (3.0 * scale).round();
         let ipad = (10.0 * scale).round();
@@ -1382,9 +1570,9 @@ impl Renderer {
                 clip: header,
                 size: None,
             });
-            let mode_row = workspace::appearance_mode_row(area, self.cell_width, scale);
+            let mode_row = workspace::appearance_mode_row(area, self.chrome_cell_width, scale);
             for (i, m) in crate::theme::Mode::ALL.iter().enumerate() {
-                let seg = workspace::mode_segment_rect(&mode_row, i, self.cell_width, scale);
+                let seg = workspace::mode_segment_rect(&mode_row, i, self.chrome_cell_width, scale);
                 let on = *m == mode;
                 let hov = !on && hover(cur, &seg);
                 bg_quads.push(self.px_rect(
@@ -1400,7 +1588,7 @@ impl Renderer {
                     seg.h / 2.0,
                 ));
                 hot.push(seg);
-                let lw = m.label().chars().count() as f32 * self.cell_width;
+                let lw = m.label().chars().count() as f32 * self.chrome_cell_width;
                 labels.push(LabelSpec {
                     text: m.label().into(),
                     color: color(if on { (255, 255, 255) } else { th.ink_dim }, 1.0),
@@ -1412,8 +1600,8 @@ impl Renderer {
             }
             // "Preview" caption + the Light/Dark toggle it names,
             // controlling which polarity the cards below show.
-            let seg0 = workspace::preview_segment_rect(&header, 0, self.cell_width, scale);
-            let cap_w = "Preview".chars().count() as f32 * self.cell_width;
+            let seg0 = workspace::preview_segment_rect(&header, 0, self.chrome_cell_width, scale);
+            let cap_w = "Preview".chars().count() as f32 * self.chrome_cell_width;
             labels.push(LabelSpec {
                 text: "Preview".into(),
                 color: color(th.ink_dim, 1.0),
@@ -1423,7 +1611,7 @@ impl Renderer {
                 size: None,
             });
             for (i, name) in ["Light", "Dark"].iter().enumerate() {
-                let seg = workspace::preview_segment_rect(&header, i, self.cell_width, scale);
+                let seg = workspace::preview_segment_rect(&header, i, self.chrome_cell_width, scale);
                 let on = (i == 1) == preview_dark;
                 let hov = !on && hover(cur, &seg);
                 bg_quads.push(self.px_rect(
@@ -1439,7 +1627,7 @@ impl Renderer {
                     seg.h / 2.0,
                 ));
                 hot.push(seg);
-                let lw = name.chars().count() as f32 * self.cell_width;
+                let lw = name.chars().count() as f32 * self.chrome_cell_width;
                 labels.push(LabelSpec {
                     text: (*name).into(),
                     color: color(if on { (255, 255, 255) } else { th.ink_dim }, 1.0),
@@ -1463,7 +1651,7 @@ impl Renderer {
                     text: caption.into(),
                     color: color(th.accent, 1.0),
                     left: column.x,
-                    top: (cap.y + (cap.h - self.cell_height) / 2.0).round(),
+                    top: (cap.y + (cap.h - self.chrome_cell_height) / 2.0).round(),
                     clip: cap,
                     size: Some(small),
                 });
@@ -1522,7 +1710,7 @@ impl Renderer {
             }
             let text_left =
                 (pill.x + ipad + 3.0 * (chip + chip_gap) + (6.0 * scale)).round();
-            let pmid = (pill.y + (pill.h - self.cell_height) / 2.0).round();
+            let pmid = (pill.y + (pill.h - self.chrome_cell_height) / 2.0).round();
             labels.push(LabelSpec {
                 text: name.into(),
                 color: color(th.ink, 1.0),
@@ -1530,7 +1718,7 @@ impl Renderer {
                 top: pmid,
                 clip: LayoutRect {
                     x: text_left,
-                    w: (pill.x + pill.w - ipad - self.cell_width - text_left).max(0.0),
+                    w: (pill.x + pill.w - ipad - self.chrome_cell_width - text_left).max(0.0),
                     ..pill
                 },
                 size: None,
@@ -1538,7 +1726,7 @@ impl Renderer {
             labels.push(LabelSpec {
                 text: "▾".into(),
                 color: color(th.ink_dim, 1.0),
-                left: (pill.x + pill.w - ipad - self.cell_width).round(),
+                left: (pill.x + pill.w - ipad - self.chrome_cell_width).round(),
                 top: pmid,
                 clip: pill,
                 size: None,
@@ -1569,7 +1757,7 @@ impl Renderer {
                 text: format!("{} · Preview", pt.label),
                 color: color(pt.ink_dim, 1.0),
                 left: (pv.x + ipad + 3.0 * (dot + dgap) + (6.0 * scale)).round(),
-                top: (pv.y + (title_h - self.cell_height) / 2.0).round(),
+                top: (pv.y + (title_h - self.chrome_cell_height) / 2.0).round(),
                 clip: pv,
                 size: Some(small),
             });
@@ -1600,7 +1788,7 @@ impl Renderer {
                     text: (*name).into(),
                     color: color(if i == 0 { pt.ink } else { pt.ink_dim }, 1.0),
                     left: rrect.x + (7.0 * scale).round(),
-                    top: (rrect.y + (rrect.h - self.cell_height) / 2.0).round(),
+                    top: (rrect.y + (rrect.h - self.chrome_cell_height) / 2.0).round(),
                     clip: rrect,
                     size: Some(small),
                 });
@@ -1641,7 +1829,7 @@ impl Renderer {
                         color(pane_dim.0, pane_dim.1)
                     },
                     left: (tile.x + ipad + i as f32 * (46.0 * scale)).round(),
-                    top: (tile.y + (strip_h - self.cell_height) / 2.0).round(),
+                    top: (tile.y + (strip_h - self.chrome_cell_height) / 2.0).round(),
                     clip: tile,
                     size: Some(small),
                 });
@@ -1664,9 +1852,9 @@ impl Renderer {
                 let top = (tile.y
                     + strip_h
                     + (8.0 * scale)
-                    + i as f32 * (self.cell_height + (4.0 * scale)))
+                    + i as f32 * (self.chrome_cell_height + (4.0 * scale)))
                     .round();
-                if top + self.cell_height > tile.y + tile.h - (6.0 * scale) {
+                if top + self.chrome_cell_height > tile.y + tile.h - (6.0 * scale) {
                     break;
                 }
                 labels.push(LabelSpec {
@@ -1729,7 +1917,7 @@ impl Renderer {
                     text: "Primary".into(),
                     color: color((255, 255, 255), 1.0),
                     left: (b1.x + ipad).round(),
-                    top: (b1.y + (b1.h - self.cell_height) / 2.0).round(),
+                    top: (b1.y + (b1.h - self.chrome_cell_height) / 2.0).round(),
                     clip: b1,
                     size: Some(small),
                 });
@@ -1745,7 +1933,7 @@ impl Renderer {
                     text: "Secondary".into(),
                     color: color(pt.ink, 1.0),
                     left: (b2.x + ipad).round(),
-                    top: (b2.y + (b2.h - self.cell_height) / 2.0).round(),
+                    top: (b2.y + (b2.h - self.chrome_cell_height) / 2.0).round(),
                     clip: b2,
                     size: Some(small),
                 });
@@ -1776,7 +1964,7 @@ impl Renderer {
                     text: "bg · surface · pane · accent · ink".into(),
                     color: color(pt.ink_dim, 1.0),
                     left: (tile.x + 5.0 * (chip + chip_gap) + (6.0 * scale)).round(),
-                    top: (chy + (chip - self.cell_height) / 2.0).round(),
+                    top: (chy + (chip - self.chrome_cell_height) / 2.0).round(),
                     clip: *area,
                     size: Some(small),
                 });
@@ -1798,7 +1986,7 @@ impl Renderer {
                 text: format!("{} · Preview", sel.map_or("Default", |t| t.label)),
                 color: color(tfg, 0.7),
                 left: (pv.x + ipad).round(),
-                top: (pv.y + (strip_h - self.cell_height) / 2.0).round(),
+                top: (pv.y + (strip_h - self.chrome_cell_height) / 2.0).round(),
                 clip: strip,
                 size: Some(small),
             });
@@ -1838,16 +2026,16 @@ impl Renderer {
                 ],
                 vec![("❯ ", magenta), ("agent watching e2e ", fgc)],
             ];
-            let lh = (self.cell_height + (4.0 * scale)).round();
+            let lh = (self.chrome_cell_height + (4.0 * scale)).round();
             let mut y = (pv.y + strip_h + (8.0 * scale)).round();
             let mut cursor_pos = None;
             for spans in lines {
-                if y + self.cell_height > pv.y + pv.h - ipad {
+                if y + self.chrome_cell_height > pv.y + pv.h - ipad {
                     break;
                 }
                 let mut x = (pv.x + ipad).round();
                 for (text, c) in spans {
-                    let w = text.chars().count() as f32 * self.cell_width;
+                    let w = text.chars().count() as f32 * self.chrome_cell_width;
                     labels.push(LabelSpec {
                         text: text.into(),
                         color: c,
@@ -1866,8 +2054,8 @@ impl Renderer {
                 let cur_r = LayoutRect {
                     x: cx,
                     y: cy,
-                    w: (self.cell_width * 0.6).round().max(1.0),
-                    h: self.cell_height,
+                    w: (self.chrome_cell_width * 0.6).round().max(1.0),
+                    h: self.chrome_cell_height,
                 };
                 bg_quads.push(self.px_rect(&cur_r, tfg, 0.9, 0.0));
             }
@@ -1881,7 +2069,7 @@ impl Renderer {
             for (i, name) in
                 ["Import from Clipboard", "Copy Theme String"].iter().enumerate()
             {
-                let b = workspace::appearance_footer_action(area, i, self.cell_width, scale);
+                let b = workspace::appearance_footer_action(area, i, self.chrome_cell_width, scale);
                 let hov = hover(cur, &b);
                 bg_quads.push(self.px_rect(
                     &b,
@@ -1890,18 +2078,18 @@ impl Renderer {
                     b.h / 2.0,
                 ));
                 hot.push(b);
-                let lw = name.chars().count() as f32 * self.cell_width;
+                let lw = name.chars().count() as f32 * self.chrome_cell_width;
                 labels.push(LabelSpec {
                     text: (*name).into(),
                     color: color(th.ink, 1.0),
                     left: (b.x + (b.w - lw) / 2.0).round(),
-                    top: (b.y + (b.h - self.cell_height) / 2.0).round(),
+                    top: (b.y + (b.h - self.chrome_cell_height) / 2.0).round(),
                     clip: b,
                     size: None,
                 });
             }
             let note = "changes apply live";
-            let w = note.chars().count() as f32 * self.cell_width;
+            let w = note.chars().count() as f32 * self.chrome_cell_width;
             labels.push(LabelSpec {
                 text: note.into(),
                 color: color(th.ink_dim, 1.0),
@@ -1993,7 +2181,7 @@ impl Renderer {
                 quads.push(self.px_rect(&r, *c, 1.0, (3.0 * scale).round()));
             }
             let text_left = (inner.x + ipad + 3.0 * (chip + cgap) + (6.0 * scale)).round();
-            let top = (row.y + (row.h - self.cell_height) / 2.0).round();
+            let top = (row.y + (row.h - self.chrome_cell_height) / 2.0).round();
             labels.push(LabelSpec {
                 text: (*name).into(),
                 color: color(if *selected { th.ink } else { th.ink_dim }, 1.0),
@@ -2006,7 +2194,7 @@ impl Renderer {
                 labels.push(LabelSpec {
                     text: "\u{25cf}".into(),
                     color: color(th.accent, 1.0),
-                    left: (inner.x + inner.w - ipad - self.cell_width).round(),
+                    left: (inner.x + inner.w - ipad - self.chrome_cell_width).round(),
                     top,
                     clip: inner,
                     size: None,
@@ -2044,7 +2232,7 @@ impl Renderer {
         rects.push(self.px_rect(&layout.search, th.ink, 0.06, (7.0 * scale).round()));
 
         // Search text (or placeholder) with a caret trailing the query.
-        let search_top = (layout.search.y + (layout.search.h - self.cell_height) / 2.0).round();
+        let search_top = (layout.search.y + (layout.search.h - self.chrome_cell_height) / 2.0).round();
         let (text, c) = if picker.query.is_empty() {
             ("Search repos…".to_string(), th.ink_dim)
         } else {
@@ -2058,12 +2246,12 @@ impl Renderer {
             clip: layout.search,
             size: None,
         });
-        let caret_x = layout.search.x + pad + picker.query.chars().count() as f32 * self.cell_width;
+        let caret_x = layout.search.x + pad + picker.query.chars().count() as f32 * self.chrome_cell_width;
         let caret = LayoutRect {
             x: caret_x,
             y: search_top,
             w: (2.0 * scale).round().max(1.0),
-            h: self.cell_height,
+            h: self.chrome_cell_height,
         };
         rects.push(self.px_rect(&caret, th.accent, 1.0, 0.0));
 
@@ -2072,7 +2260,7 @@ impl Renderer {
             let (Some(row), Some(prow)) = (layout.row_rect(i), picker.rows.get(i)) else {
                 continue;
             };
-            let top = (row.y + (row.h - self.cell_height) / 2.0).round();
+            let top = (row.y + (row.h - self.chrome_cell_height) / 2.0).round();
             match prow {
                 PickerRow::Header(title) => labels.push(LabelSpec {
                     text: title.to_string(),
@@ -2111,7 +2299,7 @@ impl Renderer {
                         labels.push(LabelSpec {
                             text: "\u{e0a0}".to_string(),
                             color: color(th.accent, 1.0),
-                            left: gx + (layout.row_h - self.cell_width) / 2.0,
+                            left: gx + (layout.row_h - self.chrome_cell_width) / 2.0,
                             top,
                             clip: cell,
                             size: None,
@@ -2122,7 +2310,7 @@ impl Renderer {
                         labels.push(LabelSpec {
                             text: "★".to_string(),
                             color: color((205, 150, 35), 1.0),
-                            left: star.x + (layout.row_h - self.cell_width) / 2.0,
+                            left: star.x + (layout.row_h - self.chrome_cell_width) / 2.0,
                             top,
                             clip: star,
                             size: None,
@@ -2160,7 +2348,7 @@ impl Renderer {
         rects.push(self.px_rect(&layout.search, th.ink, 0.06, (7.0 * scale).round()));
 
         // Search text (or placeholder) with a caret trailing the query.
-        let search_top = (layout.search.y + (layout.search.h - self.cell_height) / 2.0).round();
+        let search_top = (layout.search.y + (layout.search.h - self.chrome_cell_height) / 2.0).round();
         let (text, c) = if palette.query.is_empty() {
             ("Run a command…".to_string(), th.ink_dim)
         } else {
@@ -2174,12 +2362,12 @@ impl Renderer {
             clip: layout.search,
             size: None,
         });
-        let caret_x = layout.search.x + pad + palette.query.chars().count() as f32 * self.cell_width;
+        let caret_x = layout.search.x + pad + palette.query.chars().count() as f32 * self.chrome_cell_width;
         let caret = LayoutRect {
             x: caret_x,
             y: search_top,
             w: (2.0 * scale).round().max(1.0),
-            h: self.cell_height,
+            h: self.chrome_cell_height,
         };
         rects.push(self.px_rect(&caret, th.accent, 1.0, 0.0));
 
@@ -2188,7 +2376,7 @@ impl Renderer {
             let (Some(row), Some(action)) = (layout.row_rect(i), palette.rows.get(i)) else {
                 continue;
             };
-            let top = (row.y + (row.h - self.cell_height) / 2.0).round();
+            let top = (row.y + (row.h - self.chrome_cell_height) / 2.0).round();
             let m = (6.0 * scale).round();
             let pill = LayoutRect { x: row.x + m, w: (row.w - 2.0 * m).max(0.0), ..row };
             if i == palette.selected {
@@ -2200,7 +2388,7 @@ impl Renderer {
             hot.push(row);
             // Current binding, right-aligned; the label clips short of it.
             let binding = action.binding().display();
-            let binding_w = binding.chars().count() as f32 * self.cell_width;
+            let binding_w = binding.chars().count() as f32 * self.chrome_cell_width;
             let binding_x = row.x + row.w - pad - binding_w;
             labels.push(LabelSpec {
                 text: binding,
@@ -2243,7 +2431,7 @@ impl Renderer {
 
         // Centered panel sized to the (capped) row count: a floating white
         // card matching the Arc chrome.
-        let row_h = (self.cell_height + 8.0 * scale).round();
+        let row_h = (self.chrome_cell_height + 8.0 * scale).round();
         let visible = fork.rows.len().min(12);
         let panel_w = (self.width as f32 * 0.5).min(560.0 * scale).round();
         let panel_h = (row_h * (visible as f32 + 2.0) + pad * 2.0).round();
@@ -2261,7 +2449,7 @@ impl Renderer {
             text: format!("fork {} from…", fork.name),
             color: color(th.ink_dim, 1.0),
             left: panel_x + pad,
-            top: (header.y + (row_h - self.cell_height) / 2.0).round(),
+            top: (header.y + (row_h - self.chrome_cell_height) / 2.0).round(),
             clip: header,
             size: None,
         });
@@ -2270,7 +2458,7 @@ impl Renderer {
         let search =
             LayoutRect { x: panel_x + pad, y: panel_y + pad + row_h, w: panel_w - 2.0 * pad, h: row_h };
         rects.push(self.px_rect(&search, th.ink, 0.06, (7.0 * scale).round()));
-        let search_top = (search.y + (search.h - self.cell_height) / 2.0).round();
+        let search_top = (search.y + (search.h - self.chrome_cell_height) / 2.0).round();
         let (text, c) = if fork.query.is_empty() {
             ("Filter branches…".to_string(), th.ink_dim)
         } else {
@@ -2284,12 +2472,12 @@ impl Renderer {
             clip: search,
             size: None,
         });
-        let caret_x = search.x + pad + fork.query.chars().count() as f32 * self.cell_width;
+        let caret_x = search.x + pad + fork.query.chars().count() as f32 * self.chrome_cell_width;
         let caret = LayoutRect {
             x: caret_x,
             y: search_top,
             w: (2.0 * scale).round().max(1.0),
-            h: self.cell_height,
+            h: self.chrome_cell_height,
         };
         rects.push(self.px_rect(&caret, th.accent, 1.0, 0.0));
 
@@ -2297,7 +2485,7 @@ impl Renderer {
         let rows_top = panel_y + pad + row_h * 2.0;
         for (i, entry) in fork.rows.iter().take(visible).enumerate() {
             let row = LayoutRect { x: panel_x, y: rows_top + row_h * i as f32, w: panel_w, h: row_h };
-            let top = (row.y + (row.h - self.cell_height) / 2.0).round();
+            let top = (row.y + (row.h - self.chrome_cell_height) / 2.0).round();
             let m = (6.0 * scale).round();
             let pill = LayoutRect { x: row.x + m, w: (row.w - 2.0 * m).max(0.0), ..row };
             if i == fork.selected {
@@ -2347,7 +2535,7 @@ impl Renderer {
         rects.push(self.px_rect(&layout.search, th.ink, 0.06, (7.0 * scale).round()));
 
         // Search text (or a placeholder naming the group) with a caret.
-        let search_top = (layout.search.y + (layout.search.h - self.cell_height) / 2.0).round();
+        let search_top = (layout.search.y + (layout.search.h - self.chrome_cell_height) / 2.0).round();
         let (text, c) = if profile.query.is_empty() {
             (format!("Launch {} with…", profile.name), th.ink_dim)
         } else {
@@ -2362,12 +2550,12 @@ impl Renderer {
             size: None,
         });
         let caret_x =
-            layout.search.x + pad + profile.query.chars().count() as f32 * self.cell_width;
+            layout.search.x + pad + profile.query.chars().count() as f32 * self.chrome_cell_width;
         let caret = LayoutRect {
             x: caret_x,
             y: search_top,
             w: (2.0 * scale).round().max(1.0),
-            h: self.cell_height,
+            h: self.chrome_cell_height,
         };
         rects.push(self.px_rect(&caret, th.accent, 1.0, 0.0));
 
@@ -2376,7 +2564,7 @@ impl Renderer {
             let (Some(row), Some(entry)) = (layout.row_rect(i), profile.rows.get(i)) else {
                 continue;
             };
-            let top = (row.y + (row.h - self.cell_height) / 2.0).round();
+            let top = (row.y + (row.h - self.chrome_cell_height) / 2.0).round();
             let m = (6.0 * scale).round();
             let pill = LayoutRect { x: row.x + m, w: (row.w - 2.0 * m).max(0.0), ..row };
             if i == profile.selected {
@@ -2388,10 +2576,10 @@ impl Renderer {
             // The name has priority: the detail only gets the width left over
             // after it (a long description truncates with an ellipsis rather
             // than pushing the name out of the row).
-            let label_w = entry.label.chars().count() as f32 * self.cell_width;
-            let room = row.w - 2.0 * pad - label_w - 2.0 * self.cell_width;
-            let detail = truncate_chars(&entry.detail, (room / self.cell_width) as usize);
-            let detail_w = detail.chars().count() as f32 * self.cell_width;
+            let label_w = entry.label.chars().count() as f32 * self.chrome_cell_width;
+            let room = row.w - 2.0 * pad - label_w - 2.0 * self.chrome_cell_width;
+            let detail = truncate_chars(&entry.detail, (room / self.chrome_cell_width) as usize);
+            let detail_w = detail.chars().count() as f32 * self.chrome_cell_width;
             let detail_x = row.x + row.w - pad - detail_w;
             if !detail.is_empty() {
                 labels.push(LabelSpec {
@@ -2421,8 +2609,8 @@ impl Renderer {
     pub fn save_layout(&self, dest_rows: usize) -> SaveLayout {
         let scale = self.scale;
         let pad = (12.0 * scale).round();
-        let row_h = (self.cell_height + 8.0 * scale).round();
-        let caption_h = (self.cell_height + 4.0 * scale).round();
+        let row_h = (self.chrome_cell_height + 8.0 * scale).round();
+        let caption_h = (self.chrome_cell_height + 4.0 * scale).round();
 
         let panel_w = (self.width as f32 * 0.5).min(560.0 * scale).round();
         let dest_h = if dest_rows > 0 { caption_h + dest_rows as f32 * row_h } else { 0.0 };
@@ -2496,7 +2684,7 @@ impl Renderer {
                 text: caption.into(),
                 color: color(th.ink_dim, 1.0),
                 left: rect.x,
-                top: (rect.y - self.cell_height - 2.0 * scale).round(),
+                top: (rect.y - self.chrome_cell_height - 2.0 * scale).round(),
                 clip: layout.panel,
                 size: None,
             });
@@ -2510,7 +2698,7 @@ impl Renderer {
                 (7.0 * scale).round(),
             ));
             hot.push(*rect);
-            let top = (rect.y + (rect.h - self.cell_height) / 2.0).round();
+            let top = (rect.y + (rect.h - self.chrome_cell_height) / 2.0).round();
             labels.push(LabelSpec {
                 text: value.to_string(),
                 color: color(th.ink, 1.0),
@@ -2520,12 +2708,12 @@ impl Renderer {
                 size: None,
             });
             if focused {
-                let caret_x = rect.x + pad + value.chars().count() as f32 * self.cell_width;
+                let caret_x = rect.x + pad + value.chars().count() as f32 * self.chrome_cell_width;
                 let caret = LayoutRect {
                     x: caret_x,
                     y: top,
                     w: (2.0 * scale).round().max(1.0),
-                    h: self.cell_height,
+                    h: self.chrome_cell_height,
                 };
                 rects.push(self.px_rect(&caret, th.accent, 1.0, 0.0));
             }
@@ -2538,13 +2726,13 @@ impl Renderer {
                     text: "Save to".into(),
                     color: color(th.ink_dim, 1.0),
                     left: layout.panel.x + pad,
-                    top: (first.y - self.cell_height - 2.0 * scale).round(),
+                    top: (first.y - self.chrome_cell_height - 2.0 * scale).round(),
                     clip: layout.panel,
                     size: None,
                 });
             }
             for (i, (text, row)) in dest_labels.iter().zip(layout.rows.iter()).enumerate() {
-                let top = (row.y + (row.h - self.cell_height) / 2.0).round();
+                let top = (row.y + (row.h - self.chrome_cell_height) / 2.0).round();
                 let m = (6.0 * scale).round();
                 let pill = LayoutRect { x: row.x + m, w: (row.w - 2.0 * m).max(0.0), ..*row };
                 if i == selected {
@@ -2573,17 +2761,17 @@ impl Renderer {
         let pad = (16.0 * scale).round();
         let gap = (10.0 * scale).round();
         let btn_pad = (14.0 * scale).round();
-        let btn_h = (self.cell_height + 10.0 * scale).round();
-        let text_w = text.chars().count() as f32 * self.cell_width;
+        let btn_h = (self.chrome_cell_height + 10.0 * scale).round();
+        let text_w = text.chars().count() as f32 * self.chrome_cell_width;
         let cancel_w =
-            (CONFIRM_CANCEL.chars().count() as f32 * self.cell_width + 2.0 * btn_pad).round();
-        let close_w = (accept.chars().count() as f32 * self.cell_width + 2.0 * btn_pad).round();
+            (CONFIRM_CANCEL.chars().count() as f32 * self.chrome_cell_width + 2.0 * btn_pad).round();
+        let close_w = (accept.chars().count() as f32 * self.chrome_cell_width + 2.0 * btn_pad).round();
         let w = (text_w.max(cancel_w + gap + close_w) + 2.0 * pad)
             .min(self.width as f32 - 2.0 * pad);
-        let h = (self.cell_height + gap + btn_h + 2.0 * pad).round();
+        let h = (self.chrome_cell_height + gap + btn_h + 2.0 * pad).round();
         let x = ((self.width as f32 - w) / 2.0).round();
         let y = ((self.height as f32 - h) / 2.0).round();
-        let by = (y + pad + self.cell_height + gap).round();
+        let by = (y + pad + self.chrome_cell_height + gap).round();
         let close_x = (x + w - pad - close_w).round();
         let cancel_x = (close_x - gap - cancel_w).round();
         ConfirmLayout {
@@ -2645,12 +2833,12 @@ impl Renderer {
                 .shadow(if hov { Shadow::Soft } else { Shadow::None }),
             );
             hot.push(*rect);
-            let w = label.chars().count() as f32 * self.cell_width;
+            let w = label.chars().count() as f32 * self.chrome_cell_width;
             labels.push(LabelSpec {
                 text: label.into(),
                 color: color(if danger { (255, 255, 255) } else { th.ink }, 1.0),
                 left: (rect.x + (rect.w - w) / 2.0).round(),
-                top: (rect.y + (rect.h - self.cell_height) / 2.0).round(),
+                top: (rect.y + (rect.h - self.chrome_cell_height) / 2.0).round(),
                 clip: *rect,
                 size: None,
             });
@@ -2666,9 +2854,9 @@ impl Renderer {
         let scrim = LayoutRect { x: 0.0, y: 0.0, w: self.width as f32, h: self.height as f32 };
         rects.push(self.px_rect(&scrim, th.scrim, 0.30, 0.0));
 
-        let w = (text.chars().count() as f32 * self.cell_width + pad * 2.0)
+        let w = (text.chars().count() as f32 * self.chrome_cell_width + pad * 2.0)
             .min(self.width as f32 - pad * 2.0);
-        let h = (self.cell_height + pad * 2.0).round();
+        let h = (self.chrome_cell_height + pad * 2.0).round();
         let x = ((self.width as f32 - w) / 2.0).round();
         let y = ((self.height as f32 - h) / 2.0).round();
         let panel = LayoutRect { x, y, w, h };
@@ -2680,7 +2868,7 @@ impl Renderer {
             text: text.to_string(),
             color: color(th.ink, 1.0),
             left: x + pad,
-            top: (y + (h - self.cell_height) / 2.0).round(),
+            top: (y + (h - self.chrome_cell_height) / 2.0).round(),
             clip: panel,
             size: None,
         }]
@@ -2830,7 +3018,7 @@ impl Renderer {
                     color(pane_ink_dim.0, pane_ink_dim.1)
                 },
                 left: text_left,
-                top: (tr.y + (tr.h - self.cell_height) / 2.0).round(),
+                top: (tr.y + (tr.h - self.chrome_cell_height) / 2.0).round(),
                 clip: crate::workspace::LayoutRect {
                     w: (close.x - tr.x - tab_text_pad).max(0.0),
                     ..tr
@@ -2844,8 +3032,8 @@ impl Renderer {
                 } else {
                     color(pane_ink_dim.0, pane_ink_dim.1)
                 },
-                left: close.x + ((close.w - self.cell_width) / 2.0).round(),
-                top: (tr.y + (tr.h - self.cell_height) / 2.0).round(),
+                left: close.x + ((close.w - self.chrome_cell_width) / 2.0).round(),
+                top: (tr.y + (tr.h - self.chrome_cell_height) / 2.0).round(),
                 clip: tr,
                 size: None,
             });
@@ -2882,8 +3070,8 @@ impl Renderer {
                     } else {
                         color(pane_ink_dim.0, pane_ink_dim.1)
                     },
-                    left: rect.x + ((rect.w - self.cell_width) / 2.0).round(),
-                    top: (rect.y + (bar_h - self.cell_height) / 2.0).round(),
+                    left: rect.x + ((rect.w - self.chrome_cell_width) / 2.0).round(),
+                    top: (rect.y + (bar_h - self.chrome_cell_height) / 2.0).round(),
                     clip: rect,
                     size: None,
                 });
@@ -3159,6 +3347,31 @@ impl Renderer {
                     0.0,
                 ));
             },
+            pages::Tool::LocalDiff => {
+                // Diff mark: a `+` over a `−` (an added line above a removed
+                // one) — the working-tree review glyph.
+                // Plus: horizontal bar…
+                quads.push(self.px_rect(
+                    &LayoutRect { x: ix + px(3.0), y: iy + px(5.0) - t / 2.0, w: px(10.0), h: t },
+                    rgb,
+                    1.0,
+                    0.0,
+                ));
+                // …crossed by a vertical bar.
+                quads.push(self.px_rect(
+                    &LayoutRect { x: ix + px(8.0) - t / 2.0, y: iy + px(2.0), w: t, h: px(6.0) },
+                    rgb,
+                    1.0,
+                    0.0,
+                ));
+                // Minus below.
+                quads.push(self.px_rect(
+                    &LayoutRect { x: ix + px(3.0), y: iy + px(12.0) - t / 2.0, w: px(10.0), h: t },
+                    rgb,
+                    1.0,
+                    0.0,
+                ));
+            },
             pages::Tool::Launch => {
                 // Terminal-prompt mark (>_): launch runs a command in a shell.
                 carets.push(CaretSpec {
@@ -3258,9 +3471,15 @@ mod tests {
             sections: &[],
             editing_section: None,
             cleanup,
+            notes_enabled: false,
+            notes_vaults: &[],
+            notes_active_vault: 0,
+            notes_doc_rels: &[],
+            notes_selected_doc: None,
             ribbon_tools: &[],
             open_tool: None,
             tool_panel_w: 0.0,
+        tool_panel_floating: false,
             cursor: None,
             settings_query: "",
             settings_search_focus: false,
@@ -3312,32 +3531,37 @@ mod tests {
             frame.hot.iter().any(|r| r.x == slot.x && r.y == slot.y),
             "ribbon slot is a hover target"
         );
-        // The Launch stub stacks below: its prompt chevron sits in slot 1.
+        // Local diff stacks in slot 1 (a hover target), Launch in slot 2 with
+        // its prompt chevron.
         let slot1 = crate::workspace::ribbon_slot_rect(1, 1600, scale);
         assert!(frame.hot.iter().any(|r| r.x == slot1.x && r.y == slot1.y));
+        let slot2 = crate::workspace::ribbon_slot_rect(2, 1600, scale);
+        assert!(frame.hot.iter().any(|r| r.x == slot2.x && r.y == slot2.y));
         assert!(
-            frame.carets.iter().any(|c| c.cx >= slot1.x
-                && c.cx <= slot1.x + slot1.w
-                && c.cy >= slot1.y
-                && c.cy <= slot1.y + slot1.h),
-            "launch icon chevron renders in the second slot"
+            frame.carets.iter().any(|c| c.cx >= slot2.x
+                && c.cx <= slot2.x + slot2.w
+                && c.cy >= slot2.y
+                && c.cy <= slot2.y + slot2.h),
+            "launch icon chevron renders in the third slot"
         );
 
         // Open: the panel card paints with header + placeholder, and the tile
-        // card stops left of the panel.
+        // card stops left of the panel. The PR / Local-diff tools render as
+        // gpui element trees (not canvas), so the Launch tool — which still
+        // uses the canvas placeholder — exercises the panel-paint path here.
         let mut chrome = cleanup_chrome(&state);
         chrome.page = Page::Sessions;
         chrome.ribbon_tools = &pages::Tool::ALL;
-        chrome.open_tool = Some(pages::Tool::Pr);
+        chrome.open_tool = Some(pages::Tool::Launch);
         chrome.tool_panel_w = crate::workspace::TOOL_PANEL_DEFAULT_W;
         let frame = renderer.build_frame(
             &wss, 0, 240.0, None, None, None, None, None, None, None, None, None, None, &chrome,
         );
         let texts: Vec<&str> = frame.labels.iter().map(|l| l.text.as_str()).collect();
-        assert!(texts.contains(&"Pull Request"));
-        assert!(texts.contains(&"Pull Request view coming soon"));
+        assert!(texts.contains(&"Launch"));
+        assert!(texts.contains(&"Launch view coming soon"));
         let panel =
-            crate::workspace::tool_panel(1600, 1000, scale, crate::workspace::TOOL_PANEL_DEFAULT_W);
+            crate::workspace::tool_panel(1600, 1000, scale, crate::workspace::TOOL_PANEL_DEFAULT_W, false);
         assert!(
             frame.bg_quads.iter().any(|q| q.x == panel.x && q.w == panel.w),
             "panel card quad renders"
@@ -3425,13 +3649,13 @@ mod tests {
             &[ws], 0, sidebar_w, None, None, None, None, None, None, None, None, None, None, &chrome,
         );
         let search = crate::workspace::settings_search_rect(scale, sidebar_w);
-        let search_y = (search.y + (search.h - renderer.cell_height) / 2.0).round();
+        let search_y = (search.y + (search.h - renderer.chrome_cell_height) / 2.0).round();
         assert!(
             frame.labels.iter().any(|l| l.text == "Search settings" && l.top == search_y),
             "placeholder sits in the top sidebar slot"
         );
         let tab = crate::workspace::tab_rect(1, scale, sidebar_w);
-        let tab_y = (tab.y + (tab.h - renderer.cell_height) / 2.0).round();
+        let tab_y = (tab.y + (tab.h - renderer.chrome_cell_height) / 2.0).round();
         assert!(
             frame.labels.iter().any(|l| l.text == "Sessions" && l.top == tab_y),
             "first section tab shifts down one slot below the search box"
@@ -3622,6 +3846,7 @@ mod tests {
                 name: "MySection".into(),
                 emoji: "🔥".into(),
                 collapsed,
+                anchor: None,
             }];
             chrome.sections = &sections;
 

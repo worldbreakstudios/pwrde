@@ -49,6 +49,7 @@ pub struct SavedSection {
     pub name: String,
     pub emoji: String,
     pub collapsed: bool,
+    pub anchor: Option<u64>,
 }
 
 /// A saved tab within a group.
@@ -127,10 +128,12 @@ fn open_db(path: &Path) -> SqlResult<Connection> {
             position INTEGER NOT NULL,
             name TEXT NOT NULL,
             emoji TEXT NOT NULL,
-            collapsed INTEGER NOT NULL
+            collapsed INTEGER NOT NULL,
+            anchor_tile INTEGER
         )",
         [],
     )?;
+    let _ = conn.execute("ALTER TABLE sections ADD COLUMN anchor_tile INTEGER", []);
 
     Ok(conn)
 }
@@ -151,14 +154,15 @@ pub fn save_snapshot(
 
     for section in sections {
         tx.execute(
-            "INSERT INTO sections (id, position, name, emoji, collapsed)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO sections (id, position, name, emoji, collapsed, anchor_tile)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             (
                 section.id as i64,
                 section.position,
                 &section.name,
                 &section.emoji,
                 if section.collapsed { 1 } else { 0 },
+                section.anchor.map(|t| t as i64),
             ),
         )?;
     }
@@ -223,7 +227,7 @@ pub fn load_snapshot(path: &Path) -> (Vec<SavedGroup>, Vec<SavedSection>) {
 
 fn load_sections(conn: &Connection) -> Vec<SavedSection> {
     let mut stmt = match conn.prepare(
-        "SELECT id, position, name, emoji, collapsed FROM sections ORDER BY position",
+        "SELECT id, position, name, emoji, collapsed, anchor_tile FROM sections ORDER BY position",
     ) {
         Ok(s) => s,
         Err(e) => {
@@ -239,6 +243,7 @@ fn load_sections(conn: &Connection) -> Vec<SavedSection> {
             name: row.get(2)?,
             emoji: row.get(3)?,
             collapsed: row.get::<_, i32>(4)? != 0,
+            anchor: row.get::<_, Option<i64>>(5)?.map(|v| v as u64),
         })
     }) {
         Ok(r) => r,
@@ -389,6 +394,7 @@ pub fn sections_to_saved(sections: &[crate::workspace::Section]) -> Vec<SavedSec
             name: s.name.clone(),
             emoji: s.emoji.clone(),
             collapsed: s.collapsed,
+            anchor: s.anchor,
         })
         .collect()
 }
@@ -402,6 +408,7 @@ pub fn saved_to_sections(saved: &[SavedSection]) -> Vec<crate::workspace::Sectio
             name: s.name.clone(),
             emoji: s.emoji.clone(),
             collapsed: s.collapsed,
+            anchor: s.anchor,
         })
         .collect()
 }
@@ -644,6 +651,7 @@ mod tests {
                 name: "work".into(),
                 emoji: "👩‍💻".into(),
                 collapsed: true,
+                anchor: None,
             },
             SavedSection {
                 id: 20,
@@ -651,6 +659,7 @@ mod tests {
                 name: "play".into(),
                 emoji: String::new(),
                 collapsed: false,
+                anchor: None,
             },
         ];
         let groups = vec![

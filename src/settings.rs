@@ -102,6 +102,16 @@ pub fn get_bool(key: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
+/// A numeric setting as `f32`, or `default` when unset/non-numeric.
+pub fn get_f32(key: &str, default: f32) -> f32 {
+    store()
+        .read()
+        .ok()
+        .and_then(|map| map.get(key)?.as_f64())
+        .map(|v| v as f32)
+        .unwrap_or(default)
+}
+
 /// Update one key in memory and persist the whole store to disk. A write
 /// failure keeps the in-memory value (the session still works; only
 /// persistence is lost).
@@ -161,6 +171,12 @@ mod tests {
         // The global store is empty in tests (no init/set), so the unset key
         // must fall back to the default.
         assert_eq!(primary_command(), "claude");
+    }
+
+    #[test]
+    fn get_f32_returns_default_for_unset_key() {
+        // An unset key falls back to the default (the store has no such key).
+        assert_eq!(get_f32("accessibility.__unset_test_key__", 15.0), 15.0);
     }
 
     #[test]

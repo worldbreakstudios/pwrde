@@ -16,18 +16,38 @@ use gpui::Keystroke;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Page {
     Sessions,
+    /// Holistic pull-request list for the active group's repo — all open PRs,
+    /// openable into the shared detail view. (The Sessions PR tool is scoped to
+    /// just the checked-out branch; this page is the wider view.)
+    PullRequests,
     /// Worktree hygiene page — lists all `drop`-managed worktrees and lets the
     /// user multi-select and delete stale ones.
     Cleanup,
+    /// Obsidian-style markdown vaults. Experimental — only reachable while the
+    /// `features.notes` flag is on (see [`crate::features`]).
+    Notes,
     Settings,
 }
 
 impl Page {
     /// Dot-strip order; `cycle` walks this.
-    pub const ALL: [Page; 3] = [Page::Sessions, Page::Cleanup, Page::Settings];
+    pub const ALL: [Page; 5] = [
+        Page::Sessions,
+        Page::PullRequests,
+        Page::Cleanup,
+        Page::Notes,
+        Page::Settings,
+    ];
 
     pub fn index(self) -> usize {
         Self::ALL.iter().position(|p| *p == self).unwrap_or(0)
+    }
+
+    /// The pages the dot strip actually shows, in [`Self::ALL`] order.
+    /// Experimental pages drop out when their feature flag is off, so the
+    /// dot strip, hit-testing and page cycling all agree on slot indices.
+    pub fn visible(notes_enabled: bool) -> Vec<Page> {
+        Self::ALL.iter().copied().filter(|p| *p != Page::Notes || notes_enabled).collect()
     }
 
     /// Glyph shown in the page slot when active or hovered. The cog / broom /
@@ -35,8 +55,12 @@ impl Page {
     pub fn glyph(self) -> &'static str {
         match self {
             Page::Sessions => "<>",
+            // U+F0629 = nf-md-source_pull (Material Design Icons via Nerd Fonts)
+            Page::PullRequests => "\u{f0629}",
             // U+F00D4 = nf-md-broom (Material Design Icons via Nerd Fonts)
             Page::Cleanup => "\u{f00d4}",
+            // U+F02D = nf-fa-book (Font Awesome via Nerd Fonts)
+            Page::Notes => "\u{f02d}",
             Page::Settings => "\u{f013}",
         }
     }
@@ -58,16 +82,20 @@ pub enum Section {
     Keyboard,
     Terminal,
     Appearance,
+    Accessibility,
     Debug,
+    FeatureFlags,
 }
 
 impl Section {
-    pub const ALL: [Section; 5] = [
+    pub const ALL: [Section; 7] = [
         Section::Sessions,
         Section::Keyboard,
         Section::Terminal,
         Section::Appearance,
+        Section::Accessibility,
         Section::Debug,
+        Section::FeatureFlags,
     ];
 
     pub fn label(self) -> &'static str {
@@ -76,7 +104,9 @@ impl Section {
             Section::Keyboard => "Keyboard",
             Section::Terminal => "Terminal",
             Section::Appearance => "Appearance",
+            Section::Accessibility => "Accessibility",
             Section::Debug => "Debug",
+            Section::FeatureFlags => "Feature Flags",
         }
     }
 }
@@ -161,16 +191,18 @@ pub fn term_options(dark: bool) -> Vec<Option<&'static crate::term_theme::TermTh
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tool {
     Pr,
+    LocalDiff,
     Launch,
 }
 
 impl Tool {
-    pub const ALL: [Tool; 2] = [Tool::Pr, Tool::Launch];
+    pub const ALL: [Tool; 3] = [Tool::Pr, Tool::LocalDiff, Tool::Launch];
 
     /// Stable identifier used in the settings key (`toolpanel.tool`).
     pub fn name(self) -> &'static str {
         match self {
             Tool::Pr => "pr",
+            Tool::LocalDiff => "local_diff",
             Tool::Launch => "launch",
         }
     }
@@ -178,6 +210,7 @@ impl Tool {
     pub fn title(self) -> &'static str {
         match self {
             Tool::Pr => "Pull Request",
+            Tool::LocalDiff => "Local diff",
             Tool::Launch => "Launch",
         }
     }
@@ -217,11 +250,13 @@ pub enum Action {
     FlyoverPopout,
     SaveWorkspace,
     ToggleToolPanel,
+    IncreaseFontSize,
+    DecreaseFontSize,
 }
 
 impl Action {
     /// Keyboard-page row order.
-    pub const ALL: [Action; 30] = [
+    pub const ALL: [Action; 32] = [
         Action::SplitRight,
         Action::SplitDown,
         Action::NewTab,
@@ -252,6 +287,8 @@ impl Action {
         Action::FlyoverPopout,
         Action::SaveWorkspace,
         Action::ToggleToolPanel,
+        Action::IncreaseFontSize,
+        Action::DecreaseFontSize,
     ];
 
     /// Stable identifier used in the settings key (`keyboard.<name>`).
@@ -287,6 +324,8 @@ impl Action {
             Action::FlyoverPopout => "flyover_popout",
             Action::SaveWorkspace => "save_workspace",
             Action::ToggleToolPanel => "toggle_tool_panel",
+            Action::IncreaseFontSize => "increase_font_size",
+            Action::DecreaseFontSize => "decrease_font_size",
         }
     }
 
@@ -322,6 +361,8 @@ impl Action {
             Action::FlyoverPopout => "Flyover: panel ↔ window",
             Action::SaveWorkspace => "Save as workspace",
             Action::ToggleToolPanel => "Toggle tool panel",
+            Action::IncreaseFontSize => "Increase font size",
+            Action::DecreaseFontSize => "Decrease font size",
         }
     }
 
@@ -361,6 +402,9 @@ impl Action {
             Action::FlyoverPopout => (true, "`"),
             Action::SaveWorkspace => (true, "s"),
             Action::ToggleToolPanel => (true, "g"),
+            Action::IncreaseFontSize => (false, "="),
+            // "minus" (not "-") because "-" is the binding token separator.
+            Action::DecreaseFontSize => (false, "minus"),
         };
         Binding { shift, alt: false, ctrl: false, key: key.into() }
     }
@@ -436,6 +480,7 @@ impl Binding {
             "right" => "→".into(),
             "up" => "↑".into(),
             "down" => "↓".into(),
+            "minus" => "-".into(),
             k => k.to_uppercase(),
         });
         out
@@ -466,13 +511,16 @@ impl Binding {
     }
 }
 
-/// gpui may report shifted punctuation for bracket chords (`{` for ⇧[), and
-/// named keys are matched case-insensitively — fold both so a stored `[`
-/// matches either report.
+/// gpui may report shifted punctuation for a chord (`{` for ⇧[, `+` for ⇧=,
+/// `_` for ⇧-), and named keys are matched case-insensitively — fold both so a
+/// stored key matches either report. `-` folds to the token `minus` because a
+/// bare `-` is the binding-string separator (see [`Binding::serialize`]).
 fn normalize_key(key: &str) -> String {
     match key {
         "{" => "[".into(),
         "}" => "]".into(),
+        "+" => "=".into(),
+        "-" | "_" => "minus".into(),
         k => k.to_lowercase(),
     }
 }
@@ -502,6 +550,16 @@ pub fn settings_index() -> Vec<SettingsEntry> {
         section: Section::Sessions,
         label: "Primary command",
         keywords: "runs in the primary pane when a group opens",
+    });
+    out.push(SettingsEntry {
+        section: Section::Sessions,
+        label: "Pull request CLI",
+        keywords: "git cli lfg gh pull request pr diff tool source control",
+    });
+    out.push(SettingsEntry {
+        section: Section::Sessions,
+        label: "Async streaming (lfg -A)",
+        keywords: "git async streaming lfg force-async sse cache refresh",
     });
 
     // Keyboard — one entry per action
@@ -547,12 +605,33 @@ pub fn settings_index() -> Vec<SettingsEntry> {
         keywords: "export theme file save",
     });
 
+    // Accessibility
+    out.push(SettingsEntry {
+        section: Section::Accessibility,
+        label: "Terminal text size",
+        keywords: "font size terminal zoom larger smaller accessibility text",
+    });
+    out.push(SettingsEntry {
+        section: Section::Accessibility,
+        label: "App text size",
+        keywords: "font size app chrome ui zoom larger smaller accessibility text",
+    });
+
     // Debug
     out.push(SettingsEntry {
         section: Section::Debug,
         label: "Show frame stats",
         keywords: "frame stats fps debug performance",
     });
+
+    // Feature Flags — one entry per experimental flag.
+    for flag in crate::features::ALL {
+        out.push(SettingsEntry {
+            section: Section::FeatureFlags,
+            label: flag.label,
+            keywords: flag.description,
+        });
+    }
 
     out
 }
@@ -578,6 +657,19 @@ pub fn search_settings(query: &str) -> Vec<SettingsEntry> {
 mod tests {
     use super::*;
     use gpui::Modifiers;
+
+    /// Notes is experimental: it only appears in the dot strip when its
+    /// feature flag is on, and hiding it never disturbs the other pages.
+    #[test]
+    fn visible_pages_gate_notes_only() {
+        let off = Page::visible(false);
+        assert!(!off.contains(&Page::Notes));
+        assert_eq!(off.len(), Page::ALL.len() - 1);
+        let on = Page::visible(true);
+        assert_eq!(on, Page::ALL.to_vec());
+        // Order is preserved in both cases.
+        assert_eq!(off, Page::ALL.iter().copied().filter(|p| *p != Page::Notes).collect::<Vec<_>>());
+    }
 
     #[test]
     fn appearance_dropdown_dark_matches_label() {
@@ -695,6 +787,25 @@ mod tests {
             key_char: None,
         };
         assert!(b.matches(&ks));
+    }
+
+    #[test]
+    fn zoom_bindings_resolve() {
+        // ⌘= grows, ⌘- shrinks. `-` folds to the `minus` token so it survives
+        // the binding-string separator (see normalize_key / Binding::serialize).
+        let ks = |key: &str| Keystroke {
+            modifiers: Modifiers {
+                platform: true,
+                shift: false,
+                control: false,
+                alt: false,
+                function: false,
+            },
+            key: key.into(),
+            key_char: None,
+        };
+        assert_eq!(match_action(&ks("=")), Some(Action::IncreaseFontSize));
+        assert_eq!(match_action(&ks("-")), Some(Action::DecreaseFontSize));
     }
 
     #[test]
