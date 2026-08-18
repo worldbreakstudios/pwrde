@@ -15,7 +15,8 @@
 //!
 //! Local additions over the rcn source: [`Card::h_full`] and
 //! [`CardContent::flex_1`], so a card can fill a page-sized region with the
-//! content band absorbing the leftover height.
+//! content band absorbing the leftover height; [`Card::floating`] swaps the
+//! resting shadow for `shadow_lg` when the card floats over other content.
 
 use gpui::{
     AnyElement, App, FontWeight, IntoElement, ParentElement, RenderOnce, Styled, Window, div,
@@ -50,6 +51,7 @@ impl CardSize {
 pub struct Card {
     size: CardSize,
     full: bool,
+    floating: bool,
     children: Vec<AnyElement>,
 }
 
@@ -58,6 +60,7 @@ impl Card {
         Self {
             size: CardSize::Default,
             full: false,
+            floating: false,
             children: Vec::new(),
         }
     }
@@ -71,6 +74,13 @@ impl Card {
     /// content, for page-filling cards. Pair with [`CardContent::flex_1`].
     pub fn h_full(mut self) -> Self {
         self.full = true;
+        self
+    }
+
+    /// Local addition: raise the resting shadow to `shadow_lg` so the card
+    /// reads as floating over other content instead of sitting flush.
+    pub fn floating(mut self) -> Self {
+        self.floating = true;
         self
     }
 }
@@ -104,7 +114,8 @@ impl RenderOnce for Card {
             .text_size(px(14.))
             .line_height(px(20.))
             .text_color(theme.card_foreground)
-            .shadow_xs()
+            .when(self.floating, |el| el.shadow_lg())
+            .when(!self.floating, |el| el.shadow_xs())
             .border_1()
             .border_color(alpha(theme.foreground, 0.1))
             .children(self.children)

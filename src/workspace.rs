@@ -181,15 +181,24 @@ impl Node {
 
 /// A collapsible sidebar section grouping one or more workspaces.
 ///
-/// Display position is the position of the section's first member in the
-/// workspaces Vec; sections with zero members render at the end of the
-/// sidebar in `sections` Vec order.
+/// A populated section's header renders at the position of its first member in
+/// the workspaces Vec. An empty section (no member groups) renders immediately
+/// before the group whose `primary_tile` matches its [`anchor`]; sections with
+/// a `None` (or dangling) anchor render at the trailing end of the sidebar in
+/// `sections` Vec order.
+///
+/// [`anchor`]: Section::anchor
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Section {
     pub id: u64,
     pub name: String,
     pub emoji: String,
     pub collapsed: bool,
+    /// For an empty section (no member groups), the `primary_tile` of the group
+    /// its header renders immediately before; `None` = render at the trailing
+    /// end (bottom). Maintained by [`normalize_section_anchors`]; ignored while
+    /// the section has members.
+    pub anchor: Option<u64>,
 }
 
 pub struct Workspace {
@@ -478,14 +487,33 @@ pub enum SidebarRow {
 
 /// Derive the ordered sidebar rows from workspace membership and section
 /// collapse state. Walks `workspaces` in order: at the first member of each
-/// section emits a header, then member group rows only when expanded;
-/// ungrouped workspaces emit a group row; empty sections append at the end
-/// in `sections` order.
+/// populated section emits a header, then member group rows only when
+/// expanded; ungrouped workspaces emit a group row. An empty section (no
+/// member groups) renders its header immediately BEFORE the group whose
+/// `primary_tile == section.anchor`; empty sections with `anchor == None`
+/// or a dangling anchor (no such group present) trail at the end in
+/// `sections` order.
 pub fn sidebar_rows(workspaces: &[Workspace], sections: &[Section]) -> Vec<SidebarRow> {
     let mut rows = Vec::new();
     let mut emitted = vec![false; sections.len()];
+    // A section is empty when no workspace claims membership in it.
+    let is_empty: Vec<bool> = sections
+        .iter()
+        .map(|s| !workspaces.iter().any(|w| w.section == Some(s.id)))
+        .collect();
     let mut i = 0;
     while i < workspaces.len() {
+        // Before processing this workspace, emit any not-yet-emitted empty
+        // section whose anchor points at this group's primary_tile.
+        for section_idx in 0..sections.len() {
+            if !emitted[section_idx]
+                && is_empty[section_idx]
+                && sections[section_idx].anchor == Some(workspaces[i].primary_tile)
+            {
+                emitted[section_idx] = true;
+                rows.push(SidebarRow::SectionHeader { section_idx });
+            }
+        }
         match workspaces[i].section {
             Some(sid) => match sections.iter().position(|s| s.id == sid) {
                 Some(section_idx) if !emitted[section_idx] => {
@@ -511,6 +539,9 @@ pub fn sidebar_rows(workspaces: &[Workspace], sections: &[Section]) -> Vec<Sideb
             }
         }
     }
+    // Any still-unemitted empty section (anchor None or dangling) trails at
+    // the end, in `sections` order — matching old behavior for un-anchored
+    // sections.
     for (section_idx, was_emitted) in emitted.iter().enumerate() {
         if !was_emitted {
             rows.push(SidebarRow::SectionHeader { section_idx });
@@ -558,6 +589,21 @@ pub fn sidebar_row_rect(
     }
     // Out-of-range fallback: empty rect at the stack end.
     LayoutRect { x: pad, y, w: full_w, h: 0.0 }
+}
+
+/// The delete-section button hit region at the right edge of a section-header
+/// row (`header` = its [`sidebar_row_rect`]). Painting and hit-testing both
+/// derive it from the header rect so they never disagree; mirrors
+/// [`tile_tab_close_rect`]'s sizing.
+pub fn section_delete_rect(header: &LayoutRect, scale: f32) -> LayoutRect {
+    let s = (16.0 * scale).round();
+    let pad = (6.0 * scale).round();
+    LayoutRect {
+        x: header.x + header.w - s - pad,
+        y: (header.y + (header.h - s) / 2.0).round(),
+        w: s,
+        h: s,
+    }
 }
 
 /// Row index that should show the active pill for `active` workspace.
@@ -646,6 +692,41 @@ pub fn section_member_range(workspaces: &[Workspace], section_id: u64) -> Option
         end += 1;
     }
     Some((start, end))
+}
+
+/// Refresh section anchors so an emptied section keeps its place. For each
+/// section with members, set `anchor` to the `primary_tile` of the group
+/// immediately after its member block (`None` if the block ends the list),
+/// so the anchor is already correct the moment the section empties. For an
+/// empty section, leave `anchor` as-is but (1) clear it to `None` if it points
+/// at a `primary_tile` no longer present in `workspaces` (dangling), and
+/// (2) if it points at an interior (non-first) member of another section,
+/// re-point it to that section's first member — `sidebar_rows` only emits
+/// anchored headers at run boundaries, so an interior anchor would otherwise
+/// silently drop the empty section to the bottom.
+pub fn normalize_section_anchors(workspaces: &[Workspace], sections: &mut [Section]) {
+    for section in sections.iter_mut() {
+        match section_member_range(workspaces, section.id) {
+            Some((_start, end)) => {
+                section.anchor = workspaces.get(end).map(|w| w.primary_tile);
+            }
+            None => {
+                if let Some(t) = section.anchor {
+                    match workspaces.iter().position(|w| w.primary_tile == t) {
+                        None => section.anchor = None,
+                        Some(pos) => {
+                            if let Some(sid) = workspaces[pos].section
+                                && let Some((start, _)) =
+                                    section_member_range(workspaces, sid)
+                            {
+                                section.anchor = Some(workspaces[start].primary_tile);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Section a workspace would join when inserted at `insert_before` (before the
@@ -745,6 +826,7 @@ pub fn join_onto_group(
         name: "section".into(),
         emoji: String::new(),
         collapsed: false,
+        anchor: None,
     });
     // Place `from` immediately after `target`, then tag both.
     let new_from = relocate_workspace(workspaces, from, target + 1, Some(id));
@@ -803,17 +885,19 @@ fn snap_top_level_index(workspaces: &[Workspace], index: usize) -> usize {
     }
 }
 
-/// Delete `section_id` from `sections` when it has no remaining members.
-/// Returns true if the section was removed. Empty sections created via the
-/// button are only pruned once they have gained and then lost members — the
-/// caller decides when to invoke this (after a member leaves / group closes).
-pub fn prune_section_if_empty(
+/// Delete `section_id`: ungroup its member groups — they survive as top-level
+/// groups, keeping their order and position — and remove the section entry.
+/// Returns true if the section existed and was removed. Groups are never
+/// closed: a section is only a sidebar grouping, not an owner of its groups.
+pub fn delete_section(
     sections: &mut Vec<Section>,
-    workspaces: &[Workspace],
+    workspaces: &mut [Workspace],
     section_id: u64,
 ) -> bool {
-    if workspaces.iter().any(|w| w.section == Some(section_id)) {
-        return false;
+    for w in workspaces.iter_mut() {
+        if w.section == Some(section_id) {
+            w.section = None;
+        }
     }
     if let Some(i) = sections.iter().position(|s| s.id == section_id) {
         sections.remove(i);
@@ -1521,10 +1605,10 @@ pub const RIBBON_W: f32 = 36.0;
 pub const TOOL_PANEL_DEFAULT_W: f32 = 380.0;
 /// Minimum width (logical px) of the tool panel (drag-resize lower bound).
 pub const TOOL_PANEL_MIN_W: f32 = 260.0;
-/// Maximum width (logical px) of the tool panel (drag-resize upper bound).
-pub const TOOL_PANEL_MAX_W: f32 = 640.0;
 /// Half-width (logical px) of the grab zone on the panel's left edge for drag-resizing.
 pub const TOOL_PANEL_RESIZE_GRAB: f32 = 4.0;
+/// Margin (logical px) between the floating tool panel card and the window edges.
+pub const TOOL_PANEL_FLOAT_INSET: f32 = 10.0;
 
 /// Resting rect of the flyover panel in physical pixels, interpolated by
 /// `anim` (0.0 = fully off-screen below, 1.0 = fully visible).
@@ -1654,12 +1738,14 @@ pub fn ribbon_slot_rect(i: usize, width: u32, scale: f32) -> LayoutRect {
 
 /// The tool panel card, immediately left of the ribbon, vertically padded like
 /// `terminal_area` (i.e. inset by `AREA_PAD` top and bottom).
-pub fn tool_panel(width: u32, height: u32, scale: f32, panel_w: f32) -> LayoutRect {
+pub fn tool_panel(width: u32, height: u32, scale: f32, panel_w: f32, floating: bool) -> LayoutRect {
     let ribbon_w = (RIBBON_W * scale).round();
     let pw = (panel_w * scale).round();
-    let pad = (AREA_PAD * scale).round();
+    let base_pad = if floating { AREA_PAD + TOOL_PANEL_FLOAT_INSET } else { AREA_PAD };
+    let pad = (base_pad * scale).round();
+    let right_gap = if floating { (TOOL_PANEL_FLOAT_INSET * scale).round() } else { 0.0 };
     LayoutRect {
-        x: width as f32 - ribbon_w - pw,
+        x: width as f32 - ribbon_w - right_gap - pw,
         y: pad,
         w: pw,
         h: (height as f32 - 2.0 * pad).max(0.0),
@@ -1675,7 +1761,7 @@ mod ribbon_tests {
         let (w, h, scale) = (1600, 1000, 2.0);
         let panel_w = TOOL_PANEL_DEFAULT_W;
         let area = terminal_area(w, h, scale, SIDEBAR_DEFAULT_W, RIBBON_W + panel_w);
-        let panel = tool_panel(w, h, scale, panel_w);
+        let panel = tool_panel(w, h, scale, panel_w, false);
         let rib = ribbon(w, h, scale);
         assert!(area.x + area.w <= panel.x);
         assert!(panel.x + panel.w <= rib.x);
@@ -2098,6 +2184,7 @@ mod tests {
             name: format!("sec{id}"),
             emoji: String::new(),
             collapsed,
+            anchor: None,
         }
     }
 
@@ -2146,6 +2233,7 @@ mod tests {
             name: "keep".into(),
             emoji: "旧".into(),
             collapsed: false,
+            anchor: None,
         };
         apply_section_rename(&mut s, "✨");
         assert_eq!(s.emoji, "✨");
@@ -2203,6 +2291,114 @@ mod tests {
                 SidebarRow::SectionHeader { section_idx: 1 },
             ]
         );
+    }
+
+    #[test]
+    fn empty_section_stays_at_anchor() {
+        let mut g0 = ws("a", None);
+        g0.primary_tile = 10;
+        let mut g1 = ws("b", None);
+        g1.primary_tile = 11;
+        let workspaces = vec![g0, g1];
+        let mut s = sec(1, false);
+        s.anchor = Some(11);
+        let sections = vec![s];
+        let rows = sidebar_rows(&workspaces, &sections);
+        assert_eq!(
+            rows,
+            vec![
+                SidebarRow::Group { ws_idx: 0 },
+                SidebarRow::SectionHeader { section_idx: 0 },
+                SidebarRow::Group { ws_idx: 1 },
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_section_anchor_none_trails() {
+        let mut g0 = ws("a", None);
+        g0.primary_tile = 10;
+        let mut g1 = ws("b", None);
+        g1.primary_tile = 11;
+        let workspaces = vec![g0, g1];
+        let mut s = sec(1, false);
+        s.anchor = None;
+        let sections = vec![s];
+        let rows = sidebar_rows(&workspaces, &sections);
+        assert_eq!(
+            rows,
+            vec![
+                SidebarRow::Group { ws_idx: 0 },
+                SidebarRow::Group { ws_idx: 1 },
+                SidebarRow::SectionHeader { section_idx: 0 },
+            ]
+        );
+    }
+
+    #[test]
+    fn normalize_sets_anchor_to_following_group() {
+        let mut member = ws("m", Some(1));
+        member.primary_tile = 10;
+        let mut g = ws("g", None);
+        g.primary_tile = 11;
+        let mut workspaces = vec![member, g];
+        let mut sections = vec![sec(1, false)];
+        normalize_section_anchors(&workspaces, &mut sections);
+        assert_eq!(sections[0].anchor, Some(11));
+
+        // Remove the member; the section empties but keeps its anchor.
+        workspaces.remove(0);
+        normalize_section_anchors(&workspaces, &mut sections);
+        assert_eq!(sections[0].anchor, Some(11));
+        let rows = sidebar_rows(&workspaces, &sections);
+        assert_eq!(
+            rows,
+            vec![
+                SidebarRow::SectionHeader { section_idx: 0 },
+                SidebarRow::Group { ws_idx: 0 },
+            ]
+        );
+    }
+
+    #[test]
+    fn normalize_repoints_interior_anchor_to_first_member() {
+        // Empty section E anchored at tile 20. Tile 20 starts as section S's
+        // first member, then a new group (tile 19) is inserted ahead of it in
+        // S, making tile 20 an interior member. E's anchor must re-point to the
+        // new first member (tile 19) so its header stays before S rather than
+        // silently dropping to the bottom.
+        let mut e = sec(1, false);
+        e.anchor = Some(20);
+        let mut s_first = ws("s0", Some(2));
+        s_first.primary_tile = 19;
+        let mut s_second = ws("s1", Some(2));
+        s_second.primary_tile = 20;
+        let workspaces = vec![s_first, s_second];
+        let mut sections = vec![e, sec(2, false)];
+        normalize_section_anchors(&workspaces, &mut sections);
+        assert_eq!(sections[0].anchor, Some(19));
+        let rows = sidebar_rows(&workspaces, &sections);
+        assert_eq!(
+            rows,
+            vec![
+                SidebarRow::SectionHeader { section_idx: 0 },
+                SidebarRow::SectionHeader { section_idx: 1 },
+                SidebarRow::Group { ws_idx: 0 },
+                SidebarRow::Group { ws_idx: 1 },
+            ]
+        );
+    }
+
+    #[test]
+    fn normalize_clears_dangling_anchor() {
+        let mut g = ws("g", None);
+        g.primary_tile = 11;
+        let workspaces = vec![g];
+        let mut s = sec(1, false);
+        s.anchor = Some(999);
+        let mut sections = vec![s];
+        normalize_section_anchors(&workspaces, &mut sections);
+        assert_eq!(sections[0].anchor, None);
     }
 
     #[test]
@@ -2314,23 +2510,34 @@ mod tests {
     }
 
     #[test]
-    fn append_to_section_and_leave_prunes() {
+    fn append_to_section_then_delete_removes_it() {
         let mut workspaces = vec![ws("a", None), ws("b", Some(2)), ws("c", Some(2))];
         let mut sections = vec![sec(2, false)];
         let idx = append_to_section(&mut workspaces, 0, 2);
         assert_eq!(workspaces[idx].section, Some(2));
         assert_eq!(section_member_range(&workspaces, 2), Some((0, 3)));
 
-        // Leave: move last remaining members out one by one.
-        let n = workspaces.len();
-        for _ in 0..3 {
-            if let Some((start, _)) = section_member_range(&workspaces, 2) {
-                relocate_workspace(&mut workspaces, start, n, None);
-            }
-        }
-        assert!(prune_section_if_empty(&mut sections, &workspaces, 2));
+        // delete_section ungroups every member and drops the section; the
+        // groups themselves survive.
+        assert!(delete_section(&mut sections, &mut workspaces, 2));
         assert!(sections.is_empty());
+        assert_eq!(workspaces.len(), 3);
         assert!(workspaces.iter().all(|w| w.section.is_none()));
+    }
+
+    #[test]
+    fn delete_section_keeps_groups_ungrouped() {
+        let mut workspaces = vec![ws("a", Some(1)), ws("b", Some(1)), ws("c", None)];
+        let mut sections = vec![sec(1, false)];
+        assert!(delete_section(&mut sections, &mut workspaces, 1));
+        assert!(sections.is_empty());
+        // Groups are kept, in order, now ungrouped.
+        assert_eq!(workspaces.len(), 3);
+        assert_eq!(workspaces[0].name, "a");
+        assert_eq!(workspaces[1].name, "b");
+        assert!(workspaces.iter().all(|w| w.section.is_none()));
+        // Deleting a section that does not exist is a no-op.
+        assert!(!delete_section(&mut sections, &mut workspaces, 99));
     }
 
     #[test]
@@ -2366,16 +2573,17 @@ mod tests {
     }
 
     #[test]
-    fn empty_section_survives_until_pruned() {
-        let workspaces = vec![ws("a", None)];
+    fn empty_section_survives_until_deleted() {
+        let mut workspaces = vec![ws("a", None)];
         let mut sections = vec![sec(3, false)];
         // Empty section still renders.
         let rows = sidebar_rows(&workspaces, &sections);
         assert!(rows.contains(&SidebarRow::SectionHeader { section_idx: 0 }));
-        // Not auto-pruned just by existing empty.
+        // Nothing auto-removes it just for being empty.
         assert!(!workspaces.iter().any(|w| w.section == Some(3)));
-        // Explicit prune removes it.
-        assert!(prune_section_if_empty(&mut sections, &workspaces, 3));
+        // Only the explicit delete removes it.
+        assert!(delete_section(&mut sections, &mut workspaces, 3));
+        assert!(sections.is_empty());
     }
 
     fn row_split() -> Node {

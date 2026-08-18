@@ -19,7 +19,19 @@
 mod claude_hooks;
 mod cleanup;
 mod cleanup_ui;
+mod diff;
+mod features;
+mod file_tree;
+mod gh;
 mod git;
+mod highlight;
+mod lfg;
+mod local_diff_ui;
+mod markdown;
+mod mermaid;
+mod notes;
+mod notes_ui;
+mod pr_ui;
 mod settings_ui;
 mod links;
 mod pages;
@@ -55,7 +67,7 @@ use gpui::{
 
 use pages::{Action, Binding, Page, Section};
 use renderer::Renderer;
-use term::{Session, TermEvent};
+use term::{MouseBtn, MousePhase, Session, TermEvent};
 use workspace::{Dir, Node, Tab, Tile, Workspace};
 
 // ── Layout / interaction constants (logical px) ──────────────────────────
@@ -85,8 +97,6 @@ enum DropTarget {
     SidebarAppend { section_id: u64 },
     /// Move a dragged section block so it starts at top-level `dest_start`.
     SectionMove { dest_start: usize },
-    /// Reorder an empty section among the trailing empty headers.
-    EmptySectionMove { to_idx: usize },
 }
 
 /// A pending destructive action waiting behind the modal confirm dialog.
@@ -191,6 +201,34 @@ enum Drag {
     Section { section_id: u64 },
 }
 
+/// Which pane a forwarded mouse report belongs to — a tile in the active
+/// group, or the flyover panel's active tab.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MouseLoc {
+    Tile(u64),
+    Flyover,
+}
+
+/// An in-flight mouse-button grab by a tracking TUI: which pane got the
+/// press and which buttons are still held (bit 0 = left, 1 = middle,
+/// 2 = right), so motion/release forward to that same pane until every
+/// button lifts.
+#[derive(Clone, Copy)]
+struct MouseReport {
+    loc: MouseLoc,
+    buttons: u8,
+}
+
+impl MouseReport {
+    fn bit(btn: MouseBtn) -> u8 {
+        match btn {
+            MouseBtn::Left => 1,
+            MouseBtn::Middle => 1 << 1,
+            MouseBtn::Right => 1 << 2,
+        }
+    }
+}
+
 /// The whole application state. Under gpui this is the `Entity` that owns the
 /// terminal `Element` and all workspaces.
 struct App {
@@ -217,6 +255,12 @@ struct App {
     title: String,
     cursor: (f64, f64),
     drag: Drag,
+    /// The pane currently receiving forwarded mouse-button reports (a
+    /// mouse-tracking TUI holding a button), or `None`. Kept separate from
+    /// `drag` so motion and release reach the pane that got the press even
+    /// after the cursor leaves it, and so a right/middle press mid-left-drag
+    /// doesn't clobber the drag state.
+    mouse_report: Option<MouseReport>,
     /// Tile expanded by the first click of a potential double-click. The
     /// second click's bar double-click-to-collapse is suppressed for it, so
     /// double-clicking a collapsed pane's tab doesn't snap it shut again.
@@ -267,6 +311,24 @@ struct App {
     scroll_accum: f64,
     /// Cleanup page state (worktree listing, selection, filter).
     cleanup: cleanup::Cleanup,
+    /// Index of the active vault within `notes::vaults()` on the Notes page.
+    notes_active_vault: usize,
+    /// Markdown docs found in the active vault, refreshed by `notes_rescan`.
+    notes_docs: Vec<crate::notes::NoteDoc>,
+    /// Path of the note currently open in the Notes reader, if any.
+    notes_selected: Option<std::path::PathBuf>,
+    /// Whether the open note is being edited rather than rendered.
+    notes_edit_mode: bool,
+    /// Code-editor state backing the Notes editor while `notes_edit_mode` is on.
+    notes_editor: Option<gpui::Entity<gpui_component::input::EditorState>>,
+    /// Single-line input for registering a new vault directory (Notes page).
+    notes_add_input: gpui::Entity<crate::ui::Input>,
+    /// Whether the Notes content area is showing the "add vault" path field
+    /// (toggled by the sidebar's "＋ Add vault…" row). Always effectively on
+    /// when no vaults are registered yet.
+    notes_adding_vault: bool,
+    /// Transient Notes status line (e.g. "Saved") shown near the header.
+    notes_status: Option<String>,
     /// The active top-level page (Sessions / Settings).
     page: Page,
     /// The active section while the Settings page is up.
@@ -329,9 +391,22 @@ struct App {
     open_tool: Option<pages::Tool>,
     /// Width of the open tool panel in logical px (drag-resizable).
     tool_panel_w: f32,
+    /// Whether the tool panel floats over the tiles (vs. docking the edge).
+    tool_panel_floating: bool,
     /// Whether a group cwd sits inside a git checkout, memoized per path —
     /// ribbon registration probes this on every frame and hit-test.
     git_cwd_cache: std::cell::RefCell<std::collections::HashMap<std::path::PathBuf, bool>>,
+    // ── Git tools (PR + local diff), Sessions/git-group only ──────────────
+    /// Pull Request tool state (list / detail / diff / write actions).
+    pr: pr_ui::PrState,
+    /// Local diff tool state (mode + gathered diff).
+    local_diff: local_diff_ui::LocalDiffState,
+    /// Shared comment/request-changes text box for the PR tool.
+    pr_comment_input: gpui::Entity<crate::ui::Input>,
+    /// The `lfg events` SSE tail process, kept alive while the app runs (its
+    /// reader thread forwards cache-updated events). `None` when the async path
+    /// is off or `lfg` couldn't launch.
+    _lfg_events_child: Option<std::process::Child>,
 }
 
 impl App {
@@ -356,9 +431,20 @@ impl App {
         let mut tools = Vec::new();
         if self.active_cwd_is_git() {
             tools.push(pages::Tool::Pr);
+            tools.push(pages::Tool::LocalDiff);
         }
         tools.push(pages::Tool::Launch);
         tools
+    }
+
+    /// The active group's cwd (or the process cwd when the group inherits it),
+    /// used as the working directory for git / PR CLI invocations. `None` only
+    /// when neither is available.
+    fn active_repo_dir(&self) -> Option<std::path::PathBuf> {
+        match self.workspaces.get(self.active).and_then(|ws| ws.cwd.clone()) {
+            Some(p) => Some(p),
+            None => std::env::current_dir().ok(),
+        }
     }
 
     /// Whether the active group's cwd (or an ancestor) is a git checkout.
@@ -393,11 +479,23 @@ impl App {
         if tools.is_empty() {
             return 0.0;
         }
+        // Docked reserves the panel's width (tiles sit beside it); floating
+        // reserves nothing (tiles fill the full width and the card floats over
+        // them). So the content behind a floating panel is at full size, never
+        // shrunk to make room — and resizing the floating card never reflows
+        // the tiles, since the reserved width stays 0 regardless of panel_w.
         let panel = match self.open_tool {
-            Some(t) if tools.contains(&t) => self.tool_panel_w,
+            Some(t) if tools.contains(&t) && !self.tool_panel_floating => self.tool_panel_w,
             _ => 0.0,
         };
         workspace::RIBBON_W + panel
+    }
+
+    fn toggle_tool_panel_floating(&mut self) {
+        self.tool_panel_floating = !self.tool_panel_floating;
+        settings::set("toolpanel.floating", self.tool_panel_floating.into());
+        self.sync_layout();
+        self.request_redraw();
     }
 
     fn dpi(&self) -> u32 {
@@ -508,6 +606,7 @@ impl App {
             self.workspaces.push(ws);
         }
         self.active = 0;
+        workspace::normalize_section_anchors(&self.workspaces, &mut self.sections);
         true
     }
 
@@ -572,6 +671,7 @@ impl App {
 
     /// Re-measure every visible tile and push grid sizes to the PTYs.
     fn sync_layout(&mut self) {
+        workspace::normalize_section_anchors(&self.workspaces, &mut self.sections);
         self.sync_layout_impl(false);
         self.sync_flyover_layout(false);
     }
@@ -671,7 +771,18 @@ impl App {
 
     fn switch_workspace(&mut self, wi: usize) {
         if wi < self.workspaces.len() {
+            let changed = self.active != wi;
             self.active = wi;
+            // A different group means a different repo: reset the PR view and
+            // re-fetch whichever git surface is showing against the new cwd.
+            if changed {
+                self.pr = pr_ui::PrState::default();
+                self.local_diff.data = pr_ui::Load::Idle;
+                self.reset_pr_surface();
+                if self.visible_tool() == Some(pages::Tool::LocalDiff) {
+                    self.spawn_local_diff();
+                }
+            }
             // Activating a member of a collapsed section expands it so the
             // active group is visible in the sidebar.
             if workspace::ensure_active_section_expanded(
@@ -872,7 +983,6 @@ impl App {
                 }
             }
         }
-        let closed_section = self.workspaces.get(wi).and_then(|w| w.section);
         if self.workspaces.len() > 1 {
             self.workspaces.remove(wi);
             if self.active >= self.workspaces.len() {
@@ -881,14 +991,9 @@ impl App {
         } else {
             self.reset_empty_workspace(0);
         }
-        // Drop the section once its last member group is gone.
-        if let Some(sid) = closed_section {
-            workspace::prune_section_if_empty(
-                &mut self.sections,
-                &self.workspaces,
-                sid,
-            );
-        }
+        // A section outlives its groups: closing the last member leaves the
+        // (now empty) section in place. Sections are removed only by the
+        // explicit delete-section button.
         workspace::ensure_active_section_expanded(
             &self.workspaces,
             &mut self.sections,
@@ -896,6 +1001,28 @@ impl App {
         );
         self.workspaces[self.active].fix_focus();
         self.sync_layout();
+        self.request_redraw();
+        self.persist_snapshot();
+    }
+
+    /// Delete a sidebar section, keeping its groups: members are ungrouped
+    /// (they stay as top-level groups), then the section entry is removed.
+    /// Nothing is closed — this only undoes the grouping.
+    fn delete_section(&mut self, section_id: u64) {
+        if !workspace::delete_section(
+            &mut self.sections,
+            &mut self.workspaces,
+            section_id,
+        ) {
+            return;
+        }
+        if self
+            .editing_section
+            .as_ref()
+            .is_some_and(|(id, _)| *id == section_id)
+        {
+            self.editing_section = None;
+        }
         self.request_redraw();
         self.persist_snapshot();
     }
@@ -1221,6 +1348,11 @@ impl App {
     /// (the same tab the card's dot mirrors); a tile tab re-dots that tab.
     /// Never changes focus.
     fn on_right_mouse_down(&mut self) {
+        // A mouse-tracking TUI under the cursor gets the right-click as a
+        // report (before any sidebar context handling below).
+        if self.try_forward_secondary_press(MouseBtn::Right) {
+            return;
+        }
         if self.page != Page::Sessions
             || self.confirm.is_some()
             || self.message.is_some()
@@ -2017,54 +2149,9 @@ impl App {
             return None;
         }
         let rows = workspace::sidebar_rows(&self.workspaces, &self.sections);
-        let own_range = workspace::section_member_range(&self.workspaces, section_id);
-        let is_empty = own_range.is_none();
-        if is_empty {
-            // Empty sections only live at the trailing end — reorder among
-            // empty headers by sections-vec index.
-            let empties: Vec<usize> = self
-                .sections
-                .iter()
-                .enumerate()
-                .filter(|(_, s)| {
-                    !self.workspaces.iter().any(|w| w.section == Some(s.id))
-                })
-                .map(|(i, _)| i)
-                .collect();
-            for (ri, row) in rows.iter().enumerate() {
-                let workspace::SidebarRow::SectionHeader { section_idx } = *row else {
-                    continue;
-                };
-                if !empties.contains(&section_idx) {
-                    continue;
-                }
-                let rect = workspace::sidebar_row_rect(
-                    &rows,
-                    ri,
-                    &self.workspaces,
-                    scale,
-                    self.sidebar_w(),
-                );
-                let side = workspace::sidebar(h, scale, self.sidebar_w());
-                if py < rect.y || py >= rect.y + rect.h {
-                    continue;
-                }
-                if px < side.x || px > side.x + side.w {
-                    continue;
-                }
-                let rel = (py - rect.y) / rect.h.max(1.0);
-                let pos_among = empties.iter().position(|&i| i == section_idx)?;
-                let to = if rel < 0.5 { pos_among } else { pos_among + 1 };
-                // Map "among empties" slot back to absolute sections index.
-                let to_idx = if to >= empties.len() {
-                    empties.last().copied().unwrap_or(section_idx) + 1
-                } else {
-                    empties[to]
-                };
-                return Some(DropTarget::EmptySectionMove { to_idx });
-            }
-            return None;
-        }
+        // Empty sections have no member block, so they fall through to the same
+        // top-level gap logic as populated ones: the resulting `dest_start` is
+        // mapped to an anchor (following group) in `apply_section_drop`.
         const EDGE: f32 = 0.4;
         // Top-level gaps: edges of ungrouped groups + section headers (not
         // interiors of foreign member runs).
@@ -2213,30 +2300,6 @@ impl App {
                 let y = self.sidebar_gap_y(dest_start, &rows, scale);
                 Some(self.sidebar_insert_line(y, &rows, scale, line_h))
             },
-            DropTarget::EmptySectionMove { to_idx } => {
-                // Insertion line above the empty-header slot being targeted.
-                let si = to_idx.min(self.sections.len().saturating_sub(1));
-                for (ri, row) in rows.iter().enumerate() {
-                    if let workspace::SidebarRow::SectionHeader { section_idx } = *row {
-                        if section_idx == si {
-                            let r = workspace::sidebar_row_rect(
-                                &rows,
-                                ri,
-                                &self.workspaces,
-                                scale,
-                                self.sidebar_w(),
-                            );
-                            return Some(workspace::LayoutRect {
-                                x: r.x,
-                                y: r.y - line_h / 2.0,
-                                w: r.w,
-                                h: line_h,
-                            });
-                        }
-                    }
-                }
-                None
-            },
             DropTarget::TabBar { tile, .. }
             | DropTarget::Center { tile }
             | DropTarget::Edge { tile, .. } => {
@@ -2374,8 +2437,7 @@ impl App {
             DropTarget::SidebarInsert { .. }
             | DropTarget::SidebarJoin { .. }
             | DropTarget::SidebarAppend { .. }
-            | DropTarget::SectionMove { .. }
-            | DropTarget::EmptySectionMove { .. } => return,
+            | DropTarget::SectionMove { .. } => return,
             _ => {},
         }
 
@@ -2435,7 +2497,6 @@ impl App {
         if from >= self.workspaces.len() {
             return;
         }
-        let old_section = self.workspaces[from].section;
         let mut created_section: Option<u64> = None;
         let new_idx = match target {
             DropTarget::SidebarInsert { before, section } => {
@@ -2459,10 +2520,8 @@ impl App {
         };
         self.active =
             workspace::track_index_after_relocate(self.active, from, new_idx);
-        // Prune the section the workspace left, if now empty.
-        if let Some(sid) = old_section {
-            workspace::prune_section_if_empty(&mut self.sections, &self.workspaces, sid);
-        }
+        // A section a group leaves stays put even when now empty; sections are
+        // removed only by the explicit delete-section button.
         if let Some(sid) = created_section {
             // Open rename on the freshly created section.
             if let Some(sec) = self.sections.iter().find(|s| s.id == sid) {
@@ -2488,39 +2547,37 @@ impl App {
     fn apply_section_drop(&mut self, section_id: u64, target: DropTarget) {
         match target {
             DropTarget::SectionMove { dest_start } => {
-                // Track the active workspace across the block move by its
-                // primary tile (unique per group), not by index.
-                let active_tile = self.workspaces.get(self.active).map(|w| w.primary_tile);
-                if workspace::relocate_section_block(
-                    &mut self.workspaces,
-                    section_id,
-                    dest_start,
-                )
-                .is_some()
-                {
-                    if let Some(tile) = active_tile
-                        && let Some(i) =
-                            self.workspaces.iter().position(|w| w.primary_tile == tile)
+                if workspace::section_member_range(&self.workspaces, section_id).is_none() {
+                    // Empty section: nothing to relocate — just re-anchor it to
+                    // the group at `dest_start` (None = trailing end).
+                    let anchor = self.workspaces.get(dest_start).map(|w| w.primary_tile);
+                    if let Some(sec) =
+                        self.sections.iter_mut().find(|s| s.id == section_id)
                     {
-                        self.active = i;
+                        sec.anchor = anchor;
+                    }
+                } else {
+                    // Track the active workspace across the block move by its
+                    // primary tile (unique per group), not by index.
+                    let active_tile =
+                        self.workspaces.get(self.active).map(|w| w.primary_tile);
+                    if workspace::relocate_section_block(
+                        &mut self.workspaces,
+                        section_id,
+                        dest_start,
+                    )
+                    .is_some()
+                    {
+                        if let Some(tile) = active_tile
+                            && let Some(i) = self
+                                .workspaces
+                                .iter()
+                                .position(|w| w.primary_tile == tile)
+                        {
+                            self.active = i;
+                        }
                     }
                 }
-            },
-            DropTarget::EmptySectionMove { to_idx } => {
-                let from = match self.sections.iter().position(|s| s.id == section_id) {
-                    Some(i) => i,
-                    None => return,
-                };
-                if from == to_idx || to_idx > self.sections.len() {
-                    return;
-                }
-                let sec = self.sections.remove(from);
-                let mut dest = to_idx;
-                if dest > from {
-                    dest -= 1;
-                }
-                dest = dest.min(self.sections.len());
-                self.sections.insert(dest, sec);
             },
             _ => return,
         }
@@ -2694,7 +2751,166 @@ impl App {
         }
     }
 
-    fn on_mouse_down(&mut self, window: &mut Window, click_count: usize) {
+    // ── Mouse-report forwarding (mouse-tracking TUIs) ────────────────────
+    //
+    // When a TUI enables xterm mouse tracking, clicks and drags belong to the
+    // app, not pwrde's text selection. These helpers mirror `forward_wheel`:
+    // the press gate decides whether a pane owns the click, and the grab is
+    // tracked so motion/release reach the same pane after the cursor leaves
+    // it. Holding Shift always forces local selection (the xterm convention
+    // for overriding an app's mouse grab).
+
+    /// The session backing a mouse-report location, if it still exists.
+    fn loc_session(&self, loc: MouseLoc) -> Option<&Session> {
+        match loc {
+            MouseLoc::Flyover => self.flyover_tabs.get(self.flyover_active).map(|t| &t.session),
+            MouseLoc::Tile(id) => self.workspaces[self.active]
+                .root
+                .find_tile(id)
+                .and_then(|t| t.active_tab())
+                .map(|t| &t.session),
+        }
+    }
+
+    /// True when a click on `loc` should be forwarded to the app as a mouse
+    /// report rather than starting a text selection: the pane's app has
+    /// grabbed the mouse and Shift isn't held to override it.
+    fn pane_grabs_mouse(&self, loc: MouseLoc) -> bool {
+        !self.modifiers.shift && self.loc_session(loc).is_some_and(|s| s.app_grabs_mouse())
+    }
+
+    /// Forward one button event for `loc` as a mouse report, mapping the
+    /// pointer to a cell in that pane's content rect. Motion and release clamp
+    /// to the pane's origin when the pointer has slid off it (as `forward_wheel`
+    /// does), so a drag that leaves the pane still reports.
+    fn forward_mouse_report(&mut self, loc: MouseLoc, phase: MousePhase, btn: MouseBtn, px: f32, py: f32) {
+        let scale = self.renderer.scale;
+        let content = match loc {
+            MouseLoc::Flyover => workspace::flyover_content(&self.flyover_rect_now(), scale),
+            MouseLoc::Tile(id) => match self.tile_rect(id) {
+                Some(rect) => workspace::tile_content(&rect, scale),
+                None => return,
+            },
+        };
+        let (col, row) = self.renderer.cell_at(&content, px, py).unwrap_or((0, 0));
+        let m = self.modifiers;
+        if let Some(session) = self.loc_session(loc) {
+            session.forward_mouse(phase, btn, col, row, m.shift, m.alt, m.control);
+        }
+        self.request_redraw();
+    }
+
+    /// Record a forwarded button press: remember the pane and mark the button
+    /// held. A press over a different pane than an in-flight grab retargets to
+    /// the new one (the old pane already saw its press; cross-pane chording is
+    /// not a real workflow).
+    fn press_mouse_report(&mut self, loc: MouseLoc, btn: MouseBtn) {
+        let bit = MouseReport::bit(btn);
+        match &mut self.mouse_report {
+            Some(r) if r.loc == loc => r.buttons |= bit,
+            _ => self.mouse_report = Some(MouseReport { loc, buttons: bit }),
+        }
+    }
+
+    /// Clear a forwarded button on release, returning the pane its press went
+    /// to (so the release can be forwarded there) when the button was actually
+    /// held. The grab ends once the last held button lifts.
+    fn release_mouse_report(&mut self, btn: MouseBtn) -> Option<MouseLoc> {
+        let bit = MouseReport::bit(btn);
+        let r = self.mouse_report.as_mut()?;
+        if r.buttons & bit == 0 {
+            return None;
+        }
+        let loc = r.loc;
+        r.buttons &= !bit;
+        if r.buttons == 0 {
+            self.mouse_report = None;
+        }
+        Some(loc)
+    }
+
+    /// Route a button press over a pane: if the pane's app grabs the mouse,
+    /// forward the press as a mouse report, record the grab, and report `true`
+    /// so the caller skips its normal (selection / context-menu) handling.
+    fn try_forward_press(&mut self, loc: MouseLoc, btn: MouseBtn, px: f32, py: f32) -> bool {
+        if !self.pane_grabs_mouse(loc) {
+            return false;
+        }
+        self.forward_mouse_report(loc, MousePhase::Press, btn, px, py);
+        self.press_mouse_report(loc, btn);
+        true
+    }
+
+    /// Forward a button release to the pane that got its press, if that button
+    /// was held. Returns `true` when the release was consumed as a report.
+    fn try_forward_release(&mut self, btn: MouseBtn) -> bool {
+        let (px, py) = (self.cursor.0 as f32, self.cursor.1 as f32);
+        match self.release_mouse_report(btn) {
+            Some(loc) => {
+                self.forward_mouse_report(loc, MousePhase::Release, btn, px, py);
+                true
+            },
+            None => false,
+        }
+    }
+
+    /// The terminal pane whose *content* is under (px, py): the flyover panel
+    /// when it's open and hit, else a tile on the Sessions page. Right- and
+    /// middle-button presses use this to find their target, since they don't
+    /// run the left handler's tile loop.
+    fn pane_at(&self, px: f32, py: f32) -> Option<MouseLoc> {
+        let scale = self.renderer.scale;
+        if self.flyover_open
+            && !self.flyover_tabs.is_empty()
+            && workspace::flyover_content(&self.flyover_rect_now(), scale).contains(px, py)
+        {
+            return Some(MouseLoc::Flyover);
+        }
+        if self.page != Page::Sessions {
+            return None;
+        }
+        let ws = &self.workspaces[self.active];
+        let (tiles, _) = workspace::layout_tiles(&ws.root, self.area(), scale);
+        tiles
+            .iter()
+            .find(|(_, r)| workspace::tile_content(r, scale).contains(px, py))
+            .map(|(id, _)| MouseLoc::Tile(*id))
+    }
+
+    /// True while a modal overlay is intercepting input (the same set the left
+    /// mouse-down handler treats as modal), so mouse reports must not fire
+    /// underneath it.
+    fn modal_overlay_open(&self) -> bool {
+        self.confirm.is_some()
+            || self.message.is_some()
+            || self.save_ws.is_some()
+            || self.profile_picker.is_some()
+            || self.fork.is_some()
+            || self.picker.is_some()
+            || self.palette.is_some()
+    }
+
+    /// Right/middle button press: forward it to a mouse-tracking pane under the
+    /// cursor, if any. Returns `true` when consumed as a report.
+    fn try_forward_secondary_press(&mut self, btn: MouseBtn) -> bool {
+        if self.modal_overlay_open() {
+            return false;
+        }
+        let (px, py) = (self.cursor.0 as f32, self.cursor.1 as f32);
+        match self.pane_at(px, py) {
+            Some(loc) if self.try_forward_press(loc, btn, px, py) => {
+                self.request_redraw();
+                true
+            },
+            _ => false,
+        }
+    }
+
+    fn on_middle_mouse_down(&mut self) {
+        self.try_forward_secondary_press(MouseBtn::Middle);
+    }
+
+    fn on_mouse_down(&mut self, window: &mut Window, click_count: usize, cx: &mut Context<Self>) {
         let scale = self.renderer.scale;
         let (px, py) = (self.cursor.0 as f32, self.cursor.1 as f32);
         let (w, h) = self.renderer.surface_size();
@@ -2762,8 +2978,14 @@ impl App {
                     self.flyover_focused = true;
                     self.flyover_mark_read();
                 } else {
-                    // Click in content area: focus the panel and start selection.
+                    // Click in content area: focus the panel, then either
+                    // forward the click to a mouse-tracking TUI or start a
+                    // text selection.
                     self.flyover_focused = true;
+                    if self.try_forward_press(MouseLoc::Flyover, MouseBtn::Left, px, py) {
+                        self.request_redraw();
+                        return;
+                    }
                     let content = workspace::flyover_content(&panel, scale);
                     if let Some((col, row)) = self.renderer.cell_at(&content, px, py) {
                         if let Some(tab) = self.flyover_tabs.get(self.flyover_active) {
@@ -2810,7 +3032,7 @@ impl App {
         let ribbon_tools = self.tools_for(self.page);
         if !ribbon_tools.is_empty() {
             if self.visible_tool().is_some() {
-                let panel = workspace::tool_panel(w, h, scale, self.tool_panel_w);
+                let panel = workspace::tool_panel(w, h, scale, self.tool_panel_w, self.tool_panel_floating);
                 let pgrab = (workspace::TOOL_PANEL_RESIZE_GRAB * scale).max(1.0);
                 if (px - panel.x).abs() <= pgrab && py >= panel.y && py <= panel.y + panel.h {
                     self.drag = Drag::ToolPanelResize;
@@ -2867,9 +3089,14 @@ impl App {
                 window.start_window_move();
                 return;
             }
-            // Page-dot strip at the sidebar's bottom: click navigates.
+            // Page-dot strip at the sidebar's bottom: click navigates. The
+            // slot index is into the *visible* pages (flag-gated pages drop
+            // out), matching what the renderer painted and hit-tested.
             if let Some(i) = self.page_slot_at(px, py) {
-                self.set_page(Page::ALL[i]);
+                let visible = Page::visible(crate::features::notes_enabled());
+                if let Some(&page) = visible.get(i) {
+                    self.set_page(page);
+                }
                 return;
             }
             if self.page == Page::Settings {
@@ -2889,6 +3116,36 @@ impl App {
                         self.request_redraw();
                         return;
                     }
+                }
+                return;
+            }
+            if self.page == Page::Notes {
+                // One combined sidebar: vault rows, then the active vault's doc
+                // rows, then an "add vault" row — same stacked-row geometry the
+                // other pages use. Row index ranges must match what the
+                // renderer paints in the `Page::Notes` sidebar arm.
+                let n_vaults = crate::notes::vaults().len();
+                let n_docs = self.notes_docs.len();
+                for i in 0..(n_vaults + n_docs + 1) {
+                    if !workspace::tab_rect(i, scale, self.sidebar_w()).contains(px, py) {
+                        continue;
+                    }
+                    if i < n_vaults {
+                        self.notes_switch_vault(i);
+                    } else if i < n_vaults + n_docs {
+                        // Select a doc; autosave any in-flight edit first.
+                        let doc = self.notes_docs[i - n_vaults].path.clone();
+                        self.notes_autosave(cx);
+                        self.notes_selected = Some(doc);
+                        self.notes_edit_mode = false;
+                        self.notes_editor = None;
+                        self.notes_status = None;
+                    } else {
+                        // The trailing "+ Add vault" row.
+                        self.notes_adding_vault = !self.notes_adding_vault;
+                    }
+                    self.request_redraw();
+                    return;
                 }
                 return;
             }
@@ -2923,6 +3180,7 @@ impl App {
                     name: "section".into(),
                     emoji: String::new(),
                     collapsed: false,
+                    anchor: None,
                 });
                 self.editing_section = Some((id, "section".into()));
                 self.persist_snapshot();
@@ -2947,6 +3205,19 @@ impl App {
                 match *row {
                     workspace::SidebarRow::SectionHeader { section_idx } => {
                         let section_id = self.sections[section_idx].id;
+                        // Delete-section button (shown when the header isn't
+                        // being renamed) takes precedence over collapse/drag.
+                        let editing_this = self
+                            .editing_section
+                            .as_ref()
+                            .is_some_and(|(id, _)| *id == section_id);
+                        if !editing_this
+                            && workspace::section_delete_rect(&rect, scale)
+                                .contains(px, py)
+                        {
+                            self.delete_section(section_id);
+                            return;
+                        }
                         self.drag = Drag::SectionPress {
                             section_id,
                             start: self.cursor,
@@ -2976,6 +3247,14 @@ impl App {
         }
         // Cleanup page: the gpui overlay owns all content-area clicks.
         if self.page == Page::Cleanup {
+            return;
+        }
+        // Pull Requests page: same — the gpui overlay owns the content area.
+        if self.page == Page::PullRequests {
+            return;
+        }
+        // Notes page: same — the gpui overlay owns the content area.
+        if self.page == Page::Notes {
             return;
         }
         let area = self.area();
@@ -3051,6 +3330,13 @@ impl App {
                 }
             } else {
                 ws.focused_tile = *id;
+                // A mouse-tracking TUI owns the click: forward it as a report
+                // instead of starting a text selection.
+                if self.try_forward_press(MouseLoc::Tile(*id), MouseBtn::Left, px, py) {
+                    self.mark_visible_read();
+                    self.request_redraw();
+                    return;
+                }
                 let content = workspace::tile_content(rect, scale);
                 if let Some((col, row)) = self.renderer.cell_at(&content, px, py) {
                     if let Some(tab) =
@@ -3072,6 +3358,17 @@ impl App {
         let scale = self.renderer.scale;
         let (px, py) = (self.cursor.0 as f32, self.cursor.1 as f32);
 
+        // A mouse-tracking TUI holding a button gets drag-motion reports; the
+        // held button is carried in `mouse_report`, so no local drag runs.
+        if let Some(report) = self.mouse_report {
+            for btn in [MouseBtn::Left, MouseBtn::Middle, MouseBtn::Right] {
+                if report.buttons & MouseReport::bit(btn) != 0 {
+                    self.forward_mouse_report(report.loc, MousePhase::Move, btn, px, py);
+                }
+            }
+            return;
+        }
+
         match &self.drag {
             Drag::Sidebar => {
                 self.sidebar_expanded_w =
@@ -3081,9 +3378,10 @@ impl App {
             },
             Drag::ToolPanelResize => {
                 let (w, _) = self.renderer.surface_size();
-                let from_right = (w as f32 - px) / scale - workspace::RIBBON_W;
-                self.tool_panel_w = from_right
-                    .clamp(workspace::TOOL_PANEL_MIN_W, workspace::TOOL_PANEL_MAX_W);
+                let win_w = w as f32 / scale;
+                let from_right = win_w - (px / scale) - workspace::RIBBON_W;
+                let max = (win_w - workspace::RIBBON_W - 200.0).max(workspace::TOOL_PANEL_MIN_W);
+                self.tool_panel_w = from_right.clamp(workspace::TOOL_PANEL_MIN_W, max);
                 self.sync_layout();
                 self.request_redraw();
             },
@@ -3199,7 +3497,7 @@ impl App {
                     // must win against the dividers behind it. Grab matches
                     // on_mouse_down.
                     let panel_edge = self.visible_tool().is_some() && {
-                        let panel = workspace::tool_panel(w, h, scale, self.tool_panel_w);
+                        let panel = workspace::tool_panel(w, h, scale, self.tool_panel_w, self.tool_panel_floating);
                         let pgrab = (workspace::TOOL_PANEL_RESIZE_GRAB * scale).max(1.0);
                         (px - panel.x).abs() <= pgrab
                             && py >= panel.y
@@ -3272,6 +3570,11 @@ impl App {
 
     fn on_mouse_up(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let _ = (window, cx);
+        // A left-button release held by a mouse-tracking TUI is a report, not
+        // the end of a drag — forward it and skip the drag machinery.
+        if self.try_forward_release(MouseBtn::Left) {
+            return;
+        }
         match std::mem::replace(&mut self.drag, Drag::None) {
             Drag::Tab { tile, tab } => {
                 let (px, py) = (self.cursor.0 as f32, self.cursor.1 as f32);
@@ -3402,6 +3705,44 @@ impl App {
         // The Cleanup page owns the keyboard too (no terminal underneath).
         if self.page == Page::Cleanup {
             self.handle_cleanup_key(ev);
+            return;
+        }
+        // The Notes page has no terminal underneath: a focused markdown editor
+        // or path input handles its own text via gpui's input dispatch, so we
+        // only route ⌘ shortcuts and let Escape leave edit mode. Other keys are
+        // swallowed here rather than written to a shell.
+        if self.page == Page::Notes {
+            if ev.keystroke.modifiers.platform {
+                self.handle_shortcut(ev);
+            } else if ev.keystroke.key == "escape" && self.notes_edit_mode {
+                self.notes_edit_mode = false;
+                self.notes_editor = None;
+                window.focus(&self.focus_handle, cx);
+            }
+            self.request_redraw();
+            return;
+        }
+        // The Pull Requests page: ⌘ shortcuts still dispatch; Esc backs out of
+        // a PR detail to the list; other typing is swallowed (no terminal).
+        if self.page == Page::PullRequests {
+            if ev.keystroke.modifiers.platform {
+                self.handle_shortcut(ev);
+            } else if ev.keystroke.key == "escape" && self.pr.open.is_some() {
+                self.close_pr_detail();
+            }
+            self.request_redraw();
+            return;
+        }
+        // A focused PR-comment box owns the keyboard: let the rcn Input entity
+        // (and its own key bindings) handle editing, so keys don't reach the
+        // shell or ⌘ shortcuts. Escape blurs back to the terminal.
+        if self.visible_tool() == Some(pages::Tool::Pr)
+            && self.pr_comment_input.read(cx).focus_handle(cx).is_focused(window)
+        {
+            if ev.keystroke.key == "escape" {
+                window.focus(&self.focus_handle, cx);
+            }
+            self.request_redraw();
             return;
         }
         // ⌘ shortcuts take priority over passing bytes to the shell.
@@ -3850,6 +4191,8 @@ impl App {
                 }
                 return;
             },
+            Action::IncreaseFontSize => return self.zoom_font(renderer::FONT_SIZE_STEP),
+            Action::DecreaseFontSize => return self.zoom_font(-renderer::FONT_SIZE_STEP),
             _ => {},
         }
         if self.page != Page::Sessions {
@@ -3883,6 +4226,8 @@ impl App {
             Action::ToggleCollapse => self.toggle_focused_collapse(),
             Action::SaveWorkspace => self.open_save_workspace(),
             Action::ToggleFocusOthers => self.toggle_focus_others(),
+            // Handled earlier in `run_action` (page-agnostic), so they never
+            // reach this Sessions-only match; listed to keep it exhaustive.
             Action::PrevSidebarTab
             | Action::NextSidebarTab
             | Action::ToggleSidebar
@@ -3890,7 +4235,9 @@ impl App {
             | Action::NextPage
             | Action::OpenSettings
             | Action::Quit
-            | Action::CommandPalette => {},
+            | Action::CommandPalette
+            | Action::IncreaseFontSize
+            | Action::DecreaseFontSize => {},
             Action::ToggleFlyover => self.toggle_flyover(),
             Action::FlyoverPopout => self.flyover_toggle_windowed(),
             // Closes whichever tool is open; opens the first registered tool
@@ -3903,6 +4250,20 @@ impl App {
                 }
             },
         }
+    }
+
+    /// ⌘= / ⌘-: grow or shrink a font size. Context-aware — the terminal
+    /// font when a terminal surface is focused (the Sessions page), the
+    /// app/chrome font otherwise. The next paint detects the settings change,
+    /// re-measures the cell, and reflows the PTYs.
+    fn zoom_font(&mut self, delta: f32) {
+        let key = if self.page == Page::Sessions {
+            "terminal.font_size"
+        } else {
+            "appearance.font_size"
+        };
+        renderer::bump_font(key, delta);
+        self.request_redraw();
     }
 
     /// ⌘S: collapse/expand the sidebar. Layout re-syncs so the PTYs pick up
@@ -3921,15 +4282,32 @@ impl App {
         } else {
             self.open_tool = Some(tool);
             settings::set("toolpanel.tool", tool.name().into());
+            self.load_open_git_tool();
         }
         self.sync_layout();
         self.request_redraw();
     }
 
+    /// Fetch data for the currently-open git tool (PR list/detail or local
+    /// diff). No-op when the open tool isn't a git tool or isn't visible.
+    fn load_open_git_tool(&mut self) {
+        match self.visible_tool() {
+            // The tool is branch-scoped and re-derives its detail from the
+            // current branch, so start fresh (this may auto-open a single PR).
+            Some(pages::Tool::Pr) => self.reset_pr_surface(),
+            Some(pages::Tool::LocalDiff) => self.spawn_local_diff(),
+            _ => {}
+        }
+    }
+
     /// ⌘⇧←/→: step through `Page::ALL`, wrapping at both ends.
     fn cycle_page(&mut self, delta: isize) {
-        let i = pages::cycle(self.page.index(), Page::ALL.len(), delta);
-        self.set_page(Page::ALL[i]);
+        // Cycle within the visible pages so a flag-gated page (Notes, when
+        // off) is skipped instead of landing on a dead slot.
+        let visible = Page::visible(crate::features::notes_enabled());
+        let cur = visible.iter().position(|p| *p == self.page).unwrap_or(0);
+        let i = pages::cycle(cur, visible.len(), delta);
+        self.set_page(visible[i]);
     }
 
     /// ⌘⇧↑/↓: step through the sidebar's tabs, wrapping at both ends —
@@ -3945,6 +4323,17 @@ impl App {
                 let i = pages::cycle(cur, Section::ALL.len(), delta);
                 self.section = Section::ALL[i];
                 self.request_redraw();
+            },
+            // The Pull Requests page has no sidebar tabs of its own.
+            Page::PullRequests => {},
+            // ⌘⇧↑/↓ steps through the registered vaults.
+            Page::Notes => {
+                let n = crate::notes::vaults().len();
+                if n > 0 {
+                    let next = pages::cycle(self.notes_active_vault, n, delta);
+                    self.notes_switch_vault(next);
+                    self.request_redraw();
+                }
             },
             Page::Cleanup => {
                 let repos = self.cleanup.repos();
@@ -3966,6 +4355,11 @@ impl App {
     }
 
     fn set_page(&mut self, page: Page) {
+        // Notes is experimental: with the flag off it is not reachable at all.
+        if page == Page::Notes && !crate::features::notes_enabled() {
+            self.set_page(Page::Sessions);
+            return;
+        }
         if self.page != page {
             self.page = page;
             self.recording = None;
@@ -3975,13 +4369,86 @@ impl App {
             if page == Page::Sessions {
                 self.sync_layout();
                 self.mark_visible_read();
+                // Re-derive the branch-scoped PR tool for the active group.
+                if self.open_tool == Some(pages::Tool::Pr) {
+                    self.reset_pr_surface();
+                }
             }
             // Entering the Cleanup page triggers a fresh scan.
             if page == Page::Cleanup {
                 self.spawn_cleanup_scan();
             }
+            // Entering the Pull Requests page loads all open PRs fresh.
+            if page == Page::PullRequests {
+                self.reset_pr_surface();
+            }
+            // Entering the Notes page scans the active vault's markdown docs.
+            if page == Page::Notes {
+                let n = crate::notes::vaults().len();
+                if self.notes_active_vault >= n {
+                    self.notes_active_vault = 0;
+                }
+                self.notes_rescan();
+            }
         }
         self.request_redraw();
+    }
+
+    /// The registered vault directory the Notes page is currently showing.
+    fn notes_active_vault_path(&self) -> Option<std::path::PathBuf> {
+        crate::notes::vaults().get(self.notes_active_vault).cloned()
+    }
+
+    /// Re-read the active vault's markdown docs; an unset or missing vault
+    /// simply yields an empty list.
+    fn notes_rescan(&mut self) {
+        self.notes_docs = self
+            .notes_active_vault_path()
+            .map(|p| crate::notes::scan_vault(&p))
+            .unwrap_or_default();
+    }
+
+    /// Clear the open-note/editor state. Used when the browsed vault changes,
+    /// so the reader never shows a doc that isn't in the vault on screen (and
+    /// Save can't write to a path from the previous vault).
+    fn notes_reset_selection(&mut self) {
+        self.notes_selected = None;
+        self.notes_edit_mode = false;
+        self.notes_editor = None;
+        self.notes_status = None;
+    }
+
+    /// If a note is open in edit mode, persist the editor's current text to its
+    /// file when it differs from disk. Called before leaving the editor (a doc
+    /// switch or flipping back to View) so edits aren't silently lost.
+    fn notes_autosave(&mut self, cx: &mut Context<Self>) {
+        if !self.notes_edit_mode {
+            return;
+        }
+        let (Some(path), Some(editor)) = (self.notes_selected.clone(), self.notes_editor.clone())
+        else {
+            return;
+        };
+        let content = editor.read(cx).value().to_string();
+        let differs = crate::notes::read_doc(&path).map(|d| d != content).unwrap_or(true);
+        if differs {
+            let _ = crate::notes::write_doc(&path, &content);
+        }
+    }
+
+    /// Switch the Notes page to vault `idx`: reset the open note and rescan.
+    /// `cx`-less callers (mouse/keyboard) can't autosave a dirty editor, so if
+    /// one was open we surface a non-silent warning rather than dropping the
+    /// edits quietly.
+    fn notes_switch_vault(&mut self, idx: usize) {
+        let was_editing = self.notes_edit_mode;
+        self.notes_active_vault = idx;
+        self.notes_reset_selection();
+        if was_editing {
+            self.notes_status =
+                Some("Switched vault — unsaved edits discarded (Save before switching).".into());
+        }
+        self.notes_rescan();
     }
 
     /// The page slot under a point in the sidebar's bottom strip, if any
@@ -3989,7 +4456,8 @@ impl App {
     fn page_slot_at(&self, px: f32, py: f32) -> Option<usize> {
         let (_, h) = self.renderer.surface_size();
         let scale = self.scale();
-        let n = Page::ALL.len();
+        // Match the renderer: only visible pages get a slot.
+        let n = Page::visible(crate::features::notes_enabled()).len();
         (0..n).find(|&i| {
             workspace::page_slot_rect(i, n, h, scale, self.sidebar_w())
                 .inflate((3.0 * scale).round())
@@ -4050,7 +4518,7 @@ impl App {
         // A click in the card leaves the sidebar search box, like the rcn
         // overlay's background mouse-down does for the other sections.
         self.settings_search_focus = false;
-        let cw = self.renderer.cell_width;
+        let cw = self.renderer.chrome_cell_width;
         // An open dropdown menu captures the click: apply the option
         // it hit, and close either way.
         if let Some(menu) = self.appearance_menu {
@@ -4200,6 +4668,17 @@ impl App {
                     self.message = Some((format!("drop failed: {message}"), true));
                     redraw = true;
                 },
+                // A directory opened from outside the app (Finder, `open -a`, a
+                // `pwrde://` deep link, or argv). macOS brings the app forward
+                // on its own for these, so we just add the group.
+                TermEvent::OpenDir { cwd } => {
+                    let name = cwd
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| cwd.to_string_lossy().into_owned());
+                    self.add_group_or_pick_profile(name, cwd);
+                    redraw = true;
+                },
                 TermEvent::CleanupScanned(worktrees) => {
                     self.cleanup.set_ready(worktrees);
                     redraw = true;
@@ -4231,6 +4710,34 @@ impl App {
                     if !watched && self.set_unread_by_session(id) {
                         redraw = true;
                     }
+                },
+                TermEvent::PrListLoaded { all, result } => {
+                    self.on_pr_list_loaded(all, result);
+                    redraw = true;
+                },
+                TermEvent::PrDetailLoaded { number, result } => {
+                    self.on_pr_detail_loaded(number, result);
+                    redraw = true;
+                },
+                TermEvent::PrDiffLoaded { number, result } => {
+                    self.on_pr_diff_loaded(number, result);
+                    redraw = true;
+                },
+                TermEvent::PrActionDone(result) => {
+                    self.on_pr_action_done(result);
+                    redraw = true;
+                },
+                TermEvent::LocalDiffLoaded(result) => {
+                    self.on_local_diff_loaded(result);
+                    redraw = true;
+                },
+                TermEvent::PrCacheUpdated { kind, number, .. } => {
+                    if self.on_pr_cache_updated(&kind, number) {
+                        redraw = true;
+                    }
+                },
+                TermEvent::Redraw => {
+                    redraw = true;
                 },
             }
         }
@@ -4753,7 +5260,7 @@ impl Render for App {
                     let s = app.scale() as f64;
                     app.cursor = (f64::from(ev.position.x) * s, f64::from(ev.position.y) * s);
                     app.modifiers = ev.modifiers;
-                    app.on_mouse_down(window, ev.click_count);
+                    app.on_mouse_down(window, ev.click_count, cx);
                     cx.notify();
                 }),
             )
@@ -4767,11 +5274,43 @@ impl Render for App {
                     cx.notify();
                 }),
             )
+            .on_mouse_down(
+                MouseButton::Middle,
+                cx.listener(|app, ev: &MouseDownEvent, _window, cx| {
+                    let s = app.scale() as f64;
+                    app.cursor = (f64::from(ev.position.x) * s, f64::from(ev.position.y) * s);
+                    app.modifiers = ev.modifiers;
+                    app.on_middle_mouse_down();
+                    cx.notify();
+                }),
+            )
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|app, _ev: &MouseUpEvent, window, cx| {
                     app.on_mouse_up(window, cx);
                     cx.notify();
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Right,
+                cx.listener(|app, ev: &MouseUpEvent, _window, cx| {
+                    let s = app.scale() as f64;
+                    app.cursor = (f64::from(ev.position.x) * s, f64::from(ev.position.y) * s);
+                    app.modifiers = ev.modifiers;
+                    if app.try_forward_release(MouseBtn::Right) {
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Middle,
+                cx.listener(|app, ev: &MouseUpEvent, _window, cx| {
+                    let s = app.scale() as f64;
+                    app.cursor = (f64::from(ev.position.x) * s, f64::from(ev.position.y) * s);
+                    app.modifiers = ev.modifiers;
+                    if app.try_forward_release(MouseBtn::Middle) {
+                        cx.notify();
+                    }
                 }),
             )
             .on_scroll_wheel(cx.listener(|app, ev: &gpui::ScrollWheelEvent, _win, cx| {
@@ -4797,6 +5336,18 @@ impl Render for App {
             .when(self.page == Page::Cleanup && self.confirm.is_none(), |el| {
                 el.child(self.render_cleanup(cx))
             })
+            // Holistic Pull Requests page: full content-area element tree.
+            .when(self.page == Page::PullRequests && self.confirm.is_none(), |el| {
+                el.child(self.render_all_prs(cx))
+            })
+            // Notes page overlay (experimental, flag-gated): markdown vault
+            // browser + viewer/editor as an element tree above the canvas.
+            .when(
+                self.page == Page::Notes
+                    && crate::features::notes_enabled()
+                    && self.confirm.is_none(),
+                |el| el.child(self.render_notes(cx)),
+            )
             // Settings page overlay: same pattern as Cleanup. Sidebar search +
             // section tabs stay canvas-painted; the content card is elements —
             // except the Appearance section, which stays fully canvas-painted
@@ -4808,6 +5359,16 @@ impl Render for App {
                     && (self.section != Section::Appearance
                         || !self.settings_query.is_empty()),
                 |el| el.child(self.render_settings(cx)),
+            )
+            // Right-edge git tool panels: real element trees over the canvas
+            // placeholder, only for git-backed Sessions groups (visible_tool
+            // already gates that).
+            .when(self.visible_tool() == Some(pages::Tool::Pr) && self.confirm.is_none(), |el| {
+                el.child(self.render_pr(cx))
+            })
+            .when(
+                self.visible_tool() == Some(pages::Tool::LocalDiff) && self.confirm.is_none(),
+                |el| el.child(self.render_local_diff(cx)),
             )
     }
 }
@@ -4821,14 +5382,20 @@ impl App {
         let scale = window.scale_factor();
         let phys_w = (f32::from(bounds.size.width) * scale) as u32;
         let phys_h = (f32::from(bounds.size.height) * scale) as u32;
-        // The window moved to a display with a different backing scale: font
-        // size, cell metrics, and dpi all derive from it, so re-measure the
-        // cell and force the PTYs to learn the new cell size even if the
-        // grid dimensions happen to be unchanged.
-        let rescaled = scale != self.renderer.scale;
+        // The window moved to a display with a different backing scale, or the
+        // user changed a font-size setting (⌘= / ⌘- or the Accessibility
+        // steppers): cell metrics and dpi derive from both, so re-measure the
+        // terminal and chrome cells and force the PTYs to learn the new cell
+        // size even if the grid dimensions happen to be unchanged.
+        let term_font = renderer::terminal_font();
+        let chrome_font = renderer::chrome_font();
+        let rescaled = scale != self.renderer.scale
+            || term_font != self.renderer.term_font()
+            || chrome_font != self.renderer.chrome_font_logical();
         if rescaled {
-            let cell_width = renderer::measure_cell_width(window, scale);
-            self.renderer.update_scale(scale, cell_width);
+            let term_cw = renderer::measure_cell_width(window, scale, term_font);
+            let chrome_cw = renderer::measure_cell_width(window, scale, chrome_font);
+            self.renderer.update_metrics(scale, term_font, term_cw, chrome_font, chrome_cw);
         }
         self.renderer.resize(phys_w, phys_h);
         self.sync_layout_impl(rescaled);
@@ -4902,11 +5469,34 @@ impl App {
             _ => None,
         };
 
+        // Vault sidebar tabs show the directory name (falling back to the full
+        // path when the vault sits at a filesystem root).
+        let notes_vaults: Vec<String> = crate::notes::vaults()
+            .iter()
+            .map(|p| {
+                p.file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| p.to_string_lossy().to_string())
+            })
+            .collect();
+        // The active vault's doc labels + which one is open — the sidebar's
+        // second section, painted right under the vault rows.
+        let notes_doc_rels: Vec<String> =
+            self.notes_docs.iter().map(|d| d.rel.clone()).collect();
+        let notes_selected_doc = self.notes_selected.as_deref().and_then(|sel| {
+            self.notes_docs.iter().position(|d| d.path.as_path() == sel)
+        });
+
         let ribbon_tools = self.tools_for(self.page);
         let chrome = renderer::ChromeState {
             page: self.page,
             section: self.section,
             dot_anim: &self.dot_anim,
+            notes_enabled: crate::features::notes_enabled(),
+            notes_vaults: &notes_vaults,
+            notes_active_vault: self.notes_active_vault,
+            notes_doc_rels: &notes_doc_rels,
+            notes_selected_doc,
             preview_dark: self.preview_dark,
             appearance_menu: self.appearance_menu,
             sections: &self.sections,
@@ -4920,6 +5510,7 @@ impl App {
             ribbon_tools: &ribbon_tools,
             open_tool: self.open_tool,
             tool_panel_w: self.tool_panel_w,
+            tool_panel_floating: self.tool_panel_floating,
             // Overlay scoping happens in the renderer (only overlay elements
             // hover while one is up). Here we suppress hover mid-drag, and
             // for the chrome under an open flyover panel — clicks inside the
@@ -5032,9 +5623,13 @@ impl App {
         let origin = bounds.origin;
         let inv = 1.0 / scale; // physical px → logical px for gpui coords.
         let font = gpui::font(renderer::FONT_FAMILY);
+        // Terminal grid text uses the terminal cell metrics; chrome labels use
+        // the (independently zoomable) chrome cell metrics.
         let font_size = px(self.renderer.font_size() * inv);
         let line_height = px(self.renderer.cell_height * inv);
         let cell_height = self.renderer.cell_height;
+        let chrome_font_size = px(self.renderer.chrome_font_size() * inv);
+        let chrome_line_height = px(self.renderer.chrome_cell_height * inv);
 
         // Theme colors resolved once per frame (gradient + shadow ink).
         let th = self.renderer.theme();
@@ -5127,7 +5722,7 @@ impl App {
                     underline: None,
                     strikethrough: None,
                 }];
-                let size = label.size.map_or(font_size, |s| px(s * inv));
+                let size = label.size.map_or(chrome_font_size, |s| px(s * inv));
                 let shaped =
                     window.text_system().shape_line(label.text.clone().into(), size, &runs, None);
                 let p = Point::new(origin.x + px(label.left * inv), origin.y + px(label.top * inv));
@@ -5139,7 +5734,7 @@ impl App {
                     size: Size::new(px(label.clip.w * inv), px(label.clip.h * inv)),
                 };
                 window.with_content_mask(Some(gpui::ContentMask { bounds: clip_bounds }), |window| {
-                    let _ = shaped.paint(p, line_height, TextAlign::Left, None, window, cx);
+                    let _ = shaped.paint(p, chrome_line_height, TextAlign::Left, None, window, cx);
                 });
             }
 
@@ -5152,6 +5747,8 @@ impl App {
                 font_size,
                 line_height,
                 cell_height,
+                chrome_font_size,
+                chrome_line_height,
                 shadow_rgb,
             };
             paint_flyover_layer(
@@ -5177,7 +5774,7 @@ impl App {
                     underline: None,
                     strikethrough: None,
                 }];
-                let size = label.size.map_or(font_size, |s| px(s * inv));
+                let size = label.size.map_or(chrome_font_size, |s| px(s * inv));
                 let shaped =
                     window.text_system().shape_line(label.text.clone().into(), size, &runs, None);
                 let p = Point::new(origin.x + px(label.left * inv), origin.y + px(label.top * inv));
@@ -5189,7 +5786,7 @@ impl App {
                     size: Size::new(px(label.clip.w * inv), px(label.clip.h * inv)),
                 };
                 window.with_content_mask(Some(gpui::ContentMask { bounds: clip_bounds }), |window| {
-                    let _ = shaped.paint(p, line_height, TextAlign::Left, None, window, cx);
+                    let _ = shaped.paint(p, chrome_line_height, TextAlign::Left, None, window, cx);
                 });
             }
         });
@@ -5300,9 +5897,13 @@ struct FlyoverPaintMetrics {
     /// Physical px → logical px (1.0 / scale).
     inv: f32,
     font: gpui::Font,
+    /// Terminal-grid text metrics (flyover panes).
     font_size: Pixels,
     line_height: Pixels,
     cell_height: f32,
+    /// Chrome text metrics (flyover tab-strip labels).
+    chrome_font_size: Pixels,
+    chrome_line_height: Pixels,
     shadow_rgb: (u8, u8, u8),
 }
 
@@ -5361,7 +5962,7 @@ fn paint_flyover_layer(
             underline: None,
             strikethrough: None,
         }];
-        let size = label.size.map_or(m.font_size, |s| px(s * m.inv));
+        let size = label.size.map_or(m.chrome_font_size, |s| px(s * m.inv));
         let shaped = window.text_system().shape_line(label.text.clone().into(), size, &runs, None);
         let p = Point::new(
             m.origin.x + px(label.left * m.inv),
@@ -5375,7 +5976,7 @@ fn paint_flyover_layer(
             size: Size::new(px(label.clip.w * m.inv), px(label.clip.h * m.inv)),
         };
         window.with_content_mask(Some(gpui::ContentMask { bounds: clip_bounds }), |window| {
-            let _ = shaped.paint(p, m.line_height, TextAlign::Left, None, window, cx);
+            let _ = shaped.paint(p, m.chrome_line_height, TextAlign::Left, None, window, cx);
         });
     }
 }
@@ -5391,8 +5992,14 @@ struct FlyoverPopout {
     focus_handle: FocusHandle,
     /// Pointer position in this window's physical px.
     cursor: (f64, f64),
+    /// Keyboard modifiers from the last pointer event, so a mouse-tracking TUI
+    /// sees Shift/Alt/Ctrl on forwarded clicks (and Shift can override the grab).
+    modifiers: Modifiers,
     /// True while a selection drag is in flight.
     selecting: bool,
+    /// Buttons currently forwarded to a mouse-tracking TUI in this popout
+    /// (bit 0 = left, 1 = middle, 2 = right); mirrors `App::mouse_report`.
+    mouse_report_buttons: u8,
     /// Sub-notch wheel travel, as in `App::scroll_accum`.
     scroll_accum: f64,
     /// Interactive rects from the last paint (tab strip controls), mirroring
@@ -5409,6 +6016,59 @@ impl FlyoverPopout {
         workspace::LayoutRect { x: 0.0, y: 0.0, w: w as f32, h: h as f32 }
     }
 
+    /// True when the popout's active terminal has grabbed the mouse and Shift
+    /// isn't held to force local selection.
+    fn popout_grabs_mouse(&self, cx: &mut Context<Self>) -> bool {
+        if self.modifiers.shift {
+            return false;
+        }
+        let app = self.app.read(cx);
+        app.flyover_tabs
+            .get(app.flyover_active)
+            .is_some_and(|t| t.session.app_grabs_mouse())
+    }
+
+    /// Forward one button event to the popout's active terminal as a mouse
+    /// report, mapping the pointer through this window's renderer. Mirrors
+    /// [`App::forward_mouse_report`].
+    fn forward_popout_mouse(&self, phase: MousePhase, btn: MouseBtn, cx: &mut Context<Self>) {
+        let scale = self.renderer.scale;
+        let content = workspace::flyover_content(&self.panel_rect(), scale);
+        let (mx, my) = (self.cursor.0 as f32, self.cursor.1 as f32);
+        let (col, row) = self.renderer.cell_at(&content, mx, my).unwrap_or((0, 0));
+        let m = self.modifiers;
+        self.app.update(cx, |app, _| {
+            if let Some(tab) = app.flyover_tabs.get(app.flyover_active) {
+                tab.session.forward_mouse(phase, btn, col, row, m.shift, m.alt, m.control);
+            }
+        });
+    }
+
+    /// Forward a button press to a mouse-tracking terminal in the popout and
+    /// mark it held; `true` when consumed (so the caller skips selection).
+    fn popout_press(&mut self, btn: MouseBtn, cx: &mut Context<Self>) -> bool {
+        if !self.popout_grabs_mouse(cx) {
+            return false;
+        }
+        self.forward_popout_mouse(MousePhase::Press, btn, cx);
+        self.mouse_report_buttons |= MouseReport::bit(btn);
+        cx.notify();
+        true
+    }
+
+    /// Forward a button release for a held forwarded button; `true` when it
+    /// was held (and thus consumed as a report).
+    fn popout_release(&mut self, btn: MouseBtn, cx: &mut Context<Self>) -> bool {
+        let bit = MouseReport::bit(btn);
+        if self.mouse_report_buttons & bit == 0 {
+            return false;
+        }
+        self.mouse_report_buttons &= !bit;
+        self.forward_popout_mouse(MousePhase::Release, btn, cx);
+        cx.notify();
+        true
+    }
+
     fn on_mouse_down(&mut self, cx: &mut Context<Self>) {
         let scale = self.renderer.scale;
         let (mx, my) = (self.cursor.0 as f32, self.cursor.1 as f32);
@@ -5416,37 +6076,55 @@ impl FlyoverPopout {
         let tab_bar = workspace::flyover_tab_bar(&panel, scale);
         let content = workspace::flyover_content(&panel, scale);
         let cell = self.renderer.cell_at(&content, mx, my);
-        let mut selecting = false;
-        self.app.update(cx, |app, _| {
-            let n = app.flyover_tabs.len();
-            if n == 0 {
-                return;
-            }
-            if tab_bar.contains(mx, my) {
-                let tr = workspace::flyover_tab_rect(&panel, 0, n, scale, false);
-                let ti = (((mx - tr.x).max(0.0) / tr.w).floor() as usize).min(n - 1);
+
+        let n = self.app.read(cx).flyover_tabs.len();
+        if n == 0 {
+            return;
+        }
+        if tab_bar.contains(mx, my) {
+            let tr = workspace::flyover_tab_rect(&panel, 0, n, scale, false);
+            let ti = (((mx - tr.x).max(0.0) / tr.w).floor() as usize).min(n - 1);
+            self.app.update(cx, |app, _| {
                 if workspace::flyover_tab_close_rect(&panel, ti, n, scale, false).contains(mx, my) {
                     app.close_flyover_tab(ti);
-                    return;
+                } else {
+                    app.flyover_active = ti;
+                    app.flyover_mark_read();
+                    app.request_redraw();
                 }
-                app.flyover_active = ti;
-                app.flyover_mark_read();
-                app.request_redraw();
-            } else if let Some((col, row)) = cell {
+            });
+            cx.notify();
+            return;
+        }
+        // Content: a mouse-tracking TUI takes the click; else select text.
+        if self.popout_press(MouseBtn::Left, cx) {
+            return;
+        }
+        if let Some((col, row)) = cell {
+            self.app.update(cx, |app, _| {
                 if let Some(tab) = app.flyover_tabs.get(app.flyover_active) {
                     tab.session.begin_selection(col, row);
-                    selecting = true;
                 }
                 app.request_redraw();
-            }
-        });
-        self.selecting = selecting;
+            });
+            self.selecting = true;
+        }
         cx.notify();
     }
 
     fn on_mouse_move(&mut self, cx: &mut Context<Self>) {
         let scale = self.renderer.scale;
         let (mx, my) = (self.cursor.0 as f32, self.cursor.1 as f32);
+        // A held forwarded button turns motion into drag reports.
+        if self.mouse_report_buttons != 0 {
+            for btn in [MouseBtn::Left, MouseBtn::Middle, MouseBtn::Right] {
+                if self.mouse_report_buttons & MouseReport::bit(btn) != 0 {
+                    self.forward_popout_mouse(MousePhase::Move, btn, cx);
+                }
+            }
+            cx.notify();
+            return;
+        }
         if !self.selecting {
             // Control hover: repaint only when the hovered control changes
             // (mirrors `App::on_mouse_move`'s change detection).
@@ -5514,9 +6192,15 @@ impl FlyoverPopout {
         let scale = window.scale_factor();
         let phys_w = (f32::from(bounds.size.width) * scale) as u32;
         let phys_h = (f32::from(bounds.size.height) * scale) as u32;
-        if scale != self.renderer.scale {
-            let cell_width = renderer::measure_cell_width(window, scale);
-            self.renderer.update_scale(scale, cell_width);
+        let term_font = renderer::terminal_font();
+        let chrome_font = renderer::chrome_font();
+        if scale != self.renderer.scale
+            || term_font != self.renderer.term_font()
+            || chrome_font != self.renderer.chrome_font_logical()
+        {
+            let term_cw = renderer::measure_cell_width(window, scale, term_font);
+            let chrome_cw = renderer::measure_cell_width(window, scale, chrome_font);
+            self.renderer.update_metrics(scale, term_font, term_cw, chrome_font, chrome_cw);
         }
         self.renderer.resize(phys_w, phys_h);
 
@@ -5579,6 +6263,8 @@ impl FlyoverPopout {
             font_size: px(self.renderer.font_size() * inv),
             line_height: px(self.renderer.cell_height * inv),
             cell_height: self.renderer.cell_height,
+            chrome_font_size: px(self.renderer.chrome_font_size() * inv),
+            chrome_line_height: px(self.renderer.chrome_cell_height * inv),
             shadow_rgb: th.shadow,
         };
         let term_bg = self.renderer.term_scheme_bg();
@@ -5608,6 +6294,7 @@ impl Render for FlyoverPopout {
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _window, cx| {
                 let s = f64::from(this.renderer.scale);
                 this.cursor = (f64::from(ev.position.x) * s, f64::from(ev.position.y) * s);
+                this.modifiers = ev.modifiers;
                 this.on_mouse_move(cx);
             }))
             .on_mouse_down(
@@ -5615,14 +6302,57 @@ impl Render for FlyoverPopout {
                 cx.listener(|this, ev: &MouseDownEvent, _window, cx| {
                     let s = f64::from(this.renderer.scale);
                     this.cursor = (f64::from(ev.position.x) * s, f64::from(ev.position.y) * s);
+                    this.modifiers = ev.modifiers;
                     this.on_mouse_down(cx);
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, ev: &MouseDownEvent, _window, cx| {
+                    let s = f64::from(this.renderer.scale);
+                    this.cursor = (f64::from(ev.position.x) * s, f64::from(ev.position.y) * s);
+                    this.modifiers = ev.modifiers;
+                    this.popout_press(MouseBtn::Right, cx);
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Middle,
+                cx.listener(|this, ev: &MouseDownEvent, _window, cx| {
+                    let s = f64::from(this.renderer.scale);
+                    this.cursor = (f64::from(ev.position.x) * s, f64::from(ev.position.y) * s);
+                    this.modifiers = ev.modifiers;
+                    this.popout_press(MouseBtn::Middle, cx);
                 }),
             )
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, _ev: &MouseUpEvent, _window, cx| {
+                cx.listener(|this, ev: &MouseUpEvent, _window, cx| {
+                    let s = f64::from(this.renderer.scale);
+                    this.cursor = (f64::from(ev.position.x) * s, f64::from(ev.position.y) * s);
+                    this.modifiers = ev.modifiers;
+                    if this.popout_release(MouseBtn::Left, cx) {
+                        return;
+                    }
                     this.selecting = false;
                     cx.notify();
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Right,
+                cx.listener(|this, ev: &MouseUpEvent, _window, cx| {
+                    let s = f64::from(this.renderer.scale);
+                    this.cursor = (f64::from(ev.position.x) * s, f64::from(ev.position.y) * s);
+                    this.modifiers = ev.modifiers;
+                    this.popout_release(MouseBtn::Right, cx);
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Middle,
+                cx.listener(|this, ev: &MouseUpEvent, _window, cx| {
+                    let s = f64::from(this.renderer.scale);
+                    this.cursor = (f64::from(ev.position.x) * s, f64::from(ev.position.y) * s);
+                    this.modifiers = ev.modifiers;
+                    this.popout_release(MouseBtn::Middle, cx);
                 }),
             )
             .on_scroll_wheel(cx.listener(|this, ev: &gpui::ScrollWheelEvent, _win, cx| {
@@ -5668,13 +6398,15 @@ fn open_flyover_window(app: gpui::Entity<App>, cx: &mut GpuiApp) {
                 true
             });
             let scale = window.scale_factor();
-            let cell_width = renderer::measure_cell_width(window, scale);
+            let cell_width = renderer::measure_cell_width(window, scale, renderer::FONT_SIZE);
             cx.new(|cx| FlyoverPopout {
                 app: app_for_view.clone(),
                 renderer: Renderer::new(scale, cell_width, 0, 0),
                 focus_handle: cx.focus_handle(),
                 cursor: (0.0, 0.0),
+                modifiers: Modifiers::default(),
                 selecting: false,
+                mouse_report_buttons: 0,
                 hot_rects: Vec::new(),
                 ui_hover: None,
                 scroll_accum: 0.0,
@@ -5691,6 +6423,52 @@ fn open_flyover_window(app: gpui::Entity<App>, cx: &mut GpuiApp) {
     }
 }
 
+/// Percent-decode a URL component (`%20` → space, and so on).
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) =
+                ((bytes[i + 1] as char).to_digit(16), (bytes[i + 2] as char).to_digit(16))
+        {
+            out.push((hi * 16 + lo) as u8);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Map an incoming open URL to a directory path, or `None` when it isn't one we
+/// can open. Handles `file://` URLs (Finder "Open With" / `open -a`) and
+/// `pwrde://open?cwd=<path>` deep links; a value that isn't an existing
+/// directory is dropped.
+fn parse_open_dir(url: &str) -> Option<std::path::PathBuf> {
+    let path = if let Some(rest) = url.strip_prefix("file://") {
+        // Skip an optional authority (empty or `localhost`) before the path.
+        let slash = rest.find('/')?;
+        percent_decode(&rest[slash..])
+    } else if let Some(rest) = url.strip_prefix("pwrde://") {
+        match rest
+            .split_once('?')
+            .and_then(|(_, q)| q.split('&').find_map(|kv| kv.strip_prefix("cwd=")))
+        {
+            Some(cwd) => percent_decode(cwd),
+            // Fall back to a bare path after the authority (`pwrde:///path`).
+            None => percent_decode(&rest[rest.find('/')?..]),
+        }
+    } else {
+        return None;
+    };
+    let path = std::path::PathBuf::from(path);
+    path.is_dir().then_some(path)
+}
+
 fn main() {
     // Settings must be in memory before anything reads a binding or theme.
     settings::init();
@@ -5705,13 +6483,44 @@ fn main() {
     let app = Application::with_platform(platform)
         .with_assets(ui::assets::Assets)
         .with_quit_mode(QuitMode::LastWindowClosed);
-    app.run(|cx: &mut GpuiApp| {
+
+    let (events_tx, events_rx) = mpsc::channel::<TermEvent>();
+    // Let finished off-thread mermaid renders nudge a repaint.
+    crate::mermaid::init(events_tx.clone());
+    // React to a directory arriving from outside the app. Registered on the
+    // Application before `run` so a cold-launch `application:openURLs:`
+    // (delivered just after launch) isn't missed — gpui drops the event when no
+    // callback is set yet. Both file:// (Finder "Open With" / `open -a`) and
+    // pwrde:// deep links land here; the drain loop opens each as a group once
+    // the window is up.
+    app.on_open_urls({
+        let tx = events_tx.clone();
+        move |urls| {
+            for url in urls {
+                if let Some(cwd) = parse_open_dir(&url) {
+                    let _ = tx.send(TermEvent::OpenDir { cwd });
+                }
+            }
+        }
+    });
+
+    app.run(move |cx: &mut GpuiApp| {
         // Seed the rcn Theme global before any window opens so Theme::of
         // never panics; Cleanup re-syncs it each frame from chrome tokens.
         cx.set_global(ui::theme::Theme::from_chrome(crate::theme::current()));
         crate::ui::Input::register_key_bindings(cx);
+        // Initialize gpui-component (theme + text/textarea key bindings) for the
+        // experimental Notes page's markdown viewer and editor.
+        gpui_component::init(cx);
         let bounds = Bounds::centered(None, gpui::size(px(1200.0), px(720.0)), cx);
-        let (events_tx, events_rx) = mpsc::channel::<TermEvent>();
+
+        // `pwrde /some/dir` from a shell: open the argv path the same way.
+        if let Some(arg) = std::env::args().nth(1) {
+            let path = std::path::PathBuf::from(&arg);
+            if path.is_dir() {
+                let _ = events_tx.send(TermEvent::OpenDir { cwd: path });
+            }
+        }
 
         let main_window = cx.open_window(
             WindowOptions {
@@ -5736,8 +6545,10 @@ fn main() {
                 hide_titlebar_decoration(window);
 
                 let scale = window.scale_factor();
-                // Measure a monospace cell at the default font size.
-                let cell_width = renderer::measure_cell_width(window, scale);
+                // Measure a monospace cell at the default font size; the first
+                // paint re-measures against the live terminal/chrome font
+                // settings and reflows if they differ.
+                let cell_width = renderer::measure_cell_width(window, scale, renderer::FONT_SIZE);
                 let phys_w = (f32::from(window.viewport_size().width) * scale) as u32;
                 let phys_h = (f32::from(window.viewport_size().height) * scale) as u32;
                 let renderer = Renderer::new(scale, cell_width, phys_w.max(1), phys_h.max(1));
@@ -5756,6 +6567,7 @@ fn main() {
                         sidebar_expanded_w: workspace::SIDEBAR_DEFAULT_W,
                         sidebar_collapsed: false,
                         modifiers: Modifiers::default(),
+                        mouse_report: None,
                         title: String::new(),
                         cursor: (0.0, 0.0),
                         drag: Drag::None,
@@ -5797,6 +6609,18 @@ fn main() {
                         dot_hover: None,
                         resize_hover: None,
                         cleanup: cleanup::Cleanup::default(),
+                        notes_active_vault: 0,
+                        notes_docs: Vec::new(),
+                        notes_selected: None,
+                        notes_edit_mode: false,
+                        notes_editor: None,
+                        notes_add_input: cx.new(|cx| {
+                            let mut input = crate::ui::Input::new(cx);
+                            input.placeholder("Path to a notes folder…");
+                            input
+                        }),
+                        notes_adding_vault: false,
+                        notes_status: None,
                         link_hover: None,
                         hot_rects: Vec::new(),
                         ui_hover: None,
@@ -5821,12 +6645,18 @@ fn main() {
                         }),
                         tool_panel_w: settings::get_str("toolpanel.width")
                             .and_then(|s| s.parse::<f32>().ok())
-                            .map(|w| w.clamp(
-                                workspace::TOOL_PANEL_MIN_W,
-                                workspace::TOOL_PANEL_MAX_W,
-                            ))
+                            .map(|w| w.max(workspace::TOOL_PANEL_MIN_W))
                             .unwrap_or(workspace::TOOL_PANEL_DEFAULT_W),
+                        tool_panel_floating: settings::get_bool("toolpanel.floating", false),
                         git_cwd_cache: Default::default(),
+                        pr: pr_ui::PrState::default(),
+                        local_diff: local_diff_ui::LocalDiffState::default(),
+                        pr_comment_input: cx.new(|cx| {
+                            let mut input = crate::ui::Input::new(cx);
+                            input.placeholder("Leave a comment…");
+                            input
+                        }),
+                        _lfg_events_child: crate::lfg::spawn_event_stream(events_tx.clone()),
                     };
                     // With persistence on, reattach to the previous session's
                     // groups; otherwise launch into the empty state — no shell
@@ -6028,5 +6858,38 @@ mod capture_profile_tests {
         assert!(json.contains(r#""split":"row""#), "split dir serialized: {json}");
         let back: pwrspace::ProfileNode = serde_json::from_str(&json).unwrap();
         assert!(matches!(back, pwrspace::ProfileNode::Split(_)));
+    }
+}
+
+#[cfg(test)]
+mod open_url_tests {
+    use super::{parse_open_dir, percent_decode};
+
+    #[test]
+    fn percent_decode_handles_spaces_and_literals() {
+        assert_eq!(percent_decode("a%20b"), "a b");
+        assert_eq!(percent_decode("/no/encoding"), "/no/encoding");
+        // A stray, incomplete escape is left untouched.
+        assert_eq!(percent_decode("100%"), "100%");
+    }
+
+    #[test]
+    fn file_url_resolves_to_dir() {
+        let tmp = std::env::temp_dir();
+        let url = format!("file://{}", tmp.to_string_lossy());
+        assert_eq!(parse_open_dir(&url).as_deref(), Some(tmp.as_path()));
+    }
+
+    #[test]
+    fn pwrde_scheme_reads_cwd_query() {
+        let tmp = std::env::temp_dir();
+        let url = format!("pwrde://open?cwd={}", tmp.to_string_lossy());
+        assert_eq!(parse_open_dir(&url).as_deref(), Some(tmp.as_path()));
+    }
+
+    #[test]
+    fn non_dir_and_foreign_scheme_are_dropped() {
+        assert_eq!(parse_open_dir("file:///no/such/path/here"), None);
+        assert_eq!(parse_open_dir("https://example.com"), None);
     }
 }

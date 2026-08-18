@@ -8,6 +8,14 @@ iTerm2's performance architecture.
 cargo run --release
 ```
 
+## Optional dependencies
+
+- **[`mmdc`](https://github.com/mermaid-js/mermaid-cli) (mermaid-cli)** — enables
+  rendering ` ```mermaid ` fences in PR descriptions/comments as diagram images
+  (cached on disk by content hash under the data dir). Install with
+  `npm install -g @mermaid-js/mermaid-cli`. Without it, mermaid fences fall back
+  to a plain code block — nothing else is affected.
+
 ## UI model
 
 Borderless window with custom traffic lights. The left sidebar (resizable —

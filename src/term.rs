@@ -31,6 +31,10 @@ pub enum TermEvent {
     Attention(u64),
     /// A `drop` worktree finished provisioning: create its group at `cwd`.
     GroupReady { name: String, cwd: std::path::PathBuf },
+    /// A directory arrived from outside the app (Finder "Open With", the
+    /// `open -a` CLI, a `pwrde://` deep link, or an argv path): open it as a
+    /// new group.
+    OpenDir { cwd: std::path::PathBuf },
     /// `drop` failed; show `message` in the picker overlay.
     GroupFailed { message: String },
     /// `drop -d --json` completed: full list of managed worktrees.
@@ -40,6 +44,31 @@ pub enum TermEvent {
     /// `drop rm … --json` completed: counts of removed and failed worktrees,
     /// plus the first failure's reason when there is one.
     CleanupRemoved { removed: usize, failed: usize, error: Option<String> },
+    /// A PR list finished loading (or failed). `all` distinguishes the
+    /// holistic Pull Requests page (all open PRs) from the branch-scoped PR
+    /// tool (`--head <current branch>`).
+    PrListLoaded { all: bool, result: Result<Vec<crate::gh::PrSummary>, String> },
+    /// A PR's detail finished loading, tagged with the PR number so a stale
+    /// result for a PR the user already navigated away from can be dropped.
+    PrDetailLoaded { number: u32, result: Result<crate::gh::PrDetail, String> },
+    /// A PR's diff finished loading (parsed + syntax-highlighted off-thread),
+    /// tagged with the PR number.
+    PrDiffLoaded {
+        number: u32,
+        result: Result<std::sync::Arc<crate::pr_ui::DiffRender>, String>,
+    },
+    /// A PR write action (approve/comment/merge/ready) completed.
+    PrActionDone(Result<String, String>),
+    /// The local diff tool finished gathering + highlighting a diff.
+    LocalDiffLoaded(Result<crate::pr_ui::LocalDiffRender, String>),
+    /// `lfg` reported a cache entry refreshed; the open PR view should re-fetch
+    /// to pick up the fresh data. `number` is the PR number when the event is
+    /// PR-scoped.
+    PrCacheUpdated { kind: String, number: Option<u32> },
+    /// A bare "please repaint" nudge from a background job whose result is read
+    /// from a shared cache rather than carried in the event (e.g. a finished
+    /// mermaid render). Carries no state — just marks the frame dirty.
+    Redraw,
 }
 
 /// Forwards `Alert::ToastNotification` from wezterm-term to the UI event channel
@@ -81,6 +110,63 @@ impl Write for PtyWriter {
 
     fn flush(&mut self) -> std::io::Result<()> {
         self.0.lock().unwrap().flush()
+    }
+}
+
+/// Which lifecycle phase a forwarded mouse event is in.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MousePhase {
+    /// A button went down.
+    Press,
+    /// The pointer moved with a button held (a drag).
+    Move,
+    /// A button came up.
+    Release,
+}
+
+/// Which button a forwarded mouse event is for. The wheel keeps its own path
+/// ([`Session::forward_wheel`]); this covers the three physical buttons.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MouseBtn {
+    Left,
+    Middle,
+    Right,
+}
+
+/// Build the wezterm-term [`MouseEvent`] for a forwarded button report. Pure
+/// (no terminal lock, no I/O) so the button/phase/modifier mapping is unit
+/// testable; [`Session::forward_mouse`] hands the result to `mouse_event`.
+fn mouse_report_event(
+    phase: MousePhase,
+    button: MouseBtn,
+    col: usize,
+    row: usize,
+    shift: bool,
+    alt: bool,
+    ctrl: bool,
+) -> MouseEvent {
+    let kind = match phase {
+        MousePhase::Press => MouseEventKind::Press,
+        MousePhase::Move => MouseEventKind::Move,
+        MousePhase::Release => MouseEventKind::Release,
+    };
+    let button = match button {
+        MouseBtn::Left => MouseButton::Left,
+        MouseBtn::Middle => MouseButton::Middle,
+        MouseBtn::Right => MouseButton::Right,
+    };
+    let mut modifiers = KeyModifiers::NONE;
+    modifiers.set(KeyModifiers::SHIFT, shift);
+    modifiers.set(KeyModifiers::ALT, alt);
+    modifiers.set(KeyModifiers::CTRL, ctrl);
+    MouseEvent {
+        kind,
+        x: col,
+        y: row as VisibleRowIndex,
+        x_pixel_offset: 0,
+        y_pixel_offset: 0,
+        button,
+        modifiers,
     }
 }
 
@@ -542,6 +628,37 @@ impl Session {
         let _ = self.term.lock().unwrap().mouse_event(event);
     }
 
+    /// True when the app has enabled mouse *button* tracking (any of xterm's
+    /// 1000/1002/1003 modes), so clicks and drags belong to the app rather
+    /// than pwrde's text selection. Unlike [`app_consumes_wheel`](Self::app_consumes_wheel)
+    /// this is *not* set by the alternate screen alone — a full-screen TUI that
+    /// never asked for the mouse still lets us select text.
+    pub fn app_grabs_mouse(&self) -> bool {
+        self.term.lock().unwrap().is_mouse_grabbed()
+    }
+
+    /// Forward one mouse button event at cell (`col`, `row`) to the app as a
+    /// mouse report. `phase` picks press / drag-motion / release and `button`
+    /// picks left/middle/right; `shift`/`alt`/`ctrl` carry the keyboard
+    /// modifiers that TUIs use to distinguish clicks. wezterm-term encodes the
+    /// report per the app's active tracking + encoding mode and writes it to
+    /// the PTY; if the app hasn't enabled the matching mode this is a no-op, so
+    /// callers can forward unconditionally once [`app_grabs_mouse`](Self::app_grabs_mouse)
+    /// is true.
+    pub fn forward_mouse(
+        &self,
+        phase: MousePhase,
+        button: MouseBtn,
+        col: usize,
+        row: usize,
+        shift: bool,
+        alt: bool,
+        ctrl: bool,
+    ) {
+        let event = mouse_report_event(phase, button, col, row, shift, alt, ctrl);
+        let _ = self.term.lock().unwrap().mouse_event(event);
+    }
+
     /// The stable row index at the top of the currently displayed viewport.
     /// Holds the terminal lock only for the lookup.
     fn viewport_top_stable(&self) -> StableRowIndex {
@@ -723,6 +840,93 @@ mod tests {
         // Mouse tracking (DECSET 1000) claims the wheel on the primary screen.
         term.advance_bytes(b"\x1b[?1000h");
         assert!(term.is_mouse_grabbed(), "mouse-tracking apps claim the wheel");
+    }
+
+    /// A terminal that enabled mouse tracking turns a forwarded button event
+    /// into an SGR mouse report on its writer — press ends in `M`, release in
+    /// `m`, coords are 1-based, and modifiers shift the button code. Before the
+    /// app opts in, the same call emits nothing so pwrde keeps text selection.
+    #[test]
+    fn grabbed_terminal_emits_sgr_mouse_report() {
+        #[derive(Clone)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let size =
+            TerminalSize { rows: 24, cols: 80, pixel_width: 640, pixel_height: 384, dpi: 96 };
+        let mut term = Terminal::new(
+            size,
+            Arc::new(TermConfig),
+            "pwrde-test",
+            "0",
+            Box::new(Capture(sink.clone())),
+        );
+
+        // wezterm-term hands writes to a background thread, so reports arrive
+        // asynchronously — poll the sink until the expected bytes show up.
+        let dump = || String::from_utf8_lossy(&sink.lock().unwrap()).into_owned();
+        let wait_for = |needle: &str| {
+            for _ in 0..400 {
+                if dump().contains(needle) {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            false
+        };
+
+        // Ungrabbed: a forwarded press emits nothing (pwrde does selection).
+        term.mouse_event(mouse_report_event(
+            MousePhase::Press,
+            MouseBtn::Left,
+            4,
+            2,
+            false,
+            false,
+            false,
+        ))
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(dump().is_empty(), "ungrabbed terminal must stay silent, got {:?}", dump());
+
+        // Opt in to button tracking (1002) with SGR encoding (1006).
+        term.advance_bytes(b"\x1b[?1002h\x1b[?1006h");
+        assert!(term.is_mouse_grabbed());
+
+        // Left press at cell (4,2): button 0, coords 1-based → ESC [<0;5;3M.
+        term.mouse_event(mouse_report_event(
+            MousePhase::Press,
+            MouseBtn::Left,
+            4,
+            2,
+            false,
+            false,
+            false,
+        ))
+        .unwrap();
+        // Shift + right release at (4,2): button 2 + 4 (shift) = 6, release → m.
+        term.mouse_event(mouse_report_event(
+            MousePhase::Release,
+            MouseBtn::Right,
+            4,
+            2,
+            true,
+            false,
+            false,
+        ))
+        .unwrap();
+
+        assert!(wait_for("\x1b[<0;5;3M"), "expected left-press report, got {:?}", dump());
+        assert!(wait_for("\x1b[<6;5;3m"), "expected shift+right-release report, got {:?}", dump());
     }
 
     /// OSC 9 toasts must fire `TermEvent::Attention`; plain output must not.

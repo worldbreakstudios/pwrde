@@ -10,9 +10,11 @@
 //! them from pwrde chrome via [`theme::Theme::from_chrome`] (added locally).
 //! Deliberate local extensions: [`table`] (`TableRow::on_click`; shrinkable
 //! flex cells with optional grow weights, so columns stay aligned at narrow
-//! widths and can take unequal shares; `Table::h_full`), [`badge`]
+//! widths and can take unequal shares; `Table::h_full`; `Table::w_auto` for a
+//! content-width table inside a horizontal scroll area), [`badge`]
 //! (`Badge::color` status tints), and [`card`] (`Card::h_full` /
-//! `CardContent::flex_1` for page-filling cards).
+//! `CardContent::flex_1` for page-filling cards, `Card::floating` for a
+//! raised shadow when floating over other content).
 //!
 //! Keep the `pub use` re-exports ABOVE the `pub mod` lines: `rcn add`
 //! regenerates everything after the first `pub mod` and would drop them.
@@ -20,7 +22,7 @@
 pub use badge::{Badge, BadgeVariant};
 pub use button::{Button, ButtonSize, ButtonVariant};
 pub use card::{
-    Card, CardAction, CardContent, CardDescription, CardFooter, CardHeader, CardTitle,
+    Card, CardAction, CardContent, CardDescription, CardFooter, CardHeader, CardSize, CardTitle,
 };
 pub use checkbox::Checkbox;
 pub use hover_card::HoverCard;

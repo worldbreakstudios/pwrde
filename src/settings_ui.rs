@@ -17,8 +17,8 @@ use crate::pages::{self, Action, Section};
 use crate::settings;
 use crate::ui::theme::Theme;
 use crate::ui::{
-    Badge, BadgeVariant, Card, CardContent, CardHeader, CardTitle, Kbd, Label, Switch, Table,
-    TableBody, TableCell, TableRow,
+    Badge, BadgeVariant, Button, ButtonSize, ButtonVariant, Card, CardContent, CardHeader,
+    CardTitle, Kbd, Label, Switch, Table, TableBody, TableCell, TableRow,
 };
 use crate::App;
 
@@ -57,10 +57,14 @@ impl App {
             render_search_results(self, &theme, entity.clone())
         } else {
             match self.section {
-                Section::Sessions => render_sessions(self, &theme),
+                Section::Sessions => render_sessions(self, &theme, entity.clone()),
                 Section::Keyboard => render_keyboard(self, &theme, entity.clone()),
                 Section::Terminal => render_terminal(entity.clone()),
+                Section::Accessibility => render_accessibility(&theme, entity.clone()),
                 Section::Debug => render_debug(self, &theme, entity.clone()),
+                Section::FeatureFlags => {
+                    render_feature_flags(self, &theme, entity.clone())
+                }
                 // Canvas-painted (Renderer::appearance_page); the overlay is
                 // never mounted for it. Defensive empty body.
                 Section::Appearance => div().into_any_element(),
@@ -185,7 +189,7 @@ fn render_search_results(
 
 // ── Sessions ────────────────────────────────────────────────────────────
 
-fn render_sessions(app: &App, theme: &Theme) -> AnyElement {
+fn render_sessions(app: &App, theme: &Theme, entity: gpui::WeakEntity<App>) -> AnyElement {
     let input_el = div()
         .flex_1()
         .min_w(px(0.))
@@ -208,6 +212,78 @@ fn render_sessions(app: &App, theme: &Theme) -> AnyElement {
                 .text_color(theme.muted_foreground)
                 .child("runs in the primary pane when a group opens (enter saves, esc cancels)"),
         )
+        .child(git_cli_row(theme, entity.clone()))
+        .child(git_async_row(entity))
+        .into_any_element()
+}
+
+/// The PR-data CLI selector (a small lfg | gh segmented control). Any other
+/// value can still be set directly in the settings file's `git.cli` key.
+fn git_cli_row(theme: &Theme, entity: gpui::WeakEntity<App>) -> AnyElement {
+    let current = crate::gh::cli();
+    let mk = |id: &'static str, name: &'static str| {
+        let active = current == name;
+        let e = entity.clone();
+        Button::new(id)
+            .variant(if active { ButtonVariant::Default } else { ButtonVariant::Outline })
+            .size(ButtonSize::Sm)
+            .child(name)
+            .on_click(move |_ev: &ClickEvent, _win: &mut Window, gpui_app: &mut GpuiApp| {
+                gpui_app.stop_propagation();
+                if let Some(e) = e.upgrade() {
+                    e.update(gpui_app, move |_this, cx| {
+                        settings::set("git.cli", name.into());
+                        cx.notify();
+                    });
+                }
+            })
+    };
+    div()
+        .flex()
+        .flex_col()
+        .child(
+            settings_row()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .child(div().text_size(px(13.)).child("Pull request CLI"))
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(theme.muted_foreground)
+                                .child("tool used to fetch PR data (lfg is the fast, cached path)"),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap_1()
+                        .child(mk("git-cli-lfg", "lfg"))
+                        .child(mk("git-cli-gh", "gh")),
+                ),
+        )
+        .into_any_element()
+}
+
+fn git_async_row(entity: gpui::WeakEntity<App>) -> AnyElement {
+    let on = crate::gh::async_enabled();
+    let toggle = Switch::new("git-async")
+        .checked(on)
+        .on_change(move |checked: &bool, _win: &mut Window, gpui_app: &mut GpuiApp| {
+            gpui_app.stop_propagation();
+            let enabled = *checked;
+            if let Some(e) = entity.upgrade() {
+                e.update(gpui_app, move |_this, cx| {
+                    settings::set("git.async", enabled.into());
+                    cx.notify();
+                });
+            }
+        });
+    settings_row()
+        .child(div().text_size(px(13.)).child("Async streaming (lfg -A)"))
+        .child(toggle)
         .into_any_element()
 }
 
@@ -301,6 +377,165 @@ fn render_terminal(entity: gpui::WeakEntity<App>) -> AnyElement {
                 .child(toggle),
         )
         .into_any_element()
+}
+
+// ── Accessibility ─────────────────────────────────────────────────────────
+
+/// Font-size controls. Two independent sizes — the terminal grid text and the
+/// app/chrome text — each with −/+ steppers and a reset. Mirrors the ⌘= / ⌘-
+/// zoom hotkeys, which nudge whichever size matches the focused surface.
+fn render_accessibility(theme: &Theme, entity: gpui::WeakEntity<App>) -> AnyElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(font_size_row(
+            theme,
+            entity.clone(),
+            "term-font",
+            "Terminal text size",
+            "font size of the terminal grid (⌘= / ⌘- while a terminal is focused)",
+            "terminal.font_size",
+        ))
+        .child(font_size_row(
+            theme,
+            entity,
+            "app-font",
+            "App text size",
+            "font size of tabs, sidebar, and other app chrome (⌘= / ⌘- elsewhere)",
+            "appearance.font_size",
+        ))
+        .into_any_element()
+}
+
+/// One font-size stepper row: label + description on the left, a `−  N px  +`
+/// control plus Reset on the right. Each control writes `key` and notifies, so
+/// the next canvas paint re-measures and reflows.
+fn font_size_row(
+    theme: &Theme,
+    entity: gpui::WeakEntity<App>,
+    id: &'static str,
+    title: &'static str,
+    desc: &'static str,
+    key: &'static str,
+) -> AnyElement {
+    let cur = settings::get_f32(key, crate::renderer::FONT_SIZE);
+
+    let step_btn = |idx: usize, glyph: &'static str, delta: f32| {
+        let e = entity.clone();
+        Button::new((id, idx))
+            .variant(ButtonVariant::Outline)
+            .size(ButtonSize::Sm)
+            .child(glyph)
+            .on_click(move |_ev: &ClickEvent, _win: &mut Window, gpui_app: &mut GpuiApp| {
+                gpui_app.stop_propagation();
+                if let Some(e) = e.upgrade() {
+                    e.update(gpui_app, move |_this, cx| {
+                        crate::renderer::bump_font(key, delta);
+                        cx.notify();
+                    });
+                }
+            })
+    };
+
+    let reset_e = entity.clone();
+    let reset_btn = Button::new((id, 2usize))
+        .variant(ButtonVariant::Ghost)
+        .size(ButtonSize::Sm)
+        .child("Reset")
+        .on_click(move |_ev: &ClickEvent, _win: &mut Window, gpui_app: &mut GpuiApp| {
+            gpui_app.stop_propagation();
+            if let Some(e) = reset_e.upgrade() {
+                e.update(gpui_app, move |_this, cx| {
+                    settings::set(key, f64::from(crate::renderer::FONT_SIZE).into());
+                    cx.notify();
+                });
+            }
+        });
+
+    settings_row()
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .child(div().text_size(px(13.)).child(title))
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(theme.muted_foreground)
+                        .child(desc),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .child(step_btn(0, "−", -crate::renderer::FONT_SIZE_STEP))
+                .child(
+                    div()
+                        .min_w(px(52.))
+                        .text_size(px(13.))
+                        .text_color(theme.muted_foreground)
+                        .child(div().flex().w_full().justify_center().child(format!("{} px", cur as i32))),
+                )
+                .child(step_btn(1, "+", crate::renderer::FONT_SIZE_STEP))
+                .child(reset_btn),
+        )
+        .into_any_element()
+}
+
+// ── Feature Flags ───────────────────────────────────────────────────────
+
+/// Experimental feature toggles, one row per [`crate::features::ALL`] entry.
+/// Each flag is persisted as a `features.<key>` bool (default off).
+fn render_feature_flags(
+    _app: &App,
+    theme: &Theme,
+    entity: gpui::WeakEntity<App>,
+) -> AnyElement {
+    let mut col = div().flex().flex_col().gap_1();
+    for flag in crate::features::ALL {
+        let key = flag.key;
+        let switch_entity = entity.clone();
+        let toggle = Switch::new(key)
+            .checked(crate::features::enabled(key))
+            .on_change(
+                move |checked: &bool,
+                      _win: &mut Window,
+                      gpui_app: &mut GpuiApp| {
+                    gpui_app.stop_propagation();
+                    let on = *checked;
+                    if let Some(entity) = switch_entity.upgrade() {
+                        entity.update(gpui_app, move |_this, cx| {
+                            settings::set(&format!("features.{key}"), on.into());
+                            cx.notify();
+                        });
+                    }
+                },
+            );
+
+        col = col.child(
+            settings_row()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(div().text_size(px(13.)).child(flag.label))
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(theme.muted_foreground)
+                                .child(flag.description),
+                        ),
+                )
+                .child(toggle),
+        );
+    }
+
+    col.into_any_element()
 }
 
 // ── Debug ───────────────────────────────────────────────────────────────
