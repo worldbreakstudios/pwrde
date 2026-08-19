@@ -42,8 +42,10 @@ const PANE_PAD: f32 = 8.0;
 // gradient by default); the renderer reads the active theme each frame.
 /// Corner radius of the floating tile cards, logical px.
 const CARD_RADIUS: f32 = 12.0;
-/// Corner radius of the sidebar's rounded rows, logical px.
-const ROW_RADIUS: f32 = 9.0;
+/// Corner radius of the sidebar's rounded rows, logical px: half the 28px
+/// row height, so rows paint as fully-rounded iTerm2-style capsules. The
+/// `pill` helper clamps it per-rect, so shorter pills stay capsules too.
+const ROW_RADIUS: f32 = 14.0;
 
 /// Blend `c` 40% toward white — brightens the hovered link color.
 /// Truncate `text` to at most `max_chars` characters, ending in `…` when
@@ -539,7 +541,7 @@ impl Renderer {
                 (th.text_bright, 1.0),
                 (th.text_dim, 1.0),
                 (th.card_divider, 1.0),
-                ((255, 255, 255), 0.09),
+                ((255, 255, 255), 0.13),
             ),
         };
         let ws = &workspaces[active];
@@ -630,9 +632,9 @@ impl Renderer {
                 for (i, text, active, indent, dim) in rows {
                     let tab = workspace::tab_rect(i, self.scale, sidebar_w);
                     if active {
-                        bg_quads.push(self.px_rect(&tab, th.card, 0.78, row_r).shadow(Shadow::Soft));
+                        bg_quads.push(self.pill(&tab, th, 0.78, row_r).shadow(Shadow::Soft));
                     } else if hover(cur, &tab) {
-                        bg_quads.push(self.px_rect(&tab, th.card, 0.40, row_r));
+                        bg_quads.push(self.pill(&tab, th, 0.40, row_r));
                     }
                     hot.push(tab);
                     let indent_px = if indent { (14.0 * self.scale).round() } else { 0.0 };
@@ -655,7 +657,7 @@ impl Renderer {
                     let new_group = workspace::new_group_button(self.scale, sidebar_w);
                     let hov = hover(cur, &new_group);
                     bg_quads.push(
-                        self.px_rect(&new_group, th.card, if hov { 0.85 } else { 0.55 }, row_r)
+                        self.pill(&new_group, th, if hov { 0.85 } else { 0.55 }, row_r)
                             .shadow(if hov { Shadow::Soft } else { Shadow::None }),
                     );
                     hot.push(new_group);
@@ -670,7 +672,7 @@ impl Renderer {
                     let new_section = workspace::new_section_button(self.scale, sidebar_w);
                     let hov = hover(cur, &new_section);
                     bg_quads.push(
-                        self.px_rect(&new_section, th.card, if hov { 0.85 } else { 0.55 }, row_r)
+                        self.pill(&new_section, th, if hov { 0.85 } else { 0.55 }, row_r)
                             .shadow(if hov { Shadow::Soft } else { Shadow::None }),
                     );
                     hot.push(new_section);
@@ -690,7 +692,7 @@ impl Renderer {
                     let hint = workspace::empty_state_hint(width, height, self.scale, sidebar_w, right_w);
                     let hov = hover(cur, &cta);
                     bg_quads.push(
-                        self.px_rect(&cta, th.card, if hov { 0.85 } else { 0.62 }, row_r)
+                        self.pill(&cta, th, if hov { 0.85 } else { 0.62 }, row_r)
                             .shadow(Shadow::Soft),
                     );
                     hot.push(cta);
@@ -742,9 +744,9 @@ impl Renderer {
                 let search = workspace::settings_search_rect(self.scale, sidebar_w);
                 let focused = chrome.settings_search_focus;
                 if focused {
-                    bg_quads.push(self.px_rect(&search, th.card, 0.78, row_r).shadow(Shadow::Soft));
+                    bg_quads.push(self.pill(&search, th, 0.78, row_r).shadow(Shadow::Soft));
                 } else {
-                    bg_quads.push(self.px_rect(&search, th.card, 0.40, row_r));
+                    bg_quads.push(self.pill(&search, th, 0.40, row_r));
                 }
                 hot.push(search);
                 let empty = chrome.settings_query.is_empty();
@@ -776,12 +778,12 @@ impl Renderer {
                     let tab = workspace::tab_rect(i + 1, self.scale, sidebar_w);
                     let active_row = *section == chrome.section;
                     if active_row {
-                        bg_quads.push(self.px_rect(&tab, th.card, 0.78, row_r).shadow(Shadow::Soft));
+                        bg_quads.push(self.pill(&tab, th, 0.78, row_r).shadow(Shadow::Soft));
                     } else if hover(cur, &tab) {
                         // Hovered inactive tab: the active pill at a fraction
                         // of its strength, shadowless so it reads as "would
                         // select", not "selected".
-                        bg_quads.push(self.px_rect(&tab, th.card, 0.40, row_r));
+                        bg_quads.push(self.pill(&tab, th, 0.40, row_r));
                     }
                     hot.push(tab);
                     labels.push(LabelSpec {
@@ -811,9 +813,9 @@ impl Renderer {
                 for (i, (label, active_row)) in tabs.iter().enumerate() {
                     let tab = workspace::tab_rect(i, self.scale, sidebar_w);
                     if *active_row {
-                        bg_quads.push(self.px_rect(&tab, th.card, 0.78, row_r).shadow(Shadow::Soft));
+                        bg_quads.push(self.pill(&tab, th, 0.78, row_r).shadow(Shadow::Soft));
                     } else if hover(cur, &tab) {
-                        bg_quads.push(self.px_rect(&tab, th.card, 0.40, row_r));
+                        bg_quads.push(self.pill(&tab, th, 0.40, row_r));
                     }
                     hot.push(tab);
                     labels.push(LabelSpec {
@@ -893,7 +895,7 @@ impl Renderer {
                     h: (slot.h - 2.0 * m).max(0.0),
                 };
                 bg_quads.push(
-                    self.px_rect(&pill, th.card, if active { 0.85 } else { 0.40 }, row_r)
+                    self.pill(&pill, th, if active { 0.85 } else { 0.40 }, row_r)
                         .shadow(if active { Shadow::Soft } else { Shadow::None }),
                 );
             }
@@ -979,7 +981,13 @@ impl Renderer {
                         w: (tr.w - 2.0 * m).max(0.0),
                         h: (tr.h - 2.0 * m).max(0.0),
                     };
-                    bg_quads.push(self.px_rect(&pill, pane_pill.0, pane_pill.1, (7.0 * self.scale).round()));
+                    bg_quads.push(self.glass(
+                        &pill,
+                        pane_pill.0,
+                        pane_pill.1,
+                        pill.h / 2.0,
+                        color(pane_ink.0, 0.18),
+                    ));
                 } else {
                     // A sideways-collapsed strip is one big "expand" target:
                     // any click reopens it, so the whole bare card hovers.
@@ -1089,11 +1097,12 @@ impl Renderer {
                             w: (tr.w - 2.0 * m).max(0.0),
                             h: (tr.h - 2.0 * m).max(0.0),
                         };
-                        bg_quads.push(self.px_rect(
+                        bg_quads.push(self.glass(
                             &pill,
                             pane_pill.0,
                             pane_pill.1 * 0.55,
-                            (7.0 * self.scale).round(),
+                            pill.h / 2.0,
+                            color(pane_ink.0, 0.10),
                         ));
                     }
                     if close_hov {
@@ -1109,7 +1118,7 @@ impl Renderer {
                             &chip,
                             pane_pill.0,
                             (pane_pill.1 * 2.0).min(1.0),
-                            (4.0 * self.scale).round(),
+                            chip.h / 2.0,
                         ));
                     }
                     // The close rect is hot after its tab so reverse iteration
@@ -1329,8 +1338,6 @@ impl Renderer {
     ) {
         let rows = workspace::sidebar_rows(workspaces, chrome.sections);
         let active_row = workspace::active_row_index(&rows, workspaces, chrome.sections, active);
-        let cwd_size = self.chrome_font_size() * 0.85;
-        let cwd_line_h = self.chrome_cell_height * 0.85;
         let header_size = self.chrome_font_size() * 0.9;
 
         for (i, row) in rows.iter().enumerate() {
@@ -1347,9 +1354,9 @@ impl Renderer {
                         .map(|(_, buf)| buf);
                     if is_active_row {
                         bg_quads
-                            .push(self.px_rect(&rect, th.card, 0.78, row_r).shadow(Shadow::Soft));
+                            .push(self.pill(&rect, th, 0.78, row_r).shadow(Shadow::Soft));
                     } else if editing.is_none() && hover(cur, &rect) {
-                        bg_quads.push(self.px_rect(&rect, th.card, 0.40, row_r));
+                        bg_quads.push(self.pill(&rect, th, 0.40, row_r));
                     }
                     hot.push(rect);
                     if let Some(buf) = editing {
@@ -1468,14 +1475,12 @@ impl Renderer {
                     };
                     if is_active_row {
                         bg_quads
-                            .push(self.px_rect(&rect, th.card, 0.78, row_r).shadow(Shadow::Soft));
+                            .push(self.pill(&rect, th, 0.78, row_r).shadow(Shadow::Soft));
                     } else if hover(cur, &rect) {
-                        bg_quads.push(self.px_rect(&rect, th.card, 0.40, row_r));
+                        bg_quads.push(self.pill(&rect, th, 0.40, row_r));
                     }
                     hot.push(rect);
                     let clip_w = rect.w - group_pad;
-                    let inset =
-                        ((rect.h - (self.chrome_cell_height + cwd_line_h)) / 2.0).max(0.0);
                     // Unread (any unread tab in the group lights the dot):
                     // accent dot in the left padding gutter, centered on the
                     // row; text stays put so rows keep alignment.
@@ -1496,17 +1501,9 @@ impl Renderer {
                             1.0,
                         ),
                         left: rect.x + group_pad,
-                        top: (rect.y + inset).round(),
+                        top: (rect.y + (rect.h - self.chrome_cell_height) / 2.0).round(),
                         clip: LayoutRect { w: clip_w, ..rect },
                         size: None,
-                    });
-                    labels.push(LabelSpec {
-                        text: workspace::display_cwd(ws_item.cwd.as_deref()),
-                        color: color(th.ink_dim, 0.8),
-                        left: rect.x + group_pad,
-                        top: (rect.y + inset + self.chrome_cell_height).round(),
-                        clip: LayoutRect { w: clip_w, ..rect },
-                        size: Some(cwd_size),
                     });
                 }
             }
@@ -3394,6 +3391,37 @@ impl Renderer {
                 ));
             },
         }
+    }
+
+    /// A glassy capsule, iTerm2-style: a flat translucent fill with the
+    /// radius clamped to a true capsule for the rect, plus a crisp hairline
+    /// rim. The glass read comes from the fill sitting *lighter* than its
+    /// ground — callers pick the fill accordingly.
+    fn glass(
+        &self,
+        r: &LayoutRect,
+        rgb: (u8, u8, u8),
+        alpha: f32,
+        radius: f32,
+        rim: Hsla,
+    ) -> Quad {
+        let rim_w = (0.5 * self.scale).round().max(1.0);
+        self.px_rect(r, rgb, alpha, radius.min(r.w / 2.0).min(r.h / 2.0))
+            .border(rim_w, rim)
+    }
+
+    /// [`Self::glass`] in sidebar colors, floating on the blurred vibrancy
+    /// ground. Dark chrome cards are darker than that ground, so the fill is
+    /// lifted toward white to read as light glass like iTerm2's tabs; light
+    /// themes' white cards already do.
+    fn pill(&self, r: &LayoutRect, th: &Theme, alpha: f32, radius: f32) -> Quad {
+        let fill = if th.dark {
+            let lift = |v: u8| (v as f32 + (255.0 - v as f32) * 0.30).round() as u8;
+            (lift(th.card.0), lift(th.card.1), lift(th.card.2))
+        } else {
+            th.card
+        };
+        self.glass(r, fill, alpha, radius, color(th.ink, 0.28))
     }
 
     fn px_rect(&self, r: &LayoutRect, rgb: (u8, u8, u8), alpha: f32, radius: f32) -> Quad {
