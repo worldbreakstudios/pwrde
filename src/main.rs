@@ -5642,19 +5642,30 @@ impl App {
         window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
             // 0) the themed window gradient every card and sidebar row floats
             // on (mockup 3a's tinted wrapper).
-            // With the blurred window background, a sub-1.0 gradient lets the
-            // desktop glow through like a native sidebar; the setting restores
-            // the opaque gradient.
+            // With the blurred window background, the ground is one flat
+            // translucent tint: gradient stops band visibly when
+            // alpha-composited over blur, and native sidebars are a single
+            // uniform material anyway. Vibrancy off restores the opaque
+            // gradient.
             let vibrancy = settings::get_bool("appearance.vibrancy", true);
-            let grad_a = if vibrancy { 0.80 } else { 1.0 };
-            window.paint_quad(gpui::fill(
-                bounds,
-                gpui::linear_gradient(
-                    135.0,
-                    gpui::linear_color_stop(renderer::color(th.gradient_from, grad_a), 0.0),
-                    gpui::linear_color_stop(renderer::color(th.gradient_to, grad_a), 1.0),
-                ),
-            ));
+            if vibrancy {
+                let mid = |a: u8, b: u8| ((a as u16 + b as u16) / 2) as u8;
+                let tint = (
+                    mid(th.gradient_from.0, th.gradient_to.0),
+                    mid(th.gradient_from.1, th.gradient_to.1),
+                    mid(th.gradient_from.2, th.gradient_to.2),
+                );
+                window.paint_quad(gpui::fill(bounds, renderer::color(tint, 0.80)));
+            } else {
+                window.paint_quad(gpui::fill(
+                    bounds,
+                    gpui::linear_gradient(
+                        135.0,
+                        gpui::linear_color_stop(renderer::color(th.gradient_from, 1.0), 0.0),
+                        gpui::linear_color_stop(renderer::color(th.gradient_to, 1.0), 1.0),
+                    ),
+                ));
+            }
 
             // 1) background quads.
             for q in &frame.bg_quads {
