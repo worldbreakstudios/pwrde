@@ -124,7 +124,7 @@ impl RenderOnce for Card {
             .overflow_hidden()
             .rounded(theme.radius_xl())
             .bg(if self.glass {
-                alpha(theme.card, 0.60)
+                alpha(theme.card, 0.45)
             } else {
                 theme.card
             })

@@ -29,6 +29,7 @@ pub use checkbox::Checkbox;
 pub use hover_card::HoverCard;
 pub use input::Input;
 pub use kbd::Kbd;
+#[allow(unused_imports)] // vendored rcn surface: kept exported while no caller uses it
 pub use label::Label;
 pub use skeleton::Skeleton;
 pub use switch::Switch;

@@ -15,10 +15,10 @@ use gpui::{
 
 use crate::pages::{self, Action, Section};
 use crate::settings;
-use crate::ui::theme::Theme;
+use crate::ui::theme::{alpha, Theme};
 use crate::ui::{
     Badge, BadgeVariant, Button, ButtonSize, ButtonVariant, Card, CardContent, CardHeader,
-    CardTitle, Kbd, Label, Switch, Table, TableBody, TableCell, TableRow,
+    CardTitle, Kbd, Switch, Table, TableBody, TableCell, TableRow,
 };
 use crate::App;
 
@@ -59,7 +59,7 @@ impl App {
             match self.section {
                 Section::Sessions => render_sessions(self, &theme, entity.clone()),
                 Section::Keyboard => render_keyboard(self, &theme, entity.clone()),
-                Section::Terminal => render_terminal(entity.clone()),
+                Section::Terminal => render_terminal(&theme, entity.clone()),
                 Section::Accessibility => render_accessibility(&theme, entity.clone()),
                 Section::Debug => render_debug(self, &theme, entity.clone()),
                 Section::FeatureFlags => {
@@ -133,6 +133,47 @@ fn settings_row() -> gpui::Div {
         .rounded_md()
 }
 
+/// macOS System Settings-style grouped box: related rows in an inset rounded
+/// container — a faint lifted wash with a hairline border, rows separated by
+/// inset hairline dividers. This is what gives the glass panel its depth.
+fn settings_group(theme: &Theme, rows: Vec<AnyElement>) -> gpui::Div {
+    let mut boxed = div()
+        .flex()
+        .flex_col()
+        .rounded(theme.radius_lg())
+        .bg(alpha(theme.foreground, 0.04))
+        .border_1()
+        .border_color(alpha(theme.foreground, 0.08))
+        .overflow_hidden();
+    for (ix, row) in rows.into_iter().enumerate() {
+        if ix > 0 {
+            boxed = boxed.child(
+                div().ml_3().h(px(1.)).bg(alpha(theme.foreground, 0.06)),
+            );
+        }
+        boxed = boxed.child(row);
+    }
+    boxed
+}
+
+/// A row's left cell: 13px title with an optional 12px muted description
+/// under it — the shape every settings row shares.
+fn row_text(theme: &Theme, title: &'static str, desc: Option<&'static str>) -> gpui::Div {
+    let mut cell = div()
+        .flex()
+        .flex_col()
+        .child(div().text_size(px(13.)).child(title));
+    if let Some(desc) = desc {
+        cell = cell.child(
+            div()
+                .text_size(px(12.))
+                .text_color(theme.muted_foreground)
+                .child(desc),
+        );
+    }
+    cell
+}
+
 // ── Search results ──────────────────────────────────────────────────────
 
 fn render_search_results(
@@ -151,15 +192,16 @@ fn render_search_results(
             .into_any_element();
     }
 
-    let mut list = div().id("settings-rows").flex().flex_col().flex_1().min_h(px(0.)).overflow_y_scroll();
+    let hover_bg = alpha(theme.foreground, 0.08);
+    let mut rows: Vec<AnyElement> = Vec::new();
     for (ix, entry) in results.into_iter().enumerate() {
         let section = entry.section;
         let row_entity = entity.clone();
-        list = list.child(
+        rows.push(
             settings_row()
                 .id(("settings-search", ix))
                 .cursor_pointer()
-                .hover(|s| s.bg(theme.accent))
+                .hover(move |s| s.bg(hover_bg))
                 .on_click(move |_ev: &ClickEvent, _win: &mut Window, gpui_app: &mut GpuiApp| {
                     gpui_app.stop_propagation();
                     if let Some(entity) = row_entity.upgrade() {
@@ -182,10 +224,19 @@ fn render_search_results(
                     Badge::new()
                         .variant(BadgeVariant::Outline)
                         .child(entry.section.label()),
-                ),
+                )
+                .into_any_element(),
         );
     }
-    list.into_any_element()
+    div()
+        .id("settings-rows")
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_h(px(0.))
+        .overflow_y_scroll()
+        .child(settings_group(theme, rows))
+        .into_any_element()
 }
 
 // ── Sessions ────────────────────────────────────────────────────────────
@@ -200,21 +251,22 @@ fn render_sessions(app: &App, theme: &Theme, entity: gpui::WeakEntity<App>) -> A
     div()
         .flex()
         .flex_col()
-        .gap_2()
-        .child(
-            settings_row()
-                .child(Label::new().child("Primary command"))
-                .child(input_el),
-        )
-        .child(
-            div()
-                .px_3()
-                .text_size(px(12.))
-                .text_color(theme.muted_foreground)
-                .child("runs in the primary pane when a group opens (enter saves, esc cancels)"),
-        )
-        .child(git_cli_row(theme, entity.clone()))
-        .child(git_async_row(entity))
+        .gap_4()
+        .child(settings_group(
+            theme,
+            vec![
+                settings_row()
+                    .child(row_text(
+                        theme,
+                        "Primary command",
+                        Some("runs in the primary pane when a group opens (enter saves, esc cancels)"),
+                    ))
+                    .child(input_el)
+                    .into_any_element(),
+                git_cli_row(theme, entity.clone()),
+                git_async_row(entity),
+            ],
+        ))
         .into_any_element()
 }
 
@@ -239,31 +291,19 @@ fn git_cli_row(theme: &Theme, entity: gpui::WeakEntity<App>) -> AnyElement {
                 }
             })
     };
-    div()
-        .flex()
-        .flex_col()
+    settings_row()
+        .child(row_text(
+            theme,
+            "Pull request CLI",
+            Some("tool used to fetch PR data (lfg is the fast, cached path)"),
+        ))
         .child(
-            settings_row()
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .child(div().text_size(px(13.)).child("Pull request CLI"))
-                        .child(
-                            div()
-                                .text_size(px(12.))
-                                .text_color(theme.muted_foreground)
-                                .child("tool used to fetch PR data (lfg is the fast, cached path)"),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .gap_1()
-                        .child(mk("git-cli-lfg", "lfg"))
-                        .child(mk("git-cli-gh", "gh")),
-                ),
+            div()
+                .flex()
+                .flex_row()
+                .gap_1()
+                .child(mk("git-cli-lfg", "lfg"))
+                .child(mk("git-cli-gh", "gh")),
         )
         .into_any_element()
 }
@@ -342,13 +382,16 @@ fn render_keyboard(
         .flex_1()
         .min_h(px(0.))
         .overflow_y_scroll()
-        .child(Table::new().child(body))
+        .child(settings_group(
+            theme,
+            vec![Table::new().child(body).into_any_element()],
+        ))
         .into_any_element()
 }
 
 // ── Terminal ────────────────────────────────────────────────────────────
 
-fn render_terminal(entity: gpui::WeakEntity<App>) -> AnyElement {
+fn render_terminal(theme: &Theme, entity: gpui::WeakEntity<App>) -> AnyElement {
     let persist = settings::get_bool("terminal.persist", false);
     let switch_entity = entity.clone();
     let toggle = Switch::new("terminal-persist")
@@ -368,15 +411,15 @@ fn render_terminal(entity: gpui::WeakEntity<App>) -> AnyElement {
     div()
         .flex()
         .flex_col()
-        .child(
-            settings_row()
-                .child(
-                    div()
-                        .text_size(px(13.))
-                        .child("Persist sessions"),
-                )
-                .child(toggle),
-        )
+        .child(settings_group(
+            theme,
+            vec![
+                settings_row()
+                    .child(row_text(theme, "Persist sessions", None))
+                    .child(toggle)
+                    .into_any_element(),
+            ],
+        ))
         .into_any_element()
 }
 
@@ -389,22 +432,27 @@ fn render_accessibility(theme: &Theme, entity: gpui::WeakEntity<App>) -> AnyElem
     div()
         .flex()
         .flex_col()
-        .gap_2()
-        .child(font_size_row(
+        .gap_4()
+        .child(settings_group(
             theme,
-            entity.clone(),
-            "term-font",
-            "Terminal text size",
-            "font size of the terminal grid (⌘= / ⌘- while a terminal is focused)",
-            "terminal.font_size",
-        ))
-        .child(font_size_row(
-            theme,
-            entity,
-            "app-font",
-            "App text size",
-            "font size of tabs, sidebar, and other app chrome (⌘= / ⌘- elsewhere)",
-            "appearance.font_size",
+            vec![
+                font_size_row(
+                    theme,
+                    entity.clone(),
+                    "term-font",
+                    "Terminal text size",
+                    "font size of the terminal grid (⌘= / ⌘- while a terminal is focused)",
+                    "terminal.font_size",
+                ),
+                font_size_row(
+                    theme,
+                    entity,
+                    "app-font",
+                    "App text size",
+                    "font size of tabs, sidebar, and other app chrome (⌘= / ⌘- elsewhere)",
+                    "appearance.font_size",
+                ),
+            ],
         ))
         .into_any_element()
 }
@@ -455,18 +503,7 @@ fn font_size_row(
         });
 
     settings_row()
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .child(div().text_size(px(13.)).child(title))
-                .child(
-                    div()
-                        .text_size(px(12.))
-                        .text_color(theme.muted_foreground)
-                        .child(desc),
-                ),
-        )
+        .child(row_text(theme, title, Some(desc)))
         .child(
             div()
                 .flex()
@@ -496,7 +533,7 @@ fn render_feature_flags(
     theme: &Theme,
     entity: gpui::WeakEntity<App>,
 ) -> AnyElement {
-    let mut col = div().flex().flex_col().gap_1();
+    let mut rows: Vec<AnyElement> = Vec::new();
     for flag in crate::features::ALL {
         let key = flag.key;
         let switch_entity = entity.clone();
@@ -517,26 +554,19 @@ fn render_feature_flags(
                 },
             );
 
-        col = col.child(
+        rows.push(
             settings_row()
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .child(div().text_size(px(13.)).child(flag.label))
-                        .child(
-                            div()
-                                .text_size(px(12.))
-                                .text_color(theme.muted_foreground)
-                                .child(flag.description),
-                        ),
-                )
-                .child(toggle),
+                .child(row_text(theme, flag.label, Some(flag.description)))
+                .child(toggle)
+                .into_any_element(),
         );
     }
 
-    col.into_any_element()
+    div()
+        .flex()
+        .flex_col()
+        .child(settings_group(theme, rows))
+        .into_any_element()
 }
 
 // ── Debug ───────────────────────────────────────────────────────────────
@@ -573,9 +603,9 @@ fn render_debug(
         ),
     ];
 
-    let mut col = div().flex().flex_col().gap_1();
+    let mut diag_rows: Vec<AnyElement> = Vec::new();
     for (key, value) in diags {
-        col = col.child(
+        diag_rows.push(
             settings_row()
                 .child(
                     div()
@@ -583,7 +613,8 @@ fn render_debug(
                         .text_color(theme.muted_foreground)
                         .child(key),
                 )
-                .child(div().text_size(px(13.)).child(value)),
+                .child(div().text_size(px(13.)).child(value))
+                .into_any_element(),
         );
     }
 
@@ -602,10 +633,19 @@ fn render_debug(
             }
         });
 
-    col.child(
-        settings_row()
-            .child(div().text_size(px(13.)).child("Show frame stats"))
-            .child(toggle),
-    )
-    .into_any_element()
+    div()
+        .flex()
+        .flex_col()
+        .gap_4()
+        .child(settings_group(theme, diag_rows))
+        .child(settings_group(
+            theme,
+            vec![
+                settings_row()
+                    .child(row_text(theme, "Show frame stats", None))
+                    .child(toggle)
+                    .into_any_element(),
+            ],
+        ))
+        .into_any_element()
 }
