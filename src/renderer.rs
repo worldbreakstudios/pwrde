@@ -112,9 +112,6 @@ pub struct Quad {
     pub border: f32,
     pub border_color: Hsla,
     pub shadow: Shadow,
-    /// When set, the fill becomes a vertical gradient from this color (top)
-    /// down to `color` — the two-tone glass highlight on sidebar pills.
-    pub top_color: Option<Hsla>,
 }
 
 impl Quad {
@@ -126,11 +123,6 @@ impl Quad {
     fn border(mut self, width: f32, color: Hsla) -> Self {
         self.border = width;
         self.border_color = color;
-        self
-    }
-
-    fn top_color(mut self, color: Hsla) -> Self {
-        self.top_color = Some(color);
         self
     }
 }
@@ -549,7 +541,7 @@ impl Renderer {
                 (th.text_bright, 1.0),
                 (th.text_dim, 1.0),
                 (th.card_divider, 1.0),
-                ((255, 255, 255), 0.09),
+                ((255, 255, 255), 0.13),
             ),
         };
         let ws = &workspaces[active];
@@ -3401,10 +3393,10 @@ impl Renderer {
         }
     }
 
-    /// A glassy capsule: two-tone translucent fill (lighter, slightly more
-    /// opaque top shoulder fading to a darker base — the glass highlight),
-    /// the radius clamped to a true capsule for the rect, plus a hairline
-    /// rim (iTerm2-style).
+    /// A glassy capsule, iTerm2-style: a flat translucent fill with the
+    /// radius clamped to a true capsule for the rect, plus a crisp hairline
+    /// rim. The glass read comes from the fill sitting *lighter* than its
+    /// ground — callers pick the fill accordingly.
     fn glass(
         &self,
         r: &LayoutRect,
@@ -3414,21 +3406,22 @@ impl Renderer {
         rim: Hsla,
     ) -> Quad {
         let rim_w = (0.5 * self.scale).round().max(1.0);
-        let mix = |c: (u8, u8, u8), toward: f32, f: f32| {
-            let ch = |v: u8| (v as f32 + (toward - v as f32) * f).round() as u8;
-            (ch(c.0), ch(c.1), ch(c.2))
-        };
-        let top = mix(rgb, 255.0, 0.16);
-        let base = mix(rgb, 0.0, 0.06);
-        self.px_rect(r, base, alpha, radius.min(r.w / 2.0).min(r.h / 2.0))
-            .top_color(color(top, (alpha * 1.25).min(1.0)))
+        self.px_rect(r, rgb, alpha, radius.min(r.w / 2.0).min(r.h / 2.0))
             .border(rim_w, rim)
     }
 
-    /// [`Self::glass`] in sidebar colors: translucent card fill with an ink
-    /// rim, floating on the blurred vibrancy ground.
+    /// [`Self::glass`] in sidebar colors, floating on the blurred vibrancy
+    /// ground. Dark chrome cards are darker than that ground, so the fill is
+    /// lifted toward white to read as light glass like iTerm2's tabs; light
+    /// themes' white cards already do.
     fn pill(&self, r: &LayoutRect, th: &Theme, alpha: f32, radius: f32) -> Quad {
-        self.glass(r, th.card, alpha, radius, color(th.ink, 0.22))
+        let fill = if th.dark {
+            let lift = |v: u8| (v as f32 + (255.0 - v as f32) * 0.30).round() as u8;
+            (lift(th.card.0), lift(th.card.1), lift(th.card.2))
+        } else {
+            th.card
+        };
+        self.glass(r, fill, alpha, radius, color(th.ink, 0.28))
     }
 
     fn px_rect(&self, r: &LayoutRect, rgb: (u8, u8, u8), alpha: f32, radius: f32) -> Quad {
@@ -3442,7 +3435,6 @@ impl Renderer {
             border: 0.0,
             border_color: Hsla::default(),
             shadow: Shadow::None,
-            top_color: None,
         }
     }
 
@@ -3478,7 +3470,6 @@ impl Renderer {
             border: 0.0,
             border_color: Hsla::default(),
             shadow: Shadow::None,
-            top_color: None,
         }
     }
 }
