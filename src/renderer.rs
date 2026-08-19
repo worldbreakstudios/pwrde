@@ -989,7 +989,13 @@ impl Renderer {
                         w: (tr.w - 2.0 * m).max(0.0),
                         h: (tr.h - 2.0 * m).max(0.0),
                     };
-                    bg_quads.push(self.px_rect(&pill, pane_pill.0, pane_pill.1, (7.0 * self.scale).round()));
+                    bg_quads.push(self.glass(
+                        &pill,
+                        pane_pill.0,
+                        pane_pill.1,
+                        pill.h / 2.0,
+                        color(pane_ink.0, 0.18),
+                    ));
                 } else {
                     // A sideways-collapsed strip is one big "expand" target:
                     // any click reopens it, so the whole bare card hovers.
@@ -1099,11 +1105,12 @@ impl Renderer {
                             w: (tr.w - 2.0 * m).max(0.0),
                             h: (tr.h - 2.0 * m).max(0.0),
                         };
-                        bg_quads.push(self.px_rect(
+                        bg_quads.push(self.glass(
                             &pill,
                             pane_pill.0,
                             pane_pill.1 * 0.55,
-                            (7.0 * self.scale).round(),
+                            pill.h / 2.0,
+                            color(pane_ink.0, 0.10),
                         ));
                     }
                     if close_hov {
@@ -1119,7 +1126,7 @@ impl Renderer {
                             &chip,
                             pane_pill.0,
                             (pane_pill.1 * 2.0).min(1.0),
-                            (4.0 * self.scale).round(),
+                            chip.h / 2.0,
                         ));
                     }
                     // The close rect is hot after its tab so reverse iteration
@@ -3394,22 +3401,34 @@ impl Renderer {
         }
     }
 
-    /// A glassy sidebar capsule: two-tone translucent card fill (lighter top
-    /// shoulder fading to a slightly darker base — the glass highlight), the
-    /// radius clamped to a true capsule for the rect, plus a hairline ink rim
-    /// so the pill reads as glass on the blurred vibrancy ground
-    /// (iTerm2-style).
-    fn pill(&self, r: &LayoutRect, th: &Theme, alpha: f32, radius: f32) -> Quad {
-        let rim = (0.5 * self.scale).round().max(1.0);
+    /// A glassy capsule: two-tone translucent fill (lighter, slightly more
+    /// opaque top shoulder fading to a darker base — the glass highlight),
+    /// the radius clamped to a true capsule for the rect, plus a hairline
+    /// rim (iTerm2-style).
+    fn glass(
+        &self,
+        r: &LayoutRect,
+        rgb: (u8, u8, u8),
+        alpha: f32,
+        radius: f32,
+        rim: Hsla,
+    ) -> Quad {
+        let rim_w = (0.5 * self.scale).round().max(1.0);
         let mix = |c: (u8, u8, u8), toward: f32, f: f32| {
             let ch = |v: u8| (v as f32 + (toward - v as f32) * f).round() as u8;
             (ch(c.0), ch(c.1), ch(c.2))
         };
-        let top = mix(th.card, 255.0, 0.16);
-        let base = mix(th.card, 0.0, 0.06);
+        let top = mix(rgb, 255.0, 0.16);
+        let base = mix(rgb, 0.0, 0.06);
         self.px_rect(r, base, alpha, radius.min(r.w / 2.0).min(r.h / 2.0))
-            .top_color(color(top, alpha))
-            .border(rim, color(th.ink, 0.22))
+            .top_color(color(top, (alpha * 1.25).min(1.0)))
+            .border(rim_w, rim)
+    }
+
+    /// [`Self::glass`] in sidebar colors: translucent card fill with an ink
+    /// rim, floating on the blurred vibrancy ground.
+    fn pill(&self, r: &LayoutRect, th: &Theme, alpha: f32, radius: f32) -> Quad {
+        self.glass(r, th.card, alpha, radius, color(th.ink, 0.22))
     }
 
     fn px_rect(&self, r: &LayoutRect, rgb: (u8, u8, u8), alpha: f32, radius: f32) -> Quad {
