@@ -3392,7 +3392,7 @@ impl Renderer {
     fn pill(&self, r: &LayoutRect, th: &Theme, alpha: f32, radius: f32) -> Quad {
         let rim = (0.5 * self.scale).round().max(1.0);
         self.px_rect(r, th.card, alpha, radius.min(r.w / 2.0).min(r.h / 2.0))
-            .border(rim, color(th.ink, 0.10))
+            .border(rim, color(th.ink, 0.22))
     }
 
     fn px_rect(&self, r: &LayoutRect, rgb: (u8, u8, u8), alpha: f32, radius: f32) -> Quad {
