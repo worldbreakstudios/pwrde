@@ -5895,7 +5895,19 @@ fn paint_quad(
             }],
         );
     }
-    let mut quad = gpui::fill(b, q.color);
+    // A two-tone quad (glass pills) fills with a vertical top→bottom
+    // gradient; everything else stays a flat fill.
+    let mut quad = match q.top_color {
+        Some(top) => gpui::fill(
+            b,
+            gpui::linear_gradient(
+                180.0,
+                gpui::linear_color_stop(top, 0.0),
+                gpui::linear_color_stop(q.color, 1.0),
+            ),
+        ),
+        None => gpui::fill(b, q.color),
+    };
     // Honor the renderer's corner radius (physical px → logical), so the tile
     // cards, sidebar rows, and picker panel/search box round.
     quad.corner_radii = radii;

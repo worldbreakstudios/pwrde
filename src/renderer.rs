@@ -112,6 +112,9 @@ pub struct Quad {
     pub border: f32,
     pub border_color: Hsla,
     pub shadow: Shadow,
+    /// When set, the fill becomes a vertical gradient from this color (top)
+    /// down to `color` — the two-tone glass highlight on sidebar pills.
+    pub top_color: Option<Hsla>,
 }
 
 impl Quad {
@@ -123,6 +126,11 @@ impl Quad {
     fn border(mut self, width: f32, color: Hsla) -> Self {
         self.border = width;
         self.border_color = color;
+        self
+    }
+
+    fn top_color(mut self, color: Hsla) -> Self {
+        self.top_color = Some(color);
         self
     }
 }
@@ -3386,12 +3394,21 @@ impl Renderer {
         }
     }
 
-    /// A glassy sidebar capsule: translucent card fill with the radius
-    /// clamped to a true capsule for the rect, plus a hairline ink rim so the
-    /// pill reads as glass on the blurred vibrancy ground (iTerm2-style).
+    /// A glassy sidebar capsule: two-tone translucent card fill (lighter top
+    /// shoulder fading to a slightly darker base — the glass highlight), the
+    /// radius clamped to a true capsule for the rect, plus a hairline ink rim
+    /// so the pill reads as glass on the blurred vibrancy ground
+    /// (iTerm2-style).
     fn pill(&self, r: &LayoutRect, th: &Theme, alpha: f32, radius: f32) -> Quad {
         let rim = (0.5 * self.scale).round().max(1.0);
-        self.px_rect(r, th.card, alpha, radius.min(r.w / 2.0).min(r.h / 2.0))
+        let mix = |c: (u8, u8, u8), toward: f32, f: f32| {
+            let ch = |v: u8| (v as f32 + (toward - v as f32) * f).round() as u8;
+            (ch(c.0), ch(c.1), ch(c.2))
+        };
+        let top = mix(th.card, 255.0, 0.16);
+        let base = mix(th.card, 0.0, 0.06);
+        self.px_rect(r, base, alpha, radius.min(r.w / 2.0).min(r.h / 2.0))
+            .top_color(color(top, alpha))
             .border(rim, color(th.ink, 0.22))
     }
 
@@ -3406,6 +3423,7 @@ impl Renderer {
             border: 0.0,
             border_color: Hsla::default(),
             shadow: Shadow::None,
+            top_color: None,
         }
     }
 
@@ -3441,6 +3459,7 @@ impl Renderer {
             border: 0.0,
             border_color: Hsla::default(),
             shadow: Shadow::None,
+            top_color: None,
         }
     }
 }
