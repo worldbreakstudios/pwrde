@@ -99,6 +99,7 @@ impl App {
                 // over, keeping any row scroller bounded.
                 Card::new()
                     .h_full()
+                    .glass()
                     .child(header)
                     .child(
                         CardContent::new().flex_1().child(

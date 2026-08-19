@@ -14,7 +14,8 @@
 //! content-width table inside a horizontal scroll area), [`badge`]
 //! (`Badge::color` status tints), and [`card`] (`Card::h_full` /
 //! `CardContent::flex_1` for page-filling cards, `Card::floating` for a
-//! raised shadow when floating over other content).
+//! raised shadow when floating over other content, `Card::glass` for a
+//! translucent glass panel over the blurred vibrancy ground).
 //!
 //! Keep the `pub use` re-exports ABOVE the `pub mod` lines: `rcn add`
 //! regenerates everything after the first `pub mod` and would drop them.

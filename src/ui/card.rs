@@ -16,7 +16,9 @@
 //! Local additions over the rcn source: [`Card::h_full`] and
 //! [`CardContent::flex_1`], so a card can fill a page-sized region with the
 //! content band absorbing the leftover height; [`Card::floating`] swaps the
-//! resting shadow for `shadow_lg` when the card floats over other content.
+//! resting shadow for `shadow_lg` when the card floats over other content;
+//! [`Card::glass`] makes the card a translucent glass panel (see-through
+//! fill + stronger rim) for overlays sitting on the blurred vibrancy ground.
 
 use gpui::{
     AnyElement, App, FontWeight, IntoElement, ParentElement, RenderOnce, Styled, Window, div,
@@ -52,6 +54,7 @@ pub struct Card {
     size: CardSize,
     full: bool,
     floating: bool,
+    glass: bool,
     children: Vec<AnyElement>,
 }
 
@@ -61,6 +64,7 @@ impl Card {
             size: CardSize::Default,
             full: false,
             floating: false,
+            glass: false,
             children: Vec::new(),
         }
     }
@@ -81,6 +85,16 @@ impl Card {
     /// reads as floating over other content instead of sitting flush.
     pub fn floating(mut self) -> Self {
         self.floating = true;
+        self
+    }
+
+    /// Local addition: translucent glass panel — a see-through card fill
+    /// with a stronger hairline rim, so the blurred vibrancy ground glows
+    /// through (matches the canvas chrome's iTerm2-style glass pills). Only
+    /// for overlays whose backdrop is the window ground, never terminal
+    /// content.
+    pub fn glass(mut self) -> Self {
+        self.glass = true;
         self
     }
 }
@@ -109,7 +123,11 @@ impl RenderOnce for Card {
             .gap(spacing)
             .overflow_hidden()
             .rounded(theme.radius_xl())
-            .bg(theme.card)
+            .bg(if self.glass {
+                alpha(theme.card, 0.60)
+            } else {
+                theme.card
+            })
             .py(spacing)
             .text_size(px(14.))
             .line_height(px(20.))
@@ -117,7 +135,7 @@ impl RenderOnce for Card {
             .when(self.floating, |el| el.shadow_lg())
             .when(!self.floating, |el| el.shadow_xs())
             .border_1()
-            .border_color(alpha(theme.foreground, 0.1))
+            .border_color(alpha(theme.foreground, if self.glass { 0.16 } else { 0.1 }))
             .children(self.children)
     }
 }
