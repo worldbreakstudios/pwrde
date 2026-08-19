@@ -285,33 +285,6 @@ impl Workspace {
     }
 }
 
-/// Display form of a path with a leading `$HOME` shortened to `~`.
-pub fn display_path(dir: &std::path::Path, home: Option<&std::path::Path>) -> String {
-    if let Some(home) = home {
-        if dir == home {
-            return "~".into();
-        }
-        if let Ok(rest) = dir.strip_prefix(home) {
-            return format!("~/{}", rest.display());
-        }
-    }
-    dir.display().to_string()
-}
-
-/// Display form of a group's cwd for the sidebar card's second line. `None`
-/// (inherit) falls back to the process working directory.
-pub fn display_cwd(cwd: Option<&std::path::Path>) -> String {
-    let fallback;
-    let dir = match cwd {
-        Some(d) => d,
-        None => {
-            fallback = std::env::current_dir().unwrap_or_default();
-            &fallback
-        },
-    };
-    display_path(dir, dirs::home_dir().as_deref())
-}
-
 // ─── Layout ─────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -340,7 +313,8 @@ pub const SIDEBAR_MAX_W: f32 = 360.0;
 /// Top strip of the sidebar: native traffic lights float here and the rest
 /// is the window drag handle.
 pub const TITLEBAR_H: f32 = 44.0;
-const TAB_H: f32 = 48.0;
+/// Height of a one-line sidebar row (iTerm2/native-mac source-list style).
+const TAB_H: f32 = 28.0;
 /// Slimmer height for section header rows in the sidebar.
 const SECTION_HEADER_H: f32 = 30.0;
 /// Extra left inset for group rows nested under a section.
@@ -2061,16 +2035,6 @@ mod tests {
     }
 
     #[test]
-    fn display_path_shortens_home() {
-        use std::path::Path;
-        let home = Path::new("/Users/me");
-        assert_eq!(display_path(home, Some(home)), "~");
-        assert_eq!(display_path(Path::new("/Users/me/src/app"), Some(home)), "~/src/app");
-        assert_eq!(display_path(Path::new("/tmp/x"), Some(home)), "/tmp/x");
-        assert_eq!(display_path(Path::new("/tmp/x"), None), "/tmp/x");
-    }
-
-    #[test]
     fn empty_state_cta_centered_in_terminal_area() {
         let (w, h, scale, sidebar_w) = (1600, 1000, 2.0, SIDEBAR_DEFAULT_W);
         let area = terminal_area(w, h, scale, sidebar_w, 0.0);
@@ -2423,9 +2387,11 @@ mod tests {
         let member = sidebar_row_rect(&rows, 1, &workspaces, scale, sw);
         let bare = sidebar_row_rect(&rows, 3, &workspaces, scale, sw);
 
-        assert!(header.h < member.h);
+        // One-line group rows (TAB_H) sit under slightly taller section headers
+        // (SECTION_HEADER_H); both heights are pinned to their constants.
         assert_eq!(header.h, (SECTION_HEADER_H * scale).round());
         assert_eq!(member.h, (TAB_H * scale).round());
+        assert!(header.h > member.h);
         assert!(member.x > header.x);
         assert!((member.x + member.w - (header.x + header.w)).abs() <= 0.5);
         assert_eq!(bare.x, header.x);

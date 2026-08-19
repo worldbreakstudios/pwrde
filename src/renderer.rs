@@ -43,7 +43,8 @@ const PANE_PAD: f32 = 8.0;
 /// Corner radius of the floating tile cards, logical px.
 const CARD_RADIUS: f32 = 12.0;
 /// Corner radius of the sidebar's rounded rows, logical px.
-const ROW_RADIUS: f32 = 9.0;
+/// Matches the native macOS source-list selection radius for 28px rows.
+const ROW_RADIUS: f32 = 6.0;
 
 /// Blend `c` 40% toward white — brightens the hovered link color.
 /// Truncate `text` to at most `max_chars` characters, ending in `…` when
@@ -1329,8 +1330,6 @@ impl Renderer {
     ) {
         let rows = workspace::sidebar_rows(workspaces, chrome.sections);
         let active_row = workspace::active_row_index(&rows, workspaces, chrome.sections, active);
-        let cwd_size = self.chrome_font_size() * 0.85;
-        let cwd_line_h = self.chrome_cell_height * 0.85;
         let header_size = self.chrome_font_size() * 0.9;
 
         for (i, row) in rows.iter().enumerate() {
@@ -1474,8 +1473,6 @@ impl Renderer {
                     }
                     hot.push(rect);
                     let clip_w = rect.w - group_pad;
-                    let inset =
-                        ((rect.h - (self.chrome_cell_height + cwd_line_h)) / 2.0).max(0.0);
                     // Unread (any unread tab in the group lights the dot):
                     // accent dot in the left padding gutter, centered on the
                     // row; text stays put so rows keep alignment.
@@ -1496,17 +1493,9 @@ impl Renderer {
                             1.0,
                         ),
                         left: rect.x + group_pad,
-                        top: (rect.y + inset).round(),
+                        top: (rect.y + (rect.h - self.chrome_cell_height) / 2.0).round(),
                         clip: LayoutRect { w: clip_w, ..rect },
                         size: None,
-                    });
-                    labels.push(LabelSpec {
-                        text: workspace::display_cwd(ws_item.cwd.as_deref()),
-                        color: color(th.ink_dim, 0.8),
-                        left: rect.x + group_pad,
-                        top: (rect.y + inset + self.chrome_cell_height).round(),
-                        clip: LayoutRect { w: clip_w, ..rect },
-                        size: Some(cwd_size),
                     });
                 }
             }

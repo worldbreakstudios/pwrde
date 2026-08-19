@@ -5642,12 +5642,17 @@ impl App {
         window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
             // 0) the themed window gradient every card and sidebar row floats
             // on (mockup 3a's tinted wrapper).
+            // With the blurred window background, a sub-1.0 gradient lets the
+            // desktop glow through like a native sidebar; the setting restores
+            // the opaque gradient.
+            let vibrancy = settings::get_bool("appearance.vibrancy", true);
+            let grad_a = if vibrancy { 0.80 } else { 1.0 };
             window.paint_quad(gpui::fill(
                 bounds,
                 gpui::linear_gradient(
                     135.0,
-                    gpui::linear_color_stop(renderer::color(th.gradient_from, 1.0), 0.0),
-                    gpui::linear_color_stop(renderer::color(th.gradient_to, 1.0), 1.0),
+                    gpui::linear_color_stop(renderer::color(th.gradient_from, grad_a), 0.0),
+                    gpui::linear_color_stop(renderer::color(th.gradient_to, grad_a), 1.0),
                 ),
             ));
 
@@ -6538,6 +6543,7 @@ fn main() {
                 }),
                 is_resizable: true,
                 app_owns_titlebar_drag: true,
+                window_background: gpui::WindowBackgroundAppearance::Blurred,
                 ..Default::default()
             },
             |window, cx| {
