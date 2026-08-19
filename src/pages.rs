@@ -123,38 +123,9 @@ pub enum AppearanceDropdown {
 }
 
 impl AppearanceDropdown {
-    pub const ALL: [AppearanceDropdown; 4] = [
-        AppearanceDropdown::ThemeLight,
-        AppearanceDropdown::ThemeDark,
-        AppearanceDropdown::TermLight,
-        AppearanceDropdown::TermDark,
-    ];
-
     /// Whether this dropdown controls the dark-polarity slot.
     pub fn dark(self) -> bool {
         matches!(self, AppearanceDropdown::ThemeDark | AppearanceDropdown::TermDark)
-    }
-
-    /// Human-readable label shown above / inside the dropdown field.
-    pub fn label(self) -> &'static str {
-        match self {
-            AppearanceDropdown::ThemeLight => "Light Theme",
-            AppearanceDropdown::ThemeDark => "Dark Theme",
-            AppearanceDropdown::TermLight => "Light Profile",
-            AppearanceDropdown::TermDark => "Dark Profile",
-        }
-    }
-
-    /// Grid position as `(column, field)`: themes in column 0, terminal
-    /// profiles in column 1; the light slot before the dark one. Shared by
-    /// the renderer and main.rs so drawing and hit-testing agree.
-    pub fn grid(self) -> (usize, usize) {
-        match self {
-            AppearanceDropdown::ThemeLight => (0, 0),
-            AppearanceDropdown::ThemeDark => (0, 1),
-            AppearanceDropdown::TermLight => (1, 0),
-            AppearanceDropdown::TermDark => (1, 1),
-        }
     }
 }
 
@@ -672,15 +643,11 @@ mod tests {
     }
 
     #[test]
-    fn appearance_dropdown_dark_matches_label() {
+    fn appearance_dropdown_dark_polarity() {
         assert!(!AppearanceDropdown::ThemeLight.dark());
         assert!(AppearanceDropdown::ThemeDark.dark());
         assert!(!AppearanceDropdown::TermLight.dark());
         assert!(AppearanceDropdown::TermDark.dark());
-        assert_eq!(AppearanceDropdown::ThemeLight.label(), "Light Theme");
-        assert_eq!(AppearanceDropdown::ThemeDark.label(), "Dark Theme");
-        assert_eq!(AppearanceDropdown::TermLight.label(), "Light Profile");
-        assert_eq!(AppearanceDropdown::TermDark.label(), "Dark Profile");
     }
 
     /// Both polarities' dropdowns list every theme (mix-and-match is
