@@ -4,17 +4,17 @@
 //! component tree (vendored rcn Card/Input/Switch/…) positioned over
 //! [`workspace::terminal_area`]. Confirm dialogs stay on the canvas path, so
 //! the overlay is skipped while one is open. The Settings sidebar (search +
-//! section tabs) remains canvas-painted — and so does the whole Appearance
-//! section (`Renderer::appearance_page`), whose WYSIWYG preview cards are
-//! deliberately quad-painted; this overlay never mounts for it.
+//! section tabs) remains canvas-painted; the Appearance section's body is
+//! built here as a gpui tree (segmented controls, Selects, WYSIWYG previews).
 
 use gpui::{
     div, px, AnyElement, App as GpuiApp, ClickEvent, Context, InteractiveElement, IntoElement,
     ParentElement, StatefulInteractiveElement, Styled, Window,
 };
 
-use crate::pages::{self, Action, Section};
+use crate::pages::{self, Action, AppearanceDropdown, Section};
 use crate::settings;
+use crate::ui::select::Select;
 use crate::ui::theme::{alpha, Theme};
 use crate::ui::{
     Badge, BadgeVariant, Button, ButtonSize, ButtonVariant, Card, CardContent, CardHeader,
@@ -65,9 +65,7 @@ impl App {
                 Section::FeatureFlags => {
                     render_feature_flags(self, &theme, entity.clone())
                 }
-                // Canvas-painted (Renderer::appearance_page); the overlay is
-                // never mounted for it. Defensive empty body.
-                Section::Appearance => div().into_any_element(),
+                Section::Appearance => render_appearance(self, &theme, entity.clone()),
             }
         };
 
@@ -647,5 +645,630 @@ fn render_debug(
                     .into_any_element(),
             ],
         ))
+        .into_any_element()
+}
+
+// ── Appearance ─────────────────────────────────────────────────────────
+
+fn group_label(theme: &Theme, title: &'static str) -> gpui::Div {
+    div()
+        .px_1()
+        .text_size(px(12.))
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .text_color(theme.muted_foreground)
+        .child(title)
+}
+
+fn render_appearance(app: &App, theme: &Theme, entity: gpui::WeakEntity<App>) -> AnyElement {
+    use crate::renderer::color;
+    use crate::theme::Mode;
+
+    let preview_dark = app.preview_dark;
+    let current_mode = crate::theme::mode();
+
+    // ── Mode + Preview segmented controls ──────────────────────────────
+    let mode_seg = {
+        let mut row = div().flex().flex_row().gap_1();
+        for m in Mode::ALL {
+            let active = current_mode == m;
+            let e = entity.clone();
+            let name = m.name();
+            row = row.child(
+                Button::new(format!("appearance-mode-{}", name))
+                    .variant(if active {
+                        ButtonVariant::Default
+                    } else {
+                        ButtonVariant::Outline
+                    })
+                    .size(ButtonSize::Sm)
+                    .child(m.label())
+                    .on_click(move |_ev: &ClickEvent, _win: &mut Window, gpui_app: &mut GpuiApp| {
+                        gpui_app.stop_propagation();
+                        if let Some(e) = e.upgrade() {
+                            e.update(gpui_app, move |_this, cx| {
+                                settings::set("appearance.mode", name.into());
+                                cx.notify();
+                            });
+                        }
+                    }),
+            );
+        }
+        settings_row()
+            .child(row_text(theme, "Mode", None))
+            .child(row)
+            .into_any_element()
+    };
+
+    let preview_seg = {
+        let mk = |id: &'static str, label: &'static str, dark: bool| {
+            let active = preview_dark == dark;
+            let e = entity.clone();
+            Button::new(id)
+                .variant(if active {
+                    ButtonVariant::Default
+                } else {
+                    ButtonVariant::Outline
+                })
+                .size(ButtonSize::Sm)
+                .child(label)
+                .on_click(move |_ev: &ClickEvent, _win: &mut Window, gpui_app: &mut GpuiApp| {
+                    gpui_app.stop_propagation();
+                    if let Some(e) = e.upgrade() {
+                        e.update(gpui_app, move |this, cx| {
+                            this.preview_dark = dark;
+                            cx.notify();
+                        });
+                    }
+                })
+        };
+        settings_row()
+            .child(row_text(theme, "Preview", None))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_1()
+                    .child(mk("appearance-preview-light", "Light", false))
+                    .child(mk("appearance-preview-dark", "Dark", true)),
+            )
+            .into_any_element()
+    };
+
+    // ── App theme selects ──────────────────────────────────────────────
+    let theme_select = |which: AppearanceDropdown| -> AnyElement {
+        let dark = which.dark();
+        let opts = pages::theme_options(dark);
+        let labels: Vec<String> = opts.iter().map(|t| t.label.to_string()).collect();
+        let selected_name = crate::theme::selected(dark).name;
+        let value = opts.iter().position(|t| t.name == selected_name);
+        let open = app.appearance_menu == Some(which);
+        let e_open = entity.clone();
+        let e_change = entity.clone();
+        let opts_for_change: Vec<&'static str> = opts.iter().map(|t| t.name).collect();
+        let id = match which {
+            AppearanceDropdown::ThemeLight => "appearance-theme-light",
+            AppearanceDropdown::ThemeDark => "appearance-theme-dark",
+            _ => "appearance-theme",
+        };
+        let label = if dark { "Dark theme" } else { "Light theme" };
+        settings_row()
+            .child(row_text(theme, label, None))
+            .child(
+                div().w(px(220.)).child(
+                    Select::new(id)
+                        .options(labels)
+                        .value(value)
+                        .open(open)
+                        .on_open_change(move |is_open: &bool, _win: &mut Window, gpui_app: &mut GpuiApp| {
+                            let open = *is_open;
+                            if let Some(e) = e_open.upgrade() {
+                                e.update(gpui_app, move |this, cx| {
+                                    this.appearance_menu = if open { Some(which) } else { None };
+                                    cx.notify();
+                                });
+                            }
+                        })
+                        .on_change(move |ix: &usize, _win: &mut Window, gpui_app: &mut GpuiApp| {
+                            let name = opts_for_change.get(*ix).copied().unwrap_or("");
+                            if name.is_empty() {
+                                return;
+                            }
+                            if let Some(e) = e_change.upgrade() {
+                                e.update(gpui_app, move |_this, cx| {
+                                    settings::set(crate::theme::setting_key(dark), name.into());
+                                    cx.notify();
+                                });
+                            }
+                        }),
+                ),
+            )
+            .into_any_element()
+    };
+
+    // ── Terminal color selects ─────────────────────────────────────────
+    let term_select = |which: AppearanceDropdown| -> AnyElement {
+        let dark = which.dark();
+        let opts = pages::term_options(dark);
+        let labels: Vec<String> = opts
+            .iter()
+            .map(|t| t.map_or("Default".to_string(), |t| t.label.to_string()))
+            .collect();
+        let selected = crate::term_theme::selected(dark);
+        let value = opts.iter().position(|t| match (t, selected) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a.name == b.name,
+            _ => false,
+        });
+        let open = app.appearance_menu == Some(which);
+        let e_open = entity.clone();
+        let e_change = entity.clone();
+        let opts_names: Vec<Option<&'static str>> =
+            opts.iter().map(|t| t.map(|t| t.name)).collect();
+        let id = match which {
+            AppearanceDropdown::TermLight => "appearance-term-light",
+            AppearanceDropdown::TermDark => "appearance-term-dark",
+            _ => "appearance-term",
+        };
+        let label = if dark { "Dark theme" } else { "Light theme" };
+        settings_row()
+            .child(row_text(theme, label, None))
+            .child(
+                div().w(px(220.)).child(
+                    Select::new(id)
+                        .options(labels)
+                        .value(value)
+                        .open(open)
+                        .on_open_change(move |is_open: &bool, _win: &mut Window, gpui_app: &mut GpuiApp| {
+                            let open = *is_open;
+                            if let Some(e) = e_open.upgrade() {
+                                e.update(gpui_app, move |this, cx| {
+                                    this.appearance_menu = if open { Some(which) } else { None };
+                                    cx.notify();
+                                });
+                            }
+                        })
+                        .on_change(move |ix: &usize, _win: &mut Window, gpui_app: &mut GpuiApp| {
+                            let name = opts_names
+                                .get(*ix)
+                                .copied()
+                                .flatten()
+                                .unwrap_or("default");
+                            if let Some(e) = e_change.upgrade() {
+                                e.update(gpui_app, move |_this, cx| {
+                                    settings::set(
+                                        crate::term_theme::setting_key(dark),
+                                        name.into(),
+                                    );
+                                    cx.notify();
+                                });
+                            }
+                        }),
+                ),
+            )
+            .into_any_element()
+    };
+
+    // ── WYSIWYG preview cards ──────────────────────────────────────────
+    let pt = crate::theme::selected(preview_dark);
+    let app_preview = {
+        let (pane_bg, pane_ink, pane_dim, pane_divider) =
+            match crate::term_theme::selected(preview_dark) {
+                Some(t) => (
+                    color(t.bg, 1.0),
+                    color(t.fg, 1.0),
+                    color(t.fg, 0.55),
+                    color(t.fg, 0.15),
+                ),
+                None => (
+                    color(pt.term_bg, 1.0),
+                    color(pt.text_bright, 1.0),
+                    color(pt.text_dim, 1.0),
+                    color(pt.card_divider, 1.0),
+                ),
+            };
+        let tokens = [pt.gradient_from, pt.card, pt.term_bg, pt.accent, pt.ink];
+        let mut chips = div().flex().flex_row().items_center().gap(px(6.));
+        for c in tokens {
+            chips = chips.child(
+                div()
+                    .w(px(14.))
+                    .h(px(14.))
+                    .rounded(px(3.))
+                    .border_1()
+                    .border_color(color(pt.ink, 0.25))
+                    .bg(color(c, 1.0)),
+            );
+        }
+        chips = chips.child(
+            div()
+                .text_size(px(11.))
+                .text_color(color(pt.ink_dim, 1.0))
+                .child("bg · surface · pane · accent · ink"),
+        );
+
+        let mut sidebar = div().flex().flex_col().gap(px(4.)).w(px(110.));
+        for (i, name) in ["flaky tests", "stripe v4", "docs pass"].iter().enumerate() {
+            let mut row = div()
+                .px(px(7.))
+                .py(px(4.))
+                .rounded(px(6.))
+                .text_size(px(11.))
+                .text_color(color(if i == 0 { pt.ink } else { pt.ink_dim }, 1.0))
+                .child(*name);
+            if i == 0 {
+                row = row.bg(color(pt.card, 0.9));
+            }
+            sidebar = sidebar.child(row);
+        }
+
+        let mini_term = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(70.))
+            .rounded(px(8.))
+            .bg(pane_bg)
+            .overflow_hidden()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap(px(16.))
+                    .px(px(10.))
+                    .py(px(4.))
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(pane_ink)
+                            .child("zsh"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(pane_dim)
+                            .child("cargo"),
+                    ),
+            )
+            .child(div().h(px(1.)).bg(pane_divider))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .px(px(10.))
+                    .py(px(6.))
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(pane_ink)
+                            .child("$ cargo run"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(pane_dim)
+                            .child("   Compiling pwrde"),
+                    ),
+            );
+
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(220.))
+            .rounded(theme.radius_lg())
+            .bg(color(pt.gradient_from, 1.0))
+            .p(px(12.))
+            .gap(px(10.))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(div().w(px(8.)).h(px(8.)).rounded_full().bg(color(pt.ink, 0.25)))
+                    .child(div().w(px(8.)).h(px(8.)).rounded_full().bg(color(pt.ink, 0.25)))
+                    .child(div().w(px(8.)).h(px(8.)).rounded_full().bg(color(pt.ink, 0.25)))
+                    .child(
+                        div()
+                            .ml(px(4.))
+                            .text_size(px(11.))
+                            .text_color(color(pt.ink_dim, 1.0))
+                            .child(format!("{} · Preview", pt.label)),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap(px(10.))
+                    .flex_1()
+                    .child(sidebar)
+                    .child(mini_term),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .rounded(px(7.))
+                    .bg(color(pt.card, 1.0))
+                    .px(px(8.))
+                    .py(px(6.))
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(color(pt.ink, 1.0))
+                            .child("Surface card"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .text_size(px(11.))
+                            .child(
+                                div()
+                                    .text_color(color(pt.ink_dim, 1.0))
+                                    .child("Secondary text on surface · "),
+                            )
+                            .child(
+                                div()
+                                    .text_color(color(pt.accent, 1.0))
+                                    .child("a link"),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .px(px(10.))
+                            .py(px(4.))
+                            .rounded(px(6.))
+                            .bg(color(pt.accent, 1.0))
+                            .text_size(px(11.))
+                            .text_color(color((255, 255, 255), 1.0))
+                            .child("Primary"),
+                    )
+                    .child(
+                        div()
+                            .px(px(10.))
+                            .py(px(4.))
+                            .rounded(px(6.))
+                            .bg(color(pt.ink, 0.08))
+                            .text_size(px(11.))
+                            .text_color(color(pt.ink, 1.0))
+                            .child("Secondary"),
+                    ),
+            )
+            .child(chips)
+            .into_any_element()
+    };
+
+    let term_preview = {
+        let sel = crate::term_theme::selected(preview_dark);
+        let (tfg, tbg, ansi) = crate::term_theme::preview_colors(sel, pt.term_bg);
+        let fgc = color(tfg, 1.0);
+        let dimc = color(tfg, 0.55);
+        let red = color(ansi[1], 1.0);
+        let green = color(ansi[2], 1.0);
+        let yellow = color(ansi[3], 1.0);
+        let magenta = color(ansi[5], 1.0);
+        let cyan = color(ansi[6], 1.0);
+
+        let mut ansi_chips = div().flex().flex_row().items_center().gap(px(3.));
+        for c in ansi {
+            ansi_chips = ansi_chips.child(
+                div()
+                    .w(px(8.))
+                    .h(px(8.))
+                    .rounded(px(2.))
+                    .bg(color(c, 1.0)),
+            );
+        }
+
+        let line = |spans: Vec<AnyElement>| {
+            let mut row = div().flex().flex_row().text_size(px(11.));
+            for s in spans {
+                row = row.child(s);
+            }
+            row
+        };
+        let span = |text: &'static str, c: gpui::Hsla| {
+            div().text_color(c).child(text).into_any_element()
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(220.))
+            .rounded(theme.radius_lg())
+            .bg(color(tbg, 1.0))
+            .overflow_hidden()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .px(px(12.))
+                    .py(px(6.))
+                    .bg(color((0, 0, 0), 0.18))
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(color(tfg, 0.7))
+                            .child(format!(
+                                "{} · Preview",
+                                sel.map_or("Default", |t| t.label)
+                            )),
+                    )
+                    .child(ansi_chips),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .px(px(12.))
+                    .py(px(8.))
+                    .child(line(vec![
+                        span("you@dev", green),
+                        span(":~/checkout$", dimc),
+                        span(" git status", fgc),
+                    ]))
+                    .child(line(vec![
+                        span("On branch ", dimc),
+                        span("feature/flaky-capture", cyan),
+                    ]))
+                    .child(line(vec![
+                        span("  modified:  ", red),
+                        span("tests/conftest.py", fgc),
+                    ]))
+                    .child(line(vec![
+                        span("  new file:  ", green),
+                        span("tests/test_clock.py", fgc),
+                    ]))
+                    .child(line(vec![
+                        span("you@dev", green),
+                        span(":~$", dimc),
+                        span(" pytest -q", fgc),
+                    ]))
+                    .child(line(vec![
+                        span("warning: ", yellow),
+                        span("2 deprecation warnings", fgc),
+                    ]))
+                    .child(line(vec![
+                        span("400 passed ", green),
+                        span("0 failed", red),
+                        span(" in ", fgc),
+                        span("41.2s", magenta),
+                    ]))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .text_size(px(11.))
+                            .child(span("❯ ", magenta))
+                            .child(span("agent watching e2e ", fgc))
+                            .child(
+                                div()
+                                    .w(px(7.))
+                                    .h(px(12.))
+                                    .bg(color(tfg, 0.9)),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    };
+
+    // ── Footer actions ─────────────────────────────────────────────────
+    let import_e = entity.clone();
+    let import_btn = Button::new("appearance-import")
+        .variant(ButtonVariant::Outline)
+        .size(ButtonSize::Sm)
+        .child("Import from clipboard")
+        .on_click(move |_ev: &ClickEvent, _win: &mut Window, gpui_app: &mut GpuiApp| {
+            gpui_app.stop_propagation();
+            if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                if let Some(tokens) = clipboard
+                    .get_text()
+                    .ok()
+                    .as_deref()
+                    .and_then(crate::theme::parse_tokens)
+                {
+                    let dark = crate::theme::is_dark_color(tokens[0]);
+                    if let Some(e) = import_e.upgrade() {
+                        e.update(gpui_app, move |_this, cx| {
+                            settings::set(
+                                crate::theme::custom_key(dark),
+                                crate::theme::serialize_tokens(&tokens).into(),
+                            );
+                            settings::set(
+                                crate::theme::setting_key(dark),
+                                crate::theme::custom_name(dark).into(),
+                            );
+                            cx.notify();
+                        });
+                    }
+                }
+            }
+        });
+
+    let copy_e = entity.clone();
+    let copy_btn = Button::new("appearance-copy")
+        .variant(ButtonVariant::Outline)
+        .size(ButtonSize::Sm)
+        .child("Copy theme tokens")
+        .on_click(move |_ev: &ClickEvent, _win: &mut Window, gpui_app: &mut GpuiApp| {
+            gpui_app.stop_propagation();
+            if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                let _ = clipboard.set_text(crate::theme::export_current());
+            }
+            if let Some(e) = copy_e.upgrade() {
+                e.update(gpui_app, |_this, cx| {
+                    cx.notify();
+                });
+            }
+        });
+
+    div()
+        .id("settings-rows")
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_h(px(0.))
+        .overflow_y_scroll()
+        .gap_4()
+        .child(settings_group(theme, vec![mode_seg, preview_seg]))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(group_label(theme, "App theme"))
+                .child(settings_group(
+                    theme,
+                    vec![
+                        theme_select(AppearanceDropdown::ThemeLight),
+                        theme_select(AppearanceDropdown::ThemeDark),
+                    ],
+                )),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(group_label(theme, "Terminal colors"))
+                .child(settings_group(
+                    theme,
+                    vec![
+                        term_select(AppearanceDropdown::TermLight),
+                        term_select(AppearanceDropdown::TermDark),
+                    ],
+                )),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .gap_4()
+                .child(div().flex_1().min_w(px(0.)).child(app_preview))
+                .child(div().flex_1().min_w(px(0.)).child(term_preview)),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .gap_2()
+                .child(import_btn)
+                .child(copy_btn),
+        )
         .into_any_element()
 }
