@@ -20,6 +20,10 @@ use wezterm_term::{
     Alert, AlertHandler, KeyModifiers, MouseButton, MouseEvent, MouseEventKind, StableRowIndex,
     Terminal, TerminalConfiguration, TerminalSize, VisibleRowIndex,
 };
+/// wezterm-term's stock window title, i.e. "this pane has never set one".
+/// Panes showing this are the ones that get a process-derived name instead.
+pub const STOCK_TITLE: &str = "wezterm";
+
 /// User events forwarded to the gpui app over an mpsc channel.
 #[derive(Debug, Clone)]
 pub enum TermEvent {
@@ -27,6 +31,11 @@ pub enum TermEvent {
     Wakeup(u64),
     /// Shell exited. Tagged with the session id.
     Exit(u64),
+    /// A background `ps` sweep came back. `titles` is `(session id, short
+    /// name)` for the panes that resolved; `asked` is every id the sweep looked
+    /// at, so the ones that resolved to nothing can be counted as misses and
+    /// backed off instead of re-swept every tick.
+    ProcTitlesReady { asked: Vec<u64>, titles: Vec<(u64, String)> },
     /// The program requested attention (OSC 9 toast notification). Tagged with the session id.
     Attention(u64),
     /// A `drop` worktree finished provisioning: create its group at `cwd`.
@@ -65,6 +74,13 @@ pub enum TermEvent {
     /// to pick up the fresh data. `number` is the PR number when the event is
     /// PR-scoped.
     PrCacheUpdated { kind: String, number: Option<u32> },
+    /// A background `git_context::fetch` finished for `cwd`. The blocking git
+    /// and `gh` calls must never run on the main thread, so the aggregate
+    /// comes back here and is folded into `App::git_contexts`.
+    GitContextReady {
+        cwd: std::path::PathBuf,
+        ctx: crate::git_context::GitContext,
+    },
     /// A bare "please repaint" nudge from a background job whose result is read
     /// from a shared cache rather than carried in the event (e.g. a finished
     /// mermaid render). Carries no state — just marks the frame dirty.
@@ -258,6 +274,12 @@ pub fn deepest_descendant(
     table: &[(u32, u32, String)],
     root_pid: u32,
 ) -> Option<String> {
+    command_chain(table, root_pid).into_iter().skip(1).next_back()
+}
+
+/// The first-child chain from `root_pid` as commands, the root's own first (when
+/// the table knows it) and the deepest last. Pure, for tests.
+pub fn command_chain(table: &[(u32, u32, String)], root_pid: u32) -> Vec<String> {
     // Build parent → children map (sorted by pid for determinism).
     let mut children: std::collections::HashMap<u32, Vec<(u32, &str)>> =
         std::collections::HashMap::new();
@@ -269,18 +291,32 @@ pub fn deepest_descendant(
         v.sort_by_key(|(pid, _)| *pid);
     }
 
-    let mut current = root_pid;
-    let mut result: Option<String> = None;
-    loop {
-        match children.get(&current).and_then(|v| v.first()) {
-            Some(&(child_pid, child_cmd)) => {
-                result = Some(child_cmd.to_owned());
-                current = child_pid;
-            }
-            None => break,
-        }
+    let mut chain = Vec::new();
+    if let Some(root) = command_for_pid(table, root_pid) {
+        chain.push(root);
     }
-    result
+    let mut current = root_pid;
+    while let Some(&(child_pid, child_cmd)) = children.get(&current).and_then(|v| v.first()) {
+        chain.push(child_cmd.to_owned());
+        current = child_pid;
+    }
+    chain
+}
+
+/// The deepest command in `root_pid`'s first-child chain that yields a usable
+/// tab name, walking back up when it doesn't — a zombie caught mid-reap at the
+/// tip must not cost the pane its name — and naming the shell itself when it has
+/// no children at all (an idle pane). Pure, for tests.
+pub fn deepest_name(table: &[(u32, u32, String)], root_pid: u32) -> Option<String> {
+    command_chain(table, root_pid).iter().rev().find_map(|cmd| title_from_command(cmd))
+}
+
+/// The command field of a single row, for the case where a shell has no
+/// children at all — an idle pane. [`deepest_descendant`] only ever returns a
+/// *descendant*, so without this an idle shell resolves to nothing and the
+/// pane keeps asking to be named. Pure, for tests.
+pub fn command_for_pid(table: &[(u32, u32, String)], pid: u32) -> Option<String> {
+    table.iter().find(|(p, _, _)| *p == pid).map(|(_, _, cmd)| cmd.clone())
 }
 
 /// Run `ps` with `args` (which must select `pid=,ppid=,command=` columns) and
@@ -305,6 +341,85 @@ fn ps_table(args: &[&str]) -> Option<Vec<(u32, u32, String)>> {
             })
             .collect(),
     )
+}
+
+/// Reduce a command line to the short name a tab shows: the program itself,
+/// with a login shell's leading `-` and any directory prefix stripped
+/// (`/usr/bin/vim file.txt` → `vim`, `-zsh` → `zsh`). Plain shell names are
+/// kept deliberately — "zsh" beats the emulator's stock "wezterm". Pure, for
+/// tests.
+pub fn title_from_command(cmd: &str) -> Option<String> {
+    let token = cmd.split_whitespace().next()?;
+    // `ps` renders a process it can no longer read as `(name)`, and a zombie's
+    // command as `<defunct>`. Catching one mid-walk is easy (the walk takes the
+    // *deepest* descendant, and short-lived children come and go), and either
+    // is a worse tab name than keeping the last one — both were seen live while
+    // verifying this against real shpool sessions.
+    if token.starts_with('(') || token.starts_with('<') {
+        return None;
+    }
+    let token = token.strip_prefix('-').unwrap_or(token);
+    let name = token.rsplit('/').next().unwrap_or(token);
+    if name.is_empty() { None } else { Some(name.to_owned()) }
+}
+
+/// Process-derived titles for a whole batch of sessions: each spec is
+/// `(session id, shpool session name, direct child pid)`, walked the same way
+/// [`foreground_command`] and [`shpool_foreground_command`] walk one — with one
+/// deliberate difference: an idle pane, whose shell has no descendant at all,
+/// resolves to the shell itself here rather than to `None`, because a tab still
+/// needs a name, and an unusable name at the tip of the walk (a zombie caught
+/// mid-reap) falls back up the chain instead of dropping the pane.
+///
+/// The point of the batch is the process table: one `ps` sweep (plus the
+/// environment-tagged sweep, and only when some spec is shpool-backed) serves
+/// every session, instead of a pair per pane. Any failure yields an empty
+/// `Vec` rather than a panic, and callers keep whatever title they had.
+pub fn foreground_titles(specs: &[(u64, Option<String>, Option<u32>)]) -> Vec<(u64, String)> {
+    if specs.is_empty() {
+        return Vec::new();
+    }
+    let Some(clean) = ps_table(&["-axo", "pid=,ppid=,command="]) else {
+        return Vec::new();
+    };
+    // `ps -axE` dumps every process's whole environment, so skip it unless
+    // some pane in this batch is shpool-backed and actually needs it.
+    let env_table = if specs.iter().any(|(_, name, _)| name.is_some()) {
+        ps_table(&["-axE", "-o", "pid=,ppid=,command="])
+    } else {
+        None
+    };
+    titles_from_tables(specs, &clean, env_table.as_deref())
+}
+
+/// The resolution half of [`foreground_titles`], over process tables already
+/// gathered. Specs that don't resolve — no pid, no matching shpool subtree, no
+/// descendant, no usable name — are simply absent from the result, so a failed
+/// `ps -axE` costs only the shpool-backed specs and never the rest. Pure, for
+/// tests.
+pub fn titles_from_tables(
+    specs: &[(u64, Option<String>, Option<u32>)],
+    clean: &[(u32, u32, String)],
+    env: Option<&[(u32, u32, String)]>,
+) -> Vec<(u64, String)> {
+    specs
+        .iter()
+        .filter_map(|(id, shpool_name, child_pid)| {
+            let root = match shpool_name {
+                Some(name) => {
+                    let needle = format!("SHPOOL_SESSION_NAME={name}");
+                    env_subtree_root(env?, &needle)?
+                },
+                None => (*child_pid)?,
+            };
+            // The chain includes the subtree root, which on the shpool arm is
+            // meant to be the daemon-side shell. Should the env tag ever land on
+            // the client instead, "shpool" is a worse tab name than no name at
+            // all — leave the pane to the next sweep.
+            let name = deepest_name(clean, root).filter(|name| name != "shpool")?;
+            Some((*id, name))
+        })
+        .collect()
 }
 
 /// Return the command line of the foreground process running inside the shell
@@ -353,6 +468,16 @@ pub struct Session {
     scroll_offset: AtomicUsize,
     /// Active mouse selection, if any (in stable-row coordinates).
     selection: Mutex<Option<Sel>>,
+    /// Consecutive sweeps that failed to resolve a name for this pane. A pane
+    /// that can never resolve — a detached shpool session whose shell is gone —
+    /// would otherwise sit in the fast sweep forever, so past a few misses it
+    /// drops back to the slow renew tick.
+    proc_title_misses: AtomicUsize,
+    /// Foreground-process name from the throttled `ps` sweep, shown while the
+    /// emulator has no title of its own. Restoring a persisted shpool pane
+    /// gives it a fresh grid whose title is the stock "wezterm" until the
+    /// program inside happens to emit OSC 0/2 — this is what fills that gap.
+    proc_title: Mutex<Option<String>>,
     /// The shpool session name if this session is backed by shpool.
     pub shpool_session: Option<String>,
     /// PID of the direct child process (shell or shpool client). None for
@@ -517,6 +642,8 @@ impl Session {
             redraw_pending,
             scroll_offset: AtomicUsize::new(0),
             selection: Mutex::new(None),
+            proc_title: Mutex::new(None),
+            proc_title_misses: AtomicUsize::new(0),
             shpool_session: shpool_name,
             child_pid,
         }
@@ -544,6 +671,8 @@ impl Session {
             redraw_pending: Arc::new(AtomicBool::new(false)),
             scroll_offset: AtomicUsize::new(0),
             selection: Mutex::new(None),
+            proc_title: Mutex::new(None),
+            proc_title_misses: AtomicUsize::new(0),
             shpool_session: None,
             child_pid: None,
         }
@@ -562,9 +691,64 @@ impl Session {
         self.redraw_pending.store(false, Ordering::Release);
     }
 
-    /// Current window title as set by escape sequences.
-    pub fn title(&self) -> String {
+    /// Current window title exactly as set by escape sequences — no fallback.
+    /// Callers deciding whether a pane still needs a process-derived name use
+    /// this; everything that displays a name uses [`Session::title`].
+    pub fn emulator_title(&self) -> String {
         self.term.lock().unwrap().get_title().to_string()
+    }
+
+    /// Record (or clear) the process-derived fallback title. Returns whether
+    /// the stored value actually changed, so a caller only repaints when a name
+    /// really moved — the poll otherwise re-resolves the same name every tick
+    /// for the life of a title-less pane.
+    pub fn set_proc_title(&self, title: Option<String>) -> bool {
+        self.proc_title_misses.store(0, Ordering::Relaxed);
+        let mut slot = self.proc_title.lock().unwrap();
+        if *slot == title {
+            return false;
+        }
+        *slot = title;
+        true
+    }
+
+    /// Record a sweep that came back with no name for this pane, and return
+    /// the number of consecutive misses.
+    pub fn note_proc_title_miss(&self) -> usize {
+        self.proc_title_misses.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Consecutive sweeps that failed to name this pane.
+    pub fn proc_title_misses(&self) -> usize {
+        self.proc_title_misses.load(Ordering::Relaxed)
+    }
+
+    /// Whether a process-derived name is already recorded.
+    pub fn has_proc_title(&self) -> bool {
+        self.proc_title.lock().unwrap().is_some()
+    }
+
+    /// Whether this pane wants a process-derived name: the emulator has set no
+    /// title of its own, so [`Session::title`] would otherwise show
+    /// [`STOCK_TITLE`].
+    pub fn needs_proc_title(&self) -> bool {
+        let title = self.emulator_title();
+        title.is_empty() || title == STOCK_TITLE
+    }
+
+    /// Current window title as set by escape sequences, falling back to the
+    /// foreground process name while the emulator has none of its own. A real
+    /// OSC title always wins.
+    pub fn title(&self) -> String {
+        // Reads the term lock once: this runs per visible tab per frame, and
+        // that lock is contended with the PTY reader thread.
+        let title = self.emulator_title();
+        if (title.is_empty() || title == STOCK_TITLE)
+            && let Some(proc_title) = self.proc_title.lock().unwrap().clone()
+        {
+            return proc_title;
+        }
+        title
     }
 
     /// Paste text, honoring bracketed-paste mode (the terminal wraps it in
@@ -998,6 +1182,171 @@ mod tests {
             std::fs::read_to_string(path).unwrap(),
             "prompt_prefix = \"custom\"\n"
         );
+    }
+
+    // ── title_from_command ──────────────────────────────────────────────────
+
+    /// A bare program name is already the title.
+    #[test]
+    fn title_from_plain_command() {
+        assert_eq!(title_from_command("zsh"), Some("zsh".to_owned()));
+    }
+
+    /// `ps` reports a login shell as `-zsh`; the dash is not part of the name.
+    #[test]
+    fn title_from_login_shell() {
+        assert_eq!(title_from_command("-zsh"), Some("zsh".to_owned()));
+    }
+
+    /// An absolute path keeps only its final component, and arguments are
+    /// dropped.
+    #[test]
+    fn title_from_absolute_command_with_args() {
+        assert_eq!(title_from_command("/usr/bin/vim file.txt"), Some("vim".to_owned()));
+    }
+
+    /// Arguments never reach the title, even for a relative program name.
+    #[test]
+    fn title_from_command_ignores_arguments() {
+        assert_eq!(title_from_command("git status --short"), Some("git".to_owned()));
+    }
+
+    /// Nothing to name: empty and whitespace-only command lines yield `None`,
+    /// so the caller leaves the existing title alone.
+    #[test]
+    fn title_from_empty_command() {
+        assert_eq!(title_from_command(""), None);
+        assert_eq!(title_from_command("   "), None);
+        assert_eq!(title_from_command("/"), None);
+    }
+
+    // ── titles_from_tables / Session::title precedence ──────────────────────
+
+    /// A shpool spec resolves through the env-tagged table, a plain spec
+    /// through its own pid, and both land in one batch from one pair of tables.
+    #[test]
+    fn titles_from_tables_resolves_both_spec_kinds() {
+        let needle = "SHPOOL_SESSION_NAME=pwrde-1-abc";
+        let env = vec![
+            pt(50, 1, "shpool daemon"),
+            pt(60, 50, format!("-zsh {needle}").as_str()),
+            pt(61, 60, format!("/usr/bin/claude --foo {needle}").as_str()),
+        ];
+        let clean = vec![
+            pt(50, 1, "shpool daemon"),
+            pt(60, 50, "-zsh"),
+            pt(61, 60, "/usr/bin/claude --foo"),
+            pt(200, 1, "-zsh"),
+            pt(201, 200, "vim notes.md"),
+        ];
+        let specs =
+            vec![(1u64, Some("pwrde-1-abc".to_owned()), None), (2u64, None, Some(200u32))];
+        assert_eq!(
+            titles_from_tables(&specs, &clean, Some(&env)),
+            vec![(1, "claude".to_owned()), (2, "vim".to_owned())],
+        );
+    }
+
+    /// An idle pane — a shell with no children — resolves to the shell itself
+    /// rather than to nothing, on both the shpool and the plain-pid arm.
+    #[test]
+    fn titles_from_tables_falls_back_to_an_idle_shell() {
+        let needle = "SHPOOL_SESSION_NAME=pwrde-1-abc";
+        let env = vec![pt(50, 1, "shpool daemon"), pt(60, 50, format!("-zsh {needle}").as_str())];
+        let clean = vec![pt(50, 1, "shpool daemon"), pt(60, 50, "-zsh"), pt(200, 1, "-bash")];
+        let specs =
+            vec![(1u64, Some("pwrde-1-abc".to_owned()), None), (2u64, None, Some(200u32))];
+        assert_eq!(
+            titles_from_tables(&specs, &clean, Some(&env)),
+            vec![(1, "zsh".to_owned()), (2, "bash".to_owned())],
+        );
+    }
+
+    /// A zombie at the tip of the walk costs the pane nothing: the name comes
+    /// from the deepest command that is usable at all.
+    #[test]
+    fn titles_from_tables_walks_up_past_an_unusable_tip() {
+        let clean =
+            vec![pt(200, 1, "-zsh"), pt(201, 200, "vim notes.md"), pt(202, 201, "<defunct>")];
+        assert_eq!(deepest_descendant(&clean, 200).as_deref(), Some("<defunct>"));
+        assert_eq!(
+            titles_from_tables(&[(1u64, None, Some(200u32))], &clean, None),
+            vec![(1, "vim".to_owned())],
+        );
+    }
+
+    /// If the env tag ever lands on the `shpool attach` client, the pane is
+    /// left unnamed rather than titled after shpool itself.
+    #[test]
+    fn titles_from_tables_never_names_a_pane_shpool() {
+        let needle = "SHPOOL_SESSION_NAME=pwrde-1-abc";
+        let env = vec![pt(80, 1, format!("shpool attach pwrde-1-abc {needle}").as_str())];
+        let clean = vec![pt(80, 1, "shpool attach pwrde-1-abc")];
+        let specs = vec![(1u64, Some("pwrde-1-abc".to_owned()), None)];
+        assert!(titles_from_tables(&specs, &clean, Some(&env)).is_empty());
+    }
+
+    /// Without the env table only the shpool-backed specs are lost: the
+    /// pid-backed ones still resolve, so one failed `ps -axE` cannot blank the
+    /// whole batch. Specs with nothing to walk are absent, never defaulted.
+    #[test]
+    fn titles_from_tables_drops_only_unresolvable_specs() {
+        let clean = vec![pt(200, 1, "-zsh"), pt(201, 200, "vim notes.md")];
+        let specs = vec![
+            (1u64, Some("pwrde-1-abc".to_owned()), None),
+            (2u64, None, Some(200u32)),
+            (3u64, None, None),
+            (4u64, None, Some(999u32)),
+        ];
+        assert_eq!(titles_from_tables(&specs, &clean, None), vec![(2, "vim".to_owned())]);
+    }
+
+    /// A miss counter that backs a hopeless pane off the fast sweep, and is
+    /// reset by any name that lands.
+    #[test]
+    fn proc_title_misses_reset_on_a_name() {
+        let session = Session::placeholder();
+        assert_eq!(session.proc_title_misses(), 0);
+        assert_eq!(session.note_proc_title_miss(), 1);
+        assert_eq!(session.note_proc_title_miss(), 2);
+        assert_eq!(session.proc_title_misses(), 2);
+        session.set_proc_title(Some("vim".to_owned()));
+        assert_eq!(session.proc_title_misses(), 0);
+    }
+
+    /// `ps` parenthesizes a process it can no longer read; that is never a tab
+    /// name, so the pane keeps whatever it had.
+    #[test]
+    fn title_from_a_reaped_process_is_rejected() {
+        assert_eq!(title_from_command("(ps)"), None);
+        assert_eq!(title_from_command("(zsh)"), None);
+        assert_eq!(title_from_command("<defunct>"), None);
+    }
+
+    /// A fresh pane carries the stock emulator title, so it wants a
+    /// process-derived name and shows it once given — and re-resolving the same
+    /// name is not a change, so no repaint is owed.
+    #[test]
+    fn stock_title_takes_the_process_fallback() {
+        let session = Session::placeholder();
+        assert_eq!(session.emulator_title(), STOCK_TITLE);
+        assert!(session.needs_proc_title());
+        assert!(session.set_proc_title(Some("vim".to_owned())));
+        assert_eq!(session.title(), "vim");
+        assert!(session.has_proc_title());
+        assert!(!session.set_proc_title(Some("vim".to_owned())));
+    }
+
+    /// A real OSC title always wins over the fallback, and a pane that has one
+    /// is never asked for a process name in the first place.
+    #[test]
+    fn real_osc_title_beats_the_process_fallback() {
+        let session = Session::placeholder();
+        session.set_proc_title(Some("vim".to_owned()));
+        session.term.lock().unwrap().advance_bytes(b"\x1b]0;real\x07");
+        assert_eq!(session.emulator_title(), "real");
+        assert!(!session.needs_proc_title());
+        assert_eq!(session.title(), "real");
     }
 
     // ── foreground_command / deepest_descendant ──────────────────────────────

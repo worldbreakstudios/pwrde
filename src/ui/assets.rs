@@ -204,7 +204,34 @@ const ICONS: &[(&str, &[u8])] = &[
         "icons/circle-check.svg",
         br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/></svg>"##,
     ),
+    // ── Sidebar PR-state icons ─────────────────────────────────────────
+    // Traced from the GANTRY sidebar mock, which draws each pull-request
+    // state as a little commit graph rather than a generic symbol: two nodes
+    // on a trunk, plus whatever the third node is doing. `currentColor` so
+    // gpui's monochrome `svg()` can tint them per state.
+    (
+        "icons/git/pr-none.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><circle cx="4" cy="3.5" r="1.7"/><circle cx="4" cy="12.5" r="1.7"/><circle cx="12" cy="3.5" r="1.7"/><path d="M4 5.2v5.6"/><path d="M12 5.2c0 3-3.2 3.3-6.3 3.3"/></svg>"##,
+    ),
+    (
+        "icons/git/pr-draft.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><circle cx="4" cy="3.5" r="1.7"/><circle cx="4" cy="12.5" r="1.7"/><path d="M4 5.2v5.6"/><circle cx="12" cy="12.5" r="1.7"/><circle cx="12" cy="3.5" r="1" fill="currentColor" stroke="none"/><circle cx="12" cy="7.5" r="1" fill="currentColor" stroke="none"/></svg>"##,
+    ),
+    (
+        "icons/git/pr-open.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><circle cx="4" cy="3.5" r="1.7"/><circle cx="4" cy="12.5" r="1.7"/><circle cx="12" cy="12.5" r="1.7"/><path d="M4 5.2v5.6"/><path d="M8.7 3.5h1.55A1.75 1.75 0 0 1 12 5.25v5.4"/><path d="M7.4 2.2l1.3 1.3-1.3 1.3"/></svg>"##,
+    ),
+    (
+        "icons/git/pr-merged.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><circle cx="4" cy="3.5" r="1.7"/><circle cx="4" cy="12.5" r="1.7"/><circle cx="12" cy="8" r="1.7"/><path d="M4 5.2v5.6"/><path d="M4 5.5c.4 2.3 2.6 2.5 6.1 2.5"/></svg>"##,
+    ),
 ];
+
+/// Sidebar PR-state icons (see the table above).
+pub const ICON_PR_NONE: &str = "icons/git/pr-none.svg";
+pub const ICON_PR_DRAFT: &str = "icons/git/pr-draft.svg";
+pub const ICON_PR_OPEN: &str = "icons/git/pr-open.svg";
+pub const ICON_PR_MERGED: &str = "icons/git/pr-merged.svg";
 
 pub const ICON_CIRCLE_ALERT: &str = "icons/circle-alert.svg";
 pub const ICON_LOADER: &str = "icons/loader.svg";

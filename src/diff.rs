@@ -68,6 +68,19 @@ pub struct DiffHunk {
     pub lines: Vec<DiffLine>,
 }
 
+impl DiffHunk {
+    /// The function/scope heading git appends after the closing `@@`, if any
+    /// (e.g. `impl App {` in `@@ -a,b +c,d @@ impl App {`). Empty when absent.
+    // The hunk row currently renders the whole header line verbatim; this
+    // accessor is used by the context-expansion UI.
+    pub fn section(&self) -> &str {
+        match self.header.rfind("@@") {
+            Some(i) => self.header[i + 2..].trim(),
+            None => "",
+        }
+    }
+}
+
 /// A single file's worth of diff.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiffFile {
@@ -80,6 +93,11 @@ pub struct DiffFile {
     pub deletions: u32,
     pub binary: bool,
     pub hunks: Vec<DiffHunk>,
+    /// New-side full file content (post-change), one entry per line, when it
+    /// could be fetched. Used to expand elided context. `None` disables
+    /// expansion for this file. Not part of the parsed diff — the producers
+    /// fill it in.
+    pub new_lines: Option<std::sync::Arc<Vec<String>>>,
 }
 
 impl DiffFile {
@@ -197,6 +215,7 @@ pub fn parse(diff: &str) -> Vec<DiffFile> {
                 deletions: 0,
                 binary: false,
                 hunks: Vec::new(),
+                new_lines: None,
             });
             explicit_status = None;
             old_no = 0;
@@ -267,9 +286,12 @@ pub fn parse(diff: &str) -> Vec<DiffFile> {
             continue;
         }
         if line.starts_with("@@") {
-            let header_end = line[2..].find("@@").map(|i| i + 4).unwrap_or(line.len());
-            let header = line[..header_end].to_string();
-            let (o, n) = parse_hunk_header(&header);
+            // Parse the numbers from only the `@@ … @@` prefix so a section
+            // heading containing `-`/`+` tokens can't corrupt them, but keep
+            // the whole line as the displayed header.
+            let num_end = line[2..].find("@@").map(|i| i + 4).unwrap_or(line.len());
+            let (o, n) = parse_hunk_header(&line[..num_end]);
+            let header = line.to_string();
             old_no = o;
             new_no = n;
             if let Some(st) = explicit_status {
@@ -448,6 +470,7 @@ diff --git a/b.rs b/b.rs\n\
             deletions: 0,
             binary: false,
             hunks: Vec::new(),
+            new_lines: None,
         };
         assert_eq!(mk("src/main.rs").extension(), "rs");
         assert_eq!(mk("Makefile").extension(), "makefile");

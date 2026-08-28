@@ -33,6 +33,10 @@ gpui_platform = { git = "https://github.com/zed-industries/zed", package = "gpui
 arboard = "3.6.1"
 # Both already in gpui's dependency tree at these versions; used to reach the
 # NSWindow and hide AppKit's titlebar top-highlight hairline (see main.rs).
+# `localtime_r`, for the sidebar's Messages-style day buckets: they are
+# wall-clock ideas, so a UTC-only day boundary would misfile an evening stamp
+# as `Yesterday` west of Greenwich. Already in gpui's tree at this version.
+libc = "0.2"
 objc = "0.2"
 raw-window-handle = "0.6"
 serde = { version = "1", features = ["derive"] }

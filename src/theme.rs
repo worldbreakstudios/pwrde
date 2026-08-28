@@ -144,6 +144,17 @@ fn find(name: &str) -> Option<&'static Theme> {
 
 /// The seven tokens in string order: gradient_from, gradient_to, card,
 /// term_bg, ink, text_bright, accent.
+/// The GANTRY mock's accent — vitrine's `--accent`, `oklch(0.60 0.19 258)`
+/// resolved to sRGB, and its dark-theme sibling.
+///
+/// Pinned rather than taken from the chrome theme's `accent`, which the user
+/// retints freely: the sidebar's selected card and the focused pane's tab are a
+/// port of a specific design, and they have to agree with each other. Shared
+/// from here so the sidebar and the renderer cannot drift apart.
+pub fn gantry_accent(dark: bool) -> (u8, u8, u8) {
+    if dark { (74, 145, 248) } else { (41, 124, 239) }
+}
+
 pub type Tokens = [(u8, u8, u8); 7];
 
 /// One `#rrggbb` (or bare `rrggbb`) hex color, case-insensitive.

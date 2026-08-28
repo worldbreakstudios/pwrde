@@ -8,7 +8,9 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::io::Read;
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::diff::{DiffFile, DiffHunk, DiffLine, FileStatus, LineKind};
 
@@ -59,14 +61,112 @@ pub fn augmented_command(program: &str) -> Command {
 fn git(repo: &Path) -> Command {
     let mut cmd = augmented_command("git");
     cmd.current_dir(repo);
+    // Pin the locale: git translates its porcelain-adjacent output, and we
+    // parse some of it by keyword. Under a German locale `--shortstat` reads
+    // "3 Dateien geändert, 42 Zeilen hinzugefügt(+)", which
+    // [`parse_shortstat`] would score as all zeros — a dirty tree silently
+    // reporting "no code changes" on its sidebar card.
+    cmd.env("LC_ALL", "C");
     cmd
+}
+
+// ── Timed shell-outs ──────────────────────────────────────────────────────
+
+/// Why a shell-out produced no usable output.
+///
+/// A wedged `git` (a hung credential helper, a network filesystem) must never
+/// pin the thread that called it, so every invocation runs under a deadline.
+/// Callers care about *which* failure they hit — a timeout is worth retrying,
+/// a missing binary never is — so the cases stay distinct instead of
+/// collapsing into one opaque string.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CommandError {
+    /// The binary is not on the augmented PATH (ENOENT): not installed.
+    NotInstalled(String),
+    /// Still running when its deadline expired; the child was killed.
+    TimedOut(String),
+    /// The OS refused the spawn, or waiting on the child failed.
+    Spawn(String),
+}
+
+impl std::fmt::Display for CommandError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CommandError::NotInstalled(program) => write!(f, "{program} is not installed"),
+            CommandError::TimedOut(program) => write!(f, "{program} timed out"),
+            CommandError::Spawn(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+/// Deadline for the cheapest local reads (h20's 2s reflog tier).
+pub const TIMEOUT_QUICK: Duration = Duration::from_secs(2);
+/// Deadline for ref plumbing: `symbolic-ref`, `rev-parse`, `worktree list`.
+pub const TIMEOUT_REF: Duration = Duration::from_secs(3);
+/// Deadline for a network-backed list read (`gh pr list`).
+pub const TIMEOUT_LIST: Duration = Duration::from_secs(4);
+/// Deadline for history walks: `merge-base`, `diff`, `show`.
+pub const TIMEOUT_HISTORY: Duration = Duration::from_secs(5);
+
+/// Run `cmd` to completion under `limit`, killing it when the deadline passes.
+///
+/// std has no timed `wait` and pwrde takes no dependency for one, so this polls
+/// `try_wait` while two reader threads drain the pipes — a chatty child whose
+/// pipe filled would otherwise block forever on a write we never read.
+pub fn output_within(cmd: &mut Command, limit: Duration) -> Result<Output, CommandError> {
+    /// How often to check on the child; short enough to feel instant, long
+    /// enough not to spin a core while we wait.
+    const POLL: Duration = Duration::from_millis(5);
+
+    let program = cmd.get_program().to_string_lossy().into_owned();
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => CommandError::NotInstalled(program.clone()),
+        _ => CommandError::Spawn(format!("{program}: {e}")),
+    })?;
+    let mut out_pipe = child.stdout.take();
+    let mut err_pipe = child.stderr.take();
+    let out_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(pipe) = out_pipe.as_mut() {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let err_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(pipe) = err_pipe.as_mut() {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let deadline = Instant::now() + limit;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let stdout = out_reader.join().unwrap_or_default();
+                let stderr = err_reader.join().unwrap_or_default();
+                return Ok(Output { status, stdout, stderr });
+            }
+            Ok(None) => {}
+            Err(e) => return Err(CommandError::Spawn(format!("{program}: {e}"))),
+        }
+        if Instant::now() >= deadline {
+            // Kill *and* reap: an unreaped child would linger as a zombie.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(CommandError::TimedOut(program));
+        }
+        std::thread::sleep(POLL);
+    }
 }
 
 /// The remote's default branch (`origin/main` vs `origin/master`), mirroring
 /// drop's detection: `origin/HEAD`, then `origin/main`, then `origin/master`.
 /// `None` when there is no remote (or git is unavailable).
 pub fn default_remote_branch(repo: &Path) -> Option<String> {
-    if let Ok(out) = git(repo).args(["symbolic-ref", "refs/remotes/origin/HEAD"]).output()
+    if let Ok(out) =
+        output_within(git(repo).args(["symbolic-ref", "refs/remotes/origin/HEAD"]), TIMEOUT_REF)
         && out.status.success()
     {
         let text = String::from_utf8_lossy(&out.stdout);
@@ -76,10 +176,11 @@ pub fn default_remote_branch(repo: &Path) -> Option<String> {
         }
     }
     for candidate in ["origin/main", "origin/master"] {
-        let found = git(repo)
-            .args(["rev-parse", "--verify", "--quiet", candidate])
-            .output()
-            .is_ok_and(|o| o.status.success());
+        let found = output_within(
+            git(repo).args(["rev-parse", "--verify", "--quiet", candidate]),
+            TIMEOUT_REF,
+        )
+        .is_ok_and(|o| o.status.success());
         if found {
             return Some(candidate.to_string());
         }
@@ -133,7 +234,8 @@ pub fn list_branches(repo: &Path) -> Vec<Branch> {
 /// linked worktrees (e.g. the ones `drop` creates under `.worktrees/`). Empty
 /// when git is unavailable or the directory is not a repo.
 pub fn list_worktrees(repo: &Path) -> Vec<Worktree> {
-    let Ok(out) = git(repo).args(["worktree", "list", "--porcelain"]).output() else {
+    let Ok(out) = output_within(git(repo).args(["worktree", "list", "--porcelain"]), TIMEOUT_REF)
+    else {
         return Vec::new();
     };
     if !out.status.success() {
@@ -212,10 +314,7 @@ pub fn scope_from_git_dirs(
 ///
 /// Returns `None` when `dir` is not inside a git repo or the command fails.
 pub fn repo_root(dir: &Path) -> Option<PathBuf> {
-    let out = git(dir)
-        .args(["rev-parse", "--git-common-dir"])
-        .output()
-        .ok()?;
+    let out = output_within(git(dir).args(["rev-parse", "--git-common-dir"]), TIMEOUT_REF).ok()?;
     if !out.status.success() {
         return None;
     }
@@ -288,7 +387,8 @@ pub struct LocalDiff {
 /// The current branch name (`git rev-parse --abbrev-ref HEAD`), or `None` when
 /// detached / not a repo. Used to scope the PR tool to the checked-out branch.
 pub fn current_branch(dir: &Path) -> Option<String> {
-    let out = git(dir).args(["rev-parse", "--abbrev-ref", "HEAD"]).output().ok()?;
+    let out = output_within(git(dir).args(["rev-parse", "--abbrev-ref", "HEAD"]), TIMEOUT_QUICK)
+        .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -296,9 +396,167 @@ pub fn current_branch(dir: &Path) -> Option<String> {
     (!name.is_empty() && name != "HEAD").then_some(name)
 }
 
+/// Derive a repo name from a `--git-common-dir` path.
+///
+/// The common dir is `<repo>/.git` for a normal checkout and a bare `<repo>.git`
+/// for a bare one, so strip the final `.git` component either way. Pure so it
+/// can be exercised without a repo on disk.
+fn repo_name_from_common_dir(common: &Path) -> Option<String> {
+    let name = common.file_name()?.to_string_lossy().to_string();
+    if name == ".git" {
+        // `<repo>/.git` — the repo is the directory holding it.
+        return common
+            .parent()
+            .and_then(Path::file_name)
+            .map(|n| n.to_string_lossy().to_string())
+            .filter(|n| !n.is_empty());
+    }
+    // A bare repo: `<repo>.git`, or an already-named git dir.
+    Some(name.strip_suffix(".git").unwrap_or(&name).to_string()).filter(|n| !n.is_empty())
+}
+
+/// The repository's display name for `dir`, or `None` outside a repo.
+///
+/// Resolved from `git rev-parse --git-common-dir` rather than the basename of
+/// `--show-toplevel`: inside a linked worktree the toplevel is the *worktree's*
+/// directory (`.worktrees/04dc3ffa/pwrde`), which names the branch's scratch
+/// checkout instead of the repo. The common dir always points back at the
+/// primary `.git`, which pwrde needs because it runs from worktrees itself.
+pub fn repo_display_name(dir: &Path) -> Option<String> {
+    let out = output_within(git(dir).args(["rev-parse", "--git-common-dir"]), TIMEOUT_REF).ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if raw.is_empty() {
+        return None;
+    }
+    // git answers with a path relative to the cwd (often plain `.git`).
+    let common = Path::new(&raw);
+    let absolute = if common.is_absolute() { common.to_path_buf() } else { dir.join(common) };
+    repo_name_from_common_dir(&absolute)
+}
+
+/// How much uncommitted work a worktree is carrying: the counts git's
+/// `--shortstat` line reports for staged + unstaged changes vs `HEAD`.
+/// Untracked files are *not* counted (git excludes them from that diff).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DirtyStats {
+    /// Files touched, `0` when the tree is clean.
+    pub files: u32,
+    /// Added lines across those files.
+    pub insertions: u32,
+    /// Removed lines across those files.
+    pub deletions: u32,
+}
+
+/// Parse one `git diff --shortstat` line, e.g.
+/// `" 3 files changed, 42 insertions(+), 7 deletions(-)"`.
+///
+/// git omits the insertion or deletion clause entirely when it is zero, and
+/// prints nothing at all for a clean tree — both cases fall out as zeros. Split
+/// on commas and read the leading number of each clause rather than pulling in
+/// a regex engine for three patterns.
+fn parse_shortstat(text: &str) -> DirtyStats {
+    let mut stats = DirtyStats::default();
+    for clause in text.trim().split(',') {
+        let clause = clause.trim();
+        let digits: String = clause.chars().take_while(char::is_ascii_digit).collect();
+        let Ok(n) = digits.parse::<u32>() else { continue };
+        // Singular and plural both match: "file"/"files", "insertion"/"insertions".
+        if clause.contains("file") {
+            stats.files = n;
+        } else if clause.contains("insertion") {
+            stats.insertions = n;
+        } else if clause.contains("deletion") {
+            stats.deletions = n;
+        }
+    }
+    stats
+}
+
+/// Committed changes on this branch: `git diff <merge-base with base> HEAD
+/// --shortstat`.
+///
+/// The counterpart to [`dirty_stats`], and the number a sidebar card actually
+/// wants: `dirty_stats` compares the working tree against `HEAD`, so a branch
+/// with everything committed reports zero — which read as "no code changes" on
+/// a card whose pull request had thousands.
+///
+/// Two `--shortstat` calls rather than the pull request's own
+/// `additions`/`deletions`: those live only on `PrDetail` (one PR per request),
+/// this works with no PR at all, and it costs one cheap git call instead of a
+/// heavier `pr list` payload.
+///
+/// `None` when the base cannot be resolved (no remote, unborn HEAD) or git
+/// fails — the card then falls back to what it can show.
+pub fn branch_stats(dir: &Path) -> Option<DirtyStats> {
+    let base = default_remote_branch(dir)?;
+    let out = output_within(git(dir).args(["merge-base", "HEAD", &base]), TIMEOUT_HISTORY).ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let fork = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if fork.is_empty() {
+        return None;
+    }
+    let out =
+        output_within(git(dir).args(["diff", &fork, "HEAD", "--shortstat"]), TIMEOUT_HISTORY)
+            .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(parse_shortstat(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// Uncommitted change counts for `dir` (`git diff HEAD --shortstat`).
+///
+/// Far cheaper than [`local_diff`] + `diff::parse`, which is why the per-group
+/// status card uses it. `None` when git is unavailable, `dir` is not a repo, or
+/// there is no `HEAD` yet (a fresh repo with no commits).
+pub fn dirty_stats(dir: &Path) -> Option<DirtyStats> {
+    let out =
+        output_within(git(dir).args(["diff", "HEAD", "--shortstat"]), TIMEOUT_HISTORY).ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(parse_shortstat(&String::from_utf8_lossy(&out.stdout)))
+}
+
 /// Upper bound on an untracked file's bytes we'll render as a diff; larger
 /// files are listed as an add with no hunk body (mirrors h20's guard).
 const UNTRACKED_MAX_BYTES: usize = 256 * 1024;
+
+/// Read the full new-side content of `path` at git revision `rev` (or the
+/// working tree when `rev` is None), split into lines with no trailing newline.
+/// `None` when it can't be read (missing object, binary, or larger than the
+/// untracked cap) — expansion then stays disabled for that file.
+pub fn file_lines_at(
+    dir: &Path,
+    rev: Option<&str>,
+    path: &str,
+) -> Option<std::sync::Arc<Vec<String>>> {
+    let bytes: Vec<u8> = match rev {
+        None => std::fs::read(dir.join(path)).ok()?,
+        Some(r) => {
+            let out =
+                output_within(git(dir).args(["show", &format!("{r}:{path}")]), TIMEOUT_HISTORY)
+                    .ok()?;
+            if !out.status.success() {
+                return None;
+            }
+            out.stdout
+        }
+    };
+    if bytes.len() > UNTRACKED_MAX_BYTES {
+        return None;
+    }
+    if bytes.iter().take(8000).any(|&b| b == 0) {
+        return None; // binary
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    Some(std::sync::Arc::new(text.lines().map(str::to_string).collect()))
+}
 
 /// Gather + parse a local diff. `base_override` (branch mode only) forces the
 /// base branch; otherwise the remote default branch is used.
@@ -318,6 +576,13 @@ pub fn local_diff(
             }
             let text = String::from_utf8_lossy(&out.stdout);
             let mut files = crate::diff::parse(&text);
+            // New side = the working tree. Untracked files are appended after
+            // this (all-add, no gaps), so they keep `new_lines: None`.
+            for f in &mut files {
+                if !f.binary {
+                    f.new_lines = file_lines_at(dir, None, &f.path);
+                }
+            }
             files.extend(untracked_files(dir));
             Ok(LocalDiff { files, base_ref: "HEAD".into() })
         }
@@ -327,7 +592,8 @@ pub fn local_diff(
                 .or_else(|| default_remote_branch(dir))
                 .ok_or_else(|| "no base branch (no remote default)".to_string())?;
             // Diff against the merge-base so only this branch's own commits show.
-            let mb_out = git(dir).args(["merge-base", "HEAD", &base]).output();
+            let mb_out =
+                output_within(git(dir).args(["merge-base", "HEAD", &base]), TIMEOUT_HISTORY);
             let base_rev = match mb_out {
                 Ok(o) if o.status.success() => {
                     String::from_utf8_lossy(&o.stdout).trim().to_string()
@@ -346,7 +612,14 @@ pub fn local_diff(
                 return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
             }
             let text = String::from_utf8_lossy(&out.stdout);
-            Ok(LocalDiff { files: crate::diff::parse(&text), base_ref: base })
+            let mut files = crate::diff::parse(&text);
+            // New side = HEAD (this mode shows committed work only).
+            for f in &mut files {
+                if !f.binary {
+                    f.new_lines = file_lines_at(dir, Some("HEAD"), &f.path);
+                }
+            }
+            Ok(LocalDiff { files, base_ref: base })
         }
     }
 }
@@ -355,8 +628,10 @@ pub fn local_diff(
 /// pure additions — `git diff` omits them, but a working-tree review wants to
 /// see brand-new files.
 fn untracked_files(dir: &Path) -> Vec<DiffFile> {
-    let Ok(out) = git(dir).args(["ls-files", "--others", "--exclude-standard", "-z"]).output()
-    else {
+    let Ok(out) = output_within(
+        git(dir).args(["ls-files", "--others", "--exclude-standard", "-z"]),
+        TIMEOUT_HISTORY,
+    ) else {
         return Vec::new();
     };
     if !out.status.success() {
@@ -388,6 +663,7 @@ fn untracked_entry(dir: &Path, rel: &str) -> DiffFile {
             deletions: 0,
             binary: is_binary,
             hunks: Vec::new(),
+            new_lines: None,
         };
     }
     let content = String::from_utf8_lossy(&bytes);
@@ -416,6 +692,7 @@ fn untracked_entry(dir: &Path, rel: &str) -> DiffFile {
         deletions: 0,
         binary: false,
         hunks,
+        new_lines: None,
     }
 }
 
@@ -443,6 +720,76 @@ mod tests {
     #[test]
     fn sanitize_empty_is_none() {
         assert_eq!(sanitize_worktree_slug(""), None);
+    }
+
+    #[test]
+    fn output_within_kills_a_wedged_child() {
+        // `sleep 30` will never finish inside the deadline: the helper must
+        // give up (and reap the child) rather than block the caller.
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        let err = output_within(&mut cmd, Duration::from_millis(150)).unwrap_err();
+        assert!(matches!(err, CommandError::TimedOut(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn output_within_reports_a_missing_binary_distinctly() {
+        let mut cmd = Command::new("pwrde-definitely-not-a-real-binary");
+        let err = output_within(&mut cmd, Duration::from_secs(1)).unwrap_err();
+        assert!(matches!(err, CommandError::NotInstalled(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn repo_name_comes_from_the_common_dir_not_the_worktree() {
+        // A linked worktree's common dir still points at the primary checkout.
+        assert_eq!(
+            repo_name_from_common_dir(Path::new("/Users/me/src/pwrde/.git")),
+            Some("pwrde".to_string())
+        );
+        // Bare repos name themselves `<repo>.git`.
+        assert_eq!(
+            repo_name_from_common_dir(Path::new("/srv/git/pwrde.git")),
+            Some("pwrde".to_string())
+        );
+        assert_eq!(repo_name_from_common_dir(Path::new("/")), None);
+    }
+
+    #[test]
+    fn shortstat_parses_full_line() {
+        assert_eq!(
+            parse_shortstat(" 3 files changed, 42 insertions(+), 7 deletions(-)\n"),
+            DirtyStats { files: 3, insertions: 42, deletions: 7 }
+        );
+    }
+
+    #[test]
+    fn shortstat_without_insertions() {
+        assert_eq!(
+            parse_shortstat(" 2 files changed, 9 deletions(-)\n"),
+            DirtyStats { files: 2, insertions: 0, deletions: 9 }
+        );
+    }
+
+    #[test]
+    fn shortstat_without_deletions() {
+        assert_eq!(
+            parse_shortstat(" 2 files changed, 9 insertions(+)\n"),
+            DirtyStats { files: 2, insertions: 9, deletions: 0 }
+        );
+    }
+
+    #[test]
+    fn shortstat_empty_is_zeros() {
+        assert_eq!(parse_shortstat(""), DirtyStats::default());
+        assert_eq!(parse_shortstat("\n"), DirtyStats::default());
+    }
+
+    #[test]
+    fn shortstat_singular_line() {
+        assert_eq!(
+            parse_shortstat(" 1 file changed, 1 insertion(+), 1 deletion(-)\n"),
+            DirtyStats { files: 1, insertions: 1, deletions: 1 }
+        );
     }
 
     #[test]

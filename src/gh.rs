@@ -55,6 +55,23 @@ fn cli_cmd_sync(dir: &Path, sync: bool) -> Command {
 /// exit surfaces stderr so failures (auth, no remote) are legible.
 fn run(mut cmd: Command) -> Result<String, String> {
     let out = cmd.output().map_err(|e| format!("{}: {e}", cli()))?;
+    finish(out)
+}
+
+/// Run the CLI under `limit`, killing it when the deadline passes.
+///
+/// Used by the reads a background poller drives: a wedged daemon or a stalled
+/// network call must never pin that thread forever. The three failure modes
+/// stay distinguishable in the message — `is not installed` (ENOENT), `timed
+/// out` (deadline), and the CLI's own stderr for everything else (auth, no
+/// remote), which `is_auth_failure` can recognize.
+fn run_within(mut cmd: Command, limit: std::time::Duration) -> Result<String, String> {
+    let out = crate::git::output_within(&mut cmd, limit).map_err(|e| e.to_string())?;
+    finish(out)
+}
+
+/// Turn a finished invocation into stdout, or stderr as the error message.
+fn finish(out: std::process::Output) -> Result<String, String> {
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         let msg = err.trim();
@@ -65,6 +82,19 @@ fn run(mut cmd: Command) -> Result<String, String> {
         });
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Whether a CLI failure message is an authentication problem rather than a
+/// timeout, a missing binary, or a missing remote.
+///
+/// The distinction is what the UI needs: an auth failure is the one the user
+/// can fix (`gh auth login`), so it deserves different wording than a poll
+/// that simply timed out and will be retried.
+pub fn is_auth_failure(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    ["auth login", "authentication", "not logged in", "bad credentials", "unauthorized"]
+        .iter()
+        .any(|needle| lower.contains(needle))
 }
 
 // ── Normalized model ──────────────────────────────────────────────────────
@@ -78,6 +108,13 @@ pub struct PrSummary {
     pub is_draft: bool,
     pub head: String,
     pub author: String,
+    /// APPROVED / CHANGES_REQUESTED / REVIEW_REQUIRED — `None` when GitHub
+    /// reports no verdict yet (the CLI hands back `""` for un-reviewed PRs).
+    pub review_decision: Option<String>,
+    /// MERGEABLE / CONFLICTING / UNKNOWN, straight from the CLI.
+    pub mergeable: Option<String>,
+    /// The check rollup, so a list row can show CI without a detail fetch.
+    pub checks: Vec<Check>,
 }
 
 /// A PR's detail, everything the panel header + conversation needs.
@@ -291,6 +328,12 @@ struct RawSummary {
     head_ref_name: String,
     #[serde(default)]
     author: RawAuthor,
+    #[serde(default)]
+    review_decision: Option<String>,
+    #[serde(default)]
+    mergeable: Option<String>,
+    #[serde(default)]
+    status_check_rollup: Vec<RawCheck>,
 }
 
 #[derive(Deserialize)]
@@ -421,13 +464,33 @@ fn normalize_check(raw: RawCheck) -> Check {
     Check { name, status, url }
 }
 
+/// Collapse a PR's checks into the single status a card can show.
+///
+/// Precedence is deliberate: any failure wins, then anything still running,
+/// otherwise success. `Neutral` / `Skipped` / `Cancelled` are not interesting
+/// enough to outrank success. Returns `None` for an empty slice so a source
+/// that simply carries no checks never wipes a status we already know.
+pub fn aggregate_check_status(checks: &[Check]) -> Option<CheckStatus> {
+    if checks.is_empty() {
+        return None;
+    }
+    if checks.iter().any(|c| c.status == CheckStatus::Failure) {
+        return Some(CheckStatus::Failure);
+    }
+    if checks.iter().any(|c| c.status == CheckStatus::Pending) {
+        return Some(CheckStatus::Pending);
+    }
+    Some(CheckStatus::Success)
+}
+
 // ── Reads ───────────────────────────────────────────────────────────────
 
 const DETAIL_FIELDS: &str = "number,title,body,state,isDraft,author,createdAt,headRefName,\
 baseRefName,additions,deletions,changedFiles,reviewDecision,mergeable,url,labels,comments,\
 reviews,statusCheckRollup";
 
-const LIST_FIELDS: &str = "number,title,state,isDraft,headRefName,author";
+const LIST_FIELDS: &str =
+    "number,title,state,isDraft,headRefName,author,reviewDecision,mergeable,statusCheckRollup";
 
 fn parse_summaries(out: &str) -> Result<Vec<PrSummary>, String> {
     let trimmed = out.trim();
@@ -445,6 +508,10 @@ fn parse_summaries(out: &str) -> Result<Vec<PrSummary>, String> {
             is_draft: r.is_draft,
             head: r.head_ref_name,
             author: r.author.login,
+            // The CLI returns "" (not null) for a PR nobody has reviewed.
+            review_decision: r.review_decision.filter(|s| !s.is_empty()),
+            mergeable: r.mergeable.filter(|s| !s.is_empty()),
+            checks: r.status_check_rollup.into_iter().map(normalize_check).collect(),
         })
         .collect())
 }
@@ -455,14 +522,16 @@ fn parse_summaries(out: &str) -> Result<Vec<PrSummary>, String> {
 fn fetch_list(dir: &Path, args: &[&str]) -> Result<Vec<PrSummary>, String> {
     let mut cmd = cli_cmd_sync(dir, false);
     cmd.args(args);
-    let summaries = parse_summaries(&run(cmd)?)?;
+    // A list read is network-backed and polled from a background thread, so it
+    // runs under h20's 4s list tier instead of blocking that thread forever.
+    let summaries = parse_summaries(&run_within(cmd, crate::git::TIMEOUT_LIST)?)?;
     if !summaries.is_empty() || !use_async() {
         return Ok(summaries);
     }
     // Empty on the async path may be a cold miss; block once on a real read.
     let mut cmd = cli_cmd_sync(dir, true);
     cmd.args(args);
-    parse_summaries(&run(cmd)?)
+    parse_summaries(&run_within(cmd, crate::git::TIMEOUT_LIST)?)
 }
 
 /// List all open PRs for the repo containing `dir` (repo resolved from the git
@@ -835,6 +904,26 @@ fn parse_thread_node(node: &serde_json::Value) -> Option<ReviewThread> {
     })
 }
 
+/// The PR head commit SHA via the configured CLI, or None.
+fn pr_head_sha(dir: &Path, number: u32) -> Option<String> {
+    let n = number.to_string();
+    let mut cmd = cli_cmd_sync(dir, false);
+    cmd.args(["pr", "view", &n, "--json", "headRefOid"]);
+    let out = run(cmd).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&out).ok()?;
+    v.get("headRefOid")?.as_str().map(str::to_string)
+}
+
+/// Fill in each file's new-side content from the PR head commit, when that
+/// commit happens to be present locally. Best effort: anything that fails
+/// leaves `new_lines` as `None` and expansion stays disabled.
+fn fill_new_lines(dir: &Path, number: u32, files: &mut [DiffFile]) {
+    let Some(sha) = pr_head_sha(dir, number) else { return };
+    for f in files.iter_mut().filter(|f| !f.binary) {
+        f.new_lines = crate::git::file_lines_at(dir, Some(&sha), &f.path);
+    }
+}
+
 /// Fetch and parse a PR's unified diff.
 pub fn pr_diff(dir: &Path, number: u32) -> Result<Vec<DiffFile>, String> {
     let n = number.to_string();
@@ -842,14 +931,17 @@ pub fn pr_diff(dir: &Path, number: u32) -> Result<Vec<DiffFile>, String> {
     let mut cmd = cli_cmd_sync(dir, false);
     cmd.args(args);
     let out = run(cmd)?;
-    let files = crate::diff::parse(&out);
+    let mut files = crate::diff::parse(&out);
     // An empty diff on the async path is likely a cold miss (a PR always has a
     // diff); block once for the real one.
     if files.is_empty() && use_async() {
         let mut cmd = cli_cmd_sync(dir, true);
         cmd.args(args);
-        return Ok(crate::diff::parse(&run(cmd)?));
+        let mut files = crate::diff::parse(&run(cmd)?);
+        fill_new_lines(dir, number, &mut files);
+        return Ok(files);
     }
+    fill_new_lines(dir, number, &mut files);
     Ok(files)
 }
 
@@ -975,6 +1067,69 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_check_status_follows_failure_pending_success() {
+        let chk = |status| Check {
+            name: "c".into(),
+            status,
+            url: String::new(),
+        };
+        // No checks at all is "unknown", not "green".
+        assert_eq!(aggregate_check_status(&[]), None);
+        assert_eq!(
+            aggregate_check_status(&[chk(CheckStatus::Success), chk(CheckStatus::Success)]),
+            Some(CheckStatus::Success)
+        );
+        assert_eq!(
+            aggregate_check_status(&[chk(CheckStatus::Success), chk(CheckStatus::Pending)]),
+            Some(CheckStatus::Pending)
+        );
+        assert_eq!(
+            aggregate_check_status(&[chk(CheckStatus::Success), chk(CheckStatus::Failure)]),
+            Some(CheckStatus::Failure)
+        );
+        // Failure outranks anything still running.
+        assert_eq!(
+            aggregate_check_status(&[chk(CheckStatus::Pending), chk(CheckStatus::Failure)]),
+            Some(CheckStatus::Failure)
+        );
+        // Neutral/skipped/cancelled never outrank success.
+        assert_eq!(
+            aggregate_check_status(&[
+                chk(CheckStatus::Skipped),
+                chk(CheckStatus::Neutral),
+                chk(CheckStatus::Cancelled),
+            ]),
+            Some(CheckStatus::Success)
+        );
+    }
+
+    #[test]
+    fn aggregate_check_status_counts_unfinished_check_run_as_pending() {
+        let running = normalize_check(RawCheck {
+            name: Some("build".into()),
+            context: None,
+            status: Some("QUEUED".into()),
+            conclusion: None,
+            state: None,
+            details_url: None,
+            target_url: None,
+        });
+        let done = normalize_check(RawCheck {
+            name: Some("lint".into()),
+            context: None,
+            status: Some("COMPLETED".into()),
+            conclusion: Some("SUCCESS".into()),
+            state: None,
+            details_url: None,
+            target_url: None,
+        });
+        assert_eq!(
+            aggregate_check_status(&[done, running]),
+            Some(CheckStatus::Pending)
+        );
+    }
+
+    #[test]
     fn normalizes_legacy_status_context() {
         let c = normalize_check(RawCheck {
             name: None,
@@ -1005,6 +1160,95 @@ mod tests {
         assert!(raw[0].is_draft);
         assert_eq!(raw[0].head_ref_name, "feat");
         assert_eq!(raw[0].author.login, "me");
+    }
+
+    #[test]
+    fn auth_failures_are_distinct_from_timeouts_and_missing_binaries() {
+        assert!(is_auth_failure("gh: To get started with GitHub CLI, run: gh auth login"));
+        assert!(is_auth_failure("HTTP 401: Bad credentials"));
+        assert!(is_auth_failure("You are not logged in to any GitHub hosts"));
+        assert!(!is_auth_failure("lfg timed out"));
+        assert!(!is_auth_failure("lfg is not installed"));
+        assert!(!is_auth_failure("no git remote found"));
+    }
+
+    /// A draft PR must reach the sidebar as a draft even when its checks are
+    /// failing or it conflicts — the states that used to outrank draftness and
+    /// paint the green open-PR avatar. Driven from verbatim `gh pr list` output
+    /// rather than a hand-built struct, so a field rename in the JSON contract
+    /// fails here too.
+    #[test]
+    fn live_json_carries_draftness_to_the_card_avatar() {
+        use crate::git_context::derive_rollup;
+        use crate::sidebar_card::{CardAvatar, avatar_for};
+
+        // Verbatim `gh pr list --json ...` output for this very PR (a draft).
+        let live = r#"[{"number":23,"title":"Sidebar: draw draft PRs as drafts, and honor the app text size","state":"OPEN","isDraft":true,"headRefName":"tw-sidebar-pr-state-a11y","reviewDecision":"","mergeable":"UNKNOWN","statusCheckRollup":[]}]"#;
+        let prs = parse_summaries(live).unwrap();
+        assert!(prs[0].is_draft, "isDraft must survive parsing");
+        let r = derive_rollup(Some(&prs[0]));
+        assert_eq!(avatar_for(r, prs[0].is_draft), CardAvatar::Draft);
+
+        // The same PR once a check fails — the shape that used to draw green.
+        let failing = live.replace(
+            r#""statusCheckRollup":[]"#,
+            r#""statusCheckRollup":[{"__typename":"CheckRun","status":"COMPLETED","conclusion":"FAILURE"}]"#,
+        );
+        let prs = parse_summaries(&failing).unwrap();
+        let r = derive_rollup(Some(&prs[0]));
+        assert_eq!(r, crate::git_context::PrRollup::ChecksFailing);
+        assert_eq!(avatar_for(r, prs[0].is_draft), CardAvatar::Draft);
+
+        // And conflicting.
+        let conflicting = live.replace(r#""mergeable":"UNKNOWN""#, r#""mergeable":"CONFLICTING""#);
+        let prs = parse_summaries(&conflicting).unwrap();
+        let r = derive_rollup(Some(&prs[0]));
+        assert_eq!(avatar_for(r, prs[0].is_draft), CardAvatar::Draft);
+
+        // A real non-draft open PR must be unaffected.
+        let not_draft = live.replace(r#""isDraft":true"#, r#""isDraft":false"#);
+        let prs = parse_summaries(&not_draft).unwrap();
+        let r = derive_rollup(Some(&prs[0]));
+        assert_eq!(avatar_for(r, prs[0].is_draft), CardAvatar::Open);
+    }
+
+    #[test]
+    fn parse_summaries_maps_review_checks_and_mergeable() {
+        let json = r#"[{"number":7,"title":"Ship","state":"OPEN","isDraft":false,
+            "headRefName":"feat","author":{"login":"me"},"reviewDecision":"APPROVED",
+            "mergeable":"MERGEABLE","statusCheckRollup":[
+                {"__typename":"CheckRun","name":"build","status":"COMPLETED","conclusion":"SUCCESS","detailsUrl":"u"},
+                {"__typename":"CheckRun","name":"test","status":"IN_PROGRESS","detailsUrl":"v"}]}]"#;
+        let prs = parse_summaries(json).unwrap();
+        assert_eq!(prs[0].review_decision.as_deref(), Some("APPROVED"));
+        assert_eq!(prs[0].mergeable.as_deref(), Some("MERGEABLE"));
+        assert_eq!(prs[0].checks.len(), 2);
+        assert_eq!(prs[0].checks[0].name, "build");
+        assert_eq!(prs[0].checks[0].status, CheckStatus::Success);
+        assert_eq!(prs[0].checks[1].status, CheckStatus::Pending);
+        assert_eq!(aggregate_check_status(&prs[0].checks), Some(CheckStatus::Pending));
+    }
+
+    #[test]
+    fn parse_summaries_tolerates_missing_new_fields() {
+        // Older payloads (and lfg's cold placeholder) omit the added fields.
+        let json = r#"[{"number":42,"title":"Fix","state":"OPEN","isDraft":true,"headRefName":"feat","author":{"login":"me"}}]"#;
+        let prs = parse_summaries(json).unwrap();
+        assert_eq!(prs[0].number, 42);
+        assert_eq!(prs[0].state, "open");
+        assert_eq!(prs[0].review_decision, None);
+        assert_eq!(prs[0].mergeable, None);
+        assert!(prs[0].checks.is_empty());
+    }
+
+    #[test]
+    fn parse_summaries_normalizes_empty_review_decision_to_none() {
+        // The CLI returns "" (not null) for a PR nobody has reviewed yet.
+        let json = r#"[{"number":9,"title":"WIP","state":"OPEN","isDraft":false,
+            "headRefName":"wip","author":{"login":"me"},"reviewDecision":"","mergeable":""}]"#;
+        let prs = parse_summaries(json).unwrap();
+        assert_eq!(prs[0].review_decision, None);
+        assert_eq!(prs[0].mergeable, None);
     }
 
     #[test]
