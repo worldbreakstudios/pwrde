@@ -12,6 +12,12 @@
 //! Layout is pure math over the window size so the renderer (drawing) and
 //! the app (hit-testing, PTY resize, divider dragging) always agree.
 //!
+//! One exception, deliberately narrow: sidebar row heights also follow the
+//! `appearance.font_size` setting, because the rows are an element tree
+//! ([`crate::sidebar_ui`]) whose type scales with it. The formula itself stays
+//! pure — see [`sidebar_row_h`] — and only [`sidebar_row_rect`] and
+//! [`tab_rect`] read the setting, so paint and hit-test still share one answer.
+//!
 //! ## Collapse model
 //!
 //! Each `Tile` carries `collapsed: bool` (target state) and
@@ -35,11 +41,16 @@ pub struct Tab {
     pub rows: usize,
     /// Whether this tab has unseen output (set by attention signal, cleared on focus).
     pub unread: bool,
+    /// When this tab last asked for attention; retained after it is read so a
+    /// card can still say how long ago that was. Set by the mark-unread paths
+    /// and by an on-screen pane's attention signal, which stamps without
+    /// dotting — so a stamp does not imply the tab is currently unread.
+    pub unread_at: Option<std::time::SystemTime>,
 }
 
 impl Tab {
     pub fn new(session: Session) -> Self {
-        Self { session, cols: 0, rows: 0, unread: false }
+        Self { session, cols: 0, rows: 0, unread: false, unread_at: None }
     }
 }
 
@@ -268,6 +279,21 @@ impl Workspace {
         self.root.tiles().iter().any(|t| t.tabs.iter().any(|tab| tab.unread))
     }
 
+    /// Return the moment this workspace most recently asked for attention.
+    ///
+    /// When tabs are currently unread, this is the oldest timestamp among
+    /// those tabs (ignoring missing timestamps). Otherwise it is the newest
+    /// timestamp across all tabs, retained after tabs are read. Returns
+    /// `None` when no tab has ever been marked unread.
+    pub fn attention_at(&self) -> Option<std::time::SystemTime> {
+        let tabs = self.root.tiles().into_iter().flat_map(|tile| tile.tabs.iter());
+        let unread = tabs.clone().filter(|tab| tab.unread).filter_map(|tab| tab.unread_at);
+        if let Some(oldest) = unread.min() {
+            return Some(oldest);
+        }
+        tabs.filter_map(|tab| tab.unread_at).max()
+    }
+
     /// Ensure `focused_tile` points at an existing tile.
     pub fn fix_focus(&mut self) {
         if self.root.find_tile(self.focused_tile).is_none()
@@ -308,25 +334,84 @@ impl LayoutRect {
 
 /// Logical (pre-scale) dimensions.
 pub const SIDEBAR_MIN_W: f32 = 120.0;
-pub const SIDEBAR_DEFAULT_W: f32 = 240.0;
-pub const SIDEBAR_MAX_W: f32 = 360.0;
+/// Default sidebar width.
+///
+/// Wider than the GANTRY mock's 300px on purpose: the mock's cards carry short
+/// branch names, while real ones (`tw-madrid-15…`, `chore/node-24`) ellipsize
+/// the title line well before the timestamp beside it does. The preview card is
+/// the whole point of the panel, so it gets the room.
+pub const SIDEBAR_DEFAULT_W: f32 = 360.0;
+/// Upper bound on the drag. Generous rather than snug, so the default is
+/// somewhere to start from rather than already at the ceiling.
+pub const SIDEBAR_MAX_W: f32 = 520.0;
 /// Top strip of the sidebar: native traffic lights float here and the rest
 /// is the window drag handle.
 pub const TITLEBAR_H: f32 = 44.0;
 /// Height of a one-line sidebar row (iTerm2/native-mac source-list style).
 const TAB_H: f32 = 28.0;
+/// Height of a Sessions-page preview card row: 10px padding, a 38px avatar,
+/// 10px padding. Group rows use this instead of [`TAB_H`] on the pages that
+/// render the Messages-style sidebar; `tab_rect`'s pages keep [`TAB_H`].
+pub const CARD_H: f32 = 58.0;
 /// Slimmer height for section header rows in the sidebar.
 const SECTION_HEADER_H: f32 = 30.0;
+
+/// Ceiling on the sidebar's text-size factor.
+///
+/// The sidebar does not scroll yet — [`crate::sidebar_ui::clipped_row_layer`]
+/// clips the row stack to the panel — so every point a row grows is a point of
+/// group list that becomes unreachable, and only the first nine groups have a
+/// ⌘-number fallback. `appearance.font_size` goes to 40 (≈2.7×), which would
+/// leave about five rows visible; capping here keeps the setting useful without
+/// letting it hide groups the user has no other way to reach. Lift the cap when
+/// the scroll pass lands.
+const MAX_ROW_FONT_SCALE: f32 = 1.5;
+
+/// The live app-text-size factor the sidebar scales by, capped.
+///
+/// The rows are an element tree ([`crate::sidebar_ui`]) whose type scales with
+/// the `appearance.font_size` setting, so a fixed row height would clip that
+/// type at the larger sizes. This is the module's one read of global state; the
+/// height formulas below stay pure so they remain testable at any size.
+///
+/// `sidebar_ui` reads its type scale from here too, rather than going straight
+/// to [`crate::renderer::chrome_font_scale`] — one factor, so the rows and the
+/// text inside them can never scale apart.
+pub fn row_font_scale() -> f32 {
+    cap_row_font_scale(crate::renderer::chrome_font_scale())
+}
+
+/// [`MAX_ROW_FONT_SCALE`] applied to `f`. Pure, so the cap itself is pinned by
+/// a test rather than only reachable through the live setting.
+fn cap_row_font_scale(f: f32) -> f32 {
+    f.min(MAX_ROW_FONT_SCALE)
+}
+
+/// Height of a sidebar group row at `font_scale`, in logical px.
+///
+/// `card_rows` picks the Messages-style preview card ([`CARD_H`]) over the
+/// one-line [`TAB_H`] row. Pure, so the tests can pin the formula at a
+/// non-default text size instead of only at the ambient default.
+fn sidebar_row_h(card_rows: bool, font_scale: f32) -> f32 {
+    (if card_rows { CARD_H } else { TAB_H }) * font_scale
+}
+
+/// Height of a sidebar section-header row at `font_scale`, in logical px.
+fn section_header_h(font_scale: f32) -> f32 {
+    SECTION_HEADER_H * font_scale
+}
 /// Extra left inset for group rows nested under a section.
 const MEMBER_INDENT: f32 = 12.0;
 /// Vertical gap between the sidebar's rounded group rows.
 const TAB_GAP: f32 = 3.0;
 /// Horizontal inset of the sidebar's rows from the sidebar edges.
 const SIDEBAR_PAD: f32 = 10.0;
-/// Height of the "+" button row between the titlebar and the group tabs.
-const NEW_GROUP_H: f32 = 30.0;
-/// Gap between the side-by-side "+ group" / "+ section" buttons.
-const NEW_BTN_GAP: f32 = 6.0;
+/// Side of the square header chips ("⇤" collapse, "＋" new group). Both sit
+/// right-aligned inside [`TITLEBAR_H`], opposite the native traffic lights, so
+/// the chrome costs one strip instead of two.
+const HEADER_CHIP: f32 = 22.0;
+/// Gap between the two header chips.
+const HEADER_CHIP_GAP: f32 = 6.0;
 /// Height of the horizontal tab strip atop each tile.
 const TILE_TAB_H: f32 = 28.0;
 /// Gap between tile cards; doubles as the divider drag handle (hit tests
@@ -353,7 +438,7 @@ pub fn titlebar(scale: f32, sidebar_w: f32) -> LayoutRect {
 /// Logical width of the top-left corner the native traffic lights occupy.
 /// The buttons themselves end around x=59; the extra headroom keeps the
 /// first tab from crowding them.
-const TRAFFIC_LIGHT_SAFE_W: f32 = 78.0;
+pub const TRAFFIC_LIGHT_SAFE_W: f32 = 78.0;
 
 /// The window-drag corner while the sidebar is collapsed: the traffic-light
 /// span of the top-left tile's tab strip, plus the sliver of padding above.
@@ -381,33 +466,39 @@ pub fn tab_strip_rect(area: LayoutRect, rect: &LayoutRect, scale: f32, sidebar_w
     LayoutRect { x: rect.x + inset, w: rect.w - inset, ..*rect }
 }
 
-/// Shared geometry for the side-by-side "+ group" / "+ section" button row.
-fn new_btn_row(scale: f32, sidebar_w: f32) -> (f32, f32, f32, f32) {
+/// Shared geometry for the header chip row below the titlebar: the strip's
+/// left inset, the row's top edge, its usable width and the square chip side.
+/// The side collapses to zero along with the sidebar so a folded strip has no
+/// clickable chips left behind.
+fn header_chip_row(scale: f32, sidebar_w: f32) -> (f32, f32, f32, f32) {
     let pad = (SIDEBAR_PAD * scale).round();
-    let y = (TITLEBAR_H * scale).round();
-    let h = (NEW_GROUP_H * scale).round();
+    // Vertically centred in the titlebar strip rather than stacked below it:
+    // the native traffic lights own the left of that strip and nothing else
+    // does, so the chips ride along in the space already being spent.
+    let y = (((TITLEBAR_H - HEADER_CHIP) / 2.0) * scale).round();
     let full_w = ((sidebar_w * scale).round() - 2.0 * pad).max(0.0);
-    (pad, y, full_w, h)
+    let side = (HEADER_CHIP * scale).round().min(full_w);
+    (pad, y, full_w, side)
 }
 
-/// The "+ group" button (left half of the button row below the titlebar).
-/// Clicking it opens the cwd picker. Inset like the group rows so it renders
-/// as a rounded field floating on the gradient.
+/// The "＋" chip at the top right of the header row. Clicking it opens the cwd
+/// picker, i.e. it makes a new GROUP. Tight to the painted chip: a small
+/// square, not half the row, so no dead pixels around it are clickable.
+/// (Sections are made by dragging one group onto another, never by a button.)
 pub fn new_group_button(scale: f32, sidebar_w: f32) -> LayoutRect {
-    let (pad, y, full_w, h) = new_btn_row(scale, sidebar_w);
-    let gap = (NEW_BTN_GAP * scale).round();
-    let w = ((full_w - gap) / 2.0).floor().max(0.0);
-    LayoutRect { x: pad, y, w, h }
+    let (pad, y, full_w, side) = header_chip_row(scale, sidebar_w);
+    LayoutRect { x: pad + full_w - side, y, w: side, h: side }
 }
 
-/// The "+ section" button (right half of the button row below the titlebar).
-pub fn new_section_button(scale: f32, sidebar_w: f32) -> LayoutRect {
-    let (pad, y, full_w, h) = new_btn_row(scale, sidebar_w);
-    let gap = (NEW_BTN_GAP * scale).round();
-    let left_w = ((full_w - gap) / 2.0).floor().max(0.0);
-    let x = pad + left_w + gap;
-    let w = (pad + full_w - x).max(0.0);
-    LayoutRect { x, y, w, h }
+/// The "⇤" chip at the left of the header row, which folds the sidebar away.
+/// Mirrors [`new_group_button`] across the strip so the two read as a pair.
+pub fn sidebar_collapse_button(scale: f32, sidebar_w: f32) -> LayoutRect {
+    let (pad, y, full_w, side) = header_chip_row(scale, sidebar_w);
+    let gap = (HEADER_CHIP_GAP * scale).round();
+    // Immediately left of the "+" chip, so the pair reads as one cluster in
+    // the top-right corner.
+    let x = (pad + full_w - 2.0 * side - gap).max(pad);
+    LayoutRect { x, y, w: side, h: side }
 }
 
 /// Centered CTA used by the empty-state launch view.
@@ -435,10 +526,16 @@ pub fn empty_state_hint(width: u32, height: u32, scale: f32, sidebar_w: f32, rig
 /// list — this flat-index helper remains for callers that still treat the
 /// sidebar as a uniform stack of group tabs.
 pub fn tab_rect(index: usize, scale: f32, sidebar_w: f32) -> LayoutRect {
+    tab_rect_at(index, scale, row_font_scale(), sidebar_w)
+}
+
+/// [`tab_rect`] at an explicit text-size factor. Pure, so the tests can pin the
+/// wiring at a non-default size instead of only at the ambient default.
+fn tab_rect_at(index: usize, scale: f32, font_scale: f32, sidebar_w: f32) -> LayoutRect {
     let pad = (SIDEBAR_PAD * scale).round();
-    let h = (TAB_H * scale).round();
+    let h = (sidebar_row_h(false, font_scale) * scale).round();
     let gap = (TAB_GAP * scale).round();
-    let top = ((TITLEBAR_H + NEW_GROUP_H) * scale).round() + 2.0 * gap;
+    let top = (TITLEBAR_H * scale).round() + 2.0 * gap;
     LayoutRect {
         x: pad,
         y: top + index as f32 * (h + gap),
@@ -527,28 +624,54 @@ pub fn sidebar_rows(workspaces: &[Workspace], sections: &[Section]) -> Vec<Sideb
 /// Pixel rect for `rows[index]`. Header rows are slimmer; group rows that
 /// belong to a section are indented. Painting, hit-testing, and drop
 /// resolution must all use this so they never disagree.
+///
+/// `card_rows` selects the group-row height: the Messages-style preview cards
+/// ([`CARD_H`]) on the pages that render them, the one-line [`TAB_H`] rows
+/// everywhere else. It is threaded in rather than read off global state so
+/// every caller is forced to agree with whatever the page is painting.
 pub fn sidebar_row_rect(
     rows: &[SidebarRow],
     index: usize,
     workspaces: &[Workspace],
     scale: f32,
     sidebar_w: f32,
+    card_rows: bool,
+) -> LayoutRect {
+    sidebar_row_rect_at(rows, index, workspaces, scale, row_font_scale(), sidebar_w, card_rows)
+}
+
+/// [`sidebar_row_rect`] at an explicit text-size factor. Pure, so the tests can
+/// pin the row pitch at a non-default size.
+#[allow(clippy::too_many_arguments)]
+fn sidebar_row_rect_at(
+    rows: &[SidebarRow],
+    index: usize,
+    workspaces: &[Workspace],
+    scale: f32,
+    font_scale: f32,
+    sidebar_w: f32,
+    card_rows: bool,
 ) -> LayoutRect {
     let pad = (SIDEBAR_PAD * scale).round();
     let gap = (TAB_GAP * scale).round();
-    let top0 = ((TITLEBAR_H + NEW_GROUP_H) * scale).round() + 2.0 * gap;
+    // Rows start below the titlebar and the header chip row — exactly where
+    // `tab_rect`'s one-line rows start, so every page's ladder shares a top.
+    let top0 = (TITLEBAR_H * scale).round() + 2.0 * gap;
     let full_w = ((sidebar_w * scale).round() - 2.0 * pad).max(0.0);
     let mut y = top0;
     for (i, row) in rows.iter().enumerate() {
         let (h, indent) = match *row {
-            SidebarRow::SectionHeader { .. } => ((SECTION_HEADER_H * scale).round(), 0.0),
+            SidebarRow::SectionHeader { .. } => {
+                ((section_header_h(font_scale) * scale).round(), 0.0)
+            }
             SidebarRow::Group { ws_idx } => {
                 let indent = if workspaces.get(ws_idx).and_then(|w| w.section).is_some() {
                     (MEMBER_INDENT * scale).round()
                 } else {
                     0.0
                 };
-                ((TAB_H * scale).round(), indent)
+                let h = sidebar_row_h(card_rows, font_scale);
+                ((h * scale).round(), indent)
             }
         };
         if i == index {
@@ -577,6 +700,22 @@ pub fn section_delete_rect(header: &LayoutRect, scale: f32) -> LayoutRect {
         y: (header.y + (header.h - s) / 2.0).round(),
         w: s,
         h: s,
+    }
+}
+
+/// The "⌘N" hotkey hint chip at the right edge of a group row (`row` = its
+/// [`sidebar_row_rect`]). Purely decorative — nothing hit-tests against it —
+/// but it is derived from the row rect like [`section_delete_rect`] so the
+/// title clip and the chip can never disagree.
+pub fn group_hotkey_chip_rect(row: &LayoutRect, scale: f32) -> LayoutRect {
+    let w = (22.0 * scale).round();
+    let h = (16.0 * scale).round();
+    let pad = (6.0 * scale).round();
+    LayoutRect {
+        x: row.x + row.w - w - pad,
+        y: (row.y + (row.h - h) / 2.0).round(),
+        w,
+        h,
     }
 }
 
@@ -1778,6 +1917,58 @@ mod tests {
         }
     }
 
+    fn tab_with_attention(unread: bool, seconds: u64) -> Tab {
+        use crate::term::Session;
+        let mut tab = Tab::new(Session::placeholder());
+        tab.unread = unread;
+        tab.unread_at = Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds));
+        tab
+    }
+
+    #[test]
+    fn attention_at_returns_none_with_no_history() {
+        let ws = Workspace::new("g".into(), Tile::empty(7), None);
+        assert_eq!(ws.attention_at(), None);
+    }
+
+    #[test]
+    fn attention_at_returns_oldest_unread_tab_stamp() {
+        let mut tile = Tile::new(7, crate::term::Session::placeholder());
+        tile.tabs.push(tab_with_attention(true, 30));
+        tile.tabs.push(tab_with_attention(true, 10));
+        let ws = Workspace::new("g".into(), tile, None);
+        let expected = std::time::UNIX_EPOCH + std::time::Duration::from_secs(10);
+        assert_eq!(ws.attention_at(), Some(expected));
+    }
+
+    #[test]
+    fn attention_at_ignores_read_tabs_while_any_tab_is_unread() {
+        let mut tile = Tile::new(7, crate::term::Session::placeholder());
+        tile.tabs.push(tab_with_attention(false, 5));
+        tile.tabs.push(tab_with_attention(true, 20));
+        let ws = Workspace::new("g".into(), tile, None);
+        assert_eq!(ws.attention_at(), Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(20)));
+    }
+
+    #[test]
+    fn attention_at_returns_most_recent_stamp_once_everything_is_read() {
+        let mut tile = Tile::new(7, crate::term::Session::placeholder());
+        tile.tabs.push(tab_with_attention(false, 5));
+        tile.tabs.push(tab_with_attention(false, 20));
+        let ws = Workspace::new("g".into(), tile, None);
+        assert_eq!(ws.attention_at(), Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(20)));
+    }
+
+    #[test]
+    fn attention_at_is_none_when_unread_tabs_have_no_stamp_and_nothing_else_does() {
+        let mut tile = Tile::new(7, crate::term::Session::placeholder());
+        let mut tab = Tab::new(crate::term::Session::placeholder());
+        tab.unread = true;
+        tile.tabs.push(tab);
+        let ws = Workspace::new("g".into(), tile, None);
+        assert_eq!(ws.attention_at(), None);
+    }
+
     #[test]
     fn any_unread_false_when_no_tabs_are_unread() {
         // Empty tile has no tabs → false.
@@ -2027,6 +2218,73 @@ mod tests {
         );
     }
 
+    /// Row heights scale with the app text size, and the pure formulas are
+    /// what the rects are built from — pinned here at a non-default size,
+    /// which the ambient-default assertions elsewhere cannot reach.
+    #[test]
+    fn row_heights_follow_the_app_text_size() {
+        // Identity at the default size: this is what every other geometry
+        // assertion in this module implicitly relies on.
+        assert_eq!(sidebar_row_h(true, 1.0), CARD_H);
+        assert_eq!(sidebar_row_h(false, 1.0), TAB_H);
+        assert_eq!(section_header_h(1.0), SECTION_HEADER_H);
+
+        // Doubling the text size doubles the row that has to hold it.
+        assert_eq!(sidebar_row_h(true, 2.0), CARD_H * 2.0);
+        assert_eq!(sidebar_row_h(false, 2.0), TAB_H * 2.0);
+        assert_eq!(section_header_h(2.0), SECTION_HEADER_H * 2.0);
+
+        // A card row stays taller than a one-line row at every size, or the
+        // preview card's avatar would no longer fit its own row.
+        for f in [0.6_f32, 1.0, 1.7, 2.7] {
+            assert!(sidebar_row_h(true, f) > sidebar_row_h(false, f));
+            assert!(sidebar_row_h(true, f) > section_header_h(f));
+        }
+    }
+
+    /// The rect helpers, not just the height formulas, have to carry the text
+    /// factor through — pinned at a non-default size so dropping the wiring
+    /// fails here rather than passing on the ambient default of 1.0.
+    #[test]
+    fn row_rects_carry_the_text_factor_through() {
+        let scale = 2.0;
+        let rows = [SidebarRow::Group { ws_idx: 0 }, SidebarRow::Group { ws_idx: 1 }];
+        let workspaces = [ws("a", None), ws("b", None)];
+        let pitch = |f: f32| {
+            let a = sidebar_row_rect_at(&rows, 0, &workspaces, scale, f, 360.0, true);
+            let b = sidebar_row_rect_at(&rows, 1, &workspaces, scale, f, 360.0, true);
+            (a.h, b.y - a.y)
+        };
+        let (h1, pitch1) = pitch(1.0);
+        let (h2, pitch2) = pitch(2.0);
+        assert_eq!(h1, (CARD_H * scale).round());
+        assert_eq!(h2, (CARD_H * 2.0 * scale).round());
+        // Rows stay exactly one gap apart at either size.
+        let gap = (TAB_GAP * scale).round();
+        assert_eq!(pitch1, h1 + gap);
+        assert_eq!(pitch2, h2 + gap);
+
+        // Same for the flat-index helper, and both ladders still share a top.
+        assert_eq!(tab_rect_at(0, scale, 1.0, 360.0).h, (TAB_H * scale).round());
+        assert_eq!(tab_rect_at(0, scale, 2.0, 360.0).h, (TAB_H * 2.0 * scale).round());
+        assert_eq!(
+            tab_rect_at(0, scale, 2.0, 360.0).y,
+            sidebar_row_rect_at(&rows, 0, &workspaces, scale, 2.0, 360.0, true).y
+        );
+
+        // The live factor is capped, so a large text size can never hide more
+        // of the un-scrollable row stack than the cap allows.
+        assert!(row_font_scale() <= MAX_ROW_FONT_SCALE);
+        // Below the cap the setting passes through untouched; above it, it
+        // stops. `appearance.font_size` reaches 40px (≈2.7×), which without
+        // this would leave about five rows in a 900pt window.
+        assert_eq!(cap_row_font_scale(1.0), 1.0);
+        assert_eq!(cap_row_font_scale(1.2), 1.2);
+        assert_eq!(cap_row_font_scale(MAX_ROW_FONT_SCALE), MAX_ROW_FONT_SCALE);
+        assert_eq!(cap_row_font_scale(2.7), MAX_ROW_FONT_SCALE);
+        assert_eq!(cap_row_font_scale(40.0 / 15.0), MAX_ROW_FONT_SCALE);
+    }
+
     #[test]
     fn rows_empty_section_at_end() {
         let workspaces = vec![ws("a", None)];
@@ -2168,9 +2426,9 @@ mod tests {
         let rows = sidebar_rows(&workspaces, &sections);
         let scale = 2.0;
         let sw = SIDEBAR_DEFAULT_W;
-        let header = sidebar_row_rect(&rows, 0, &workspaces, scale, sw);
-        let member = sidebar_row_rect(&rows, 1, &workspaces, scale, sw);
-        let bare = sidebar_row_rect(&rows, 3, &workspaces, scale, sw);
+        let header = sidebar_row_rect(&rows, 0, &workspaces, scale, sw, false);
+        let member = sidebar_row_rect(&rows, 1, &workspaces, scale, sw, false);
+        let bare = sidebar_row_rect(&rows, 3, &workspaces, scale, sw, false);
 
         // One-line group rows (TAB_H) sit under slightly taller section headers
         // (SECTION_HEADER_H); both heights are pinned to their constants.
@@ -2184,22 +2442,128 @@ mod tests {
         // Non-overlapping and top-to-bottom ordered.
         let mut prev_bottom = f32::NEG_INFINITY;
         for i in 0..rows.len() {
-            let r = sidebar_row_rect(&rows, i, &workspaces, scale, sw);
+            let r = sidebar_row_rect(&rows, i, &workspaces, scale, sw, false);
             assert!(r.y >= prev_bottom);
             prev_bottom = r.y + r.h;
         }
     }
 
     #[test]
-    fn new_buttons_side_by_side() {
+    fn card_rows_pick_the_taller_group_height() {
+        let workspaces = vec![ws("a", Some(1)), ws("b", Some(1)), ws("c", None)];
+        let sections = vec![sec(1, false)];
+        let rows = sidebar_rows(&workspaces, &sections);
         let scale = 2.0;
         let sw = SIDEBAR_DEFAULT_W;
-        let g = new_group_button(scale, sw);
-        let s = new_section_button(scale, sw);
-        assert_eq!(g.y, s.y);
-        assert_eq!(g.h, s.h);
-        assert!(g.x + g.w <= s.x);
-        assert!(s.x + s.w > g.x + g.w);
+
+        // Same rows, same index: only the flag decides the group height.
+        for i in [1usize, 2, 3] {
+            let card = sidebar_row_rect(&rows, i, &workspaces, scale, sw, true);
+            let tab = sidebar_row_rect(&rows, i, &workspaces, scale, sw, false);
+            assert_eq!(card.h, (CARD_H * scale).round());
+            assert_eq!(tab.h, (TAB_H * scale).round());
+        }
+        // Section headers are the same height either way.
+        let header_card = sidebar_row_rect(&rows, 0, &workspaces, scale, sw, true);
+        let header_tab = sidebar_row_rect(&rows, 0, &workspaces, scale, sw, false);
+        assert_eq!(header_card.h, (SECTION_HEADER_H * scale).round());
+        assert_eq!(header_card.h, header_tab.h);
+    }
+
+    #[test]
+    fn card_rows_stay_gap_separated_below_the_header() {
+        let workspaces = vec![ws("a", Some(1)), ws("b", Some(1)), ws("c", None)];
+        let sections = vec![sec(1, false)];
+        let rows = sidebar_rows(&workspaces, &sections);
+        let scale = 2.0;
+        let sw = SIDEBAR_DEFAULT_W;
+        let gap = (TAB_GAP * scale).round();
+
+        // The first row clears the titlebar and the header chip row, and
+        // starts exactly where the one-line pages' first row does — the
+        // taller cards must not creep up under the chrome.
+        let first = sidebar_row_rect(&rows, 0, &workspaces, scale, sw, true);
+        assert!(first.y >= (TITLEBAR_H * scale).round());
+        assert_eq!(first.y, tab_rect(0, scale, sw).y);
+
+        // Consecutive rows are separated by exactly one gap, so nothing
+        // overlaps even at CARD_H.
+        for i in 1..rows.len() {
+            let prev = sidebar_row_rect(&rows, i - 1, &workspaces, scale, sw, true);
+            let cur = sidebar_row_rect(&rows, i, &workspaces, scale, sw, true);
+            assert_eq!(cur.y, prev.y + prev.h + gap);
+            assert!(cur.y > prev.y + prev.h);
+        }
+    }
+
+    #[test]
+    fn card_rows_do_not_change_sidebar_rows_ordering() {
+        // Row *heights* are a paint concern; the row *list* is not, so the
+        // card pass must leave sidebar_rows' output untouched.
+        let workspaces = vec![ws("a", Some(1)), ws("b", Some(1)), ws("c", None)];
+        let sections = vec![sec(1, false)];
+        assert_eq!(
+            sidebar_rows(&workspaces, &sections),
+            vec![
+                SidebarRow::SectionHeader { section_idx: 0 },
+                SidebarRow::Group { ws_idx: 0 },
+                SidebarRow::Group { ws_idx: 1 },
+                SidebarRow::Group { ws_idx: 2 },
+            ]
+        );
+    }
+
+    #[test]
+    fn terminal_area_agrees_with_the_wider_sidebar() {
+        let (w, h, scale) = (1600u32, 1000u32, 2.0f32);
+        let area = terminal_area(w, h, scale, SIDEBAR_DEFAULT_W, 0.0);
+        // The split tree starts exactly at the sidebar's right edge.
+        assert_eq!(area.x, (SIDEBAR_DEFAULT_W * scale).round());
+
+        // ...and every card row stays inside the sidebar, clear of it.
+        let workspaces = vec![ws("a", None), ws("b", None)];
+        let rows = sidebar_rows(&workspaces, &[]);
+        for i in 0..rows.len() {
+            let r = sidebar_row_rect(&rows, i, &workspaces, scale, SIDEBAR_DEFAULT_W, true);
+            assert!(r.x + r.w <= area.x);
+        }
+    }
+
+    #[test]
+    fn header_chips_cluster_right_inside_the_titlebar() {
+        let scale = 2.0;
+        let sw = SIDEBAR_DEFAULT_W;
+        let plus = new_group_button(scale, sw);
+        let collapse = sidebar_collapse_button(scale, sw);
+        // Same row, both square, neither is half the strip.
+        assert_eq!(plus.y, collapse.y);
+        assert_eq!(plus.w, plus.h);
+        assert_eq!(collapse.w, collapse.h);
+        assert_eq!(plus.w, (HEADER_CHIP * scale).round());
+        assert!(plus.w < (sw * scale) / 4.0);
+
+        // Both hug the right inset as one cluster, collapse immediately left
+        // of plus, with the chip gap between them.
+        let pad = (SIDEBAR_PAD * scale).round();
+        let gap = (HEADER_CHIP_GAP * scale).round();
+        assert_eq!(plus.x + plus.w, (sw * scale).round() - pad);
+        assert_eq!(collapse.x + collapse.w + gap, plus.x);
+
+        // Riding inside the titlebar, not stacked under it: the whole cluster
+        // fits within TITLEBAR_H, which is what reclaimed the old chip row.
+        assert!(collapse.y > 0.0);
+        assert!(plus.y + plus.h <= (TITLEBAR_H * scale).round());
+
+        // Clear of the native traffic lights on the left of the same strip.
+        assert!(collapse.x > (TRAFFIC_LIGHT_SAFE_W * scale).round());
+    }
+
+    #[test]
+    fn header_chips_vanish_with_a_collapsed_sidebar() {
+        for chip in [new_group_button(2.0, 0.0), sidebar_collapse_button(2.0, 0.0)] {
+            assert_eq!(chip.w, 0.0);
+            assert!(!chip.contains(0.0, chip.y));
+        }
     }
 
     // --- (d) move / join / leave / reorder ---

@@ -14,6 +14,7 @@
 use rusqlite::{Connection, Result as SqlResult};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Serializable layout tree mirroring workspace::Node without live state.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -61,6 +62,7 @@ pub struct SavedTab {
     pub shpool_session: Option<String>,
     pub cwd: Option<String>,
     pub unread: bool,
+    pub unread_at: Option<i64>,
 }
 
 /// Compose the DB path under `data_dir`, optionally scoped to a worktree slug.
@@ -121,6 +123,8 @@ fn open_db(path: &Path) -> SqlResult<Connection> {
     // to existing tables, so ALTER and ignore the duplicate-column error.
     let _ = conn.execute("ALTER TABLE groups ADD COLUMN section_id INTEGER", []);
     let _ = conn.execute("ALTER TABLE tabs ADD COLUMN unread INTEGER", []);
+    // Migrate pre-attention DBs; duplicate-column errors are intentionally ignored.
+    let _ = conn.execute("ALTER TABLE tabs ADD COLUMN unread_at INTEGER", []);
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS sections (
@@ -190,8 +194,8 @@ pub fn save_snapshot(
 
         for tab in &group.tabs {
             tx.execute(
-                "INSERT INTO tabs (group_id, tile_id, tab_index, active, shpool_session, cwd, unread)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO tabs (group_id, tile_id, tab_index, active, shpool_session, cwd, unread, unread_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 (
                     group_id,
                     tab.tile_id,
@@ -200,6 +204,7 @@ pub fn save_snapshot(
                     &tab.shpool_session,
                     &tab.cwd,
                     if tab.unread { 1 } else { 0 },
+                    tab.unread_at,
                 ),
             )?;
         }
@@ -314,7 +319,7 @@ fn load_groups(conn: &Connection) -> Vec<SavedGroup> {
         };
 
         let mut tab_stmt = match conn.prepare(
-            "SELECT tile_id, tab_index, active, shpool_session, cwd, unread
+            "SELECT tile_id, tab_index, active, shpool_session, cwd, unread, unread_at
              FROM tabs WHERE group_id = ?1 ORDER BY tile_id, tab_index",
         ) {
             Ok(s) => s,
@@ -332,6 +337,7 @@ fn load_groups(conn: &Connection) -> Vec<SavedGroup> {
                 shpool_session: row.get(3)?,
                 cwd: row.get(4)?,
                 unread: row.get::<_, Option<i64>>(5)?.map(|v| v != 0).unwrap_or(false),
+                unread_at: row.get::<_, Option<i64>>(6)?,
             })
         }) {
             Ok(r) => r,
@@ -361,6 +367,18 @@ fn load_groups(conn: &Connection) -> Vec<SavedGroup> {
     }
 
     groups
+}
+
+/// Convert a system time to non-negative Unix epoch seconds.
+pub fn to_epoch_secs(time: Option<SystemTime>) -> Option<i64> {
+    time.and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .and_then(|d| i64::try_from(d.as_secs()).ok())
+}
+
+/// Convert non-negative Unix epoch seconds to a system time.
+pub fn from_epoch_secs(secs: Option<i64>) -> Option<SystemTime> {
+    secs.filter(|&s| s >= 0)
+        .and_then(|s| UNIX_EPOCH.checked_add(Duration::from_secs(s as u64)))
 }
 
 /// Convert live Workspace instances to SavedGroup format.
@@ -431,6 +449,7 @@ fn node_to_layout_rec(node: &crate::workspace::Node, tabs: &mut Vec<SavedTab>) -
                     shpool_session: tab.session.shpool_session.clone(),
                     cwd: None, // cwd is not tracked on Session; shpool will preserve it
                     unread: tab.unread,
+                    unread_at: to_epoch_secs(tab.unread_at),
                 });
             }
             LayoutNode::Leaf {
@@ -503,6 +522,7 @@ mod tests {
                 shpool_session: Some("pwrde-1-abc".into()),
                 cwd: Some("/home/user".into()),
                 unread: false,
+                unread_at: None,
             }],
             section_id,
         }
@@ -557,6 +577,7 @@ mod tests {
                         shpool_session: Some("pwrde-1-abc".into()),
                         cwd: Some("/home/user".into()),
                         unread: false,
+                        unread_at: None,
                     },
                     SavedTab {
                         tile_id: 1,
@@ -565,6 +586,7 @@ mod tests {
                         shpool_session: Some("pwrde-2-def".into()),
                         cwd: Some("/tmp".into()),
                         unread: false,
+                        unread_at: None,
                     },
                     SavedTab {
                         tile_id: 2,
@@ -573,6 +595,7 @@ mod tests {
                         shpool_session: None,
                         cwd: None,
                         unread: false,
+                        unread_at: None,
                     },
                 ],
                 section_id: None,
@@ -590,6 +613,7 @@ mod tests {
                     shpool_session: Some("pwrde-3-xyz".into()),
                     cwd: Some("/var/log".into()),
                     unread: false,
+                    unread_at: None,
                 }],
                 section_id: None,
             },
@@ -829,6 +853,7 @@ mod tests {
                     shpool_session: None,
                     cwd: None,
                     unread: true,
+                    unread_at: Some(1_700_000_000),
                 },
                 SavedTab {
                     tile_id: 1,
@@ -837,6 +862,7 @@ mod tests {
                     shpool_session: None,
                     cwd: None,
                     unread: false,
+                    unread_at: None,
                 },
             ],
             section_id: None,
@@ -848,8 +874,22 @@ mod tests {
         assert_eq!(loaded[0].tabs.len(), 2);
         assert!(loaded[0].tabs[0].unread, "first tab should be unread");
         assert!(!loaded[0].tabs[1].unread, "second tab should not be unread");
+        assert_eq!(
+            loaded[0].tabs[0].unread_at,
+            Some(1_700_000_000),
+            "the moment a tab was marked unread should survive the roundtrip"
+        );
+        assert_eq!(loaded[0].tabs[1].unread_at, None, "a tab that never signalled has no stamp");
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn epoch_conversion_roundtrips_and_rejects_pre_epoch() {
+        let time = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        assert_eq!(from_epoch_secs(to_epoch_secs(Some(time))), Some(time));
+        assert_eq!(to_epoch_secs(Some(UNIX_EPOCH - Duration::from_secs(1))), None);
+        assert_eq!(from_epoch_secs(Some(-1)), None);
     }
 
     #[test]
@@ -907,6 +947,10 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].tabs.len(), 1);
         assert!(!groups[0].tabs[0].unread, "pre-migration rows load as unread=false");
+        assert_eq!(
+            groups[0].tabs[0].unread_at, None,
+            "pre-migration rows have no attention stamp"
+        );
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }

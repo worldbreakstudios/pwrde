@@ -21,7 +21,7 @@ use gpui::Hsla;
 use termwiz::surface::CursorVisibility;
 use wezterm_term::color::ColorPalette;
 
-use crate::pages::{self, Page, Section};
+use crate::pages::{self, Page};
 use crate::palette::Palette;
 use crate::picker::{ForkPicker, Picker, PickerLayout, PickerRow, ProfilePicker};
 use crate::rect::char_rects;
@@ -40,8 +40,16 @@ pub const FONT_FAMILY: &str = "JetBrainsMono Nerd Font Mono";
 const PANE_PAD: f32 = 8.0;
 // All chrome colors live in `theme::Theme` presets (Arc-style dark cards on a
 // gradient by default); the renderer reads the active theme each frame.
-/// Corner radius of the floating tile cards, logical px.
-const CARD_RADIUS: f32 = 12.0;
+/// Ink for text sitting on the accent fill (the focused pane's active tab).
+const ON_ACCENT_INK: (u8, u8, u8) = (255, 255, 255);
+
+/// Corner radius of the floating tile cards and chrome panels, logical px.
+///
+/// Matches the sidebar panel's `sidebar_ui::PANEL_RADIUS`, which is vitrine's
+/// `--radius-l`: the GANTRY mock draws its terminal tiles on the same radius as
+/// its sidebar, and a tile that rounded off tighter than the panel beside it
+/// read as two different materials.
+pub(crate) const CARD_RADIUS: f32 = 18.0;
 /// Corner radius of the sidebar's rounded rows, logical px: half the 28px
 /// row height, so rows paint as fully-rounded iTerm2-style capsules. The
 /// `pill` helper clamps it per-rect, so shorter pills stay capsules too.
@@ -203,32 +211,15 @@ pub struct SaveModalView<'a> {
 }
 
 /// Per-frame page/navigation state the renderer needs beyond the workspaces:
-/// which page is up, which settings section, the dot-strip animation
-/// progresses (0..1 per page), the keyboard row being rebound, sidebar
-/// sections, and any in-progress inline editors.
+/// which page is up, the dot-strip animation progresses (0..1 per page) and
+/// the tool ribbon/panel. No sidebar rows live here any more — every page's
+/// rows are an element tree (`sidebar_ui`), so neither their contents nor the
+/// inline editors ever reach the canvas.
 pub struct ChromeState<'a> {
     pub page: Page,
-    pub section: Section,
-    pub dot_anim: &'a [f32],
-    /// Sidebar section definitions (Sessions page). Display order is derived
-    /// via [`workspace::sidebar_rows`]; empty sections append at the end.
-    pub sections: &'a [workspace::Section],
-    /// In-progress section rename: `(section_id, buffer)`. When set, that
-    /// section header paints the buffer + caret instead of emoji/name.
-    pub editing_section: Option<(u64, &'a str)>,
-    /// Cleanup page state (sidebar repo list; table is gpui-overlaid).
-    pub cleanup: &'a crate::cleanup::Cleanup,
     /// Whether the experimental `features.notes` flag is on. Gates the Notes
     /// page out of the dot strip entirely when off.
     pub notes_enabled: bool,
-    /// Registered notes vault names, in registration order (sidebar tabs).
-    pub notes_vaults: &'a [String],
-    /// Index into `notes_vaults` of the vault the Notes page is showing.
-    pub notes_active_vault: usize,
-    /// The active vault's markdown docs, as sidebar-row labels (relative paths).
-    pub notes_doc_rels: &'a [String],
-    /// Index into `notes_doc_rels` of the open doc, if any.
-    pub notes_selected_doc: Option<usize>,
     /// Tools registered for this page/group, in ribbon slot order (resolved
     /// by `App::tools_for`). Empty hides the ribbon and its inset entirely.
     pub ribbon_tools: &'a [pages::Tool],
@@ -242,10 +233,6 @@ pub struct ChromeState<'a> {
     /// Physical-pixel cursor position for hover painting. `None` while any
     /// drag is active so hover highlights are suppressed mid-drag.
     pub cursor: Option<(f32, f32)>,
-    /// In-progress search query for the settings sidebar search box.
-    pub settings_query: &'a str,
-    /// Whether the settings search box has keyboard focus.
-    pub settings_search_focus: bool,
 }
 
 /// Everything `main.rs`'s terminal `Element` needs to paint one frame — all
@@ -320,6 +307,15 @@ pub fn terminal_font() -> f32 {
 /// range. Defaults to [`FONT_SIZE`] when unset.
 pub fn chrome_font() -> f32 {
     crate::settings::get_f32("appearance.font_size", FONT_SIZE).clamp(MIN_FONT_SIZE, MAX_FONT_SIZE)
+}
+
+/// The chrome font size as a multiple of the default [`FONT_SIZE`].
+///
+/// Element-tree surfaces (the sidebar) hardcode their type and geometry at the
+/// default size and multiply through this, which is how they track the
+/// `appearance.font_size` setting without re-deriving every literal.
+pub fn chrome_font_scale() -> f32 {
+    chrome_font() / FONT_SIZE
 }
 
 /// Nudge a font-size setting by `delta`, clamping to the allowed range, and
@@ -529,7 +525,9 @@ impl Renderer {
         // keeps the chrome theme's exact colors.
         let scheme = crate::term_theme::selected(crate::theme::dark_active());
         let term_palette = crate::term_theme::build(scheme, th.term_bg);
-        let (pane_bg, pane_ink, pane_ink_dim, pane_divider, pane_pill) = match scheme {
+        // `pane_bg` is deliberately dropped: the ground is painted in that
+        // colour already (`term_scheme_bg`), so no pane fills itself.
+        let (_, pane_ink, pane_ink_dim, pane_divider, pane_pill) = match scheme {
             Some(t) => (t.bg, (t.fg, 1.0), (t.fg, 0.55), (t.fg, 0.15), (t.fg, 0.12)),
             None => (
                 th.term_bg,
@@ -597,92 +595,16 @@ impl Renderer {
         // CTA still paints — it is positioned off `terminal_area`).
         let collapsed = sidebar_w == 0.0;
         let row_r = (ROW_RADIUS * self.scale).round();
-        let group_pad = (12.0 * self.scale).round();
         // Traffic lights are the native macOS buttons now (transparent titlebar),
         // so we no longer draw our own here.
         match chrome.page {
-            Page::Notes if collapsed => {},
-            Page::Notes => {
-                // One combined sidebar, stacked top-to-bottom in the same rows
-                // groups occupy on Sessions:
-                //   [0, V)         vault rows (active highlighted)
-                //   [V, V+D)       the active vault's doc rows (indented)
-                //   V+D            an "＋ Add vault…" row
-                // The hit-test in main.rs (`Page::Notes` mouse branch) walks the
-                // same index ranges, so paint and clicks stay in lock-step.
-                let n_vaults = chrome.notes_vaults.len();
-                let n_docs = chrome.notes_doc_rels.len();
-
-                // (row index, label, active?, indent?, dim-when-inactive?)
-                let mut rows: Vec<(usize, String, bool, bool, bool)> = Vec::new();
-                for (i, name) in chrome.notes_vaults.iter().enumerate() {
-                    rows.push((i, name.clone(), i == chrome.notes_active_vault, false, false));
-                }
-                for (k, rel) in chrome.notes_doc_rels.iter().enumerate() {
-                    let selected = chrome.notes_selected_doc == Some(k);
-                    rows.push((n_vaults + k, rel.clone(), selected, true, true));
-                }
-                rows.push((n_vaults + n_docs, "+ Add vault".to_string(), false, false, true));
-
-                for (i, text, active, indent, dim) in rows {
-                    let tab = workspace::tab_rect(i, self.scale, sidebar_w);
-                    if active {
-                        bg_quads.push(self.pill(&tab, th, 0.78, row_r).shadow(Shadow::Soft));
-                    } else if hover(cur, &tab) {
-                        bg_quads.push(self.pill(&tab, th, 0.40, row_r));
-                    }
-                    hot.push(tab);
-                    let indent_px = if indent { (14.0 * self.scale).round() } else { 0.0 };
-                    let ink = if active || !dim { th.ink } else { th.ink_dim };
-                    labels.push(LabelSpec {
-                        text,
-                        color: color(ink, 1.0),
-                        left: tab.x + group_pad + indent_px,
-                        top: (tab.y + (tab.h - self.chrome_cell_height) / 2.0).round(),
-                        clip: LayoutRect { w: tab.w - group_pad - indent_px, ..tab },
-                        size: None,
-                    });
-                }
-            },
             // The Pull Requests page shares the Sessions sidebar (its list is
             // scoped to the active group's repo, so group switching applies).
             Page::Sessions | Page::PullRequests => {
-                if !collapsed {
-                    // Side-by-side "+ group" / "+ section" buttons below the titlebar.
-                    let new_group = workspace::new_group_button(self.scale, sidebar_w);
-                    let hov = hover(cur, &new_group);
-                    bg_quads.push(
-                        self.pill(&new_group, th, if hov { 0.85 } else { 0.55 }, row_r)
-                            .shadow(if hov { Shadow::Soft } else { Shadow::None }),
-                    );
-                    hot.push(new_group);
-                    labels.push(LabelSpec {
-                        text: "+ group".into(),
-                        color: color(th.ink_dim, 1.0),
-                        left: (new_group.x + group_pad).round(),
-                        top: (new_group.y + (new_group.h - self.chrome_cell_height) / 2.0).round(),
-                        clip: new_group,
-                        size: None,
-                    });
-                    let new_section = workspace::new_section_button(self.scale, sidebar_w);
-                    let hov = hover(cur, &new_section);
-                    bg_quads.push(
-                        self.pill(&new_section, th, if hov { 0.85 } else { 0.55 }, row_r)
-                            .shadow(if hov { Shadow::Soft } else { Shadow::None }),
-                    );
-                    hot.push(new_section);
-                    labels.push(LabelSpec {
-                        text: "+ section".into(),
-                        color: color(th.ink_dim, 1.0),
-                        left: (new_section.x + group_pad).round(),
-                        top: (new_section.y + (new_section.h - self.chrome_cell_height) / 2.0).round(),
-                        clip: new_section,
-                        size: None,
-                    });
-                }
                 if empty {
-                    // Empty state: a centered CTA instead of group rows.
-                    // Empty sections (if any) still render below the buttons.
+                    // Empty state: a centered CTA in the terminal area. The
+                    // sidebar itself (rows, sections, header buttons) is a
+                    // gpui element tree now — see `sidebar_ui::render_sidebar`.
                     let cta = workspace::empty_state_cta(width, height, self.scale, sidebar_w, right_w);
                     let hint = workspace::empty_state_hint(width, height, self.scale, sidebar_w, right_w);
                     let hov = hover(cur, &cta);
@@ -712,163 +634,26 @@ impl Renderer {
                         size: None,
                     });
                 }
-                // Painted even in the empty state (under the CTA) so a just-
-                // created section is visible before it gains members.
-                if !collapsed {
-                    self.paint_sidebar_rows(
-                        workspaces,
-                        active,
-                        sidebar_w,
-                        chrome,
-                        th,
-                        row_r,
-                        group_pad,
-                        cur,
-                        &mut bg_quads,
-                        &mut labels,
-                        &mut hot,
-                    );
-                }
             },
-            Page::Settings if collapsed => {},
-            Page::Settings => {
-                // Search box in the top slot: typing filters every section's
-                // settings (the content card lists the matches). Focused it
-                // takes the active-tab treatment; a quad caret trails the
-                // query like the primary-command editor's.
-                let search = workspace::settings_search_rect(self.scale, sidebar_w);
-                let focused = chrome.settings_search_focus;
-                if focused {
-                    bg_quads.push(self.pill(&search, th, 0.78, row_r).shadow(Shadow::Soft));
-                } else {
-                    bg_quads.push(self.pill(&search, th, 0.40, row_r));
-                }
-                hot.push(search);
-                let empty = chrome.settings_query.is_empty();
-                let text_top = (search.y + (search.h - self.chrome_cell_height) / 2.0).round();
-                if !empty || !focused {
-                    labels.push(LabelSpec {
-                        text: if empty { "Search settings".into() } else { chrome.settings_query.to_string() },
-                        color: color(if empty { th.ink_dim } else { th.ink }, 1.0),
-                        left: search.x + group_pad,
-                        top: text_top,
-                        clip: LayoutRect { w: search.w - group_pad, ..search },
-                        size: None,
-                    });
-                }
-                if focused {
-                    let w = chrome.settings_query.chars().count() as f32 * self.chrome_cell_width;
-                    let caret = LayoutRect {
-                        x: (search.x + group_pad + w + if empty { 0.0 } else { 2.0 }).round(),
-                        y: text_top,
-                        w: (2.0 * self.scale).round().max(1.0),
-                        h: self.chrome_cell_height,
-                    };
-                    bg_quads.push(self.px_rect(&caret, th.accent, 1.0, 0.0));
-                }
-
-                // Settings sections as sidebar tabs, shifted to slot i+1 to
-                // make room for the search box at slot 0.
-                for (i, section) in Section::ALL.iter().enumerate() {
-                    let tab = workspace::tab_rect(i + 1, self.scale, sidebar_w);
-                    let active_row = *section == chrome.section;
-                    if active_row {
-                        bg_quads.push(self.pill(&tab, th, 0.78, row_r).shadow(Shadow::Soft));
-                    } else if hover(cur, &tab) {
-                        // Hovered inactive tab: the active pill at a fraction
-                        // of its strength, shadowless so it reads as "would
-                        // select", not "selected".
-                        bg_quads.push(self.pill(&tab, th, 0.40, row_r));
-                    }
-                    hot.push(tab);
-                    labels.push(LabelSpec {
-                        text: section.label().into(),
-                        color: color(if active_row { th.ink } else { th.ink_dim }, 1.0),
-                        left: tab.x + group_pad,
-                        top: (tab.y + (tab.h - self.chrome_cell_height) / 2.0).round(),
-                        clip: LayoutRect { w: tab.w - group_pad, ..tab },
-                        size: None,
-                    });
-                }
-            },
-            Page::Cleanup if collapsed => {},
-            Page::Cleanup => {
-                // "All" plus one tab per repo with drop worktrees, in the same
-                // rows the groups occupy on Sessions so the chrome reads as one.
-                let repos = chrome.cleanup.repos();
-                let filter = chrome.cleanup.repo_filter.as_deref();
-                let mut tabs: Vec<(String, bool)> =
-                    vec![("All".to_string(), filter.is_none())];
-                for repo in &repos {
-                    tabs.push((
-                        format!("{} · {}", repo.display, repo.count),
-                        filter == Some(repo.root.as_str()),
-                    ));
-                }
-                for (i, (label, active_row)) in tabs.iter().enumerate() {
-                    let tab = workspace::tab_rect(i, self.scale, sidebar_w);
-                    if *active_row {
-                        bg_quads.push(self.pill(&tab, th, 0.78, row_r).shadow(Shadow::Soft));
-                    } else if hover(cur, &tab) {
-                        bg_quads.push(self.pill(&tab, th, 0.40, row_r));
-                    }
-                    hot.push(tab);
-                    labels.push(LabelSpec {
-                        text: label.clone(),
-                        color: color(if *active_row { th.ink } else { th.ink_dim }, 1.0),
-                        left: tab.x + group_pad,
-                        top: (tab.y + (tab.h - self.chrome_cell_height) / 2.0).round(),
-                        clip: LayoutRect { w: tab.w - group_pad, ..tab },
-                        size: None,
-                    });
-                }
-            },
+            // Every other page's sidebar rows live in the element tree now
+            // (`sidebar_ui::render_sidebar`), so the canvas paints nothing
+            // for them here — only the page-dot strip below.
+            _ => {},
         }
 
         // ── Page-dot strip (bottom of the sidebar, every page) ─────────
-        // Each slot crossfades between a subtle dot and the page's glyph as
-        // its animation progress moves 0 → 1 (hovered or active page).
+        // The dots themselves are painted by the element tree now
+        // (`sidebar_ui::page_dot_layer`), which would occlude anything the
+        // canvas drew here anyway. What stays is the *hit* registration: the
+        // slots are still interactive rects, so they belong in `hot` for the
+        // pointing-hand cursor, and `main.rs::page_slot_at` still resolves
+        // the click. Flag-gated pages (Notes) drop out of the strip entirely
+        // so the slots stay contiguous with what the element tree paints.
         if !collapsed {
-            // Flag-gated pages (Notes) drop out of the strip entirely, so the
-            // slots stay contiguous; the animation array is still indexed by
-            // the page's stable global index.
             let pages = Page::visible(chrome.notes_enabled);
             let n_pages = pages.len();
-            for (i, page) in pages.iter().enumerate() {
-                let slot = workspace::page_slot_rect(i, n_pages, height, self.scale, sidebar_w);
-                // The dot→glyph crossfade is the hover treatment here; hot
-                // registration just adds the pointing hand.
-                hot.push(slot);
-                let p = chrome
-                    .dot_anim
-                    .get(page.index())
-                    .copied()
-                    .unwrap_or(0.0)
-                    .clamp(0.0, 1.0);
-                if p < 1.0 {
-                    let d = (5.0 * self.scale).round().max(2.0);
-                    let dot = LayoutRect {
-                        x: (slot.x + (slot.w - d) / 2.0).round(),
-                        y: (slot.y + (slot.h - d) / 2.0).round(),
-                        w: d,
-                        h: d,
-                    };
-                    bg_quads.push(self.px_rect(&dot, th.ink_dim, 0.45 * (1.0 - p), d / 2.0));
-                }
-                if p > 0.0 {
-                    let glyph = page.glyph();
-                    let gw = glyph.chars().count() as f32 * self.chrome_cell_width;
-                    labels.push(LabelSpec {
-                        text: glyph.into(),
-                        color: color(th.ink, p),
-                        left: (slot.x + (slot.w - gw) / 2.0).round(),
-                        // Glyphs may be a hair wider than the slot ("<>"): allow
-                        // a small clip overhang so they aren't shaved.
-                        top: (slot.y + (slot.h - self.chrome_cell_height) / 2.0).round(),
-                        clip: slot.inflate((4.0 * self.scale).round()),
-                        size: None,
-                    });
-                }
+            for i in 0..n_pages {
+                hot.push(workspace::page_slot_rect(i, n_pages, height, self.scale, sidebar_w));
             }
         }
 
@@ -934,10 +719,33 @@ impl Renderer {
             // the canvas paints the sidebar only.
         } else {
             let hair = (1.0 * self.scale).round().max(1.0);
-            for (id, rect) in &tiles {
-                // Each tile is a floating dark card: rounded, shadowed, with its
-                // tab strip inside the card above a hairline divider.
-                bg_quads.push(self.px_rect(rect, pane_bg, 1.0, card_r).shadow(Shadow::Card));
+            // Messages-style blending: only the focused pane is a *card*. The
+            // rest share the window's ground (which is `term_bg` too), so they
+            // carry no shadow and no divider and are delimited only by their
+            // capsule tab — the same way an unselected Messages thread has no
+            // chrome of its own.
+            let focus = ws.focused_tile;
+            // Focused tile LAST. `layout_tiles` returns tree order, so an
+            // unfocused pane's fill could land after the focused pane's shadow
+            // and clip it — a soft gradient stopping at a hard edge, which read
+            // as a smudge rather than a shadow. Painting the raised card after
+            // everything that sits at ground level makes the shadow composite
+            // uniformly on all four sides.
+            let mut order: Vec<&(u64, workspace::LayoutRect)> = tiles.iter().collect();
+            order.sort_by_key(|(id, _)| *id == focus);
+            for (id, rect) in order {
+                let is_focused = *id == focus;
+                // Unfocused panes skip the fill entirely: the ground is already
+                // painted in this exact colour (`term_scheme_bg`), so the quad
+                // is a no-op that can only overdraw a neighbour's shadow. That
+                // is what makes them read as the app background rather than as
+                // panes that happen to match it.
+                // No fill and no shadow for any pane, focused included. The
+                // ground is already this exact colour, and a shadow made the
+                // focused pane pop out of the window instead of sitting in it.
+                // Focus is shown by tinting its active tab accent — the same
+                // signal the sidebar uses for the selected group, so the two
+                // read as one idea.
                 let axis = collapse_axis_map.get(id).copied().flatten();
                 let Some(tile) = ws.root.find_tile(*id) else { continue };
                 // Collapsed (or mid-animation) panes hide their content; a
@@ -946,7 +754,10 @@ impl Renderer {
                 let side_strip = axis == Some(workspace::Dir::Row) && collapsing;
                 let strip = workspace::tab_strip_rect(area, rect, self.scale, sidebar_w);
                 let bar = workspace::tile_tab_bar(&strip, self.scale);
-                if !collapsing {
+                // The rule under the tab strip is part of the card, so it
+                // goes with the card: an unfocused pane would otherwise be a
+                // stray hairline floating on the ground.
+                if !collapsing && is_focused {
                     let divider =
                         LayoutRect { x: rect.x, y: bar.y + bar.h - hair, w: rect.w, h: hair };
                     bg_quads.push(self.px_rect(&divider, pane_divider.0, pane_divider.1, 0.0));
@@ -968,13 +779,24 @@ impl Renderer {
                         w: (tr.w - 2.0 * m).max(0.0),
                         h: (tr.h - 2.0 * m).max(0.0),
                     };
-                    bg_quads.push(self.glass(
-                        &pill,
-                        pane_pill.0,
-                        pane_pill.1,
-                        pill.h / 2.0,
-                        color(pane_ink.0, 0.18),
-                    ));
+                    if is_focused {
+                        // The focused pane's tab wears the accent, exactly like
+                        // the sidebar's selected group card.
+                        bg_quads.push(self.px_rect(
+                            &pill,
+                            crate::theme::gantry_accent(th.dark),
+                            1.0,
+                            pill.h / 2.0,
+                        ));
+                    } else {
+                        bg_quads.push(self.glass(
+                            &pill,
+                            pane_pill.0,
+                            pane_pill.1,
+                            pill.h / 2.0,
+                            color(pane_ink.0, 0.18),
+                        ));
+                    }
                 } else {
                     // A sideways-collapsed strip is one big "expand" target:
                     // any click reopens it, so the whole bare card hovers.
@@ -1066,6 +888,7 @@ impl Renderer {
                 }
 
                 // Tab labels for this tile's tab strip.
+                let tile_focused = Some(*id) == focused_tile;
                 let strip = workspace::tab_strip_rect(area, rect, self.scale, sidebar_w);
                 let tab_text_pad = (8.0 * self.scale).round();
                 for (ti, tab) in tile.tabs.iter().enumerate() {
@@ -1130,10 +953,13 @@ impl Renderer {
                     }
                     labels.push(LabelSpec {
                         text,
-                        color: if ti == tile.active {
-                            color(pane_ink.0, pane_ink.1)
-                        } else {
-                            color(pane_ink_dim.0, pane_ink_dim.1)
+                        color: match (ti == tile.active, tile_focused) {
+                            // On the accent pill the scheme's ink would be
+                            // unreadable, so the active tab of the focused pane
+                            // takes the on-accent treatment.
+                            (true, true) => color(ON_ACCENT_INK, 1.0),
+                            (true, false) => color(pane_ink.0, pane_ink.1),
+                            _ => color(pane_ink_dim.0, pane_ink_dim.1),
                         },
                         left: text_left,
                         top: (tr.y + (tr.h - self.chrome_cell_height) / 2.0).round(),
@@ -1158,16 +984,6 @@ impl Renderer {
                 }
             }
 
-            // Focused-tile border (only interesting with multiple tiles): a
-            // rounded accent outline hugging the card's corner radius.
-            if tiles.len() > 1
-                && let Some((_, rect)) = tiles.iter().find(|(id, _)| Some(*id) == focused_tile)
-            {
-                let t = (1.5 * self.scale).round();
-                fg_quads.push(
-                    self.px_rect(rect, th.term_bg, 0.0, card_r).border(t, color(th.accent, 0.9)),
-                );
-            }
 
             // Drag-drop target hint (a translucent accent overlay).
             if let Some(hint) = drop_hint {
@@ -1179,20 +995,12 @@ impl Renderer {
         // target reads before the press. Geometry lives here; main only paints.
         if let Some(hover) = resize_hover {
             match hover {
-                workspace::ResizeHover::Sidebar => {
-                    let sb = (sidebar_w * self.scale).round();
-                    let line_w = (2.0 * self.scale).round().max(1.0);
-                    let top = workspace::titlebar(self.scale, sidebar_w).h;
-                    // Same bottom margin the tile area uses (AREA_PAD via terminal_area).
-                    let bottom = area.y + area.h;
-                    let line = LayoutRect {
-                        x: sb - line_w / 2.0,
-                        y: top,
-                        w: line_w,
-                        h: (bottom - top).max(0.0),
-                    };
-                    self.push_resize_grip(&mut bg_quads, &line, true, th.ink);
-                }
+                // The sidebar's grip is drawn by `sidebar_ui`. The canvas used
+                // to put it on `x = sidebar_w`, but the panel's right edge is
+                // a gutter to the left of that, so the element tree swallowed
+                // the grip's inner half. The hover state itself is unchanged;
+                // only the pixels moved.
+                workspace::ResizeHover::Sidebar => {}
                 workspace::ResizeHover::Divider { path, .. } => {
                     // Empty state has no dividers; find is a no-op then.
                     if let Some(d) = dividers.iter().find(|d| d.path == *path) {
@@ -1294,196 +1102,6 @@ impl Renderer {
         }
     }
 
-    /// Paint Sessions sidebar rows (section headers + group cards) using the
-    /// pure `sidebar_rows` / `sidebar_row_rect` geometry so hit-testing and
-    /// drop resolution can share the same layout.
-    fn paint_sidebar_rows(
-        &self,
-        workspaces: &[Workspace],
-        active: usize,
-        sidebar_w: f32,
-        chrome: &ChromeState,
-        th: &Theme,
-        row_r: f32,
-        group_pad: f32,
-        cur: Option<(f32, f32)>,
-        bg_quads: &mut Vec<Quad>,
-        labels: &mut Vec<LabelSpec>,
-        hot: &mut Vec<LayoutRect>,
-    ) {
-        let rows = workspace::sidebar_rows(workspaces, chrome.sections);
-        let active_row = workspace::active_row_index(&rows, workspaces, chrome.sections, active);
-        let header_size = self.chrome_font_size() * 0.9;
-
-        for (i, row) in rows.iter().enumerate() {
-            let rect = workspace::sidebar_row_rect(&rows, i, workspaces, self.scale, sidebar_w);
-            let is_active_row = active_row == Some(i);
-            match *row {
-                workspace::SidebarRow::SectionHeader { section_idx } => {
-                    let Some(sec) = chrome.sections.get(section_idx) else {
-                        continue;
-                    };
-                    let editing = chrome
-                        .editing_section
-                        .filter(|(id, _)| *id == sec.id)
-                        .map(|(_, buf)| buf);
-                    if is_active_row {
-                        bg_quads
-                            .push(self.pill(&rect, th, 0.78, row_r).shadow(Shadow::Soft));
-                    } else if editing.is_none() && hover(cur, &rect) {
-                        bg_quads.push(self.pill(&rect, th, 0.40, row_r));
-                    }
-                    hot.push(rect);
-                    if let Some(buf) = editing {
-                        bg_quads.push(self.px_rect(&rect, th.accent, 0.18, row_r));
-                        let caret_w = (2.0 * self.scale).round().max(1.0);
-                        let text_left = (rect.x + group_pad).round();
-                        let top =
-                            (rect.y + (rect.h - self.chrome_cell_height) / 2.0).round();
-                        labels.push(LabelSpec {
-                            text: buf.to_string(),
-                            color: color(th.ink, 1.0),
-                            left: text_left,
-                            top,
-                            clip: LayoutRect {
-                                w: (rect.w - group_pad - caret_w - 2.0).max(0.0),
-                                ..rect
-                            },
-                            size: Some(header_size),
-                        });
-                        let w = buf.chars().count() as f32 * self.chrome_cell_width * 0.9;
-                        let caret = LayoutRect {
-                            x: (text_left + w).round(),
-                            y: top,
-                            w: caret_w,
-                            h: self.chrome_cell_height,
-                        };
-                        bg_quads.push(self.px_rect(&caret, th.accent, 1.0, 0.0));
-                    } else {
-                        let chevron = if sec.collapsed { "▸" } else { "▾" };
-                        let member_count = workspaces
-                            .iter()
-                            .filter(|w| w.section == Some(sec.id))
-                            .count();
-                        let mut text = String::new();
-                        text.push_str(chevron);
-                        text.push(' ');
-                        if !sec.emoji.is_empty() {
-                            text.push_str(&sec.emoji);
-                            text.push(' ');
-                        }
-                        text.push_str(&sec.name);
-                        if sec.collapsed && member_count > 0 {
-                            text.push_str(&format!(" · {member_count}"));
-                        }
-                        // Reserve the right gutter for the delete-section
-                        // button so the label never reflows when it appears.
-                        let del = workspace::section_delete_rect(&rect, self.scale);
-                        let gap = (4.0 * self.scale).round();
-                        labels.push(LabelSpec {
-                            text,
-                            color: color(
-                                if is_active_row { th.ink } else { th.ink_dim },
-                                1.0,
-                            ),
-                            left: (rect.x + group_pad).round(),
-                            top: (rect.y + (rect.h - self.chrome_cell_height) / 2.0).round(),
-                            clip: LayoutRect {
-                                w: (del.x - rect.x - gap).max(0.0),
-                                ..rect
-                            },
-                            size: Some(header_size),
-                        });
-                        // Delete-section button, revealed on row hover: a
-                        // rounded chip behind an × (mirrors the tab close).
-                        if hover(cur, &rect) {
-                            let del_hov = hover(cur, &del);
-                            let inset = (3.0 * self.scale).round();
-                            let chip = LayoutRect {
-                                x: del.x + inset,
-                                y: del.y + inset,
-                                w: (del.w - 2.0 * inset).max(0.0),
-                                h: (del.h - 2.0 * inset).max(0.0),
-                            };
-                            bg_quads.push(self.px_rect(
-                                &chip,
-                                th.card,
-                                if del_hov { 1.0 } else { 0.5 },
-                                (4.0 * self.scale).round(),
-                            ));
-                            labels.push(LabelSpec {
-                                text: "×".to_string(),
-                                color: color(
-                                    if del_hov { th.ink } else { th.ink_dim },
-                                    1.0,
-                                ),
-                                left: del.x
-                                    + ((del.w - self.chrome_cell_width) / 2.0).round(),
-                                top: (rect.y + (rect.h - self.chrome_cell_height) / 2.0)
-                                    .round(),
-                                clip: rect,
-                                size: Some(header_size),
-                            });
-                        }
-                        // Group unread bubbles up: if any member workspace has
-                        // an unread tab, light an accent dot on the section
-                        // header (regardless of collapsed/expanded state).
-                        let section_has_unread = workspaces
-                            .iter()
-                            .filter(|w| w.section == Some(sec.id))
-                            .any(|w| w.any_unread());
-                        if section_has_unread {
-                            let ds = (7.0 * self.scale).round();
-                            let dot = LayoutRect {
-                                x: (rect.x + (group_pad - ds) / 2.0).round(),
-                                y: (rect.y + (rect.h - ds) / 2.0).round(),
-                                w: ds,
-                                h: ds,
-                            };
-                            bg_quads.push(self.px_rect(&dot, th.accent, 1.0, ds / 2.0));
-                        }
-                    }
-                }
-                workspace::SidebarRow::Group { ws_idx } => {
-                    let Some(ws_item) = workspaces.get(ws_idx) else {
-                        continue;
-                    };
-                    if is_active_row {
-                        bg_quads
-                            .push(self.pill(&rect, th, 0.78, row_r).shadow(Shadow::Soft));
-                    } else if hover(cur, &rect) {
-                        bg_quads.push(self.pill(&rect, th, 0.40, row_r));
-                    }
-                    hot.push(rect);
-                    let clip_w = rect.w - group_pad;
-                    // Unread (any unread tab in the group lights the dot):
-                    // accent dot in the left padding gutter, centered on the
-                    // row; text stays put so rows keep alignment.
-                    if ws_item.any_unread() {
-                        let ds = (7.0 * self.scale).round();
-                        let dot = LayoutRect {
-                            x: (rect.x + (group_pad - ds) / 2.0).round(),
-                            y: (rect.y + (rect.h - ds) / 2.0).round(),
-                            w: ds,
-                            h: ds,
-                        };
-                        bg_quads.push(self.px_rect(&dot, th.accent, 1.0, ds / 2.0));
-                    }
-                    labels.push(LabelSpec {
-                        text: ws_item.title(),
-                        color: color(
-                            if is_active_row { th.ink } else { th.ink_dim },
-                            1.0,
-                        ),
-                        left: rect.x + group_pad,
-                        top: (rect.y + (rect.h - self.chrome_cell_height) / 2.0).round(),
-                        clip: LayoutRect { w: clip_w, ..rect },
-                        size: None,
-                    });
-                }
-            }
-        }
-    }
 
     fn picker_overlay(
         &self,
@@ -2760,7 +2378,6 @@ impl Renderer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cleanup::Cleanup;
 
     /// Long profile details truncate with an ellipsis instead of overrunning
     /// the row; degenerate widths drop the detail entirely.
@@ -2774,26 +2391,15 @@ mod tests {
         assert_eq!(truncate_chars("", 0), "");
     }
 
-    fn cleanup_chrome(cleanup: &Cleanup) -> ChromeState<'_> {
+    fn cleanup_chrome() -> ChromeState<'static> {
         ChromeState {
             page: Page::Cleanup,
-            section: Section::ALL[0],
-            dot_anim: &[0.0, 0.0, 0.0],
-            sections: &[],
-            editing_section: None,
-            cleanup,
             notes_enabled: false,
-            notes_vaults: &[],
-            notes_active_vault: 0,
-            notes_doc_rels: &[],
-            notes_selected_doc: None,
             ribbon_tools: &[],
             open_tool: None,
             tool_panel_w: 0.0,
         tool_panel_floating: false,
             cursor: None,
-            settings_query: "",
-            settings_search_focus: false,
         }
     }
 
@@ -2804,12 +2410,11 @@ mod tests {
     fn tool_ribbon_and_panel_render() {
         let scale = 2.0;
         let renderer = Renderer::new(scale, 18.0, 1600, 1000);
-        let state = Cleanup::default();
         let tile = crate::workspace::Tile::new(1, crate::term::Session::placeholder());
         let wss = [crate::workspace::Workspace::new("g".into(), tile, None)];
 
         // Closed: the ribbon icon is there, the panel is not.
-        let mut chrome = cleanup_chrome(&state);
+        let mut chrome = cleanup_chrome();
         chrome.page = Page::Sessions;
         chrome.ribbon_tools = &pages::Tool::ALL;
         let frame = renderer.build_frame(
@@ -2858,7 +2463,7 @@ mod tests {
         // card stops left of the panel. The PR / Local-diff tools render as
         // gpui element trees (not canvas), so the Launch tool — which still
         // uses the canvas placeholder — exercises the panel-paint path here.
-        let mut chrome = cleanup_chrome(&state);
+        let mut chrome = cleanup_chrome();
         chrome.page = Page::Sessions;
         chrome.ribbon_tools = &pages::Tool::ALL;
         chrome.open_tool = Some(pages::Tool::Launch);
@@ -2918,7 +2523,7 @@ mod tests {
         // No tools registered (non-Sessions pages, or a group without the
         // tool's context): ribbon and panel hide — even with a stale
         // open_tool — and the tiles reclaim the full width.
-        let mut chrome = cleanup_chrome(&state);
+        let mut chrome = cleanup_chrome();
         chrome.page = Page::Sessions;
         chrome.open_tool = Some(pages::Tool::Pr);
         chrome.tool_panel_w = crate::workspace::TOOL_PANEL_DEFAULT_W;
@@ -2938,219 +2543,15 @@ mod tests {
         );
     }
 
-    /// The Settings sidebar renders the search box's placeholder in the top
-    /// slot and the section tabs one slot down, off the same rect helpers
-    /// main.rs hit-tests.
-    #[test]
-    fn settings_sidebar_shows_search_placeholder_above_tabs() {
-        let scale = 2.0;
-        let renderer = Renderer::new(scale, 18.0, 1600, 1000);
-        let state = Cleanup::default();
-        let mut chrome = cleanup_chrome(&state);
-        chrome.page = Page::Settings;
-        let ws = crate::workspace::Workspace::new(
-            "g".into(),
-            crate::workspace::Tile::empty(1),
-            None,
-        );
-        let sidebar_w = 240.0;
-        let frame = renderer.build_frame(
-            &[ws], 0, sidebar_w, None, None, None, None, None, None, None, None, None, None, &chrome,
-        );
-        let search = crate::workspace::settings_search_rect(scale, sidebar_w);
-        let search_y = (search.y + (search.h - renderer.chrome_cell_height) / 2.0).round();
-        assert!(
-            frame.labels.iter().any(|l| l.text == "Search settings" && l.top == search_y),
-            "placeholder sits in the top sidebar slot"
-        );
-        let tab = crate::workspace::tab_rect(1, scale, sidebar_w);
-        let tab_y = (tab.y + (tab.h - renderer.chrome_cell_height) / 2.0).round();
-        assert!(
-            frame.labels.iter().any(|l| l.text == "Sessions" && l.top == tab_y),
-            "first section tab shifts down one slot below the search box"
-        );
-    }
-
-    /// The Settings content area is the gpui overlay in settings_ui — the
-    /// canvas must not paint the terminal tiles (or their hot rects)
-    /// underneath it, same as on Cleanup.
-    #[test]
-    fn settings_page_paints_sidebar_only() {
-        let scale = 2.0;
-        let renderer = Renderer::new(scale, 18.0, 1600, 1000);
-        let state = Cleanup::default();
-        let mut chrome = cleanup_chrome(&state);
-        chrome.page = Page::Settings;
-        let ws = crate::workspace::Workspace::new(
-            "g".into(),
-            crate::workspace::Tile::empty(1),
-            None,
-        );
-        let sidebar_w = 240.0;
-        let settings_frame = renderer.build_frame(
-            &[ws], 0, sidebar_w, None, None, None, None, None, None, None, None, None, None,
-            &chrome,
-        );
-        chrome.page = Page::Sessions;
-        let ws = crate::workspace::Workspace::new(
-            "g".into(),
-            crate::workspace::Tile::empty(1),
-            None,
-        );
-        let sessions_frame = renderer.build_frame(
-            &[ws], 0, sidebar_w, None, None, None, None, None, None, None, None, None, None,
-            &chrome,
-        );
-        assert!(
-            settings_frame.bg_quads.len() < sessions_frame.bg_quads.len(),
-            "Settings ({} quads) must skip the tile cards the Sessions page paints ({} quads)",
-            settings_frame.bg_quads.len(),
-            sessions_frame.bg_quads.len()
-        );
-    }
-
-    /// The sidebar unread dot sits in the row's left padding gutter, not at
-    /// the card's right edge.
-    #[test]
-    fn sidebar_unread_dot_sits_in_left_gutter() {
-        let scale = 2.0;
-        let renderer = Renderer::new(scale, 18.0, 1600, 1000);
-        let state = Cleanup::default();
-        let mut chrome = cleanup_chrome(&state);
-        chrome.page = Page::Sessions;
-
-        let mut tile = crate::workspace::Tile::new(1, crate::term::Session::placeholder());
-        if let Some(tab) = tile.active_tab_mut() {
-            tab.unread = true;
-        }
-        let wss = [crate::workspace::Workspace::new("g".into(), tile, None)];
-
-        let sidebar_w = 240.0;
-        let frame = renderer.build_frame(
-            &wss, 0, sidebar_w, None, None, None, None, None, None, None, None, None, None, &chrome,
-        );
-
-        let rows = crate::workspace::sidebar_rows(&wss, &[]);
-        let row = crate::workspace::sidebar_row_rect(&rows, 0, &wss, scale, sidebar_w);
-        let group_pad = (12.0 * scale).round();
-        let ds = (7.0 * scale).round();
-        let expected_x = (row.x + (group_pad - ds) / 2.0).round();
-        let expected_y = (row.y + (row.h - ds) / 2.0).round();
-        assert!(
-            frame.bg_quads.iter().any(|q| q.w == ds
-                && q.h == ds
-                && q.radius == ds / 2.0
-                && q.x == expected_x
-                && q.y == expected_y),
-            "unread dot should sit in the left gutter, centered on the group row"
-        );
-    }
-
-    /// The section-header unread dot sits in the left gutter when any member
-    /// workspace has an unread tab — for both collapsed and expanded sections.
-    #[test]
-    fn sidebar_section_header_unread_dot_sits_in_left_gutter() {
-        let scale = 2.0;
-        let renderer = Renderer::new(scale, 18.0, 1600, 1000);
-        let state = Cleanup::default();
-
-        let section_id: u64 = 42;
-
-        for &collapsed in &[false, true] {
-            let mut chrome = cleanup_chrome(&state);
-            chrome.page = Page::Sessions;
-
-            // Build a workspace assigned to the section with an unread tab.
-            let mut tile = crate::workspace::Tile::new(1, crate::term::Session::placeholder());
-            if let Some(tab) = tile.active_tab_mut() {
-                tab.unread = true;
-            }
-            let mut ws = crate::workspace::Workspace::new("g".into(), tile, None);
-            ws.section = Some(section_id);
-            let wss = [ws];
-
-            let sections = [crate::workspace::Section {
-                id: section_id,
-                name: "MySection".into(),
-                emoji: "🔥".into(),
-                collapsed,
-                anchor: None,
-            }];
-            chrome.sections = &sections;
-
-            let sidebar_w = 240.0;
-            let frame = renderer.build_frame(
-                &wss, 0, sidebar_w, None, None, None, None, None, None, None, None, None, None, &chrome,
-            );
-
-            // The section header is always row 0.
-            let rows = crate::workspace::sidebar_rows(&wss, &sections);
-            let header_row = crate::workspace::sidebar_row_rect(&rows, 0, &wss, scale, sidebar_w);
-            let group_pad = (12.0 * scale).round();
-            let ds = (7.0 * scale).round();
-            let expected_x = (header_row.x + (group_pad - ds) / 2.0).round();
-
-            assert!(
-                frame.bg_quads.iter().any(|q| q.w == ds
-                    && q.h == ds
-                    && q.radius == ds / 2.0
-                    && q.x == expected_x
-                    && q.y >= header_row.y
-                    && q.y + q.h <= header_row.y + header_row.h),
-                "unread dot should sit in the left gutter of the section header row (collapsed={collapsed})"
-            );
-        }
-    }
-
-    /// Hovering the "+ group" button brightens it and adds the soft shadow;
-    /// without a cursor the button stays in its resting style.
-    #[test]
-    fn new_group_button_hover_brightens_and_soft_shadows() {
-        let scale = 2.0;
-        let renderer = Renderer::new(scale, 18.0, 1600, 1000);
-        let state = Cleanup::default();
-        let mut chrome = cleanup_chrome(&state);
-        chrome.page = Page::Sessions;
-        let sidebar_w = 240.0;
-        let btn = crate::workspace::new_group_button(scale, sidebar_w);
-        let wss = [crate::workspace::Workspace::new(
-            "g".into(),
-            crate::workspace::Tile::empty(1),
-            None,
-        )];
-
-        let quad_at_btn = |frame: &Frame| {
-            frame
-                .bg_quads
-                .iter()
-                .find(|q| q.x == btn.x && q.y == btn.y && q.w == btn.w && q.h == btn.h)
-                .map(|q| q.shadow == Shadow::Soft)
-        };
-
-        let resting = renderer.build_frame(
-            &wss, 0, sidebar_w, None, None, None, None, None, None, None, None, None, None, &chrome,
-        );
-        assert_eq!(quad_at_btn(&resting), Some(false), "resting button has no soft shadow");
-        assert!(resting.hot.iter().any(|r| r.x == btn.x && r.y == btn.y), "button is hot");
-
-        chrome.cursor = Some((btn.x + btn.w / 2.0, btn.y + btn.h / 2.0));
-        let hovered = renderer.build_frame(
-            &wss, 0, sidebar_w, None, None, None, None, None, None, None, None, None, None, &chrome,
-        );
-        assert_eq!(quad_at_btn(&hovered), Some(true), "hovered button gains the soft shadow");
-    }
-
     /// A modal overlay owns the frame's hot list: only its elements register,
     /// never the chrome underneath.
     #[test]
     fn frame_hot_scopes_to_overlay_when_modal() {
         let scale = 2.0;
         let renderer = Renderer::new(scale, 18.0, 1600, 1000);
-        let state = Cleanup::default();
-        let mut chrome = cleanup_chrome(&state);
+        let mut chrome = cleanup_chrome();
         chrome.page = Page::Sessions;
         let sidebar_w = 240.0;
-        let btn = crate::workspace::new_group_button(scale, sidebar_w);
         let wss = [crate::workspace::Workspace::new(
             "g".into(),
             crate::workspace::Tile::empty(1),
@@ -3161,7 +2562,6 @@ mod tests {
             &wss, 0, sidebar_w, None, None, None, None, None, None, None, None, None, None, &chrome,
         );
         assert!(!plain.hot.is_empty());
-        assert!(plain.hot.iter().any(|r| r.x == btn.x && r.y == btn.y));
 
         let confirm = renderer.build_frame(
             &wss,
@@ -3181,47 +2581,6 @@ mod tests {
         );
         // Exactly the dialog's Cancel and accept buttons are interactive.
         assert_eq!(confirm.hot.len(), 2, "confirm dialog exposes only its two buttons");
-        assert!(!confirm.hot.iter().any(|r| r.x == btn.x && r.y == btn.y));
-    }
-
-    /// A hovered inactive sidebar group row gains the shadowless hover pill;
-    /// without a cursor no quad is painted for it at all.
-    #[test]
-    fn hovered_inactive_sidebar_row_gains_pill() {
-        let scale = 2.0;
-        let renderer = Renderer::new(scale, 18.0, 1600, 1000);
-        let state = Cleanup::default();
-        let mut chrome = cleanup_chrome(&state);
-        chrome.page = Page::Sessions;
-        let sidebar_w = 240.0;
-        let wss = [
-            crate::workspace::Workspace::new("a".into(), crate::workspace::Tile::empty(1), None),
-            crate::workspace::Workspace::new("b".into(), crate::workspace::Tile::empty(2), None),
-        ];
-        let rows = crate::workspace::sidebar_rows(&wss, &[]);
-        let row = crate::workspace::sidebar_row_rect(&rows, 1, &wss, scale, sidebar_w);
-        let row_quad = |frame: &Frame| {
-            frame
-                .bg_quads
-                .iter()
-                .find(|q| q.x == row.x && q.y == row.y && q.w == row.w && q.h == row.h)
-                .map(|q| q.shadow)
-        };
-
-        let resting = renderer.build_frame(
-            &wss, 0, sidebar_w, None, None, None, None, None, None, None, None, None, None, &chrome,
-        );
-        assert_eq!(row_quad(&resting), None, "inactive row paints no pill at rest");
-
-        chrome.cursor = Some((row.x + row.w / 2.0, row.y + row.h / 2.0));
-        let hovered = renderer.build_frame(
-            &wss, 0, sidebar_w, None, None, None, None, None, None, None, None, None, None, &chrome,
-        );
-        assert_eq!(
-            row_quad(&hovered),
-            Some(Shadow::None),
-            "hovered inactive row gains the shadowless pill"
-        );
     }
 
     /// Hovering a flyover tab's × registers it hot and paints the chip; with

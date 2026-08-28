@@ -24,6 +24,7 @@ mod features;
 mod file_tree;
 mod gh;
 mod git;
+mod git_context;
 mod highlight;
 mod lfg;
 mod local_diff_ui;
@@ -42,6 +43,8 @@ mod pwrspace;
 mod rect;
 mod renderer;
 mod settings;
+mod sidebar_card;
+mod sidebar_ui;
 mod term;
 mod term_theme;
 mod theme;
@@ -53,7 +56,7 @@ mod ui;
 mod workspace;
 
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use gpui::{
     canvas, div, px, App as GpuiApp, AppContext, Application, Bounds, Context, CursorStyle,
@@ -76,6 +79,35 @@ use workspace::{Dir, Node, Tab, Tile, Workspace};
 const GRAB: f32 = 4.0;
 /// Pointer travel (logical px) before a tab press becomes a drag.
 const DRAG_THRESHOLD: f64 = 6.0;
+/// How often the sidebar cards are topped up while the user stays inside one
+/// group. Comfortably longer than the cache's `FRESH_WINDOW`, so a tick only
+/// walks entries that have actually aged out; a tick with nothing stale hands
+/// the worker slot straight back.
+const GIT_CTX_POLL: std::time::Duration = std::time::Duration::from_secs(6);
+/// How often panes that still have *no name at all* — no emulator title and no
+/// process-derived one — are looked up. Short, because this is exactly the
+/// window after a restart in which restored shpool tabs would otherwise read
+/// "wezterm", and it costs nothing once every pane has been named.
+const PROC_TITLE_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+/// How often already-named title-less panes are re-resolved, so a tab follows
+/// the program running in it. Much slower than the first-name poll: a pane
+/// whose shell never sets a title stays in this sweep for the life of the app,
+/// and `ps -axE` dumps every process's environment, so the steady-state cost
+/// has to be an occasional sweep rather than a treadmill.
+const PROC_TITLE_REFRESH: std::time::Duration = std::time::Duration::from_secs(15);
+/// Consecutive sweeps a pane may fail to resolve before it drops off the fast
+/// tick. Some panes can never be named — a detached shpool session whose shell
+/// is gone — and they must not hold the 2s sweep open for the whole session.
+const PROC_TITLE_MISS_LIMIT: usize = 3;
+
+/// Whether a process-title sweep is due, and whether it should also re-resolve
+/// the panes that already have a name (`Some(renew)`). Pure, for tests.
+fn proc_title_due(
+    since_poll: std::time::Duration,
+    since_renew: std::time::Duration,
+) -> Option<bool> {
+    (since_poll >= PROC_TITLE_POLL).then_some(since_renew >= PROC_TITLE_REFRESH)
+}
 
 /// A drop landing zone resolved from the pointer during a tab drag.
 #[derive(Clone, Copy, Debug)]
@@ -97,6 +129,25 @@ enum DropTarget {
     SidebarAppend { section_id: u64 },
     /// Move a dragged section block so it starts at top-level `dest_start`.
     SectionMove { dest_start: usize },
+}
+
+impl DropTarget {
+    /// Whether this target's preview lands inside the sidebar panel.
+    ///
+    /// The panel is an opaque gpui element painted *over* the canvas, so a
+    /// hint pushed as a canvas quad here would be swallowed. These variants
+    /// are drawn by [`crate::sidebar_ui`] instead; the rest stay on the
+    /// canvas, where nothing occludes them.
+    fn in_sidebar(self) -> bool {
+        matches!(
+            self,
+            DropTarget::Group { .. }
+                | DropTarget::SidebarInsert { .. }
+                | DropTarget::SidebarJoin { .. }
+                | DropTarget::SidebarAppend { .. }
+                | DropTarget::SectionMove { .. }
+        )
+    }
 }
 
 /// A pending destructive action waiting behind the modal confirm dialog.
@@ -244,6 +295,27 @@ struct App {
     sections: Vec<workspace::Section>,
     /// Monotonic id counter for newly created sidebar sections.
     next_section_id: u64,
+    /// Per-group git/PR aggregates behind a 5s stale-while-revalidate cache.
+    /// The paint path only ever *reads* it (`get`); every write arrives as a
+    /// `TermEvent::GitContextReady` from the refresh worker.
+    git_contexts: git_context::GitContextCache,
+    /// True while the serial git-context worker is alive, so a burst of
+    /// refresh triggers cannot fan out into N simultaneous `gh` calls.
+    git_ctx_busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// A refresh trigger that arrived while the worker was busy. Remembered
+    /// rather than dropped, and re-fired once the worker is done.
+    git_ctx_pending: bool,
+    /// When the periodic sidebar-card poll last fired. Cards quote a working
+    /// tree that changes under us (commits, dirty counts), so a group the user
+    /// never leaves still has to be topped up on a timer.
+    git_ctx_polled_at: std::time::Instant,
+    /// True while the process-title sweep is alive, so the throttle can never
+    /// stack `ps` sweeps on top of each other.
+    proc_title_busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// When the first-name process-title poll last fired.
+    proc_title_polled_at: std::time::Instant,
+    /// When the slower re-resolve of already-named title-less panes last fired.
+    proc_title_refreshed_at: std::time::Instant,
     next_session_id: u64,
     next_tile_id: u64,
     /// Sidebar width when expanded, logical px (user-resizable).
@@ -418,6 +490,14 @@ impl App {
     /// (`workspace` geometry treats 0 as collapsed), else the user's width.
     fn sidebar_w(&self) -> f32 {
         if self.sidebar_collapsed { 0.0 } else { self.sidebar_expanded_w }
+    }
+
+    /// Whether the current page paints the Messages-style preview cards, which
+    /// are taller than the one-line rows every other page uses. Sessions and
+    /// Pull Requests share one sidebar, so both must answer the same way or
+    /// hit-testing would drift from what is painted.
+    fn card_rows(&self) -> bool {
+        matches!(self.page, Page::Sessions | Page::PullRequests)
     }
 
     /// Tools registered for `page`, resolved against the active group.
@@ -632,6 +712,7 @@ impl App {
                         .spawn_session_named(tab_cwd.as_deref().or(cwd), st.shpool_session.clone());
                     let mut tab = Tab::new(session);
                     tab.unread = st.unread;
+                    tab.unread_at = persist::from_epoch_secs(st.unread_at);
                     restored.tabs.push(tab);
                 }
                 restored.active = saved.iter().position(|st| st.active).unwrap_or(0);
@@ -779,6 +860,9 @@ impl App {
                 self.pr = pr_ui::PrState::default();
                 self.local_diff.data = pr_ui::Load::Idle;
                 self.reset_pr_surface();
+                // The sidebar card for the group we just left (and the one we
+                // arrived at) may be stale by now.
+                self.spawn_git_context_refresh();
                 if self.visible_tool() == Some(pages::Tool::LocalDiff) {
                     self.spawn_local_diff();
                 }
@@ -1289,6 +1373,40 @@ impl App {
             || self.flyover_visible(id)
     }
 
+    /// Record that the tab owning session `id` asked for attention, without
+    /// dotting it — the pane is on screen, so the user is already watching it.
+    ///
+    /// The stamp still moves so the group's card can say when its work last
+    /// spoke up; only the unread dot is withheld. An already-unread tab keeps
+    /// its existing stamp, exactly as the mark-unread paths do: that stamp is
+    /// the moment it started waiting, which is what a card reports, and it
+    /// also keeps a chatty pane from rewriting the snapshot on every toast.
+    /// Returns whether a stamp was written, so the caller knows to redraw.
+    fn stamp_attention_by_session(&mut self, id: u64) -> bool {
+        let now = SystemTime::now();
+        if let Some(tab) = self.flyover_tabs.iter_mut().find(|tab| tab.session.id == id) {
+            if !tab.unread {
+                tab.unread_at = Some(now);
+            }
+            return false; // Flyover tabs have no sidebar card to restamp.
+        }
+        let changed = self.workspaces.iter_mut().any(|ws| {
+            ws.root.tiles_mut().into_iter().any(|t| {
+                t.tabs.iter_mut().any(|tab| {
+                    let hit = tab.session.id == id && !tab.unread;
+                    if hit {
+                        tab.unread_at = Some(now);
+                    }
+                    hit
+                })
+            })
+        });
+        if changed {
+            self.persist_snapshot();
+        }
+        changed
+    }
+
     /// Mark the tab owning session `id` unread. Returns true (and persists)
     /// only on a false→true transition, so repeated attention signals from
     /// one pane don't churn the snapshot.
@@ -1297,6 +1415,9 @@ impl App {
         if let Some(tab) = self.flyover_tabs.iter_mut().find(|tab| tab.session.id == id) {
             let hit = !tab.unread;
             tab.unread = true;
+            if hit {
+                tab.unread_at = Some(SystemTime::now());
+            }
             return hit;
         }
         let changed = self.workspaces.iter_mut().any(|ws| {
@@ -1305,6 +1426,7 @@ impl App {
                     let hit = tab.session.id == id && !tab.unread;
                     if hit {
                         tab.unread = true;
+                        tab.unread_at = Some(SystemTime::now());
                     }
                     hit
                 })
@@ -1374,6 +1496,7 @@ impl App {
                     &self.workspaces,
                     scale,
                     self.sidebar_w(),
+                    self.card_rows(),
                 );
                 if !rect.contains(px, py) {
                     continue;
@@ -1386,6 +1509,7 @@ impl App {
                         && !tab.unread
                     {
                         tab.unread = true;
+                        tab.unread_at = Some(SystemTime::now());
                         self.persist_snapshot();
                         self.request_redraw();
                     }
@@ -1418,6 +1542,7 @@ impl App {
                     && !tab.unread
                 {
                     tab.unread = true;
+                    tab.unread_at = Some(SystemTime::now());
                     self.persist_snapshot();
                     self.request_redraw();
                 }
@@ -2012,6 +2137,7 @@ impl App {
                     &self.workspaces,
                     scale,
                     self.sidebar_w(),
+                    self.card_rows(),
                 );
                 if !rect.contains(px, py) {
                     continue;
@@ -2054,6 +2180,7 @@ impl App {
                 &self.workspaces,
                 scale,
                 self.sidebar_w(),
+                self.card_rows(),
             );
             // Full sidebar x-span for the row's y band (indented members still hit).
             let side = workspace::sidebar(h, scale, self.sidebar_w());
@@ -2112,6 +2239,7 @@ impl App {
                 &self.workspaces,
                 scale,
                 self.sidebar_w(),
+                self.card_rows(),
             );
             if py >= rect.y + rect.h {
                 return Some(DropTarget::SidebarInsert {
@@ -2162,6 +2290,7 @@ impl App {
                 &self.workspaces,
                 scale,
                 self.sidebar_w(),
+                self.card_rows(),
             );
             let side = workspace::sidebar(h, scale, self.sidebar_w());
             if py < rect.y || py >= rect.y + rect.h {
@@ -2224,6 +2353,7 @@ impl App {
                 &self.workspaces,
                 scale,
                 self.sidebar_w(),
+                self.card_rows(),
             );
             if py >= rect.y + rect.h {
                 return Some(DropTarget::SectionMove {
@@ -2234,10 +2364,32 @@ impl App {
         None
     }
 
-    /// The translucent highlight rect for a resolved drop target, in physical
-    /// px. Mirrors `resolve_drop`'s geometry so the preview matches the landing.
-    fn drop_hint(&self, target: DropTarget) -> Option<workspace::LayoutRect> {
-        let scale = self.scale();
+    /// The landing zone the pointer is over right now, if a drag is live.
+    ///
+    /// The canvas hint and the sidebar's own element-tree feedback both read
+    /// this, so a preview can never disagree with the drop `mouse_up` resolves
+    /// — they run the same resolvers against the same cursor. `self.cursor` is
+    /// already physical px (see the mouse listeners), so it must NOT be scaled
+    /// again: doing so put the preview at cursor×scale² and made it disagree
+    /// with the landing.
+    fn current_drop_target(&self) -> Option<DropTarget> {
+        let (x, y) = (self.cursor.0 as f32, self.cursor.1 as f32);
+        match self.drag {
+            Drag::Tab { tile, .. } => self.resolve_drop(x, y, tile),
+            Drag::Group { .. } => self.resolve_sidebar_group_drop(x, y),
+            Drag::Section { section_id } => self.resolve_section_drop(x, y, section_id),
+            _ => None,
+        }
+    }
+
+    /// The translucent highlight rect for a resolved drop target, at `scale`.
+    /// Mirrors `resolve_drop`'s geometry so the preview matches the landing.
+    ///
+    /// Pass the device scale for canvas painting; `sidebar_ui` passes 1.0
+    /// because gpui lays out in logical px. Only the sidebar arms honour that —
+    /// the tile arms read `self.area()`, which is physical — so element-tree
+    /// callers must keep to [`DropTarget::in_sidebar`] targets.
+    fn drop_hint(&self, target: DropTarget, scale: f32) -> Option<workspace::LayoutRect> {
         let rows = workspace::sidebar_rows(&self.workspaces, &self.sections);
         let line_h = (2.0 * scale).max(1.0);
         match target {
@@ -2252,6 +2404,7 @@ impl App {
                                 &self.workspaces,
                                 scale,
                                 self.sidebar_w(),
+                                self.card_rows(),
                             ));
                         }
                     }
@@ -2268,6 +2421,7 @@ impl App {
                                 &self.workspaces,
                                 scale,
                                 self.sidebar_w(),
+                                self.card_rows(),
                             ));
                         }
                     }
@@ -2285,6 +2439,7 @@ impl App {
                                 &self.workspaces,
                                 scale,
                                 self.sidebar_w(),
+                                self.card_rows(),
                             ));
                         }
                     }
@@ -2364,6 +2519,7 @@ impl App {
                 &self.workspaces,
                 scale,
                 self.sidebar_w(),
+                self.card_rows(),
             );
             match *row {
                 workspace::SidebarRow::Group { ws_idx } if ws_idx >= before => {
@@ -2391,6 +2547,7 @@ impl App {
                 &self.workspaces,
                 scale,
                 self.sidebar_w(),
+                self.card_rows(),
             );
             return rect.y + rect.h;
         }
@@ -2412,7 +2569,14 @@ impl App {
         let side = workspace::sidebar(h, scale, self.sidebar_w());
         let mut x = side.x + (8.0 * scale).round();
         for ri in 0..rows.len() {
-            let r = workspace::sidebar_row_rect(rows, ri, &self.workspaces, scale, self.sidebar_w());
+            let r = workspace::sidebar_row_rect(
+                rows,
+                ri,
+                &self.workspaces,
+                scale,
+                self.sidebar_w(),
+                self.card_rows(),
+            );
             x = if ri == 0 { r.x } else { x.min(r.x) };
         }
         let w = side.w - (x - side.x) * 2.0;
@@ -3054,6 +3218,15 @@ impl App {
                 }
                 return;
             }
+            if self.visible_tool().is_some() && self.tool_panel_floating {
+                // Click landed outside the panel and outside the ribbon: only a
+                // floating panel dismisses on blur, so collapse it here. A docked
+                // panel reserves its own width and stays open until explicitly
+                // closed (ribbon slot toggle or close control). Either way the
+                // click falls through so the terminal tile under the cursor still
+                // gets focused.
+                self.close_tool();
+            }
         }
 
         // Empty state (Sessions only): the centered CTA is the only
@@ -3081,6 +3254,20 @@ impl App {
 
         // Sidebar: titlebar strip = traffic lights + window drag handle.
         if sidebar.contains(px, py) {
+            // Header chips FIRST: they now ride inside the titlebar strip, and
+            // that strip is the window-drag handle — so testing the drag first
+            // swallowed every chip click as a window move. The "＋" at the top
+            // right makes a group; the "⇤" beside it folds the sidebar away.
+            // (Sections are made by dragging one group onto another, not by a
+            // button.)
+            if workspace::new_group_button(scale, self.sidebar_w()).contains(px, py) {
+                self.open_picker();
+                return;
+            }
+            if workspace::sidebar_collapse_button(scale, self.sidebar_w()).contains(px, py) {
+                self.toggle_sidebar();
+                return;
+            }
             // Window-drag is scoped to the titlebar strip ONLY so that clicks on
             // tile tab strips are never treated as a window move.
             if workspace::titlebar(scale, self.sidebar_w()).contains(px, py) {
@@ -3167,26 +3354,6 @@ impl App {
                 }
                 return;
             }
-            if workspace::new_group_button(scale, self.sidebar_w()).contains(px, py) {
-                self.open_picker();
-                return;
-            }
-            if workspace::new_section_button(scale, self.sidebar_w()).contains(px, py) {
-                // Append an empty expanded section and open the rename editor.
-                let id = self.next_section_id;
-                self.next_section_id = self.next_section_id.saturating_add(1);
-                self.sections.push(workspace::Section {
-                    id,
-                    name: "section".into(),
-                    emoji: String::new(),
-                    collapsed: false,
-                    anchor: None,
-                });
-                self.editing_section = Some((id, "section".into()));
-                self.persist_snapshot();
-                self.request_redraw();
-                return;
-            }
             // Consume the shared row list so paint and hit-test never disagree.
             // Arm a press; click actions fire on mouse-up if the drag threshold
             // is never crossed (mirrors TabPress → Tab).
@@ -3198,6 +3365,7 @@ impl App {
                     &self.workspaces,
                     scale,
                     self.sidebar_w(),
+                    self.card_rows(),
                 );
                 if !rect.contains(px, py) {
                     continue;
@@ -4284,6 +4452,16 @@ impl App {
         self.request_redraw();
     }
 
+    /// Collapse the currently-open tool panel (e.g. when it loses focus).
+    fn close_tool(&mut self) {
+        if self.open_tool.is_some() {
+            self.open_tool = None;
+            settings::set("toolpanel.tool", "".into());
+            self.sync_layout();
+            self.request_redraw();
+        }
+    }
+
     /// Fetch data for the currently-open git tool (PR list/detail or local
     /// diff). No-op when the open tool isn't a git tool or isn't visible.
     fn load_open_git_tool(&mut self) {
@@ -4361,6 +4539,13 @@ impl App {
             self.recording = None;
             self.settings_query.clear();
             self.settings_search_focus = false;
+            // The sidebar cards are on screen again; top up whatever went
+            // stale while another page was up. Sessions and Pull Requests
+            // share one card sidebar (`card_rows`), so both must refresh or
+            // the Pull Requests page would quote a frozen snapshot forever.
+            if self.card_rows() {
+                self.spawn_git_context_refresh();
+            }
             // Grids may have gone stale while the Settings page was up.
             if page == Page::Sessions {
                 self.sync_layout();
@@ -4461,6 +4646,64 @@ impl App {
         })
     }
 
+    /// Refresh the per-group git/PR aggregates the sidebar cards read.
+    ///
+    /// `git_context::fetch` shells out to `git` and `gh`, so it must never be
+    /// reachable from the paint path: every stale group is handed to a single
+    /// background worker that walks them *serially* and posts each result back
+    /// as a `TermEvent::GitContextReady`. The serial walk (guarded by
+    /// `git_ctx_busy`) is the concurrency cap — N groups can never become N
+    /// simultaneous `gh` calls, however often this is triggered. Groups
+    /// without a `cwd` have no repo to describe and are skipped.
+    fn spawn_git_context_refresh(&mut self) {
+        use std::sync::atomic::Ordering;
+        // Claim the worker slot in one atomic step, so the guard does not rest
+        // on an unstated "only ever called from the foreground thread".
+        if self
+            .git_ctx_busy
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            // A walk is already in flight. Remember the trigger rather than
+            // dropping it — `drain_events` re-fires it once the slot frees.
+            self.git_ctx_pending = true;
+            return;
+        }
+        self.git_ctx_pending = false;
+        // Deduplicated: several groups can point at one checkout, and each
+        // fetch is a fistful of shell-outs worth doing once.
+        let mut stale: Vec<std::path::PathBuf> = Vec::new();
+        for cwd in self.workspaces.iter().filter_map(|w| w.cwd.clone()) {
+            if self.git_contexts.needs_refresh(&cwd) && !stale.contains(&cwd) {
+                stale.push(cwd);
+            }
+        }
+        if stale.is_empty() {
+            // Nothing to walk, so hand the slot straight back.
+            self.git_ctx_busy.store(false, Ordering::Release);
+            return;
+        }
+        let tx = self.events_tx.clone();
+        let busy = self.git_ctx_busy.clone();
+        std::thread::spawn(move || {
+            // Clear the flag on the way out however we leave, so a panic in a
+            // shell-out can't wedge refreshes off for the rest of the session.
+            struct Clear(std::sync::Arc<std::sync::atomic::AtomicBool>);
+            impl Drop for Clear {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::Release);
+                }
+            }
+            let _clear = Clear(busy);
+
+            for cwd in stale {
+                let ctx = git_context::fetch(&cwd);
+                if tx.send(TermEvent::GitContextReady { cwd, ctx }).is_err() {
+                    break;
+                }
+            }
+        });
+    }
 
     /// Kick off a background `drop -d --json` sweep and show the scanning
     /// state until its `TermEvent` lands.
@@ -4475,6 +4718,72 @@ impl App {
             let _ = tx.send(event);
         });
         self.request_redraw();
+    }
+
+    /// Re-name every pane that still has no emulator title from its foreground
+    /// process, off-thread. Modelled on `spawn_git_context_refresh`: the slot
+    /// is claimed in one atomic step so the guard doesn't rest on an unstated
+    /// "foreground thread only", and a `ps` sweep never runs on the render
+    /// thread. Unlike the card walk there is no pending-trigger retry — the
+    /// poll fires again in `PROC_TITLE_POLL` anyway. Returns whether a sweep
+    /// was actually started, so the caller knows whether a `renew` tick was
+    /// spent or swallowed.
+    fn spawn_proc_title_refresh(&mut self, renew: bool) -> bool {
+        use std::sync::atomic::Ordering;
+        if self
+            .proc_title_busy
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        // Only panes the emulator hasn't named: a real OSC title always wins.
+        // On a fast tick, only the ones with no name at all — the panes a user
+        // is actually staring at after a restart; the rest wait for `renew`.
+        let specs: Vec<(u64, Option<String>, Option<u32>)> = self
+            .workspaces
+            .iter()
+            .flat_map(|ws| ws.root.tiles())
+            .flat_map(|tile| tile.tabs.iter())
+            .chain(self.flyover_tabs.iter())
+            .filter(|tab| {
+                // A pane with neither a pid nor a shpool session can never
+                // resolve (placeholder, or a spawn that failed), and would
+                // otherwise keep the fast sweep alive for the life of the app.
+                (tab.session.child_pid.is_some() || tab.session.shpool_session.is_some())
+                    && tab.session.needs_proc_title()
+                    && (renew
+                        || (!tab.session.has_proc_title()
+                            && tab.session.proc_title_misses() < PROC_TITLE_MISS_LIMIT))
+            })
+            .map(|tab| {
+                (tab.session.id, tab.session.shpool_session.clone(), tab.session.child_pid)
+            })
+            .collect();
+        if specs.is_empty() {
+            // Nothing to name, so hand the slot straight back. Still counts as
+            // a sweep: there was no work, not a lost turn.
+            self.proc_title_busy.store(false, Ordering::Release);
+            return true;
+        }
+        let tx = self.events_tx.clone();
+        let busy = self.proc_title_busy.clone();
+        std::thread::spawn(move || {
+            // Clear the flag however we leave, so a panic in a shell-out can't
+            // wedge title refreshes off for the rest of the session.
+            struct Clear(std::sync::Arc<std::sync::atomic::AtomicBool>);
+            impl Drop for Clear {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::Release);
+                }
+            }
+            let _clear = Clear(busy);
+
+            let titles = term::foreground_titles(&specs);
+            let asked = specs.iter().map(|(id, _, _)| *id).collect();
+            let _ = tx.send(TermEvent::ProcTitlesReady { asked, titles });
+        });
+        true
     }
 
     /// Handle keyboard input on the Cleanup page (mirrors handle_settings_key).
@@ -4536,6 +4845,28 @@ impl App {
                     self.remove_session(id);
                     redraw = true;
                 },
+                // The `ps` sweep came back: fill in the fallback names. Every
+                // surface reads `Session::title()`, so a redraw is all it takes
+                // for tab strips and sidebar cards to pick them up — and only
+                // a name that actually moved is worth one, since the sweep
+                // re-resolves the same name for as long as a pane stays
+                // title-less.
+                TermEvent::ProcTitlesReady { asked, titles } => {
+                    for (id, title) in &titles {
+                        if let Some(session) = self.find_session(*id)
+                            && session.set_proc_title(Some(title.clone()))
+                        {
+                            redraw = true;
+                        }
+                    }
+                    // Panes the sweep couldn't name: count the miss so a pane
+                    // that can never resolve stops holding the fast tick open.
+                    for id in asked.iter().filter(|id| !titles.iter().any(|(i, _)| i == *id)) {
+                        if let Some(session) = self.find_session(*id) {
+                            session.note_proc_title_miss();
+                        }
+                    }
+                },
                 // A backgrounded worktree drop finished: clear the provisioning
                 // message and open the new group — with the profile chosen
                 // before provisioning, when there was one — or surface the
@@ -4588,11 +4919,18 @@ impl App {
                 },
                 // A pane signaled for attention (OSC 9, emitted by the Claude
                 // Code hooks). On-screen tabs of the active group are being
-                // watched, so only hidden tabs gain the unread dot.
+                // watched, so only hidden tabs gain the unread dot — but a
+                // watched pane still stamps its attention time, or the one
+                // group the user is looking at would be the only card whose
+                // timestamp never moves.
                 TermEvent::Attention(id) => {
                     let watched = (self.page == Page::Sessions && self.is_visible(id))
                         || self.flyover_visible(id);
-                    if !watched && self.set_unread_by_session(id) {
+                    if watched {
+                        if self.stamp_attention_by_session(id) {
+                            redraw = true;
+                        }
+                    } else if self.set_unread_by_session(id) {
                         redraw = true;
                     }
                 },
@@ -4620,6 +4958,21 @@ impl App {
                     if self.on_pr_cache_updated(&kind, number) {
                         redraw = true;
                     }
+                    // The PR cache moved under us, so every aggregate that
+                    // quotes it is due for a re-fetch — but a wipe would blink
+                    // every card back to its bare title until some unrelated
+                    // trigger refilled it. Bump staleness instead, keeping the
+                    // last-known-good values on screen (and available to
+                    // `merge`) until the new ones land.
+                    self.git_contexts.mark_all_stale();
+                    self.spawn_git_context_refresh();
+                },
+                TermEvent::GitContextReady { cwd, ctx } => {
+                    // Folded through the cache's `merge`, then repainted the
+                    // same way every other event here does: `redraw` is what
+                    // the caller turns into `cx.notify()`.
+                    self.git_contexts.insert(&cwd, ctx);
+                    redraw = true;
                 },
                 TermEvent::Redraw => {
                     redraw = true;
@@ -4675,6 +5028,43 @@ impl App {
                 // Anim settled at the open position — resize flyover PTYs now.
                 // Forced, so cell-metric changes made while hidden still land.
                 self.sync_flyover_layout(true);
+            }
+        }
+        // Re-fire a git-context trigger that arrived while the serial worker
+        // was mid-walk. This drain runs on the foreground executor every
+        // ~16ms, so the retry costs one atomic until the slot frees and is
+        // never dropped on the floor the way a plain early return would.
+        if self.git_ctx_pending {
+            self.spawn_git_context_refresh();
+        }
+        // Keep the cards honest while the user stays put: commits land and
+        // dirty counts move inside a single group, and nothing else would
+        // ever trigger a walk. Polling on this same foreground drain (no
+        // extra thread, no timer per group) is what makes the cache's 5s
+        // `FRESH_WINDOW` reachable at all — a tick with nothing stale hands
+        // the worker slot straight back, so the idle cost is one atomic.
+        if self.card_rows()
+            && !self.sidebar_collapsed
+            && self.git_ctx_polled_at.elapsed() >= GIT_CTX_POLL
+        {
+            self.git_ctx_polled_at = std::time::Instant::now();
+            self.spawn_git_context_refresh();
+        }
+        // Name the panes the emulator hasn't named. Not gated on the sidebar
+        // the way the card walk is: tab strips show these titles whether or
+        // not any card is visible.
+        if let Some(renew) = proc_title_due(
+            self.proc_title_polled_at.elapsed(),
+            self.proc_title_refreshed_at.elapsed(),
+        ) {
+            self.proc_title_polled_at = std::time::Instant::now();
+            // Panes that already have a name only ride along on the slow tick,
+            // so the steady state is a sweep every `PROC_TITLE_REFRESH`.
+            // Only credit the slow tick once the sweep is actually running:
+            // a `renew` swallowed by a still-busy slot would otherwise not be
+            // retried for another `PROC_TITLE_REFRESH`.
+            if self.spawn_proc_title_refresh(renew) && renew {
+                self.proc_title_refreshed_at = std::time::Instant::now();
             }
         }
         redraw || self.dirty
@@ -5215,6 +5605,12 @@ impl Render for App {
                 // the terminal never paints.
                 .size_full(),
             )
+            // Sessions sidebar: an element tree drawn as a sibling of the
+            // canvas. Geometry still comes from `workspace::sidebar_row_rect`,
+            // so the canvas underneath keeps resolving every click and drag.
+            // Returns an empty element when collapsed or on the canvas-sidebar
+            // pages.
+            .child(self.render_sidebar(cx))
             // Cleanup page overlay: real gpui element tree above the canvas.
             // Skip while a confirm dialog is open so the canvas-painted scrim
             // owns the screen (v1 tradeoff).
@@ -5242,11 +5638,12 @@ impl Render for App {
             // Right-edge git tool panels: real element trees over the canvas
             // placeholder, only for git-backed Sessions groups (visible_tool
             // already gates that).
-            .when(self.visible_tool() == Some(pages::Tool::Pr) && self.confirm.is_none(), |el| {
-                el.child(self.render_pr(cx))
-            })
             .when(
-                self.visible_tool() == Some(pages::Tool::LocalDiff) && self.confirm.is_none(),
+                self.visible_tool() == Some(pages::Tool::Pr) && !self.modal_overlay_open(),
+                |el| el.child(self.render_pr(cx)),
+            )
+            .when(
+                self.visible_tool() == Some(pages::Tool::LocalDiff) && !self.modal_overlay_open(),
                 |el| el.child(self.render_local_diff(cx)),
             )
     }
@@ -5329,61 +5726,20 @@ impl App {
         }
 
         // While a tab/group/section is being dragged, resolve the current
-        // landing zone and compute its translucent preview rect.
-        // `self.cursor` is already physical px (see the mouse listeners), so
-        // it must NOT be scaled again — doing so put the preview at cursor×
-        // scale² and made it disagree with the drop resolved on mouse-up.
-        let (cursor_x, cursor_y) = self.cursor;
-        let drop_hint = match self.drag {
-            Drag::Tab { tile, .. } => {
-                self.resolve_drop(cursor_x as f32, cursor_y as f32, tile)
-                    .and_then(|t| self.drop_hint(t))
-            },
-            Drag::Group { .. } => self
-                .resolve_sidebar_group_drop(cursor_x as f32, cursor_y as f32)
-                .and_then(|t| self.drop_hint(t)),
-            Drag::Section { section_id } => self
-                .resolve_section_drop(cursor_x as f32, cursor_y as f32, section_id)
-                .and_then(|t| self.drop_hint(t)),
-            _ => None,
-        };
-
-        // Vault sidebar tabs show the directory name (falling back to the full
-        // path when the vault sits at a filesystem root).
-        let notes_vaults: Vec<String> = crate::notes::vaults()
-            .iter()
-            .map(|p| {
-                p.file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| p.to_string_lossy().to_string())
-            })
-            .collect();
-        // The active vault's doc labels + which one is open — the sidebar's
-        // second section, painted right under the vault rows.
-        let notes_doc_rels: Vec<String> =
-            self.notes_docs.iter().map(|d| d.rel.clone()).collect();
-        let notes_selected_doc = self.notes_selected.as_deref().and_then(|sel| {
-            self.notes_docs.iter().position(|d| d.path.as_path() == sel)
-        });
+        // landing zone and compute its translucent preview rect. Sidebar
+        // targets are deliberately filtered out: the panel is an opaque
+        // element sibling painted after the canvas, so a fg_quad in sidebar
+        // coordinates would be occluded. `sidebar_ui::drop_feedback_layer`
+        // draws those, at the very same rects.
+        let drop_hint = self
+            .current_drop_target()
+            .filter(|t| !t.in_sidebar())
+            .and_then(|t| self.drop_hint(t, scale));
 
         let ribbon_tools = self.tools_for(self.page);
         let chrome = renderer::ChromeState {
             page: self.page,
-            section: self.section,
-            dot_anim: &self.dot_anim,
             notes_enabled: crate::features::notes_enabled(),
-            notes_vaults: &notes_vaults,
-            notes_active_vault: self.notes_active_vault,
-            notes_doc_rels: &notes_doc_rels,
-            notes_selected_doc,
-            sections: &self.sections,
-            editing_section: self
-                .editing_section
-                .as_ref()
-                .map(|(id, buf)| (*id, buf.as_str())),
-            cleanup: &self.cleanup,
-            settings_query: &self.settings_query,
-            settings_search_focus: self.settings_search_focus,
             ribbon_tools: &ribbon_tools,
             open_tool: self.open_tool,
             tool_panel_w: self.tool_panel_w,
@@ -5517,32 +5873,28 @@ impl App {
         // established content-mask context those sub-layers don't composite —
         // this mirrors how Zed's own TerminalElement paints.
         window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
-            // 0) the themed window gradient every card and sidebar row floats
-            // on (mockup 3a's tinted wrapper).
-            // With the blurred window background, the ground is one flat
-            // translucent tint: gradient stops band visibly when
-            // alpha-composited over blur, and native sidebars are a single
-            // uniform material anyway. Vibrancy off restores the opaque
-            // gradient.
-            let vibrancy = settings::get_bool("appearance.vibrancy", true);
-            if vibrancy {
-                let mid = |a: u8, b: u8| ((a as u16 + b as u16) / 2) as u8;
-                let tint = (
-                    mid(th.gradient_from.0, th.gradient_to.0),
-                    mid(th.gradient_from.1, th.gradient_to.1),
-                    mid(th.gradient_from.2, th.gradient_to.2),
-                );
-                window.paint_quad(gpui::fill(bounds, renderer::color(tint, 0.80)));
-            } else {
-                window.paint_quad(gpui::fill(
-                    bounds,
-                    gpui::linear_gradient(
-                        135.0,
-                        gpui::linear_color_stop(renderer::color(th.gradient_from, 1.0), 0.0),
-                        gpui::linear_color_stop(renderer::color(th.gradient_to, 1.0), 1.0),
-                    ),
-                ));
-            }
+            // 0) the ground every card and sidebar row floats on.
+            //
+            // Messages-style blending: the ground is the *terminal* background,
+            // not a tinted gradient, so an unfocused pane has nothing to stand
+            // out against and reads as part of the window. Only the focused
+            // pane keeps its border and shadow (see `renderer.rs`), and the
+            // sidebar stays a floating card — the same trick Messages plays
+            // with its conversation list against a flat message area.
+            //
+            // `term_scheme_bg()` and not the chrome theme's `term_bg`: those
+            // are different colours whenever a terminal scheme is selected, and
+            // it is the *scheme's* background the panes actually paint. Reading
+            // the chrome value put a dark ground behind white panes and killed
+            // the whole effect. Also why this is not a literal white — it
+            // tracks whichever terminal theme is live, so a dark scheme blends
+            // just as cleanly.
+            //
+            // Opaque even under vibrancy: a translucent ground lets the desktop
+            // through, which reintroduces exactly the contrast the panes are
+            // supposed to be losing.
+            let ground = renderer::color(self.renderer.term_scheme_bg(), 1.0);
+            window.paint_quad(gpui::fill(bounds, ground));
 
             // 1) background quads.
             for q in &frame.bg_quads {
@@ -6456,6 +6808,29 @@ fn main() {
                         active: 0,
                         sections: Vec::new(),
                         next_section_id: 0,
+                        git_contexts: git_context::GitContextCache::new(),
+                        git_ctx_busy: std::sync::Arc::new(
+                            std::sync::atomic::AtomicBool::new(false),
+                        ),
+                        git_ctx_pending: false,
+                        // Backdated a full interval so the first foreground
+                        // drain walks the groups immediately. Starting at
+                        // `now()` would leave every card showing its bare
+                        // title for the first `GIT_CTX_POLL` after launch,
+                        // which is exactly when the user is looking at them.
+                        git_ctx_polled_at: std::time::Instant::now()
+                            .checked_sub(GIT_CTX_POLL)
+                            .unwrap_or_else(std::time::Instant::now),
+                        proc_title_busy: std::sync::Arc::new(
+                            std::sync::atomic::AtomicBool::new(false),
+                        ),
+                        // Backdated for the same reason: restored panes are
+                        // named on the first drain rather than after a beat of
+                        // showing the stock "wezterm".
+                        proc_title_polled_at: std::time::Instant::now()
+                            .checked_sub(PROC_TITLE_POLL)
+                            .unwrap_or_else(std::time::Instant::now),
+                        proc_title_refreshed_at: std::time::Instant::now(),
                         next_session_id: 0,
                         next_tile_id: 0,
                         sidebar_expanded_w: workspace::SIDEBAR_DEFAULT_W,
@@ -6561,6 +6936,11 @@ fn main() {
                         app.workspaces.push(Workspace::placeholder());
                     }
                     app.sync_layout();
+                    // Cards launch empty otherwise: without a first walk the
+                    // sidebar shows the bare `Workspace::title()` fallback —
+                    // no branch or diffstat — until the user happens to switch
+                    // groups. This only enqueues the serial worker.
+                    app.spawn_git_context_refresh();
 
                     // Drain PTY wakeups on the foreground executor: poll the
                     // mpsc channel and notify when a redraw is needed. This
@@ -6785,5 +7165,33 @@ mod open_url_tests {
     fn non_dir_and_foreign_scheme_are_dropped() {
         assert_eq!(parse_open_dir("file:///no/such/path/here"), None);
         assert_eq!(parse_open_dir("https://example.com"), None);
+    }
+}
+
+#[cfg(test)]
+mod proc_title_tests {
+    use super::{PROC_TITLE_POLL, PROC_TITLE_REFRESH, proc_title_due};
+    use std::time::Duration;
+
+    /// Nothing is due until the fast tick elapses, however stale the slow one.
+    #[test]
+    fn no_sweep_before_the_fast_tick() {
+        assert_eq!(proc_title_due(Duration::ZERO, PROC_TITLE_REFRESH), None);
+        assert_eq!(
+            proc_title_due(PROC_TITLE_POLL - Duration::from_millis(1), PROC_TITLE_REFRESH),
+            None
+        );
+    }
+
+    /// The fast tick sweeps only the nameless panes until the slow tick is
+    /// also due, at which point the already-named ones are re-resolved too.
+    #[test]
+    fn renew_rides_the_slow_tick() {
+        assert_eq!(proc_title_due(PROC_TITLE_POLL, Duration::ZERO), Some(false));
+        assert_eq!(
+            proc_title_due(PROC_TITLE_POLL, PROC_TITLE_REFRESH - Duration::from_millis(1)),
+            Some(false)
+        );
+        assert_eq!(proc_title_due(PROC_TITLE_POLL, PROC_TITLE_REFRESH), Some(true));
     }
 }
