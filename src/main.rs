@@ -42,6 +42,7 @@ mod palette_ui;
 mod palette;
 mod persist;
 mod picker;
+mod picker_ui;
 mod pwrspace;
 mod rect;
 mod renderer;
@@ -373,7 +374,7 @@ struct App {
     /// `Some(placeholder)` right after a modal opened: the next render clears
     /// the field, sets that placeholder and focuses it (opening happens in
     /// handlers without a `Window`).
-    modal_search_reset: Option<&'static str>,
+    modal_search_reset: Option<String>,
     /// A centered one-line message. `bool` is `dismissable`: false while `drop`
     /// provisions (input swallowed), true for a failure note the user can close.
     message: Option<(String, bool)>,
@@ -1580,15 +1581,53 @@ impl App {
 
     // ── cwd picker ──────────────────────────────────────────────────────
 
+    /// Show the directory picker, claiming the shared search field.
+    fn set_picker(&mut self, picker: picker::Picker) {
+        self.picker = Some(picker);
+        self.modal_search_reset = Some(picker_ui::DIR_PLACEHOLDER.into());
+    }
+
+    /// Show the fork-source picker, claiming the shared search field.
+    fn set_fork(&mut self, fork: picker::ForkPicker) {
+        self.fork = Some(fork);
+        self.modal_search_reset = Some(picker_ui::FORK_PLACEHOLDER.into());
+    }
+
+    /// Show the workspace-profile picker, claiming the shared search field.
+    fn set_profile(&mut self, profile: picker::ProfilePicker) {
+        self.modal_search_reset = Some(picker_ui::profile_placeholder(&profile.name));
+        self.profile_picker = Some(profile);
+    }
+
+    /// True while any modal that owns the shared search field is up.
+    fn search_modal_open(&self) -> bool {
+        self.palette.is_some()
+            || self.picker.is_some()
+            || self.fork.is_some()
+            || self.profile_picker.is_some()
+    }
+
+    /// Close the directory picker without choosing. Cancelling the flyover's
+    /// first-open picker closes the waiting surface too — there is nothing
+    /// to show yet.
+    fn cancel_picker(&mut self) {
+        self.picker = None;
+        if self.picker_target == PickerTarget::Flyover && self.flyover_tabs.is_empty() {
+            self.flyover_open = false;
+            self.flyover_focused = false;
+            self.flyover_window_visible = false;
+        }
+    }
+
     fn open_picker(&mut self) {
         self.picker_target = PickerTarget::Group;
-        self.picker = Some(picker::Picker::new());
+        self.set_picker(picker::Picker::new());
         self.request_redraw();
     }
 
     fn open_flyover_picker(&mut self) {
         self.picker_target = PickerTarget::Flyover;
-        self.picker = Some(picker::Picker::new());
+        self.set_picker(picker::Picker::new());
         self.request_redraw();
     }
 
@@ -1757,7 +1796,7 @@ impl App {
                     .into_iter()
                     .filter(|c| matches!(c.scope, picker::ForkScope::RepoRoot | picker::ForkScope::Worktree))
                     .collect::<Vec<_>>();
-                self.fork = Some(picker::ForkPicker::new(entry.path, name, choices));
+                self.set_fork(picker::ForkPicker::new(entry.path, name, choices));
                 self.picker = None;
             } else {
                 self.picker = None;
@@ -1766,7 +1805,7 @@ impl App {
         } else if entry.is_git {
             // Step 2: choose where to fork a drop worktree from.
             let choices = build_fork_choices(&entry.path);
-            self.fork = Some(picker::ForkPicker::new(entry.path, name, choices));
+            self.set_fork(picker::ForkPicker::new(entry.path, name, choices));
             self.picker = None;
         } else {
             self.picker = None;
@@ -1818,7 +1857,7 @@ impl App {
         let found = pwrspace::discover(&pwrspace::candidate_paths(&repo));
         if !found.is_empty() {
             self.fork = None;
-            self.profile_picker = Some(picker::ProfilePicker::new(name.clone(), found));
+            self.set_profile(picker::ProfilePicker::new(name.clone(), found));
             self.profile_next = Some(ProfileNext::Fork { repo, name, from });
             self.request_redraw();
             return;
@@ -1853,7 +1892,7 @@ impl App {
         if found.is_empty() {
             self.add_group(name, Some(cwd));
         } else {
-            self.profile_picker = Some(picker::ProfilePicker::new(name.clone(), found));
+            self.set_profile(picker::ProfilePicker::new(name.clone(), found));
             self.profile_next = Some(ProfileNext::Open { name, cwd });
             self.request_redraw();
         }
@@ -1888,9 +1927,9 @@ impl App {
         match self.profile_next.take() {
             Some(ProfileNext::Fork { repo, name, .. }) => {
                 let choices = build_fork_choices(&repo);
-                self.fork = Some(picker::ForkPicker::new(repo, name, choices));
+                self.set_fork(picker::ForkPicker::new(repo, name, choices));
             },
-            _ => self.picker = Some(picker::Picker::new()),
+            _ => self.set_picker(picker::Picker::new()),
         }
         self.request_redraw();
     }
@@ -2803,97 +2842,6 @@ impl App {
 
     // ── Pointer events (from the terminal Element) ──────────────────────────
 
-    /// Routes a click to whichever overlay is up, in priority order
-    /// (message → fork picker → dir picker). Ports origin/main's overlay_click
-    /// into the gpui three-field model.
-    fn overlay_click(&mut self, px: f32, py: f32, width: u32, height: u32, scale: f32) {
-        // The confirm dialog and the message panel are element modals now
-        // (`modal_ui`): their occluding scrim means no click reaches the
-        // canvas while either is up, so there is nothing to resolve here.
-        if self.confirm.is_some() || self.message.is_some() {
-            return;
-        }
-
-        // The save-as-workspace modal is an element tree (`save_ui`): its
-        // occluding scrim keeps every click off the canvas.
-        if self.save_ws.is_some() {
-            return;
-        }
-
-        // Profile picker (step 3): click a row to select+confirm, click
-        // outside to step back.
-        if let Some(pp) = &mut self.profile_picker {
-            let layout =
-                picker::PickerLayout::compute(width, height, scale, pp.rows.len(), pp.selected);
-            if !layout.panel.contains(px, py) {
-                self.cancel_profile();
-                self.request_redraw();
-                return;
-            }
-            if let Some(index) = layout.row_at(px, py) {
-                pp.select(index);
-                self.confirm_profile();
-            }
-            self.request_redraw();
-            return;
-        }
-
-        // Fork picker (step 2): click a row to select+confirm, click outside to
-        // step back to the dir picker.
-        if let Some(fork) = &mut self.fork {
-            let layout =
-                picker::PickerLayout::compute(width, height, scale, fork.rows.len(), fork.selected);
-            if !layout.panel.contains(px, py) {
-                self.fork = None;
-                self.picker = Some(picker::Picker::new());
-                self.request_redraw();
-                return;
-            }
-            if let Some(index) = layout.row_at(px, py) {
-                fork.select(index);
-                self.confirm_fork();
-            }
-            self.request_redraw();
-            return;
-        }
-
-        // Dir picker (step 1): existing behaviour.
-        if let Some(picker) = &mut self.picker {
-            let layout = picker::PickerLayout::compute(width, height, scale, picker.rows.len(), picker.selected);
-            if !layout.panel.contains(px, py) {
-                self.picker = None;
-                // Same as Escape: cancelling the flyover's first-open picker
-                // closes the waiting surface.
-                if self.picker_target == PickerTarget::Flyover && self.flyover_tabs.is_empty() {
-                    self.flyover_open = false;
-                    self.flyover_focused = false;
-                    self.flyover_window_visible = false;
-                }
-                self.request_redraw();
-                return;
-            }
-            let Some(index) = layout.row_at(px, py) else { return };
-            let Some(rect) = layout.row_rect(index) else { return };
-            let Some(picker::PickerRow::Entry(entry)) = picker.rows.get(index).cloned() else {
-                return;
-            };
-            picker.select(index);
-            if layout.star_rect(&rect).contains(px, py) {
-                picker.toggle_pin(&entry.path);
-                self.request_redraw();
-                return;
-            }
-            self.confirm_picker();
-            return;
-        }
-
-        // The command palette is an element tree (`palette_ui`): its
-        // occluding scrim keeps every click off the canvas.
-        if self.palette.is_some() {
-            return;
-        }
-    }
-
     // ── Mouse-report forwarding (mouse-tracking TUIs) ────────────────────
     //
     // When a TUI enables xterm mouse tracking, clicks and drags belong to the
@@ -3074,7 +3022,9 @@ impl App {
             || self.picker.is_some()
             || self.palette.is_some()
         {
-            self.overlay_click(px, py, w, h, scale);
+            // Every modal is an element tree now (modal_ui / save_ui /
+            // palette_ui / picker_ui): its occluding scrim keeps the click
+            // off the canvas, so there is nothing to resolve here.
             return;
         }
 
@@ -3936,21 +3886,8 @@ impl App {
                         pp.move_selection(1);
                     }
                 },
-                "backspace" => {
-                    if let Some(pp) = self.profile_picker.as_mut() {
-                        pp.backspace();
-                    }
-                },
-                _ => {
-                    if !ev.keystroke.modifiers.control
-                        && let Some(text) = ev.keystroke.key_char.as_deref()
-                        && let Some(pp) = self.profile_picker.as_mut()
-                    {
-                        for ch in text.chars().filter(|c| !c.is_control()) {
-                            pp.push_char(ch);
-                        }
-                    }
-                },
+                // Editing keys belong to the focused search field.
+                _ => {},
             }
             self.request_redraw();
             return;
@@ -3960,7 +3897,7 @@ impl App {
             match key {
                 "escape" => {
                     self.fork = None;
-                    self.picker = Some(picker::Picker::new());
+                    self.set_picker(picker::Picker::new());
                 },
                 "enter" => self.confirm_fork(),
                 "up" => {
@@ -3973,21 +3910,8 @@ impl App {
                         f.move_selection(1);
                     }
                 },
-                "backspace" => {
-                    if let Some(f) = self.fork.as_mut() {
-                        f.backspace();
-                    }
-                },
-                _ => {
-                    if !ev.keystroke.modifiers.control
-                        && let Some(text) = ev.keystroke.key_char.as_deref()
-                        && let Some(f) = self.fork.as_mut()
-                    {
-                        for ch in text.chars().filter(|c| !c.is_control()) {
-                            f.push_char(ch);
-                        }
-                    }
-                },
+                // Editing keys belong to the focused search field.
+                _ => {},
             }
             self.request_redraw();
             return;
@@ -3995,18 +3919,7 @@ impl App {
         // Step 1: the dir picker. Escape closes the overlay entirely.
         if self.picker.is_some() {
             match key {
-                "escape" => {
-                    self.picker = None;
-                    // Cancelling the flyover's first-open picker closes the
-                    // waiting surface too — there's nothing to show yet.
-                    if self.picker_target == PickerTarget::Flyover
-                        && self.flyover_tabs.is_empty()
-                    {
-                        self.flyover_open = false;
-                        self.flyover_focused = false;
-                        self.flyover_window_visible = false;
-                    }
-                },
+                "escape" => self.cancel_picker(),
                 "enter" => self.confirm_picker(),
                 "up" => {
                     if let Some(p) = self.picker.as_mut() {
@@ -4018,24 +3931,8 @@ impl App {
                         p.move_selection(1);
                     }
                 },
-                "backspace" => {
-                    if let Some(p) = self.picker.as_mut() {
-                        p.backspace();
-                    }
-                },
-                _ => {
-                    // A printable character extends the query. gpui hands us the
-                    // already-composed text (respecting shift/dead keys) in
-                    // key_char; ignore control chords and non-text keys.
-                    if !ev.keystroke.modifiers.control
-                        && let Some(text) = ev.keystroke.key_char.as_deref()
-                        && let Some(p) = self.picker.as_mut()
-                    {
-                        for ch in text.chars().filter(|c| !c.is_control()) {
-                            p.push_char(ch);
-                        }
-                    }
-                },
+                // Editing keys belong to the focused search field.
+                _ => {},
             }
         } else if self.palette.is_some() {
             // The palette's own chord closes it again — the overlay owns the
@@ -4291,7 +4188,7 @@ impl App {
                     self.palette = None;
                 } else {
                     self.palette = Some(palette::Palette::new());
-                    self.modal_search_reset = Some(palette_ui::PALETTE_PLACEHOLDER);
+                    self.modal_search_reset = Some(palette_ui::PALETTE_PLACEHOLDER.into());
                 }
                 return;
             },
@@ -5479,7 +5376,7 @@ impl Render for App {
                 input.set_text("", cx);
             });
             window.focus(&self.modal_search.read(cx).focus_handle(cx), cx);
-        } else if self.palette.is_none()
+        } else if !self.search_modal_open()
             && self.modal_search.read(cx).focus_handle(cx).is_focused(window)
         {
             window.focus(&self.focus_handle, cx);
@@ -5625,8 +5522,10 @@ impl Render for App {
                 self.visible_tool() == Some(pages::Tool::Launch) && !self.modal_overlay_open(),
                 |el| el.child(self.render_launch(cx)),
             )
-            // Command palette (element tree; see `palette_ui`).
+            // Command palette and the pickers (element trees; see
+            // `palette_ui` / `picker_ui`).
             .child(self.render_palette(cx))
+            .child(self.render_pickers(cx))
             // Save-as-workspace modal (element tree; see `save_ui`).
             .child(self.render_save(cx))
             // Modal overlays (confirm dialog, message panel): last, so they
@@ -5738,7 +5637,7 @@ impl App {
             element_modal: self.confirm.is_some()
                 || self.message.is_some()
                 || self.save_ws.is_some()
-                || self.palette.is_some(),
+                || self.search_modal_open(),
             cursor: {
                 let (cx, cy) = (self.cursor.0 as f32, self.cursor.1 as f32);
                 let flyover_covers = !overlay_open
@@ -5772,9 +5671,6 @@ impl App {
             drop_hint,
             resize_hover,
             link_hover_suppressed,
-            self.picker.as_ref(),
-            self.fork.as_ref(),
-            self.profile_picker.as_ref(),
             &chrome,
         );
         // The flyover panel lives outside the workspace tree, so its layer is
@@ -5990,34 +5886,8 @@ impl App {
                 &frame.flyover_labels,
             );
 
-            // 5) picker / fork / message overlay.
-            for q in &frame.picker_quads {
-                paint_quad(window, origin, inv, q, shadow_rgb);
-            }
-            for label in &frame.picker_labels {
-                let runs = [TextRun {
-                    len: label.text.len(),
-                    font: font.clone(),
-                    color: label.color,
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                }];
-                let size = label.size.map_or(chrome_font_size, |s| px(s * inv));
-                let shaped =
-                    window.text_system().shape_line(label.text.clone().into(), size, &runs, None);
-                let p = Point::new(origin.x + px(label.left * inv), origin.y + px(label.top * inv));
-                let clip_bounds = Bounds {
-                    origin: Point::new(
-                        origin.x + px(label.clip.x * inv),
-                        origin.y + px(label.clip.y * inv),
-                    ),
-                    size: Size::new(px(label.clip.w * inv), px(label.clip.h * inv)),
-                };
-                window.with_content_mask(Some(gpui::ContentMask { bounds: clip_bounds }), |window| {
-                    let _ = shaped.paint(p, chrome_line_height, TextAlign::Left, None, window, cx);
-                });
-            }
+            // 5) The modal overlays (pickers, palette, save, confirm, message)
+            //    are element trees now — nothing paints above the flyover here.
         });
 
         self.dirty = false;
@@ -6909,10 +6779,25 @@ fn main() {
                             });
                             cx.observe(&input, |this: &mut App, input, cx| {
                                 let text = input.read(cx).text().to_string();
-                                if let Some(p) = this.palette.as_mut()
-                                    && p.query != text
-                                {
+                                // Whichever search modal is up (profile over
+                                // fork over dir over palette, the canvas's
+                                // paint order) takes the query.
+                                let changed = if let Some(p) = this.profile_picker.as_mut() {
                                     p.set_query(&text);
+                                    true
+                                } else if let Some(f) = this.fork.as_mut() {
+                                    f.set_query(&text);
+                                    true
+                                } else if let Some(p) = this.picker.as_mut() {
+                                    p.set_query(&text);
+                                    true
+                                } else if let Some(p) = this.palette.as_mut() {
+                                    p.set_query(&text);
+                                    true
+                                } else {
+                                    false
+                                };
+                                if changed {
                                     this.request_redraw();
                                     cx.notify();
                                 }
