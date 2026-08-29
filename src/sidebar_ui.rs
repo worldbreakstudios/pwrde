@@ -10,9 +10,11 @@
 //! drag-and-drop in gpui's paradigm.
 //!
 //! Interaction is migrating onto the elements themselves, surface by
-//! surface: the page-dot strip ([`App::page_dot_layer`]) and the Sessions
-//! empty state ([`App::render_empty_state`]) are real gpui click targets that
-//! `occlude()` the canvas, so `main.rs` no longer hit-tests their rects.
+//! surface: the page-dot strip ([`App::page_dot_layer`]), the Sessions
+//! empty state ([`App::render_empty_state`]), and the Settings page's rows —
+//! a real rcn `Input` for the search field plus click-target section rows
+//! ([`App::settings_row_layer`]) — are gpui-owned and `occlude()` the
+//! canvas, so `main.rs` no longer hit-tests their rects.
 //!
 //! Colors come from the live chrome theme ([`crate::ui::theme::Theme`]), never
 //! from the mock's hardcoded palette, so the panel reads correctly in both
@@ -79,14 +81,8 @@ const ROW_RADIUS: f32 = 14.0;
 /// under its vault. The canvas used the same 14px.
 const ROW_INDENT: f32 = 14.0;
 
-/// Width of the Settings search box's caret. The canvas drew a 2px quad.
-const CARET_W: f32 = 2.0;
-
-/// Height of that caret — one text line at the sidebar's 12px type.
-const CARET_H: f32 = 14.0;
-
-/// What the Settings search box shows when it is empty and unfocused.
-const SEARCH_SETTINGS_PLACEHOLDER: &str = "Search settings";
+/// What the Settings search field shows while it is empty.
+pub(crate) const SEARCH_SETTINGS_PLACEHOLDER: &str = "Search settings";
 
 /// Diameter of an idle page-dot — the resting state of a page-strip slot,
 /// before it crossfades into that page's glyph. Matches the 5px the canvas
@@ -180,7 +176,7 @@ impl App {
                     // and let the row layer own everything below it.
                     .child(div().flex_1()),
             )
-            .child(self.clipped_row_layer(&theme))
+            .child(self.clipped_row_layer(&theme, cx))
             .child(self.drop_feedback_layer(&theme))
             .child(self.header_chips(&theme))
             .child(self.page_dot_layer(&theme, cx.entity().downgrade()))
@@ -570,7 +566,7 @@ impl App {
     /// window-tall, so every row still lands at its own absolute rect and the
     /// canvas hit-test stays the authority. (Scrolling to reach the clipped
     /// rows is a separate pass.)
-    fn clipped_row_layer(&self, theme: &Theme) -> gpui::Div {
+    fn clipped_row_layer(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
         let (_, surface_h) = self.renderer.surface_size();
         let height = (surface_h as f32 / self.scale()).round();
         // The titlebar's own height, in the same logical pixels the row rects
@@ -589,7 +585,7 @@ impl App {
             .h(px(bottom - top))
             .overflow_hidden()
             .child(
-                self.sidebar_row_layer(theme)
+                self.sidebar_row_layer(theme, cx)
                     .top(px(-top))
                     .h(px(height)),
             )
@@ -604,14 +600,14 @@ impl App {
     /// Settings get one-line rows at [`crate::workspace::tab_rect`] — the very
     /// rects `main.rs` already hit-tests for those pages. The split is
     /// [`App::card_rows`], the same predicate the geometry helpers take.
-    fn sidebar_row_layer(&self, theme: &Theme) -> gpui::Div {
+    fn sidebar_row_layer(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
         if self.card_rows() {
             return self.card_row_layer(theme);
         }
         match self.page {
             crate::Page::Cleanup => self.cleanup_row_layer(theme),
             crate::Page::Notes => self.notes_row_layer(theme),
-            crate::Page::Settings => self.settings_row_layer(theme),
+            crate::Page::Settings => self.settings_row_layer(theme, cx),
             // Any page without rows of its own still gets the shell.
             _ => div().absolute().left(px(0.0)).top(px(0.0)).size_full(),
         }
@@ -620,35 +616,53 @@ impl App {
     /// The Settings rows: the live search box in slot 0 and one tab per
     /// [`crate::pages::Section`] at slot `i + 1`, the shift `main.rs`'s
     /// `Page::Settings` mouse branch makes to leave room for the box.
-    fn settings_row_layer(&self, theme: &Theme) -> gpui::Div {
+    fn settings_row_layer(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
         let w = self.sidebar_w();
+        let entity = cx.entity().downgrade();
         let mut layer = div()
             .absolute()
             .left(px(0.0))
             .top(px(0.0))
             .size_full()
-            .child(self.settings_search_row(theme));
+            .child(self.settings_search_row(theme, cx));
         for (i, section) in crate::pages::Section::ALL.iter().enumerate() {
             let rect = crate::workspace::tab_rect(i + 1, 1.0, w);
             let active = *section == self.section;
-            layer = layer.child(self.simple_row(theme, &rect, section.label(), active, false, true));
+            let section = *section;
+            let entity = entity.clone();
+            layer = layer.child(
+                self.simple_row(theme, &rect, section.label(), active, false, true)
+                    .id(("settings-section", i))
+                    .occlude()
+                    .cursor_pointer()
+                    .on_click(move |_ev: &ClickEvent, win: &mut Window, app: &mut GpuiApp| {
+                        if let Some(entity) = entity.upgrade() {
+                            entity.update(app, |this, cx| {
+                                this.section = section;
+                                this.recording = None;
+                                this.clear_settings_search(cx);
+                                this.blur_settings_search(win, cx);
+                                cx.notify();
+                            });
+                        }
+                    }),
+            );
         }
         layer
     }
 
     /// The Settings search box, sitting in slot 0 where
-    /// [`crate::workspace::settings_search_rect`] — and therefore the mouse
-    /// path — expects it. It is the one sidebar field with live state, so it
-    /// gets its own builder rather than a row's:
-    /// it shows `settings_query`, takes the active-row treatment while
-    /// focused, and trails a caret after the query so typing is visible. The
-    /// unfocused box still paints its fill (unlike a row, which is
-    /// transparent until hovered) because it is an affordance, not a
-    /// selection.
-    fn settings_search_row(&self, theme: &Theme) -> gpui::Div {
+    /// [`crate::workspace::settings_search_rect`] expects it. The field
+    /// itself is the rcn [`crate::ui::Input`] entity in `App::settings_search`
+    /// (bare, at the row's type size), so typing, selection and the caret are
+    /// the framework's; this row supplies the sidebar shell around it: the
+    /// active-row treatment while focused, and a painted fill even when
+    /// unfocused (unlike a row, which is transparent until hovered) because
+    /// it is an affordance, not a selection. It occludes the canvas, so the
+    /// click that focuses it never reaches the canvas mouse path.
+    fn settings_search_row(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let rect = crate::workspace::settings_search_rect(1.0, self.sidebar_w());
         let focused = self.settings_search_focus;
-        let empty = self.settings_query.is_empty();
         // Same lift as `simple_row`: dark chrome's card token needs it to read
         // as light glass over the panel material.
         let fill = if theme.dark {
@@ -656,13 +670,19 @@ impl App {
         } else {
             theme.card
         };
+        // The row's type size tracks the Accessibility text setting; keep the
+        // field's in step (no-op when unchanged).
+        let text_size = px(scaled(12.0));
+        self.settings_search.update(cx, |input, _| input.set_text_size(Some(text_size)));
 
         div()
+            .id("settings-search")
             .absolute()
             .left(px(rect.x))
             .top(px(rect.y))
             .w(px(rect.w))
             .h(px(rect.h))
+            .occlude()
             .rounded(px(ROW_RADIUS))
             .when(focused, |d| {
                 d.bg(fill.opacity(0.78))
@@ -683,37 +703,7 @@ impl App {
             .items_center()
             .pl(px(scaled(ROW_PAD)))
             .pr(px(scaled(ROW_PAD)))
-            .text_size(px(scaled(12.0)))
-            .when_some(
-                settings_search_label(&self.settings_query, focused),
-                |d, (text, placeholder)| {
-                    d.child(
-                        div()
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .text_color(if placeholder {
-                                theme.muted_foreground
-                            } else {
-                                theme.foreground
-                            })
-                            .child(text),
-                    )
-                },
-            )
-            .when(focused, |d| {
-                // The query's own caret, in the chrome accent (`primary` is
-                // where `Theme::from_chrome` puts it). It hugs the text, so an
-                // empty query gets no leading gap.
-                d.child(
-                    div()
-                        .flex_none()
-                        .ml(px(scaled(if empty { 0.0 } else { 2.0 })))
-                        .w(px(CARET_W))
-                        .h(px(scaled(CARET_H)))
-                        .bg(theme.primary),
-                )
-            })
+            .child(self.settings_search.clone())
     }
 
     /// The Notes rows: one combined list stacking the registered vaults, then
@@ -1731,17 +1721,6 @@ fn page_slot(
         })
 }
 
-/// The text the Settings search box shows, and whether it is the placeholder
-/// rather than the query itself. `None` means show no text at all: a focused,
-/// empty box is just its caret, the way the canvas painted it.
-fn settings_search_label(query: &str, focused: bool) -> Option<(SharedString, bool)> {
-    match (query.is_empty(), focused) {
-        (true, true) => None,
-        (true, false) => Some((SEARCH_SETTINGS_PLACEHOLDER.into(), true)),
-        (false, _) => Some((query.to_string().into(), false)),
-    }
-}
-
 /// The Cleanup sidebar's rows, in slot order: `("All", no filter)` first, then
 /// one `("{repo} · {count}", is the filter)` row per repo the scan found.
 ///
@@ -1923,28 +1902,6 @@ mod tests {
         // Green and purple must never collapse onto one another.
         assert_ne!(pr_open(true), pr_merged(true));
         assert_ne!(pr_open(false), pr_merged(false));
-    }
-
-    #[test]
-    fn settings_search_shows_the_placeholder_only_when_it_is_idle() {
-        // Idle and empty: the placeholder, flagged as such so it inks dim.
-        assert_eq!(
-            settings_search_label("", false),
-            Some(("Search settings".into(), true))
-        );
-        // Focused and empty: nothing but the caret, the way the canvas drew it.
-        assert_eq!(settings_search_label("", true), None);
-    }
-
-    #[test]
-    fn settings_search_shows_the_query_whether_or_not_it_is_focused() {
-        for focused in [false, true] {
-            assert_eq!(
-                settings_search_label("theme", focused),
-                Some(("theme".into(), false)),
-                "focused = {focused}"
-            );
-        }
     }
 
     /// A worktree in `repo_root` — only the fields the row list reads matter.

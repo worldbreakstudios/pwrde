@@ -82,11 +82,11 @@ impl App {
             // armed recording and the sidebar search box's focus — exactly
             // like the old canvas settings_click. Row/control handlers run
             // at mouse-up (on_click), so they re-arm on top of this.
-            .on_mouse_down(gpui::MouseButton::Left, move |_ev, _win, gpui_app| {
+            .on_mouse_down(gpui::MouseButton::Left, move |_ev, win, gpui_app| {
                 if let Some(entity) = bg_entity.upgrade() {
                     entity.update(gpui_app, |this, cx| {
                         this.recording = None;
-                        this.settings_search_focus = false;
+                        this.blur_settings_search(win, cx);
                         cx.notify();
                     });
                 }
@@ -200,13 +200,13 @@ fn render_search_results(
                 .id(("settings-search", ix))
                 .cursor_pointer()
                 .hover(move |s| s.bg(hover_bg))
-                .on_click(move |_ev: &ClickEvent, _win: &mut Window, gpui_app: &mut GpuiApp| {
+                .on_click(move |_ev: &ClickEvent, win: &mut Window, gpui_app: &mut GpuiApp| {
                     gpui_app.stop_propagation();
                     if let Some(entity) = row_entity.upgrade() {
                         entity.update(gpui_app, move |this, cx| {
                             this.section = section;
-                            this.settings_query.clear();
-                            this.settings_search_focus = false;
+                            this.clear_settings_search(cx);
+                            this.blur_settings_search(win, cx);
                             cx.notify();
                         });
                     }
