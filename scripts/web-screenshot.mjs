@@ -5,7 +5,13 @@
 // before the wasm app has laid itself out. Dependency-free: Node's built-in
 // WebSocket and fetch (Node 22+).
 //
-//   web-screenshot.mjs <chromium> <url> <out.png> [WxH] [settle-ms]
+//   web-screenshot.mjs <chromium> <url> <out.png> [WxH] [settle-ms] [keys] [clicks]
+//
+// `clicks` ("x,y;x,y", page pixels) are performed after the settle, then
+// `keys` is typed (each char as a key press; `\n` is Enter, `\b` Backspace,
+// `\x03` ^C, `\M-p` Meta+p — the ⌘ shortcuts on a Mac browser), and the
+// capture waits another second — enough to verify an interactive path without
+// a test framework.
 //
 // Console messages and uncaught errors from the page are echoed to stderr, so
 // a Rust panic shows up in the log instead of a blank capture.
@@ -15,7 +21,7 @@ import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-const [chrome, url, out, sizeArg = "1200x720", settleArg = "6000"] = process.argv.slice(2);
+const [chrome, url, out, sizeArg = "1200x720", settleArg = "6000", keys = "", clicks = ""] = process.argv.slice(2);
 if (!chrome || !url || !out) {
     console.error("usage: web-screenshot.mjs <chromium> <url> <out.png> [WxH] [settle-ms]");
     process.exit(2);
@@ -100,6 +106,38 @@ await send("Page.navigate", { url });
 await Promise.race([loaded, new Promise((r) => setTimeout(r, 30000))]);
 // Let the wasm module boot, lay out, and paint a few real frames.
 await new Promise((r) => setTimeout(r, settle));
+const click = async (x, y) => {
+    await send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
+    await send("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", clickCount: 1 });
+    await send("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1 });
+    await new Promise((r) => setTimeout(r, 150));
+};
+if (clicks) {
+    for (const pair of clicks.split(";").filter(Boolean)) {
+        const [x, y] = pair.split(",").map(Number);
+        await click(x, y);
+    }
+}
+if (keys) {
+    // Nothing clicked yet: click the canvas so gpui focuses the window.
+    if (!clicks) await click(width / 2, height / 2);
+    // Tokens: `\n`, `\b`, `\x03`, `\M-<char>` (Meta), or a literal character.
+    const tokens = keys.match(/\\M-.|\\n|\\b|\\x03|[\s\S]/g) ?? [];
+    for (const tok of tokens) {
+        let ch = tok, modifiers = 0; // 2 = Control, 4 = Meta
+        if (tok.startsWith("\\M-")) { ch = tok.slice(3); modifiers = 4; }
+        else if (tok === "\\n") ch = "\n";
+        else if (tok === "\\b") ch = "\b";
+        else if (tok === "\\x03") { ch = "c"; modifiers = 2; }
+        const special = { "\n": ["Enter", "Enter", 13], "\b": ["Backspace", "Backspace", 8] }[ch];
+        const [key, code, keyCode] = special ?? [ch, `Key${ch.toUpperCase()}`, ch.toUpperCase().charCodeAt(0)];
+        const text = special || modifiers ? undefined : ch;
+        await send("Input.dispatchKeyEvent", { type: "keyDown", key, code, windowsVirtualKeyCode: keyCode, text, unmodifiedText: text, modifiers });
+        await send("Input.dispatchKeyEvent", { type: "keyUp", key, code, windowsVirtualKeyCode: keyCode, modifiers });
+        await new Promise((r) => setTimeout(r, 30));
+    }
+}
+if (clicks || keys) await new Promise((r) => setTimeout(r, 1000));
 const { data } = await send("Page.captureScreenshot", { format: "png" });
 writeFileSync(out, Buffer.from(data, "base64"));
 ws.close();

@@ -44,6 +44,10 @@ pub const DEMO: &[Group] = &[
 pub fn seed(app: &mut App, groups: &[Group]) {
     for group in groups {
         app.add_group(group.name.to_string(), None);
+        // `add_group` queues the primary command (`claude` by default) for the
+        // founding pane's first wakeup. A transcript already shows a program
+        // running, so nothing should be typed over it.
+        app.pending_primary_cmd.clear();
         // `add_group` founds the tile with one tab; every further tile is a
         // side-by-side split of the focused one, every further transcript in
         // a tile is another tab. Splits and tabs both spawn sessions.

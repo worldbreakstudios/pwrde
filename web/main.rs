@@ -17,11 +17,17 @@ use pwrde::app::App;
 use pwrde::pages::Page;
 use std::borrow::Cow;
 
-/// The faces `web/fonts/README.md` describes.
+/// The faces `web/fonts/README.md` describes: the terminal/chrome family,
+/// then symbol fallbacks for what it lacks.
 const FONTS: &[&[u8]] = &[
     include_bytes!("fonts/JetBrainsMonoNerdFontMono-Regular.ttf"),
     include_bytes!("fonts/JetBrainsMonoNerdFontMono-Bold.ttf"),
     include_bytes!("fonts/JetBrainsMonoNerdFontMono-Italic.ttf"),
+    include_bytes!("fonts/NotoSansSymbols-Regular.ttf"),
+    include_bytes!("fonts/NotoSansSymbols2-Regular.ttf"),
+    include_bytes!("fonts/NotoSansMath-Regular.ttf"),
+    include_bytes!("fonts/NotoEmoji-Regular.ttf"),
+    include_bytes!("fonts/NotoSansJP-Fullwidth.ttf"),
 ];
 
 /// The URL's query string, split into `key=value` pairs.

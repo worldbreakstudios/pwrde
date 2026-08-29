@@ -23,6 +23,82 @@ use wezterm_term::{
     Alert, AlertHandler, KeyModifiers, MouseButton, MouseEvent, MouseEventKind, StableRowIndex,
     Terminal, TerminalConfiguration, TerminalSize, VisibleRowIndex,
 };
+/// The line discipline that stands in for a shell on wasm32: echoes what is
+/// typed, edits the line on Backspace, starts a fresh prompt on Enter and ^C,
+/// clears on ^L, and swallows escape sequences (arrow keys) whole. Commands
+/// are not run — there is nothing to run them — except `clear` and `echo`,
+/// which are enough to make a pane feel alive in a browser test.
+#[cfg(target_family = "wasm")]
+#[derive(Default)]
+struct EchoShell {
+    line: Vec<u8>,
+    /// Inside an ESC sequence (until its final byte, 0x40..=0x7E).
+    in_escape: bool,
+}
+
+#[cfg(target_family = "wasm")]
+impl EchoShell {
+    const PROMPT: &'static [u8] = b"\x1b[1;32mpwrde-web\x1b[0m \x1b[1m$\x1b[0m ";
+
+    fn handle(&mut self, input: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for &b in input {
+            if self.in_escape {
+                if (0x40..=0x7e).contains(&b) {
+                    self.in_escape = false;
+                }
+                continue;
+            }
+            match b {
+                b'\r' | b'\n' => {
+                    out.extend_from_slice(b"\r\n");
+                    let line = std::mem::take(&mut self.line);
+                    out.extend_from_slice(&Self::run(&line));
+                    out.extend_from_slice(Self::PROMPT);
+                },
+                0x7f | 0x08 => {
+                    if self.line.pop().is_some() {
+                        out.extend_from_slice(b"\x08 \x08");
+                    }
+                },
+                0x03 => {
+                    self.line.clear();
+                    out.extend_from_slice(b"^C\r\n");
+                    out.extend_from_slice(Self::PROMPT);
+                },
+                0x0c => {
+                    out.extend_from_slice(b"\x1b[2J\x1b[H");
+                    out.extend_from_slice(Self::PROMPT);
+                    out.extend_from_slice(&self.line);
+                },
+                0x1b => self.in_escape = true,
+                b if b >= 0x20 => {
+                    self.line.push(b);
+                    out.push(b);
+                },
+                _ => {},
+            }
+        }
+        out
+    }
+
+    fn run(line: &[u8]) -> Vec<u8> {
+        let cmd = String::from_utf8_lossy(line);
+        let cmd = cmd.trim();
+        if cmd.is_empty() {
+            return Vec::new();
+        }
+        if cmd == "clear" {
+            return b"\x1b[2J\x1b[H".to_vec();
+        }
+        if let Some(rest) = cmd.strip_prefix("echo ") {
+            return format!("{rest}\r\n").into_bytes();
+        }
+        format!("\x1b[2mpwrde-web: no shell on wasm32 — `{cmd}` echoed, not run\x1b[0m\r\n")
+            .into_bytes()
+    }
+}
+
 /// wezterm-term's stock window title, i.e. "this pane has never set one".
 /// Panes showing this are the ones that get a process-derived name instead.
 pub const STOCK_TITLE: &str = "wezterm";
@@ -464,6 +540,9 @@ pub fn shpool_foreground_command(session_name: &str) -> Option<String> {
 pub struct Session {
     pub id: u64,
     pub term: Arc<Mutex<Terminal>>,
+    /// Input side of the PTY. On wasm32 the terminal's writer is a sink and
+    /// input goes through `echo` instead, so there is nothing to keep.
+    #[cfg(not(target_family = "wasm"))]
     writer: PtyWriter,
     /// The PTY master, for resizes. Absent on wasm32, where there is no PTY
     /// and a session is fed bytes directly (see `docs/web-build.md`).
@@ -486,6 +565,15 @@ pub struct Session {
     proc_title: Mutex<Option<String>>,
     /// The shpool session name if this session is backed by shpool.
     pub shpool_session: Option<String>,
+    /// wasm32 stands in for the shell: input is echoed back through this
+    /// line discipline so typing, Enter, and Backspace behave. See
+    /// [`EchoShell`].
+    #[cfg(target_family = "wasm")]
+    echo: Mutex<EchoShell>,
+    /// Wakeups for [`Session::feed`] on wasm32, where no reader thread sends
+    /// them.
+    #[cfg(target_family = "wasm")]
+    events: Sender<TermEvent>,
     /// PID of the direct child process (shell or shpool client). None for
     /// placeholder sessions and when spawn fails. Used by `foreground_command`
     /// to find the deepest foreground descendant.
@@ -693,7 +781,6 @@ impl Session {
         Self {
             id,
             term: Arc::new(Mutex::new(term)),
-            writer,
             redraw_pending,
             scroll_offset: AtomicUsize::new(0),
             selection: Mutex::new(None),
@@ -701,6 +788,8 @@ impl Session {
             proc_title_misses: AtomicUsize::new(0),
             shpool_session: None,
             child_pid: None,
+            echo: Mutex::new(EchoShell::default()),
+            events,
         }
     }
 
@@ -738,14 +827,32 @@ impl Session {
     /// content on screen without a shell.
     pub fn feed(&self, bytes: &[u8]) {
         self.term.lock().unwrap().advance_bytes(bytes);
+        // Same coalescing as the reader thread: one wakeup per frame.
+        #[cfg(target_family = "wasm")]
+        if !self.redraw_pending.swap(true, Ordering::AcqRel) {
+            let _ = self.events.send(TermEvent::Wakeup(self.id));
+        }
+        #[cfg(not(target_family = "wasm"))]
         self.redraw_pending.store(true, Ordering::Release);
     }
 
     /// Write user input to the PTY.
+    #[cfg(not(target_family = "wasm"))]
     pub fn write(&self, bytes: impl AsRef<[u8]>) {
         let mut writer = self.writer.clone();
         let _ = writer.write_all(bytes.as_ref());
         let _ = writer.flush();
+    }
+
+    /// wasm32: there is no PTY, so input goes through the echo shell and
+    /// whatever it answers lands on the grid — the same round trip a shell's
+    /// echo makes, minus the shell.
+    #[cfg(target_family = "wasm")]
+    pub fn write(&self, bytes: impl AsRef<[u8]>) {
+        let out = self.echo.lock().unwrap().handle(bytes.as_ref());
+        if !out.is_empty() {
+            self.feed(&out);
+        }
     }
 
     /// Mark the pending redraw as consumed; the next PTY chunk after this
@@ -816,8 +923,15 @@ impl Session {
 
     /// Paste text, honoring bracketed-paste mode (the terminal wraps it in
     /// ESC[200~ / ESC[201~ when the app has requested that).
+    #[cfg(not(target_family = "wasm"))]
     pub fn paste(&self, text: &str) {
         let _ = self.term.lock().unwrap().send_paste(text);
+    }
+
+    /// wasm32: bracketed paste has no shell to read it; type the text.
+    #[cfg(target_family = "wasm")]
+    pub fn paste(&self, text: &str) {
+        self.write(text);
     }
 
     // ── Scrollback ──────────────────────────────────────────────────────

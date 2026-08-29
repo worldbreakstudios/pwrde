@@ -116,10 +116,19 @@ loop before the app has laid itself out. Page console output (including Rust
 panics, with `Error.stackTraceLimit` raised in `index.html` so the Rust frames
 survive) is appended to `target/web-serve.log`.
 
-Known gaps in the picture: glyphs outside JetBrainsMono Nerd Font Mono and
-IBM Plex Sans — emoji, `⏺`/`✻`, rounded box-drawing corners — draw as boxes;
-sidebar cards show the pane title (`zsh`) rather than the fixture group name,
-exactly as native does for a pane whose shell has not set a title.
+Interaction: the page takes the same keyboard and mouse paths as native.
+Typing into a pane goes through the wasm `Session::write`, where a small line
+discipline (`term::EchoShell`) stands in for the shell — it echoes, edits the
+line on Backspace, starts a fresh prompt on Enter and ^C, clears on ^L, and
+answers `echo`/`clear`; anything else is echoed back as "not run". For an
+unattended check, `PWRDE_WEB_CLICKS="x,y;x,y"` and
+`PWRDE_WEB_KEYS='echo hi\n'` drive the capture (`\M-p` sends ⌘P).
+
+Browser limits, not app ones: Chrome reserves ⌘T, ⌘W, ⌘N and ⌘Q for itself
+(no page can preventDefault those), so use the command palette or the sidebar
+for new tabs/groups; ⌘P, ⌘D, ⌘[ / ⌘] and the rest reach the app. Sidebar
+cards show the pane title (`zsh`) rather than the fixture group name, exactly
+as native does for a pane whose shell has not set a title.
 
 ## The wezterm patch
 
@@ -156,7 +165,8 @@ On top of the patch, wasm32 needs a randomness backend spelled out:
 | `objc` / `raw-window-handle` — titlebar hairline hack | `app.rs` | already `cfg(target_os = "macos")` |
 | `std::thread::spawn` — git/PR/cleanup/ps workers | `bg.rs` | the job is dropped; callers already tolerate a worker that never answers |
 | `std::time::Instant` / `SystemTime` | everywhere | `web_time` (std re-exported natively, `performance.now()` on wasm) |
-| system fonts | `web/main.rs` | `web/fonts/` registered via `text_system().add_fonts` |
+| system fonts | `web/main.rs` | `web/fonts/` registered via `text_system().add_fonts` (the terminal family plus Noto symbol/emoji fallbacks) |
+| the shell behind a pane | `term.rs` | `EchoShell`, a line discipline that echoes input on wasm32 |
 | `wezterm-term`'s writer thread | patch | writes synchronously on targets without threads |
 
 Things that **compile** on wasm32 and simply fail at runtime, which the app
@@ -193,5 +203,5 @@ writer) and are filled with `Session::feed(bytes)`.
   loading.
 - Group names in cards: the fixture could set an OSC 0 title per pane so
   cards read `pwrde` / `rcn` rather than `zsh`.
-- A symbols fallback font (Nerd Font Symbols or Noto Symbols) for the glyphs
-  the terminal transcripts use.
+- Grow `EchoShell` only if a test needs it (a canned `ls`, say); it is a
+  stand-in, not a shell.
