@@ -12,6 +12,11 @@
 //! Colors come from the live chrome theme ([`crate::ui::theme::Theme`]), never
 //! from the mock's hardcoded palette, so the panel reads correctly in both
 //! light and dark polarity.
+//!
+//! Pinned groups move out of the rows into an iMessage-style strip above
+//! them — one avatar bubble per pin, painted on this same absolute layer
+//! straight from [`crate::workspace::pinned_bubble_rect`], so painting and the
+//! hit test in `main.rs` never disagree.
 
 use gpui::{
     AnyElement, BoxShadow, Context, FontWeight, Hsla, IntoElement, ParentElement, SharedString,
@@ -641,7 +646,141 @@ impl App {
                 }
             }
         }
+        // The pinned quick-access strip rides above the rows on this same
+        // absolute layer: one bubble per pinned group at exactly the rect
+        // `pinned_bubble_rect` hands the mouse path (scale 1.0 — gpui already
+        // works in logical px), so a click that lands on a bubble *is* that
+        // bubble as far as hit-testing is concerned. `sidebar_rows` has already
+        // left these groups out of the ladder, so the strip is their only home.
+        let pinned = crate::workspace::pinned_indices(&self.workspaces);
+        for (k, &ws_idx) in pinned.iter().enumerate() {
+            let Some(ws) = self.workspaces.get(ws_idx) else {
+                continue;
+            };
+            let rect = crate::workspace::pinned_bubble_rect(k, pinned.len(), 1.0, w);
+            layer = layer.child(self.pinned_bubble(theme, ws, ws_idx, &rect));
+        }
         layer
+    }
+
+    /// One iMessage-style pinned bubble: a big round avatar with the group's
+    /// name under it, absolutely positioned at the rect
+    /// [`crate::workspace::pinned_bubble_rect`] handed the mouse path. The
+    /// avatar kind is derived exactly the way [`Self::group_card`] derives it
+    /// (`avatar_for` over the cached git context — never a blocking fetch), so
+    /// a bubble reads the same state its card would have shown before the pin.
+    /// The active group wears a gantry ring, an unread group gets a
+    /// dot beside its name, and hover is deliberately inert: the bubbles have
+    /// no hover well, they are just a big target.
+    fn pinned_bubble(
+        &self,
+        theme: &Theme,
+        ws: &crate::workspace::Workspace,
+        ws_idx: usize,
+        rect: &crate::workspace::LayoutRect,
+    ) -> gpui::Div {
+        let ctx = ws
+            .cwd
+            .as_deref()
+            .and_then(|cwd| self.git_contexts.get(cwd));
+        let rollup = ctx.map_or(PrRollup::None, |c| derive_rollup(c.pr.as_ref()));
+        let kind = avatar_for(
+            rollup,
+            ctx.and_then(|c| c.pr.as_ref()).is_some_and(|p| p.is_draft),
+        );
+        let active = ws_idx == self.active;
+
+        // The 64px disc. A draft glows in the gantry accent like its card
+        // does, with a soft shadow to lift it off the panel; the other three
+        // states wear GitHub's status gradients, inked for each fill.
+        let disc = div()
+            .flex_none()
+            .w(px(64.0))
+            .h(px(64.0))
+            .rounded_full()
+            .flex()
+            .items_center()
+            .justify_center();
+        let disc = match kind {
+            CardAvatar::Draft => disc
+                .bg(gantry_accent(theme.dark))
+                .shadow(vec![BoxShadow {
+                    color: gantry_accent(theme.dark).opacity(0.35),
+                    offset: point(px(0.0), px(3.0)),
+                    blur_radius: px(8.0),
+                    spread_radius: px(0.0),
+                    inset: false,
+                }]),
+            CardAvatar::Open => disc.bg(linear_gradient(
+                180.,
+                linear_color_stop(gpui::rgb(0xb7e3c0), 0.),
+                linear_color_stop(gpui::rgb(0x7cc98c), 1.),
+            )),
+            CardAvatar::NoPr => disc.bg(linear_gradient(
+                180.,
+                linear_color_stop(gpui::rgb(0xc9ccd4), 0.),
+                linear_color_stop(gpui::rgb(0x9aa0ab), 1.),
+            )),
+            CardAvatar::Merged => disc.bg(linear_gradient(
+                180.,
+                linear_color_stop(gpui::rgb(0xd9c8f7), 0.),
+                linear_color_stop(gpui::rgb(0xb08ff0), 1.),
+            )),
+        }
+        // The active group's ring is the only chrome a bubble carries.
+        .when(active, |d| d.border_2().border_color(gantry_accent(theme.dark)))
+        .child(
+            gpui::svg()
+                .path(avatar_icon(kind))
+                .w(px(28.0))
+                .h(px(28.0))
+                .text_color(match kind {
+                    CardAvatar::Draft | CardAvatar::NoPr => gpui::white(),
+                    CardAvatar::Open => gpui::rgb(0x155e2b).into(),
+                    CardAvatar::Merged => pr_merged(theme.dark),
+                }),
+        );
+
+        div()
+            .absolute()
+            .left(px(rect.x))
+            .top(px(rect.y))
+            .w(px(rect.w))
+            .h(px(rect.h))
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap(px(5.0)) // the geometry's disc→label gap; the rect owns the rest.
+            .child(disc)
+            .child(
+                div()
+                    .max_w(px(rect.w))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(4.0))
+                    .text_size(px(scaled(10.5)))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme.foreground)
+                    .when(ws.any_unread(), |d| {
+                        d.child(
+                            div()
+                                .flex_none()
+                                .w(px(5.0))
+                                .h(px(5.0))
+                                .rounded_full()
+                                .bg(theme.primary),
+                        )
+                    })
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(ws.title()),
+                    ),
+            )
     }
 
     /// One one-line row, for the pages with no git context worth previewing:

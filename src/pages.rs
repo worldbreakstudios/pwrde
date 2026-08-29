@@ -199,6 +199,7 @@ pub enum Action {
     Paste,
     CloseTab,
     CloseGroup,
+    TogglePin,
     Quit,
     PrevTile,
     NextTile,
@@ -227,7 +228,7 @@ pub enum Action {
 
 impl Action {
     /// Keyboard-page row order.
-    pub const ALL: [Action; 32] = [
+    pub const ALL: [Action; 33] = [
         Action::SplitRight,
         Action::SplitDown,
         Action::NewTab,
@@ -236,6 +237,7 @@ impl Action {
         Action::Paste,
         Action::CloseTab,
         Action::CloseGroup,
+        Action::TogglePin,
         Action::Quit,
         Action::PrevTile,
         Action::NextTile,
@@ -273,6 +275,7 @@ impl Action {
             Action::Paste => "paste",
             Action::CloseTab => "close_tab",
             Action::CloseGroup => "close_group",
+            Action::TogglePin => "toggle_pin",
             Action::Quit => "quit",
             Action::PrevTile => "prev_tile",
             Action::NextTile => "next_tile",
@@ -310,6 +313,7 @@ impl Action {
             Action::Paste => "Paste",
             Action::CloseTab => "Close tab",
             Action::CloseGroup => "Close group",
+            Action::TogglePin => "Pin/unpin group",
             Action::Quit => "Quit",
             Action::PrevTile => "Focus previous tile",
             Action::NextTile => "Focus next tile",
@@ -351,6 +355,7 @@ impl Action {
             Action::Paste => (false, "v"),
             Action::CloseTab => (false, "w"),
             Action::CloseGroup => (true, "w"),
+            Action::TogglePin => (true, "p"),
             Action::Quit => (false, "q"),
             Action::PrevTile => (false, "["),
             Action::NextTile => (false, "]"),
@@ -703,6 +708,14 @@ mod tests {
         }
         let full = Binding { shift: true, alt: true, ctrl: true, key: "left".into() };
         assert_eq!(Binding::parse(&full.serialize()), Some(full));
+    }
+
+    /// ⌘⇧P (pin/unpin) must survive the settings string round-trip.
+    #[test]
+    fn toggle_pin_binding_roundtrips() {
+        let b = Action::TogglePin.default_binding();
+        assert_eq!(b.serialize(), "cmd-shift-p");
+        assert_eq!(Binding::parse(&b.serialize()), Some(b));
     }
 
     /// ⌘P must reach the palette through the same lookup every hotkey uses.

@@ -681,6 +681,7 @@ impl App {
                 cwd,
                 primary_tile,
                 section: group.section_id,
+                pinned: group.pinned,
             };
             ws.fix_focus();
             self.workspaces.push(ws);
@@ -1937,6 +1938,7 @@ impl App {
             cwd,
             primary_tile,
             section: None,
+            pinned: false,
         };
         ws.fix_focus();
         if empty {
@@ -3354,6 +3356,21 @@ impl App {
                 }
                 return;
             }
+            // Pinned-bubble strip sits above the section/card list. Hit it first
+            // so a click switches groups without arming a card-row drag.
+            if self.card_rows() {
+                let pinned = workspace::pinned_indices(&self.workspaces);
+                let n = pinned.len();
+                let sidebar_w = self.sidebar_w();
+                for (k, &ws_idx) in pinned.iter().enumerate() {
+                    let rect = workspace::pinned_bubble_rect(k, n, scale, sidebar_w);
+                    if rect.contains(px, py) {
+                        self.switch_workspace(ws_idx);
+                        self.request_redraw();
+                        return;
+                    }
+                }
+            }
             // Consume the shared row list so paint and hit-test never disagree.
             // Arm a press; click actions fire on mouse-up if the drag threshold
             // is never crossed (mirrors TabPress → Tab).
@@ -4379,6 +4396,15 @@ impl App {
             Action::Paste => self.paste(),
             Action::CloseTab => self.close_active_tab(),
             Action::CloseGroup => self.close_focused_group(),
+            Action::TogglePin => {
+                if self.page == Page::Sessions {
+                    if let Some(ws) = self.workspaces.get_mut(self.active) {
+                        ws.pinned = !ws.pinned;
+                        self.persist_snapshot();
+                        self.request_redraw();
+                    }
+                }
+            }
             Action::PrevTile => self.cycle_tile(-1),
             Action::NextTile => self.cycle_tile(1),
             Action::PrevTab => self.cycle_tab(-1),
