@@ -225,8 +225,11 @@ pub struct Workspace {
     /// Sidebar section this group belongs to, if any. Workspaces sharing a
     /// section id must stay contiguous in the parent `workspaces` Vec.
     pub section: Option<u64>,
-    /// When true, this group also appears in the pinned-bubble strip above the
-    /// Sessions card list (a quick-access duplicate; the normal card row stays).
+    /// When true, this group lives in the pinned-bubble strip above the
+    /// Sessions card list instead of in the list itself: [`sidebar_rows`]
+    /// leaves it out, the way Messages lifts a pinned conversation out of the
+    /// scroll. Its section membership survives the pin so unpinning drops it
+    /// straight back where it was.
     pub pinned: bool,
 }
 
@@ -581,6 +584,11 @@ pub enum SidebarRow {
 /// `primary_tile == section.anchor`; empty sections with `anchor == None`
 /// or a dangling anchor (no such group present) trail at the end in
 /// `sections` order.
+///
+/// Pinned workspaces never get a group row — they are shown in the bubble
+/// strip instead ([`pinned_indices`]). A section whose members are all pinned
+/// still keeps its header, so the folder stays visible to unpin back into;
+/// it just has nothing to expand.
 pub fn sidebar_rows(workspaces: &[Workspace], sections: &[Section]) -> Vec<SidebarRow> {
     let mut rows = Vec::new();
     let mut emitted = vec![false; sections.len()];
@@ -609,7 +617,7 @@ pub fn sidebar_rows(workspaces: &[Workspace], sections: &[Section]) -> Vec<Sideb
                     rows.push(SidebarRow::SectionHeader { section_idx });
                     let collapsed = sections[section_idx].collapsed;
                     while i < workspaces.len() && workspaces[i].section == Some(sid) {
-                        if !collapsed {
+                        if !collapsed && !workspaces[i].pinned {
                             rows.push(SidebarRow::Group { ws_idx: i });
                         }
                         i += 1;
@@ -617,12 +625,16 @@ pub fn sidebar_rows(workspaces: &[Workspace], sections: &[Section]) -> Vec<Sideb
                 }
                 _ => {
                     // Orphan id or non-contiguous repeat: show as a bare group.
-                    rows.push(SidebarRow::Group { ws_idx: i });
+                    if !workspaces[i].pinned {
+                        rows.push(SidebarRow::Group { ws_idx: i });
+                    }
                     i += 1;
                 }
             },
             None => {
-                rows.push(SidebarRow::Group { ws_idx: i });
+                if !workspaces[i].pinned {
+                    rows.push(SidebarRow::Group { ws_idx: i });
+                }
                 i += 1;
             }
         }
@@ -2681,6 +2693,45 @@ mod tests {
         assert_eq!(line_after.y, line_before.y);
         // Both ladders share the unshifted origin.
         assert_eq!(card_before.y, line_before.y);
+    }
+
+    /// A pinned group is lifted out of the list: no row for it, whether it is
+    /// bare or a section member, while its neighbours and its section header
+    /// stay put. Unpinning restores the exact row it had.
+    #[test]
+    fn pinned_groups_leave_the_row_list() {
+        let mut workspaces = vec![ws("bare", None), ws("m1", Some(0)), ws("m2", Some(0))];
+        let sections = vec![sec(0, false)];
+        let before = sidebar_rows(&workspaces, &sections);
+        assert_eq!(
+            before,
+            vec![
+                SidebarRow::Group { ws_idx: 0 },
+                SidebarRow::SectionHeader { section_idx: 0 },
+                SidebarRow::Group { ws_idx: 1 },
+                SidebarRow::Group { ws_idx: 2 },
+            ]
+        );
+
+        workspaces[0].pinned = true;
+        workspaces[1].pinned = true;
+        assert_eq!(pinned_indices(&workspaces), vec![0, 1]);
+        assert_eq!(
+            sidebar_rows(&workspaces, &sections),
+            vec![SidebarRow::SectionHeader { section_idx: 0 }, SidebarRow::Group { ws_idx: 2 }]
+        );
+
+        // Every member pinned: the folder header survives with nothing under it.
+        workspaces[2].pinned = true;
+        assert_eq!(
+            sidebar_rows(&workspaces, &sections),
+            vec![SidebarRow::SectionHeader { section_idx: 0 }]
+        );
+
+        for w in &mut workspaces {
+            w.pinned = false;
+        }
+        assert_eq!(sidebar_rows(&workspaces, &sections), before);
     }
 
     #[test]

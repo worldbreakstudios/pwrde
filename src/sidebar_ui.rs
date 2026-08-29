@@ -13,8 +13,8 @@
 //! from the mock's hardcoded palette, so the panel reads correctly in both
 //! light and dark polarity.
 //!
-//! Pinned groups additionally get an iMessage-style quick-access strip above
-//! the rows — one avatar bubble per pin, painted on this same absolute layer
+//! Pinned groups move out of the rows into an iMessage-style strip above
+//! them — one avatar bubble per pin, painted on this same absolute layer
 //! straight from [`crate::workspace::pinned_bubble_rect`], so painting and the
 //! hit test in `main.rs` never disagree.
 
@@ -650,8 +650,8 @@ impl App {
         // absolute layer: one bubble per pinned group at exactly the rect
         // `pinned_bubble_rect` hands the mouse path (scale 1.0 — gpui already
         // works in logical px), so a click that lands on a bubble *is* that
-        // bubble as far as hit-testing is concerned. The strip duplicates the
-        // pinned cards rather than replacing them, so nothing here hides a row.
+        // bubble as far as hit-testing is concerned. `sidebar_rows` has already
+        // left these groups out of the ladder, so the strip is their only home.
         let pinned = crate::workspace::pinned_indices(&self.workspaces);
         for (k, &ws_idx) in pinned.iter().enumerate() {
             let Some(ws) = self.workspaces.get(ws_idx) else {
@@ -668,8 +668,8 @@ impl App {
     /// [`crate::workspace::pinned_bubble_rect`] handed the mouse path. The
     /// avatar kind is derived exactly the way [`Self::group_card`] derives it
     /// (`avatar_for` over the cached git context — never a blocking fetch), so
-    /// a bubble and its duplicate card can never disagree about the state
-    /// they show. The active group wears a gantry ring, an unread group gets a
+    /// a bubble reads the same state its card would have shown before the pin.
+    /// The active group wears a gantry ring, an unread group gets a
     /// dot beside its name, and hover is deliberately inert: the bubbles have
     /// no hover well, they are just a big target.
     fn pinned_bubble(
