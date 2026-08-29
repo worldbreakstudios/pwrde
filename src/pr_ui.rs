@@ -42,7 +42,10 @@ pub(crate) fn tool_panel_overlay(
     body: gpui::AnyElement,
 ) -> gpui::AnyElement {
     use crate::workspace::{AREA_PAD, RIBBON_W, TOOL_PANEL_FLOAT_INSET};
-    let mut root = div().absolute().w(px(panel_w));
+    // Occluding: the canvas no longer swallows clicks over the panel rect,
+    // so the panel must own every click inside it — a floating panel sits
+    // over live tiles.
+    let mut root = div().absolute().occlude().w(px(panel_w));
     root = if floating {
         root.right(px(RIBBON_W + TOOL_PANEL_FLOAT_INSET))
             .top(px(AREA_PAD + TOOL_PANEL_FLOAT_INSET))

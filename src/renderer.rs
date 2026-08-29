@@ -624,32 +624,10 @@ impl Renderer {
             self.ribbon_icon(*tool, &slot, ink, &mut bg_quads, &mut carets);
             hot.push(slot);
         }
-        // The PR and Local-diff panels are real gpui element trees drawn over
-        // the canvas (see `pr_ui` / `local_diff_ui`), so nothing is painted for
-        // them here. Launch has no element overlay yet, so it keeps the
-        // canvas-painted "coming soon" placeholder card.
-        if let Some(tool @ pages::Tool::Launch) = open_tool {
-            let panel = workspace::tool_panel(width, height, self.scale, chrome.tool_panel_w, chrome.tool_panel_floating);
-            let pad = (14.0 * self.scale).round();
-            // Chrome-polarity card like Settings/Cleanup, not a dark tile.
-            bg_quads.push(self.px_rect(&panel, th.card, 1.0, card_r).shadow(Shadow::Card));
-            labels.push(LabelSpec {
-                text: tool.title().into(),
-                color: color(th.ink, 1.0),
-                left: panel.x + pad,
-                top: panel.y + pad,
-                clip: panel,
-                size: None,
-            });
-            labels.push(LabelSpec {
-                text: format!("{} view coming soon", tool.title()),
-                color: color(th.ink_dim, 1.0),
-                left: panel.x + pad,
-                top: (panel.y + pad + 2.0 * self.chrome_cell_height).round(),
-                clip: panel,
-                size: None,
-            });
-        }
+        // Every tool panel (PR, Local diff, Launch) is a gpui element tree
+        // drawn over the canvas (`pr_ui` / `local_diff_ui` / `launch_ui`), so
+        // nothing is painted for the panel body here — only the ribbon above
+        // and the tile inset the docked panel reserves.
 
         if chrome.page == Page::Cleanup
             || chrome.page == Page::Settings
@@ -2280,10 +2258,9 @@ mod tests {
             "launch icon chevron renders in the third slot"
         );
 
-        // Open: the panel card paints with header + placeholder, and the tile
-        // card stops left of the panel. The PR / Local-diff tools render as
-        // gpui element trees (not canvas), so the Launch tool — which still
-        // uses the canvas placeholder — exercises the panel-paint path here.
+        // Open: every tool panel is an element tree now, so the canvas paints
+        // no card or label for it — but the tile card must still stop left of
+        // the docked panel's reserved width.
         let mut chrome = cleanup_chrome();
         chrome.page = Page::Sessions;
         chrome.ribbon_tools = &pages::Tool::ALL;
@@ -2293,13 +2270,12 @@ mod tests {
             &wss, 0, 240.0, None, None, None, None, None, None, None, None, &chrome,
         );
         let texts: Vec<&str> = frame.labels.iter().map(|l| l.text.as_str()).collect();
-        assert!(texts.contains(&"Launch"));
-        assert!(texts.contains(&"Launch view coming soon"));
+        assert!(!texts.contains(&"Launch view coming soon"));
         let panel =
             crate::workspace::tool_panel(1600, 1000, scale, crate::workspace::TOOL_PANEL_DEFAULT_W, false);
         assert!(
-            frame.bg_quads.iter().any(|q| q.x == panel.x && q.w == panel.w),
-            "panel card quad renders"
+            !frame.bg_quads.iter().any(|q| q.x == panel.x && q.w == panel.w),
+            "no canvas panel card: the element tree owns the panel"
         );
         let area = crate::workspace::terminal_area(
             1600,
