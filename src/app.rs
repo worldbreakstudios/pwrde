@@ -1435,6 +1435,16 @@ impl App {
     /// Move the flyover between the in-window panel and its own popout
     /// window. The sessions never move — only which surface renders them.
     pub(crate) fn flyover_toggle_windowed(&mut self) {
+        // A browser page is one window: on wasm32 the popout stays docked,
+        // and the toggle only makes sure the panel is up.
+        #[cfg(target_family = "wasm")]
+        if !self.flyover_windowed {
+            self.flyover_open = true;
+            self.flyover_focused = true;
+            self.flyover_mark_read();
+            self.request_redraw();
+            return;
+        }
         if self.flyover_windowed {
             // Dock back: the pump closes the window; the panel takes over.
             self.flyover_windowed = false;
@@ -2917,7 +2927,7 @@ impl App {
                 && let Some(tab) = ws.root.find_tile(*id).and_then(|t| t.active_tab())
                 && let Some(url) = tab.session.link_at(col, row)
             {
-                let _ = std::process::Command::new("open").arg(url).spawn();
+                crate::links::open(&url);
                 return true;
             }
         }

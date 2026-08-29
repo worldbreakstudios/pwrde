@@ -72,9 +72,9 @@ raw-window-handle = "0.6"
 [target.'cfg(target_family = "wasm")'.dependencies]
 getrandom = { version = "0.3", features = ["wasm_js"] }
 uuid = { version = "1", features = ["js"] }
-# The browser's async clipboard, for `clipboard::set_text` (already in gpui's
-# tree at this version).
-web-sys = { version = "0.3", features = ["Window", "Navigator", "Clipboard"] }
+# The browser's clipboard (`clipboard::set_text`), `localStorage` (the settings
+# file's stand-in), and `window.open` (`links::open`); already in gpui's tree.
+web-sys = { version = "0.3", features = ["Window", "Navigator", "Clipboard", "Storage"] }
 
 # objc 0.2's msg_send! probes `feature = "cargo-clippy"` inside its expansion,
 # which rustc's check-cfg would flag at every call site. Registering the value

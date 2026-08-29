@@ -274,3 +274,15 @@ mod tests {
         assert_eq!(hovered_url(&hits, 1, 10), None);
     }
 }
+
+/// Open `url` the way the platform does: `open` on macOS, a new tab on wasm32.
+pub fn open(url: &str) {
+    #[cfg(not(target_family = "wasm"))]
+    {
+        let _ = std::process::Command::new("open").arg(url).spawn();
+    }
+    #[cfg(target_family = "wasm")]
+    if let Some(window) = web_sys::window() {
+        let _ = window.open_with_url_and_target(url, "_blank");
+    }
+}

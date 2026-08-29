@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use crate::app::App;
 use crate::cleanup::{PrInfo, WorktreeInfo};
 use crate::gh::{PrDetail, PrSummary};
+use crate::pr_ui::{LocalDiffRender, build_diff_render};
 use crate::git::DirtyStats;
 use crate::git_context::GitContext;
 use crate::term::TermEvent;
@@ -30,6 +31,9 @@ pub const CLAUDE: Transcript =
 /// A release build with one warning.
 pub const BUILD: Transcript =
     Transcript { title: "cargo", bytes: include_bytes!("fixtures/build.vt") };
+/// A unified diff (two files, one new) for the PR "Files changed" tab and the
+/// local-diff tool.
+pub const DIFF: &str = include_str!("fixtures/pr.diff");
 
 /// What the sidebar card knows about a group's checkout — the snapshot the
 /// git-context worker would have taken, minus the shell-outs.
@@ -156,6 +160,19 @@ fn worker_answers(groups: &[Group]) -> Vec<TermEvent> {
             }),
         });
     }
+    // The diff is highlighted for the polarity in effect when seeded, the
+    // way the worker highlights for the polarity in effect when it runs.
+    let render = std::sync::Arc::new(build_diff_render(
+        &crate::diff::parse(DIFF),
+        crate::theme::dark_active(),
+    ));
+    if let Some(pr) = branch_prs.first() {
+        events.push(TermEvent::PrDiffLoaded { number: pr.number, result: Ok(render.clone()) });
+    }
+    events.push(TermEvent::LocalDiffLoaded(Ok(LocalDiffRender {
+        base_ref: "origin/main".to_string(),
+        render,
+    })));
     let worktrees = groups
         .iter()
         .enumerate()
@@ -194,6 +211,10 @@ pub fn seed(app: &mut App, groups: &[Group]) {
         // keyed by the group's cwd; this is the snapshot the worker would
         // have produced (and on wasm never will).
         app.git_contexts.insert(&cwd, git_context(&cwd, group.name, &group.repo));
+        // Sessions tools (PR, local diff) are offered per group only when its
+        // cwd is a git checkout; that probe caches per path, and the fixture's
+        // directories exist nowhere, so answer it here.
+        app.git_cwd_cache.borrow_mut().insert(cwd.clone(), true);
         // `add_group` queues the primary command (`claude` by default) for the
         // founding pane's first wakeup. A transcript already shows a program
         // running, so nothing should be typed over it.

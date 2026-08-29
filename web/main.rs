@@ -9,6 +9,8 @@
 //!   `?page=sessions|settings|cleanup|…`  open on that page (see `pages::Page`)
 //!   `?dark=1` / `?dark=0`                force the appearance polarity
 //!   `?fixture=none`                      skip the demo workspace (empty state)
+//!   `?tool=pr|local_diff|launch`         open that tool panel (`pages::Tool` names)
+//!   `?set=<key>=<value>` (repeatable)     any settings key, e.g. `features.notes=true`
 //!   `?backend=webgpu` / `?backend=webgl` force a renderer (default: auto)
 
 use gpui::{App as GpuiApp, Bounds, WindowBounds, WindowOptions, px, size};
@@ -55,6 +57,24 @@ impl Query {
         self.0.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
     }
 
+    /// Every `?set=key=value`, in order. `true`/`false` and numbers become
+    /// JSON booleans/numbers, everything else a string — the shapes the
+    /// settings store holds.
+    fn settings(&self) -> impl Iterator<Item = (&str, serde_json::Value)> {
+        self.0.iter().filter(|(k, _)| k == "set").filter_map(|(_, v)| {
+            let (key, value) = v.split_once('=')?;
+            let value = match value {
+                "true" => serde_json::Value::Bool(true),
+                "false" => serde_json::Value::Bool(false),
+                v => v.parse::<f64>().ok().and_then(serde_json::Number::from_f64).map_or_else(
+                    || serde_json::Value::String(v.to_string()),
+                    serde_json::Value::Number,
+                ),
+            };
+            Some((key, value))
+        })
+    }
+
     fn backend(&self) -> gpui_platform::WebBackendPreference {
         match self.get("backend") {
             Some("webgpu") => gpui_platform::WebBackendPreference::WebGpu,
@@ -78,6 +98,13 @@ impl Query {
         }
     }
 
+    /// `?tool=local_diff` → the `toolpanel.tool` setting, which `App::new`
+    /// reads to open a tool panel.
+    fn tool(&self) -> Option<&str> {
+        let want = self.get("tool")?;
+        pwrde::pages::Tool::ALL.iter().map(|t| t.name()).find(|n| *n == want)
+    }
+
     fn fixture(&self) -> bool {
         !matches!(self.get("fixture"), Some("none") | Some("0"))
     }
@@ -95,6 +122,12 @@ fn main() {
     pwrde::settings::init();
     if let Some(dark) = query.dark() {
         pwrde::settings::set("appearance.mode", if dark { "dark" } else { "light" }.into());
+    }
+    if let Some(tool) = query.tool() {
+        pwrde::settings::set("toolpanel.tool", tool.into());
+    }
+    for (key, value) in query.settings() {
+        pwrde::settings::set(key, value);
     }
 
     let (events_tx, events_rx) = std::sync::mpsc::channel();

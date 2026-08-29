@@ -125,23 +125,58 @@ pub fn set(key: &str, value: Value) {
 /// Read a settings map from `path`. Missing file, unreadable file, invalid
 /// JSON, or a non-object root all yield an empty map.
 fn load(path: &Path) -> Map {
-    let Ok(bytes) = std::fs::read(path) else { return Map::new() };
-    match serde_json::from_slice::<Value>(&bytes) {
+    let Some(text) = read_text(path) else { return Map::new() };
+    match serde_json::from_str::<Value>(&text) {
         Ok(Value::Object(obj)) => obj.into_iter().collect(),
         _ => Map::new(),
     }
 }
 
+/// The file's contents, or `None` when it cannot be read.
+#[cfg(not(target_family = "wasm"))]
+fn read_text(path: &Path) -> Option<String> {
+    String::from_utf8(std::fs::read(path).ok()?).ok()
+}
+
+/// wasm32 has no home directory or files: the browser's `localStorage` holds
+/// the settings under the path they would have had, so the same worktree
+/// scoping and fork-from-base logic applies and a reload keeps them.
+#[cfg(target_family = "wasm")]
+fn read_text(path: &Path) -> Option<String> {
+    let storage = web_sys::window()?.local_storage().ok()??;
+    storage.get_item(&storage_key(path)).ok()?
+}
+
+#[cfg(target_family = "wasm")]
+fn storage_key(path: &Path) -> String {
+    format!("pwrde:{}", path.display())
+}
+
 /// Write `map` to `path` as pretty-printed JSON, creating parent directories
 /// (the `~/.pwrde` dir on first save).
 fn save(path: &Path, map: &Map) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
     let obj: serde_json::Map<String, Value> =
         map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     let text = serde_json::to_string_pretty(&Value::Object(obj))?;
+    write_text(path, &text)
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn write_text(path: &Path, text: &str) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
     std::fs::write(path, text)
+}
+
+/// See [`read_text`].
+#[cfg(target_family = "wasm")]
+fn write_text(path: &Path, text: &str) -> std::io::Result<()> {
+    let unsupported = || std::io::Error::new(std::io::ErrorKind::Unsupported, "no localStorage");
+    let storage = web_sys::window()
+        .and_then(|w| w.local_storage().ok().flatten())
+        .ok_or_else(unsupported)?;
+    storage.set_item(&storage_key(path), text).map_err(|_| unsupported())
 }
 
 #[cfg(test)]

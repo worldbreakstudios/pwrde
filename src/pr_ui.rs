@@ -431,7 +431,7 @@ impl App {
                         .size(ButtonSize::Sm)
                         .child("\u{2197} GitHub")
                         .on_click(move |_ev: &ClickEvent, _win: &mut Window, _app: &mut GpuiApp| {
-                            let _ = std::process::Command::new("open").arg(&url).spawn();
+                            crate::links::open(&url);
                         }),
                 );
             }
@@ -538,7 +538,7 @@ impl App {
                         .size(ButtonSize::Sm)
                         .child("\u{2197} GitHub")
                         .on_click(move |_ev: &ClickEvent, _win: &mut Window, _app: &mut GpuiApp| {
-                            let _ = std::process::Command::new("open").arg(&url).spawn();
+                            crate::links::open(&url);
                         }),
                 );
             }
