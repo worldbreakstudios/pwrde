@@ -12,11 +12,16 @@
 //! canvas (`flyover_overlay(.., paint_strip = true)`): it has no window
 //! buttons, its own cursor, and its own element root.
 
-use gpui::{AnyElement, Context, IntoElement, ParentElement, Styled, div, px, prelude::FluentBuilder as _};
+use std::rc::Rc;
+
+use gpui::{
+    AnyElement, App as GpuiApp, Context, InteractiveElement, IntoElement, MouseButton,
+    MouseDownEvent, ParentElement, Styled, Window, div, px, prelude::FluentBuilder as _,
+};
 
 use crate::App;
 use crate::renderer::color;
-use crate::tile_ui::{StripStyle, StripTab, modal_veil, tab_strip};
+use crate::tile_ui::{PressHandler, StripStyle, StripTab, modal_veil, tab_strip};
 use crate::ui::theme::Theme;
 use crate::workspace::{self, LayoutRect};
 
@@ -55,6 +60,7 @@ impl App {
         };
         let hov = |r: &LayoutRect| cur.is_some_and(|(x, y)| r.contains(x, y));
         let font = crate::renderer::chrome_font();
+        let entity = cx.entity().downgrade();
 
         let tabs: Vec<StripTab> = self
             .flyover_tabs
@@ -67,17 +73,29 @@ impl App {
                 close: workspace::flyover_tab_close_rect(&panel, i, n, scale, maximized),
             })
             .collect();
-        let mut strip_el = tab_strip(&bar, inv, &tabs, self.flyover_active, &hov, &style);
+        let press_entity = entity.clone();
+        let on_press: PressHandler = Rc::new(move |ti, close, ev, app| {
+            app.stop_propagation();
+            if let Some(entity) = press_entity.upgrade() {
+                entity.update(app, |this, cx| {
+                    this.note_pointer(ev);
+                    this.press_flyover_tab(ti, close);
+                    cx.notify();
+                });
+            }
+        });
+        let mut strip_el = tab_strip(&bar, inv, &tabs, self.flyover_active, &hov, &style, on_press);
 
         // Minimize / maximize buttons at the bar's right edge — not while a
         // modal owns the frame, so a picker never floats over decoy
         // controls (the canvas gated them the same way).
         if !modal {
-            for (rect, glyph) in [
-                (workspace::flyover_minimize_rect(&panel, scale), "–"),
-                (workspace::flyover_maximize_rect(&panel, scale), "□"),
+            for (rect, glyph, maximize) in [
+                (workspace::flyover_minimize_rect(&panel, scale), "–", false),
+                (workspace::flyover_maximize_rect(&panel, scale), "□", true),
             ] {
                 let h = hov(&rect);
+                let entity = entity.clone();
                 strip_el = strip_el.child(
                     div()
                         .absolute()
@@ -85,6 +103,21 @@ impl App {
                         .top(px((rect.y - bar.y) * inv))
                         .w(px(rect.w * inv))
                         .h(px(rect.h * inv))
+                        .on_mouse_down(MouseButton::Left, move |ev: &MouseDownEvent, _win: &mut Window, app: &mut GpuiApp| {
+                            app.stop_propagation();
+                            if let Some(entity) = entity.upgrade() {
+                                entity.update(app, |this, cx| {
+                                    this.note_pointer(ev);
+                                    if maximize {
+                                        this.flyover_toggle_maximized();
+                                    } else {
+                                        this.toggle_flyover();
+                                    }
+                                    this.request_redraw();
+                                    cx.notify();
+                                });
+                            }
+                        })
                         .when(h, |d| {
                             d.child(
                                 div()
