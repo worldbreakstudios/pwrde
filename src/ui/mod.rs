@@ -15,18 +15,26 @@
 //! (`Badge::color` status tints), and [`card`] (`Card::h_full` /
 //! `CardContent::flex_1` for page-filling cards, `Card::floating` for a
 //! raised shadow when floating over other content, `Card::glass` for a
-//! translucent glass panel over the blurred vibrancy ground), and [`input`]
-//! (`Input::set_text_size` so a bare field can match its host row's type).
+//! translucent glass panel over the blurred vibrancy ground), [`input`]
+//! (`Input::set_text_size` so a bare field can match its host row's type),
+//! and [`alert_dialog`] (`AlertDialog::scrim` for the chrome's own scrim
+//! color, `AlertDialog::on_backdrop_click` for clicks on the scrim outside
+//! the panel, and the panel width yielding to `Styled` refinements).
 //!
 //! Keep the `pub use` re-exports ABOVE the `pub mod` lines: `rcn add`
 //! regenerates everything after the first `pub mod` and would drop them.
 
 pub use badge::{Badge, BadgeVariant};
+pub use alert_dialog::{AlertDialog, AlertDialogFooter};
+#[allow(unused_imports)] // vendored rcn surface: kept exported while no caller uses it
+pub use alert_dialog::{AlertDialogDescription, AlertDialogHeader, AlertDialogTitle};
 pub use button::{Button, ButtonSize, ButtonVariant};
 pub use card::{
     Card, CardAction, CardContent, CardDescription, CardFooter, CardHeader, CardSize, CardTitle,
 };
 pub use checkbox::Checkbox;
+#[allow(unused_imports)] // vendored rcn surface: kept exported while no caller uses it
+pub use dialog::{Dialog, DialogDescription, DialogFooter, DialogHeader, DialogTitle};
 pub use hover_card::HoverCard;
 pub use input::Input;
 pub use kbd::Kbd;
@@ -36,12 +44,14 @@ pub use skeleton::Skeleton;
 pub use switch::Switch;
 pub use table::{Table, TableBody, TableCell, TableHead, TableHeader, TableRow};
 
+pub mod alert_dialog;
 pub mod assets;
 pub mod badge;
 pub mod button;
 pub mod button_group;
 pub mod card;
 pub mod checkbox;
+pub mod dialog;
 pub mod hover_card;
 pub mod input;
 pub mod kbd;

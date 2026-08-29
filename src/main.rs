@@ -30,6 +30,7 @@ mod lfg;
 mod local_diff_ui;
 mod markdown;
 mod mermaid;
+mod modal_ui;
 mod notes;
 mod notes_ui;
 mod pr_ui;
@@ -2784,26 +2785,10 @@ impl App {
     /// (message → fork picker → dir picker). Ports origin/main's overlay_click
     /// into the gpui three-field model.
     fn overlay_click(&mut self, px: f32, py: f32, width: u32, height: u32, scale: f32) {
-        // Confirm dialog is topmost: the buttons decide; a click outside the
-        // panel cancels (the safe default for a destructive action).
-        if let Some(confirm) = self.confirm.as_ref() {
-            let layout = self.renderer.confirm_layout(&confirm.text, confirm.accept_label());
-            if layout.close.contains(px, py) {
-                self.confirm_accept();
-            } else if layout.cancel.contains(px, py) || !layout.panel.contains(px, py) {
-                self.confirm = None;
-            }
-            self.request_redraw();
-            return;
-        }
-
-        // Message overlay: a dismissable one clears on any click,
-        // a modal (provisioning) one swallows the click.
-        if let Some((_, dismissable)) = self.message.as_ref() {
-            if *dismissable {
-                self.message = None;
-            }
-            self.request_redraw();
+        // The confirm dialog and the message panel are element modals now
+        // (`modal_ui`): their occluding scrim means no click reaches the
+        // canvas while either is up, so there is nothing to resolve here.
+        if self.confirm.is_some() || self.message.is_some() {
             return;
         }
 
@@ -5640,29 +5625,20 @@ impl Render for App {
             // the terminal area; its click resolves on the element.
             .child(self.render_empty_state(cx))
             // Cleanup page overlay: real gpui element tree above the canvas.
-            // Skip while a confirm dialog is open so the canvas-painted scrim
-            // owns the screen (v1 tradeoff).
-            .when(self.page == Page::Cleanup && self.confirm.is_none(), |el| {
-                el.child(self.render_cleanup(cx))
-            })
+            // The confirm dialog is an element modal above it now, so the
+            // page stays on screen (dimmed) while a delete is pending.
+            .when(self.page == Page::Cleanup, |el| el.child(self.render_cleanup(cx)))
             // Holistic Pull Requests page: full content-area element tree.
-            .when(self.page == Page::PullRequests && self.confirm.is_none(), |el| {
-                el.child(self.render_all_prs(cx))
-            })
+            .when(self.page == Page::PullRequests, |el| el.child(self.render_all_prs(cx)))
             // Notes page overlay (experimental, flag-gated): markdown vault
             // browser + viewer/editor as an element tree above the canvas.
             .when(
-                self.page == Page::Notes
-                    && crate::features::notes_enabled()
-                    && self.confirm.is_none(),
+                self.page == Page::Notes && crate::features::notes_enabled(),
                 |el| el.child(self.render_notes(cx)),
             )
             // Settings page overlay: same pattern as Cleanup. Sidebar search +
             // section tabs stay canvas-painted; the content card is elements.
-            .when(
-                self.page == Page::Settings && self.confirm.is_none(),
-                |el| el.child(self.render_settings(cx)),
-            )
+            .when(self.page == Page::Settings, |el| el.child(self.render_settings(cx)))
             // Right-edge git tool panels: real element trees over the canvas
             // placeholder, only for git-backed Sessions groups (visible_tool
             // already gates that).
@@ -5674,6 +5650,10 @@ impl Render for App {
                 self.visible_tool() == Some(pages::Tool::LocalDiff) && !self.modal_overlay_open(),
                 |el| el.child(self.render_local_diff(cx)),
             )
+            // Modal overlays (confirm dialog, message panel): last, so they
+            // sit above every page overlay; the canvas flyover is painted
+            // inside the canvas element, so they cover it too.
+            .child(self.render_modals(cx))
     }
 }
 
@@ -5776,6 +5756,7 @@ impl App {
             // for the chrome under an open flyover panel — clicks inside the
             // panel never fall through, so hover mustn't either. Modal
             // overlays sit above the flyover, so they keep the live cursor.
+            element_modal: self.confirm.is_some() || self.message.is_some(),
             cursor: {
                 let (cx, cy) = (self.cursor.0 as f32, self.cursor.1 as f32);
                 let flyover_covers = !overlay_open
@@ -5820,8 +5801,6 @@ impl App {
             self.profile_picker.as_ref(),
             save_view.as_ref(),
             self.palette.as_ref(),
-            self.message.as_ref(),
-            self.confirm.as_ref().map(|c| (c.text.as_str(), c.accept_label())),
             &chrome,
         );
         // The flyover panel lives outside the workspace tree, so its layer is
