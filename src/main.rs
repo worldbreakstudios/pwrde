@@ -996,6 +996,61 @@ impl App {
         self.request_redraw();
     }
 
+    /// A press on Notes sidebar row `i`: vault rows switch vaults, doc rows
+    /// select a doc (autosaving any in-flight edit first), the trailing row
+    /// toggles the add-vault field.
+    pub(crate) fn press_notes_row(&mut self, i: usize, cx: &mut Context<Self>) {
+        let n_vaults = crate::notes::vaults().len();
+        let n_docs = self.notes_docs.len();
+        if i < n_vaults {
+            self.notes_switch_vault(i);
+        } else if i < n_vaults + n_docs {
+            let doc = self.notes_docs[i - n_vaults].path.clone();
+            self.notes_autosave(cx);
+            self.notes_selected = Some(doc);
+            self.notes_edit_mode = false;
+            self.notes_editor = None;
+            self.notes_status = None;
+        } else {
+            self.notes_adding_vault = !self.notes_adding_vault;
+        }
+        self.request_redraw();
+    }
+
+    /// A press on Cleanup sidebar row `i`: 0 = "All", then one per repo.
+    pub(crate) fn press_cleanup_row(&mut self, i: usize) {
+        self.cleanup.repo_filter = if i == 0 {
+            None
+        } else {
+            self.cleanup.repos().get(i - 1).map(|r| r.root.clone())
+        };
+        self.request_redraw();
+    }
+
+    /// A press on a pinned bubble switches groups without arming a drag.
+    pub(crate) fn press_pinned(&mut self, ws_idx: usize) {
+        self.switch_workspace(ws_idx);
+        self.request_redraw();
+    }
+
+    /// A press on a section header: the delete chip (when the header isn't
+    /// being renamed) deletes; anything else arms a section press whose
+    /// click / double-click / drag resolve on mouse-up and move.
+    pub(crate) fn press_section_header(&mut self, section_id: u64, delete: bool, click_count: usize) {
+        let editing_this = self.editing_section.as_ref().is_some_and(|(id, _)| *id == section_id);
+        if delete && !editing_this {
+            self.delete_section(section_id);
+            return;
+        }
+        self.drag = Drag::SectionPress { section_id, start: self.cursor, click_count };
+    }
+
+    /// A press on a group card arms a group press; the click fires on
+    /// mouse-up if the drag threshold is never crossed (mirrors TabPress).
+    pub(crate) fn press_group_row(&mut self, ws_idx: usize) {
+        self.drag = Drag::GroupPress { ws: ws_idx, start: self.cursor };
+    }
+
     /// A press on flyover tab `ti`: activate + focus the panel, or × closes.
     pub(crate) fn press_flyover_tab(&mut self, ti: usize, close: bool) {
         if ti >= self.flyover_tabs.len() {
@@ -3227,117 +3282,11 @@ impl App {
                 self.blur_settings_search(window, cx);
                 return;
             }
-            if self.page == Page::Notes {
-                // One combined sidebar: vault rows, then the active vault's doc
-                // rows, then an "add vault" row — same stacked-row geometry the
-                // other pages use. Row index ranges must match what the
-                // renderer paints in the `Page::Notes` sidebar arm.
-                let n_vaults = crate::notes::vaults().len();
-                let n_docs = self.notes_docs.len();
-                for i in 0..(n_vaults + n_docs + 1) {
-                    if !workspace::tab_rect(i, scale, self.sidebar_w()).contains(px, py) {
-                        continue;
-                    }
-                    if i < n_vaults {
-                        self.notes_switch_vault(i);
-                    } else if i < n_vaults + n_docs {
-                        // Select a doc; autosave any in-flight edit first.
-                        let doc = self.notes_docs[i - n_vaults].path.clone();
-                        self.notes_autosave(cx);
-                        self.notes_selected = Some(doc);
-                        self.notes_edit_mode = false;
-                        self.notes_editor = None;
-                        self.notes_status = None;
-                    } else {
-                        // The trailing "+ Add vault" row.
-                        self.notes_adding_vault = !self.notes_adding_vault;
-                    }
-                    self.request_redraw();
-                    return;
-                }
-                return;
-            }
-            if self.page == Page::Cleanup {
-                // Tab 0 = "All", then one per repo.
-                let repos = self.cleanup.repos();
-                // "All" tab at index 0.
-                if workspace::tab_rect(0, scale, self.sidebar_w()).contains(px, py) {
-                    self.cleanup.repo_filter = None;
-                    self.request_redraw();
-                    return;
-                }
-                for (i, repo) in repos.iter().enumerate() {
-                    if workspace::tab_rect(i + 1, scale, self.sidebar_w()).contains(px, py) {
-                        self.cleanup.repo_filter = Some(repo.root.clone());
-                        self.request_redraw();
-                        return;
-                    }
-                }
-                return;
-            }
-            // Pinned-bubble strip sits above the section/card list. Hit it first
-            // so a click switches groups without arming a card-row drag.
-            if self.card_rows() {
-                let pinned = workspace::pinned_indices(&self.workspaces);
-                let n = pinned.len();
-                let sidebar_w = self.sidebar_w();
-                for (k, &ws_idx) in pinned.iter().enumerate() {
-                    let rect = workspace::pinned_bubble_rect(k, n, scale, sidebar_w);
-                    if rect.contains(px, py) {
-                        self.switch_workspace(ws_idx);
-                        self.request_redraw();
-                        return;
-                    }
-                }
-            }
-            // Consume the shared row list so paint and hit-test never disagree.
-            // Arm a press; click actions fire on mouse-up if the drag threshold
-            // is never crossed (mirrors TabPress → Tab).
-            let rows = workspace::sidebar_rows(&self.workspaces, &self.sections);
-            for (ri, row) in rows.iter().enumerate() {
-                let rect = workspace::sidebar_row_rect(
-                    &rows,
-                    ri,
-                    &self.workspaces,
-                    scale,
-                    self.sidebar_w(),
-                    self.card_rows(),
-                );
-                if !rect.contains(px, py) {
-                    continue;
-                }
-                match *row {
-                    workspace::SidebarRow::SectionHeader { section_idx } => {
-                        let section_id = self.sections[section_idx].id;
-                        // Delete-section button (shown when the header isn't
-                        // being renamed) takes precedence over collapse/drag.
-                        let editing_this = self
-                            .editing_section
-                            .as_ref()
-                            .is_some_and(|(id, _)| *id == section_id);
-                        if !editing_this
-                            && workspace::section_delete_rect(&rect, scale)
-                                .contains(px, py)
-                        {
-                            self.delete_section(section_id);
-                            return;
-                        }
-                        self.drag = Drag::SectionPress {
-                            section_id,
-                            start: self.cursor,
-                            click_count,
-                        };
-                        return;
-                    },
-                    workspace::SidebarRow::Group { ws_idx } => {
-                        self.drag = Drag::GroupPress {
-                            ws: ws_idx,
-                            start: self.cursor,
-                        };
-                        return;
-                    },
-                }
-            }
+            // Every other sidebar row — Notes vaults/docs, Cleanup filters,
+            // the pinned bubbles, section headers (and their delete chip) and
+            // group cards — is an element click target now (`sidebar_ui`),
+            // which arms the same presses this branch used to; a press that
+            // reaches here landed between rows.
             return;
         }
 
