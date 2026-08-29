@@ -451,7 +451,6 @@ impl Renderer {
         active: usize,
         sidebar_w: f32,
         drop_hint: Option<LayoutRect>,
-        resize_hover: Option<&workspace::ResizeHover>,
         link_hover: Option<(u64, usize, usize)>,
         chrome: &ChromeState,
     ) -> Frame {
@@ -498,7 +497,7 @@ impl Renderer {
         // Dividers aren't painted (the gap between cards shows the gradient);
         // they remain drag handles for hit-testing in `main.rs`. The empty
         // state draws no tile cards at all — just the centered CTA.
-        let (tiles, dividers) = if empty {
+        let (tiles, _dividers) = if empty {
             (Vec::new(), Vec::new())
         } else {
             workspace::layout_tiles(&ws.root, area, self.scale)
@@ -731,44 +730,8 @@ impl Renderer {
             }
         }
 
-        // Resize-handle hover: slim ink line + centered grip pill so the drag
-        // target reads before the press. Geometry lives here; main only paints.
-        if let Some(hover) = resize_hover {
-            match hover {
-                // The sidebar's grip is drawn by `sidebar_ui`. The canvas used
-                // to put it on `x = sidebar_w`, but the panel's right edge is
-                // a gutter to the left of that, so the element tree swallowed
-                // the grip's inner half. The hover state itself is unchanged;
-                // only the pixels moved.
-                workspace::ResizeHover::Sidebar => {}
-                workspace::ResizeHover::Divider { path, .. } => {
-                    // Empty state has no dividers; find is a no-op then.
-                    if let Some(d) = dividers.iter().find(|d| d.path == *path) {
-                        let vertical = d.dir == workspace::Dir::Row;
-                        self.push_resize_grip(&mut bg_quads, &d.rect, vertical, th.ink);
-                    }
-                }
-                workspace::ResizeHover::ToolPanel => {
-                    if open_tool.is_some() {
-                        let panel = workspace::tool_panel(
-                            width,
-                            height,
-                            self.scale,
-                            chrome.tool_panel_w,
-                            chrome.tool_panel_floating,
-                        );
-                        let line_w = (2.0 * self.scale).round().max(1.0);
-                        let line = LayoutRect {
-                            x: panel.x - line_w / 2.0,
-                            y: panel.y,
-                            w: line_w,
-                            h: panel.h,
-                        };
-                        self.push_resize_grip(&mut bg_quads, &line, true, th.ink);
-                    }
-                }
-            }
-        }
+        // Resize grips (sidebar edge, dividers, tool panel edge) are element
+        // handles now (`resize_ui`), which paint their own hover grip.
 
         // Frame-stats overlay (Settings → Debug toggle): one line near the
         // content area's top-right, painted on every page.
@@ -1194,39 +1157,6 @@ impl Renderer {
         rows_spans
     }
 
-    /// Slim ink line along `rect` plus a centered grip pill (~28 logical px).
-    /// `vertical` is true for a row-split divider / the sidebar edge (pill is tall).
-    fn push_resize_grip(
-        &self,
-        quads: &mut Vec<Quad>,
-        rect: &LayoutRect,
-        vertical: bool,
-        ink: (u8, u8, u8),
-    ) {
-        let thickness = if vertical { rect.w } else { rect.h };
-        let radius = thickness / 2.0;
-        quads.push(self.px_rect(rect, ink, 0.14, radius));
-        let pill_len = (28.0 * self.scale).round();
-        let pill = if vertical {
-            let h = pill_len.min(rect.h);
-            LayoutRect {
-                x: rect.x,
-                y: rect.y + ((rect.h - h) / 2.0).max(0.0),
-                w: rect.w,
-                h,
-            }
-        } else {
-            let w = pill_len.min(rect.w);
-            LayoutRect {
-                x: rect.x + ((rect.w - w) / 2.0).max(0.0),
-                y: rect.y,
-                w,
-                h: rect.h,
-            }
-        };
-        quads.push(self.px_rect(&pill, ink, 0.45, radius));
-    }
-
     /// A quad straight from layout coordinates (already physical px).
     /// A tool's ribbon glyph, drawn as vector quads inside a 16×16 logical-px
     /// box centered on the slot — fonts can't be trusted to carry
@@ -1459,7 +1389,7 @@ mod tests {
         chrome.page = Page::Sessions;
         chrome.ribbon_tools = &pages::Tool::ALL;
         let frame = renderer.build_frame(
-            &wss, 0, 240.0, None, None, None, &chrome,
+            &wss, 0, 240.0, None, None, &chrome,
         );
         let texts: Vec<&str> = frame.labels.iter().map(|l| l.text.as_str()).collect();
         assert!(!texts.contains(&"Pull Request"));
@@ -1509,7 +1439,7 @@ mod tests {
         chrome.open_tool = Some(pages::Tool::Launch);
         chrome.tool_panel_w = crate::workspace::TOOL_PANEL_DEFAULT_W;
         let frame = renderer.build_frame(
-            &wss, 0, 240.0, None, None, None, &chrome,
+            &wss, 0, 240.0, None, None, &chrome,
         );
         let texts: Vec<&str> = frame.labels.iter().map(|l| l.text.as_str()).collect();
         assert!(!texts.contains(&"Launch view coming soon"));
@@ -1532,26 +1462,6 @@ mod tests {
         );
         assert!(area.x + area.w <= panel.x, "tiles stop left of the panel");
 
-        // Hovering the panel's left edge paints the same ink-line grip the
-        // sidebar edge and dividers get.
-        let frame = renderer.build_frame(
-            &wss,
-            0,
-            240.0,
-            None,
-            Some(&crate::workspace::ResizeHover::ToolPanel),
-            None,
-            &chrome,
-        );
-        let line_w = (2.0 * scale).round();
-        assert!(
-            frame
-                .bg_quads
-                .iter()
-                .any(|q| q.w == line_w && q.h == panel.h && q.x == panel.x - line_w / 2.0),
-            "panel edge grip line renders on hover"
-        );
-
         // No tools registered (non-Sessions pages, or a group without the
         // tool's context): ribbon and panel hide — even with a stale
         // open_tool — and the tiles reclaim the full width.
@@ -1560,7 +1470,7 @@ mod tests {
         chrome.open_tool = Some(pages::Tool::Pr);
         chrome.tool_panel_w = crate::workspace::TOOL_PANEL_DEFAULT_W;
         let frame = renderer.build_frame(
-            &wss, 0, 240.0, None, None, None, &chrome,
+            &wss, 0, 240.0, None, None, &chrome,
         );
         let texts: Vec<&str> = frame.labels.iter().map(|l| l.text.as_str()).collect();
         assert!(!texts.contains(&"Pull Request"));
