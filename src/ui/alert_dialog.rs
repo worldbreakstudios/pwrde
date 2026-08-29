@@ -15,13 +15,15 @@
 //!   scrim behind the panel (panel clicks are occluded and never reach it).
 //! - [`AlertDialog::scrim`] — the backdrop color, for callers whose chrome
 //!   has its own scrim token (upstream hardcodes `hsla(0, 0, 0, 0.5)`).
+//! - [`AlertDialog::top`] — pin the panel's top edge at a viewport offset
+//!   instead of centering it vertically.
 //! - The panel's fixed 512px width yields to the caller's [`Styled`]
 //!   refinements (`w_auto()` gives a content-sized panel).
 
 use gpui::{
     AnyElement, App, ClickEvent, ElementId, Hsla, InteractiveElement as _, IntoElement,
-    ParentElement, Refineable as _, RenderOnce, StatefulInteractiveElement as _, StyleRefinement,
-    Styled, Window, anchored, deferred, div, point, px,
+    ParentElement, Pixels, Refineable as _, RenderOnce, StatefulInteractiveElement as _,
+    StyleRefinement, Styled, Window, anchored, deferred, div, point, px,
 };
 
 pub use crate::ui::dialog::{
@@ -37,6 +39,7 @@ pub struct AlertDialog {
     id: ElementId,
     open: bool,
     scrim: Option<Hsla>,
+    top: Option<Pixels>,
     on_backdrop_click: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
     children: Vec<AnyElement>,
     style: StyleRefinement,
@@ -48,6 +51,7 @@ impl AlertDialog {
             id: id.into(),
             open: false,
             scrim: None,
+            top: None,
             on_backdrop_click: None,
             children: Vec::new(),
             style: StyleRefinement::default(),
@@ -62,6 +66,13 @@ impl AlertDialog {
     /// Local addition: the backdrop color (default `hsla(0, 0, 0, 0.5)`).
     pub fn scrim(mut self, color: Hsla) -> Self {
         self.scrim = Some(color);
+        self
+    }
+
+    /// Local addition: place the panel's top edge `top` below the viewport's
+    /// top instead of centering it vertically.
+    pub fn top(mut self, top: Pixels) -> Self {
+        self.top = Some(top);
         self
     }
 
@@ -122,9 +133,12 @@ impl RenderOnce for AlertDialog {
             .w(viewport.width)
             .h(viewport.height)
             .flex()
-            .items_center()
             .justify_center()
             .bg(scrim);
+        backdrop = match self.top {
+            Some(top) => backdrop.items_start().pt(top),
+            None => backdrop.items_center(),
+        };
         if let Some(handler) = self.on_backdrop_click {
             backdrop = backdrop.on_click(handler);
         }

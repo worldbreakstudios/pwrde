@@ -19,7 +19,8 @@
 //! (`Input::set_text_size` so a bare field can match its host row's type),
 //! and [`alert_dialog`] (`AlertDialog::scrim` for the chrome's own scrim
 //! color, `AlertDialog::on_backdrop_click` for clicks on the scrim outside
-//! the panel, and the panel width yielding to `Styled` refinements).
+//! the panel, `AlertDialog::top` to pin the panel below the viewport's top
+//! edge, and the panel width yielding to `Styled` refinements).
 //!
 //! Keep the `pub use` re-exports ABOVE the `pub mod` lines: `rcn add`
 //! regenerates everything after the first `pub mod` and would drop them.
