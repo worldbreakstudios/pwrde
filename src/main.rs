@@ -27,6 +27,7 @@ mod git;
 mod git_context;
 mod highlight;
 mod lfg;
+mod launch_ui;
 mod local_diff_ui;
 mod markdown;
 mod mermaid;
@@ -3196,10 +3197,8 @@ impl App {
                     self.request_redraw();
                     return;
                 }
-                if panel.contains(px, py) {
-                    // Placeholder body: nothing interactive yet.
-                    return;
-                }
+                // The panel body itself is an element tree (pr_ui /
+                // local_diff_ui / launch_ui) and resolves its own clicks.
             }
             if workspace::ribbon(w, h, scale).contains(px, py) {
                 for (i, tool) in ribbon_tools.iter().enumerate() {
@@ -5649,6 +5648,10 @@ impl Render for App {
             .when(
                 self.visible_tool() == Some(pages::Tool::LocalDiff) && !self.modal_overlay_open(),
                 |el| el.child(self.render_local_diff(cx)),
+            )
+            .when(
+                self.visible_tool() == Some(pages::Tool::Launch) && !self.modal_overlay_open(),
+                |el| el.child(self.render_launch(cx)),
             )
             // Modal overlays (confirm dialog, message panel): last, so they
             // sit above every page overlay; the canvas flyover is painted
