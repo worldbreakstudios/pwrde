@@ -5227,6 +5227,7 @@ dependencies = [
  "termwiz",
  "unicode-segmentation",
  "uuid",
+ "web-sys",
  "web-time",
  "wezterm-term",
 ]

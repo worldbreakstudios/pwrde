@@ -59,7 +59,7 @@ Painting happens inside a single custom gpui `Element`'s `paint()` in `app.rs`. 
 - `main.rs` — the native binary: `fn main` calls `pwrde::app::run_native()`, nothing else.
 - `app.rs` — the gpui `App` entity: window boot (`run_native`), the terminal `Element`, keyboard/mouse handling, tab drag & drop (`DropTarget`/`Drag`). Items are `pub(crate)` because the UI modules reach into it.
 - `clipboard.rs` — the system clipboard behind one seam (`arboard` natively, no-ops on wasm32).
-- `bg.rs` — off-thread work behind one seam (`std::thread::spawn` natively; dropped on wasm32, where threads panic). Use it for fire-and-forget workers that report back over `TermEvent`.
+- `bg.rs` — off-thread work behind one seam (`std::thread::spawn` natively; on wasm32, where threads panic, the job is dropped and the fixture's canned `TermEvent`s answer instead). Use it for fire-and-forget workers that report back over `TermEvent`.
 - `fixture.rs` — deterministic demo workspace for the web build and tests: groups/splits/tabs whose sessions are fed the recorded transcripts in `src/fixtures/*.vt` via `Session::feed`.
 - `workspace.rs` — group/split-tree/tile/tab model plus pure layout math over the window size, so drawing and hit-testing/PTY-resize always agree.
 - `term.rs` — `Session`: PTY (portable-pty) + VT emulation (wezterm-term) + reader thread.

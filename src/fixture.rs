@@ -4,7 +4,14 @@
 //! `Session::new` has no PTY, so this is the only way content reaches a grid
 //! there; on native the same seeding works on top of real shells.
 
+use std::path::PathBuf;
+
 use crate::app::App;
+use crate::cleanup::{PrInfo, WorktreeInfo};
+use crate::gh::{PrDetail, PrSummary};
+use crate::git::DirtyStats;
+use crate::git_context::GitContext;
+use crate::term::TermEvent;
 use crate::workspace::Dir;
 
 /// A recorded transcript: what a pane shows, plus the tab title the program
@@ -24,26 +31,169 @@ pub const CLAUDE: Transcript =
 pub const BUILD: Transcript =
     Transcript { title: "cargo", bytes: include_bytes!("fixtures/build.vt") };
 
-/// One group of the demo layout: its sidebar name and the transcripts of its
-/// tiles, in split order (the first tile is the founding, primary one).
+/// What the sidebar card knows about a group's checkout — the snapshot the
+/// git-context worker would have taken, minus the shell-outs.
+pub struct Repo {
+    pub branch: &'static str,
+    /// (files, insertions, deletions) uncommitted; `(0, 0, 0)` is clean.
+    pub dirty: (u32, u32, u32),
+    /// The same, for the branch's committed work against the base branch.
+    pub branch_diff: (u32, u32, u32),
+    /// An open pull request for the branch: (number, title, draft).
+    pub pr: Option<(u32, &'static str, bool)>,
+}
+
+/// One group of the demo layout: its sidebar name, where it lives (the
+/// directory the card keys its git context on; it need not exist), the
+/// checkout to describe, and the transcripts of its tiles in split order (the
+/// first tile is the founding, primary one).
 pub struct Group {
     pub name: &'static str,
+    pub cwd: &'static str,
+    pub repo: Repo,
     pub tiles: &'static [&'static [Transcript]],
 }
 
 /// The demo workspace: a pwrde group split side-by-side (shell | claude, with
-/// a build tab behind the shell) and a second group holding one shell.
+/// a build tab behind the shell) on a branch with a draft PR, and a clean rcn
+/// group holding one shell.
 pub const DEMO: &[Group] = &[
-    Group { name: "pwrde", tiles: &[&[SHELL, BUILD], &[CLAUDE]] },
-    Group { name: "rcn", tiles: &[&[SHELL]] },
+    Group {
+        name: "pwrde",
+        cwd: "/Users/tyler/src/pwrde",
+        repo: Repo {
+            branch: "navis/web-build",
+            dirty: (3, 41, 7),
+            branch_diff: (36, 1057, 553),
+            pr: Some((77, "Build pwrde for wasm32 so headless Chromium can screenshot the UI", true)),
+        },
+        tiles: &[&[SHELL, BUILD], &[CLAUDE]],
+    },
+    Group {
+        name: "rcn",
+        cwd: "/Users/tyler/src/rcn",
+        repo: Repo { branch: "main", dirty: (0, 0, 0), branch_diff: (0, 0, 0), pr: None },
+        tiles: &[&[SHELL]],
+    },
 ];
+
+fn stats((files, insertions, deletions): (u32, u32, u32)) -> DirtyStats {
+    DirtyStats { files, insertions, deletions }
+}
+
+/// The git context a group's card renders, as the worker would have reported
+/// it for `cwd`.
+fn git_context(cwd: &std::path::Path, name: &str, repo: &Repo) -> GitContext {
+    GitContext {
+        is_git: true,
+        cwd: cwd.to_path_buf(),
+        repo: Some(name.to_string()),
+        branch: Some(repo.branch.to_string()),
+        default_branch: Some("origin/main".to_string()),
+        dirty: Some(stats(repo.dirty)),
+        branch_diff: Some(stats(repo.branch_diff)),
+        pr: repo.pr.map(|(number, title, is_draft)| pr_summary(number, title, is_draft, repo.branch)),
+        pr_error: None,
+        fetched_at: web_time::SystemTime::now(),
+    }
+}
+
+fn pr_summary(number: u32, title: &str, is_draft: bool, head: &str) -> PrSummary {
+    PrSummary {
+        number,
+        title: title.to_string(),
+        state: "OPEN".to_string(),
+        is_draft,
+        head: head.to_string(),
+        author: "a1re1".to_string(),
+        review_decision: None,
+        mergeable: Some("MERGEABLE".to_string()),
+        checks: Vec::new(),
+    }
+}
+
+/// What the PR and Cleanup workers would have answered for the demo groups:
+/// the repo's open PRs (the branch-scoped list and the page-wide one), the
+/// detail of the branch's own PR, and a `drop` worktree scan. These go through
+/// [`crate::bg::answer_requests_with`] on wasm32, where no worker can run.
+fn worker_answers(groups: &[Group]) -> Vec<TermEvent> {
+    let Some(first) = groups.first() else { return Vec::new() };
+    let branch_prs: Vec<PrSummary> = first
+        .repo
+        .pr
+        .map(|(n, t, d)| vec![pr_summary(n, t, d, first.repo.branch)])
+        .unwrap_or_default();
+    let mut all_prs = branch_prs.clone();
+    all_prs.push(pr_summary(76, "Unify the pickers into one rcn command palette", false, "navis/palette-session-picker"));
+    all_prs.push(pr_summary(74, "Sidebar status doc", false, "rcn/17-status-doc"));
+    let mut events = vec![
+        TermEvent::PrListLoaded { all: false, result: Ok(branch_prs.clone()) },
+        TermEvent::PrListLoaded { all: true, result: Ok(all_prs) },
+    ];
+    if let Some(pr) = branch_prs.first() {
+        events.push(TermEvent::PrDetailLoaded {
+            number: pr.number,
+            result: Ok(PrDetail {
+                number: pr.number,
+                title: pr.title.clone(),
+                body: "## Goal\n\nMake pwrde's UI renderable in a browser so headless Chrome can \
+                       screenshot and drive it.\n\n## Testing\n\n- `cargo test`: 404 passed\n- wasm32 \
+                       check clean\n- captures verified for Sessions, Settings, dark mode"
+                    .to_string(),
+                state: "OPEN".to_string(),
+                is_draft: pr.is_draft,
+                author: pr.author.clone(),
+                head: pr.head.clone(),
+                base: "main".to_string(),
+                additions: first.repo.branch_diff.1,
+                deletions: first.repo.branch_diff.2,
+                changed_files: first.repo.branch_diff.0,
+                review_decision: None,
+                mergeable: Some("MERGEABLE".to_string()),
+                url: format!("https://github.com/worldbreakstudios/pwrde/pull/{}", pr.number),
+                created_at: "2026-08-29T15:31:00Z".to_string(),
+                ..Default::default()
+            }),
+        });
+    }
+    let worktrees = groups
+        .iter()
+        .enumerate()
+        .map(|(i, g)| WorktreeInfo {
+            repo_root: format!("/Users/tyler/src/{}", g.name),
+            path: g.cwd.to_string(),
+            id: format!("{}-{}", g.name, i + 1),
+            branch: Some(g.repo.branch.to_string()),
+            head: format!("{:07x}", 0x1d4b156 + i as u32 * 0x1111),
+            dirty_count: g.repo.dirty.0,
+            merged: g.repo.branch == "main",
+            ahead: if g.repo.branch == "main" { 0 } else { 2 },
+            behind: 0,
+            last_activity_ms: 1_787_000_000_000.0 - i as f64 * 86_400_000.0,
+            is_current: i == 0,
+            pr: g.repo.pr.map(|(number, title, draft)| PrInfo {
+                number,
+                state: if draft { "draft" } else { "open" }.to_string(),
+                title: title.to_string(),
+            }),
+            dirty_files: Vec::new(),
+        })
+        .collect();
+    events.push(TermEvent::CleanupScanned(worktrees));
+    events
+}
 
 /// Replace the empty state with `groups`, feeding every tab its transcript.
 /// The first group ends up active. Call once the window exists, so the grids
 /// get their real size from `sync_layout` before the bytes land.
 pub fn seed(app: &mut App, groups: &[Group]) {
     for group in groups {
-        app.add_group(group.name.to_string(), None);
+        let cwd = PathBuf::from(group.cwd);
+        app.add_group(group.name.to_string(), Some(cwd.clone()));
+        // The card reads its branch/diffstat/PR from the git-context cache,
+        // keyed by the group's cwd; this is the snapshot the worker would
+        // have produced (and on wasm never will).
+        app.git_contexts.insert(&cwd, git_context(&cwd, group.name, &group.repo));
         // `add_group` queues the primary command (`claude` by default) for the
         // founding pane's first wakeup. A transcript already shows a program
         // running, so nothing should be typed over it.
@@ -74,6 +224,7 @@ pub fn seed(app: &mut App, groups: &[Group]) {
         }
     }
     app.switch_workspace(0);
+    crate::bg::answer_requests_with(app.events_tx.clone(), worker_answers(groups));
     app.request_redraw();
 }
 

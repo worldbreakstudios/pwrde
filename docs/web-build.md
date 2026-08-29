@@ -163,7 +163,8 @@ On top of the patch, wasm32 needs a randomness backend spelled out:
 | `arboard` — system clipboard | `clipboard.rs` | no-ops (`set_text`, `contents`) until routed through the browser clipboard API |
 | `libc::localtime_r` — sidebar day buckets | `sidebar_card.rs` | UTC (`local_offset` returns 0) |
 | `objc` / `raw-window-handle` — titlebar hairline hack | `app.rs` | already `cfg(target_os = "macos")` |
-| `std::thread::spawn` — git/PR/cleanup/ps workers | `bg.rs` | the job is dropped; callers already tolerate a worker that never answers |
+| `std::thread::spawn` — git/PR/cleanup/ps workers | `bg.rs` | the job is dropped and the fixture's canned answers (`bg::answer_requests_with`) are sent instead: the PR lists and detail, the cleanup scan |
+| `arboard` — system clipboard | `clipboard.rs` | `navigator.clipboard.writeText` plus an in-page copy for the synchronous read, so ⌘C/⌘V round-trip |
 | `std::time::Instant` / `SystemTime` | everywhere | `web_time` (std re-exported natively, `performance.now()` on wasm) |
 | system fonts | `web/main.rs` | `web/fonts/` registered via `text_system().add_fonts` (the terminal family plus Noto symbol/emoji fallbacks) |
 | the shell behind a pane | `term.rs` | `EchoShell`, a line discipline that echoes input on wasm32 |
@@ -171,10 +172,16 @@ On top of the patch, wasm32 needs a randomness backend spelled out:
 
 Things that **compile** on wasm32 and simply fail at runtime, which the app
 tolerates: `std::process::Command` (git, gh/lfg, drop, ps, shpool, mmdc)
-returns an error, so the git-context cards stay bare and the PR/cleanup panels
-stay on their loading state; `dirs::home_dir()` is `None`, so `settings::init`
-loads the empty store (defaults everywhere) and writes are lost — which is how
-`?dark=` works without a settings file.
+returns an error; `dirs::home_dir()` is `None`, so `settings::init` loads the
+empty store (defaults everywhere) and writes are lost — which is how `?dark=`
+works without a settings file.
+
+Everything a worker would have shelled out for comes from `fixture::DEMO`
+instead: each group's git context (branch, diffstat, PR — what the sidebar
+card shows), the repo's PR list and the branch PR's detail, and a `drop`
+scan for the Cleanup page. They are the same `TermEvent`s the workers send,
+so the pages take their normal path from "loading" to "ready"; the PR diff is
+the one answer not canned yet (Files changed stays on its skeleton).
 
 One rendering detail the web surfaced: gpui_web's window reports a 1×1
 viewport until the canvas is laid out, so the first paint resizes the
@@ -198,9 +205,8 @@ writer) and are filled with `Session::feed(bytes)`.
   the gstack `/browse` skill against `trunk serve`, and grow
   `scripts/web-screenshot.sh` into a small flow runner (navigate, click,
   capture) for review threads.
-- More fixtures: a PR panel fed a recorded `gh pr view --json`, a Cleanup scan
-  from a recorded `drop -d --json`, so those pages render populated instead of
-  loading.
+- Can the PR diff too (`PrDiffLoaded` wants a `DiffRender`, so it needs a
+  recorded unified diff run through `pr_ui::build_diff_render`).
 - Group names in cards: the fixture could set an OSC 0 title per pane so
   cards read `pwrde` / `rcn` rather than `zsh`.
 - Grow `EchoShell` only if a test needs it (a canned `ls`, say); it is a
