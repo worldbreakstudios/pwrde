@@ -178,7 +178,7 @@ impl App {
             )
             .child(self.clipped_row_layer(&theme, cx))
             .child(self.drop_feedback_layer(&theme))
-            .child(self.header_chips(&theme))
+            .child(self.header_chips(&theme, cx.entity().downgrade()))
             .child(self.page_dot_layer(&theme, cx.entity().downgrade()))
             .child(self.resize_grip_layer(&theme))
             // Last, so the veil falls over every affordance the panel owns.
@@ -533,11 +533,13 @@ impl App {
         layer
     }
 
-    /// The two header chips, in their own absolute layer so they sit at
-    /// exactly the rects `main.rs` hit-tests: "⇤" on the left toggles the
-    /// sidebar collapse, "＋" at the top right opens the cwd picker (a new
-    /// group). No gpui handlers — the canvas mouse path owns both clicks.
-    fn header_chips(&self, theme: &Theme) -> gpui::Div {
+    /// The two header chips, in their own absolute layer at the rects
+    /// `workspace.rs` lays them out at: "⇤" on the left toggles the sidebar
+    /// collapse, "＋" at the top right opens the cwd picker (a new group).
+    /// They are gpui click targets that occlude the canvas — so the titlebar
+    /// window-drag beneath them never sees the press — and go inert while a
+    /// canvas modal owns the frame (the modal veil dims them).
+    fn header_chips(&self, theme: &Theme, entity: gpui::WeakEntity<Self>) -> gpui::Div {
         let w = self.sidebar_w();
         let cur = self.sidebar_cursor();
         let plus = crate::workspace::new_group_button(1.0, w);
@@ -545,13 +547,40 @@ impl App {
         let hovered = |r: &crate::workspace::LayoutRect| {
             cur.is_some_and(|(x, y)| r.contains(x, y))
         };
+        let modal = self.modal_overlay_open();
+        let handler = |entity: gpui::WeakEntity<Self>, act: fn(&mut Self)| {
+            move |_ev: &ClickEvent, _win: &mut Window, app: &mut GpuiApp| {
+                if let Some(entity) = entity.upgrade() {
+                    entity.update(app, |this, cx| {
+                        act(this);
+                        cx.notify();
+                    });
+                }
+            }
+        };
         div()
             .absolute()
             .left(px(0.0))
             .top(px(0.0))
             .size_full()
-            .child(chip(theme, &collapse, hovered(&collapse), "⇤"))
-            .child(chip(theme, &plus, hovered(&plus), "＋"))
+            .child(
+                chip(theme, &collapse, hovered(&collapse), "⇤")
+                    .id("sidebar-collapse")
+                    .occlude()
+                    .when(!modal, |c| {
+                        c.cursor_pointer()
+                            .on_click(handler(entity.clone(), |this| this.toggle_sidebar()))
+                    }),
+            )
+            .child(
+                chip(theme, &plus, hovered(&plus), "＋")
+                    .id("sidebar-new-group")
+                    .occlude()
+                    .when(!modal, |c| {
+                        c.cursor_pointer()
+                            .on_click(handler(entity, |this| this.open_picker()))
+                    }),
+            )
     }
 
     /// The row layer, clipped to the band between the header and the page strip.

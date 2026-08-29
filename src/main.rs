@@ -3233,20 +3233,11 @@ impl App {
 
         // Sidebar: titlebar strip = traffic lights + window drag handle.
         if sidebar.contains(px, py) {
-            // Header chips FIRST: they now ride inside the titlebar strip, and
-            // that strip is the window-drag handle — so testing the drag first
-            // swallowed every chip click as a window move. The "＋" at the top
-            // right makes a group; the "⇤" beside it folds the sidebar away.
-            // (Sections are made by dragging one group onto another, not by a
-            // button.)
-            if workspace::new_group_button(scale, self.sidebar_w()).contains(px, py) {
-                self.open_picker();
-                return;
-            }
-            if workspace::sidebar_collapse_button(scale, self.sidebar_w()).contains(px, py) {
-                self.toggle_sidebar();
-                return;
-            }
+            // The header chips ("＋" makes a group, "⇤" folds the sidebar)
+            // are element click targets that occlude the canvas
+            // (`sidebar_ui::header_chips`), so a press that reaches here is
+            // never on one of them. (Sections are made by dragging one group
+            // onto another, not by a button.)
             // Window-drag is scoped to the titlebar strip ONLY so that clicks on
             // tile tab strips are never treated as a window move.
             if workspace::titlebar(scale, self.sidebar_w()).contains(px, py) {
