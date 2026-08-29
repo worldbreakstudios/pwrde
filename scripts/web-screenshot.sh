@@ -16,8 +16,7 @@
 # (text typed last; \n = Enter, \b = Backspace, \M-p = ⌘P),
 # PWRDE_WEB_RELEASE=1 for an optimized build, PWRDE_WEZTERM_LOCAL=1 to build
 # against the local wezterm checkout from scripts/web-wezterm-fork.sh instead
-# of the published fork branch (trunk cannot pass cargo `--config`, so the
-# patch table is appended to web/.cargo/config.toml for the run and restored).
+# of the published fork branch (see scripts/web-serve.sh).
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -33,40 +32,30 @@ CHROME=${PWRDE_CHROME:-$(ls -d "$HOME"/Library/Caches/ms-playwright/chromium_hea
 command -v node >/dev/null || { echo "node (22+) is required for the DevTools capture" >&2; exit 1; }
 mkdir -p "$(dirname "$OUT")" "$ROOT/target"
 
-cd "$ROOT/web"
 SERVE=""
-CONFIG_BAK=""
 cleanup() {
-    [ -n "$SERVE" ] && kill "$SERVE" 2>/dev/null || true
-    [ -n "$CONFIG_BAK" ] && cp "$CONFIG_BAK" .cargo/config.toml
+    if [ -n "$SERVE" ]; then
+        kill "$SERVE" 2>/dev/null || true
+        wait "$SERVE" 2>/dev/null || true
+    fi
 }
 trap cleanup EXIT
 
-if [ "${PWRDE_WEZTERM_LOCAL:-}" = 1 ]; then
-    PATCH_CFG="$ROOT/target/wezterm-fork-patch.toml"
-    [ -f "$PATCH_CFG" ] || "$ROOT/scripts/web-wezterm-fork.sh" >/dev/null
-    # A run that was killed before its cleanup leaves the block behind; drop
-    # it so it is never backed up or appended twice.
-    if grep -q '^# temporary — scripts/web-screenshot.sh' .cargo/config.toml; then
-        sed -i '' '/^# temporary — scripts\/web-screenshot.sh/,$d' .cargo/config.toml
-        sed -i '' -e :a -e '/^\n*$/{$d;N;ba' -e '}' .cargo/config.toml
-    fi
-    CONFIG_BAK="$ROOT/target/web-cargo-config.bak"
-    cp .cargo/config.toml "$CONFIG_BAK"
-    { echo; echo "# temporary — scripts/web-screenshot.sh (PWRDE_WEZTERM_LOCAL) restores this file"; cat "$PATCH_CFG"; } >> .cargo/config.toml
-fi
-
-# `trunk serve` builds first, then listens; the loop below waits for it.
-trunk serve --no-autoreload --port "$PORT" ${PWRDE_WEB_RELEASE:+--release} \
+# scripts/web-serve.sh builds and serves (and, with PWRDE_WEZTERM_LOCAL=1,
+# swaps the wezterm patch to the local checkout for the run). Wait for trunk
+# to announce the server — a probe alone could hit a previous run's dying
+# server and capture a page that is still being rebuilt.
+: >"$ROOT/target/web-serve.log"
+PWRDE_WEB_PORT="$PORT" "$ROOT/scripts/web-serve.sh" ${PWRDE_WEB_RELEASE:+--release} \
     >"$ROOT/target/web-serve.log" 2>&1 &
 SERVE=$!
-for _ in $(seq 1 3000); do
-    if ! kill -0 $SERVE 2>/dev/null; then
-        echo "trunk serve exited; see target/web-serve.log" >&2
+for _ in $(seq 1 6000); do
+    if ! kill -0 "$SERVE" 2>/dev/null; then
+        echo "web-serve exited; see target/web-serve.log" >&2
         tail -20 "$ROOT/target/web-serve.log" >&2
         exit 1
     fi
-    curl -fs "http://127.0.0.1:$PORT/" >/dev/null && break
+    grep -q 'server listening' "$ROOT/target/web-serve.log" && break
     sleep 0.2
 done
 
