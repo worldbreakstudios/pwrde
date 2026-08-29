@@ -28,7 +28,7 @@
 use gpui::{
     AnyElement, App as GpuiApp, BoxShadow, ClickEvent, Context, FontWeight, Hsla,
     InteractiveElement, IntoElement, ParentElement, SharedString, StatefulInteractiveElement,
-    Styled, Window, div, linear_color_stop, linear_gradient, point,
+    MouseButton, Styled, Window, div, linear_color_stop, linear_gradient, point,
     prelude::FluentBuilder as _, px,
 };
 
@@ -183,6 +183,35 @@ impl App {
             .child(self.resize_grip_layer(&theme))
             // Last, so the veil falls over every affordance the panel owns.
             .child(self.overlay_scrim(panel_w))
+            .into_any_element()
+    }
+
+    /// The region that drags the window: the titlebar strip above the
+    /// sidebar, or — with the sidebar folded away — the traffic-light corner
+    /// the top-left tile's strip cedes. It is an element now, so the
+    /// hit-test is gpui's; the move itself still goes through
+    /// `Window::start_window_move` from the press (the window is opened with
+    /// `app_owns_titlebar_drag`, and gpui's `WindowControlArea::Drag`
+    /// hitboxes are a no-op on macOS in the pinned rev). The header chips
+    /// paint above it and occlude, so a chip press never drags.
+    pub fn render_window_drag_zones(&self) -> AnyElement {
+        let zone = if self.sidebar_collapsed {
+            crate::workspace::collapsed_drag_zone(1.0)
+        } else {
+            crate::workspace::titlebar(1.0, self.sidebar_w())
+        };
+        div()
+            .absolute()
+            .left(px(zone.x))
+            .top(px(zone.y))
+            .w(px(zone.w))
+            .h(px(zone.h))
+            .on_mouse_down(MouseButton::Left, |_ev, window: &mut Window, app: &mut GpuiApp| {
+                // Native traffic-light buttons handle their own clicks; a
+                // press anywhere else in the strip drags the window.
+                app.stop_propagation();
+                window.start_window_move();
+            })
             .into_any_element()
     }
 
