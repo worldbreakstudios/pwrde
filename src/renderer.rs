@@ -842,6 +842,7 @@ impl Renderer {
         show_window_buttons: bool,
         maximized: bool,
         cursor: Option<(f32, f32)>,
+        paint_strip: bool,
         hot: &mut Vec<LayoutRect>,
     ) -> (Vec<Quad>, Vec<PaneText>, Vec<Quad>, Vec<LabelSpec>) {
         let th = self.theme();
@@ -884,8 +885,10 @@ impl Renderer {
         quads.push(self.px_rect(&border, pane_divider.0, pane_divider.1 * 0.5, 0.0));
 
         // Tab strip: highlight pill for the active tab, inset like the tile
-        // strips' pill so the bar shows around it.
-        if n > 0 {
+        // strips' pill so the bar shows around it. `paint_strip` is false in
+        // the main window, where `flyover_ui` paints the strip's pixels and
+        // the canvas only registers its hot rects.
+        if paint_strip && n > 0 {
             let tr = crate::workspace::flyover_tab_rect(panel_rect, active, n, scale, maximized);
             let m = (4.0 * scale).round();
             let pill = crate::workspace::LayoutRect {
@@ -905,7 +908,7 @@ impl Renderer {
             let close_hov = hover(cursor, &close);
             // Same hover language as the tile strips: dim pill on an inactive
             // tab, rounded chip + brightened glyph on the ×.
-            if i != active && hover(cursor, &tr) && !close_hov {
+            if paint_strip && i != active && hover(cursor, &tr) && !close_hov {
                 let m = (4.0 * scale).round();
                 let pill = crate::workspace::LayoutRect {
                     x: tr.x + m,
@@ -915,7 +918,7 @@ impl Renderer {
                 };
                 quads.push(self.px_rect(&pill, pane_pill.0, pane_pill.1 * 0.55, (7.0 * scale).round()));
             }
-            if close_hov {
+            if paint_strip && close_hov {
                 let inset = (3.0 * scale).round();
                 let chip = crate::workspace::LayoutRect {
                     x: close.x + inset,
@@ -934,6 +937,9 @@ impl Renderer {
             // resolves × over the tab it sits in.
             hot.push(tr);
             hot.push(close);
+            if !paint_strip {
+                continue;
+            }
             let title = tab.session.title();
             let text = if title.is_empty() { "shell".to_string() } else { title };
             let mut text_left = tr.x + tab_text_pad;
@@ -989,7 +995,7 @@ impl Renderer {
                 (crate::workspace::flyover_maximize_rect(panel_rect, scale), "□"),
             ] {
                 let hov = hover(cursor, &rect);
-                if hov {
+                if paint_strip && hov {
                     let inset = (3.0 * scale).round();
                     let chip = crate::workspace::LayoutRect {
                         x: rect.x + inset,
@@ -1005,6 +1011,9 @@ impl Renderer {
                     ));
                 }
                 hot.push(rect);
+                if !paint_strip {
+                    continue;
+                }
                 labels.push(LabelSpec {
                     text: glyph.to_string(),
                     color: if hov {
@@ -1566,6 +1575,32 @@ mod tests {
         );
     }
 
+    /// In the main window the strip's pixels are an element tree
+    /// (`flyover_ui`): with `paint_strip == false` the canvas still registers
+    /// every hot rect (tab, ×, minimize, maximize) but paints no pill, chip,
+    /// label or dot for them.
+    #[test]
+    fn flyover_without_strip_pixels_keeps_hot_rects() {
+        let scale = 2.0;
+        let renderer = Renderer::new(scale, 18.0, 1600, 1000);
+        let panel = crate::workspace::flyover_rect(1600, 1000, scale, 1.0, 0.35, false);
+        let tabs = [crate::workspace::Tab::new(crate::term::Session::placeholder())];
+        let close = crate::workspace::flyover_tab_close_rect(&panel, 0, 1, scale, false);
+        let cursor = Some((close.x + close.w / 2.0, close.y + close.h / 2.0));
+
+        let mut hot_painted = Vec::new();
+        let (painted_quads, _, _, painted_labels) = renderer
+            .flyover_overlay(&tabs, 0, &panel, true, true, true, false, cursor, true, &mut hot_painted);
+        let mut hot_bare = Vec::new();
+        let (bare_quads, _, _, bare_labels) = renderer
+            .flyover_overlay(&tabs, 0, &panel, true, true, true, false, cursor, false, &mut hot_bare);
+
+        assert_eq!(hot_bare.len(), hot_painted.len(), "hit-testing survives without strip pixels");
+        assert_eq!(hot_bare.len(), 4, "tab + close + minimize + maximize stay hot");
+        assert!(!painted_labels.is_empty() && bare_labels.is_empty(), "no strip labels on the canvas");
+        assert!(bare_quads.len() < painted_quads.len(), "no pills or chips on the canvas");
+    }
+
     /// Hovering a flyover tab's × registers it hot and paints the chip; with
     /// no cursor the strip stays in its resting style. While a modal overlay
     /// owns the frame (`draw_cursor == false`) the inert window buttons must
@@ -1580,7 +1615,7 @@ mod tests {
 
         let mut hot = Vec::new();
         let (resting_quads, ..) = renderer
-            .flyover_overlay(&tabs, 0, &panel, true, true, true, false, None, &mut hot);
+            .flyover_overlay(&tabs, 0, &panel, true, true, true, false, None, true, &mut hot);
         // Tab, its ×, and the two window buttons are all interactive.
         assert_eq!(hot.len(), 4, "tab + close + minimize + maximize are hot");
         assert!(hot.iter().any(|r| r.x == close.x && r.y == close.y));
@@ -1588,7 +1623,7 @@ mod tests {
         let cursor = Some((close.x + close.w / 2.0, close.y + close.h / 2.0));
         let mut hot2 = Vec::new();
         let (hovered_quads, ..) = renderer
-            .flyover_overlay(&tabs, 0, &panel, true, true, true, false, cursor, &mut hot2);
+            .flyover_overlay(&tabs, 0, &panel, true, true, true, false, cursor, true, &mut hot2);
         assert_eq!(
             hovered_quads.len(),
             resting_quads.len() + 1,
@@ -1599,7 +1634,7 @@ mod tests {
         // must not register as clickable above the overlay.
         let mut hot3 = Vec::new();
         renderer
-            .flyover_overlay(&tabs, 0, &panel, true, false, true, false, None, &mut hot3);
+            .flyover_overlay(&tabs, 0, &panel, true, false, true, false, None, true, &mut hot3);
         assert_eq!(
             hot3.len(),
             2,

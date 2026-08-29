@@ -22,6 +22,7 @@ mod cleanup_ui;
 mod diff;
 mod features;
 mod file_tree;
+mod flyover_ui;
 mod gh;
 mod git;
 mod git_context;
@@ -5488,6 +5489,8 @@ impl Render for App {
             // Tile tab strips: pixels on the element tree, clipped per
             // strip; clicks and drags still resolve on the canvas rects.
             .child(self.render_tile_chrome(cx))
+            // Flyover tab strip: same pixels-on-elements split (`flyover_ui`).
+            .child(self.render_flyover_chrome(cx))
             .child(self.render_sidebar(cx))
             // Sessions empty state ("New group" pill + hint): element tree in
             // the terminal area; its click resolves on the element.
@@ -5698,6 +5701,8 @@ impl App {
                 true,
                 self.flyover_maximized,
                 flyover_cursor,
+                // The strip's pixels are an element tree (`flyover_ui`).
+                false,
                 &mut flyover_hot,
             );
             frame.flyover_quads = quads;
@@ -6336,6 +6341,8 @@ impl FlyoverPopout {
                 false,
                 false,
                 popout_cursor,
+                // The popout paints its own strip on the canvas.
+                true,
                 &mut hot,
             )
         });
