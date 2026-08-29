@@ -1,13 +1,18 @@
 //! Sessions sidebar as a gpui element tree over the canvas.
 //!
 //! The sidebar used to be painted by `renderer::paint_sidebar_rows`. Only the
-//! *pixels* moved here: geometry still lives in [`crate::workspace`]
-//! (`sidebar_rows` / `sidebar_row_rect`), and every click, drag and rename is
-//! still resolved on the canvas mouse path in `main.rs` against those same
-//! rects. That is deliberate — the rects are the single authority that keeps
-//! painting, hit-testing and PTY resize in agreement, so this tree is
+//! *pixels* moved here at first: geometry still lives in [`crate::workspace`]
+//! (`sidebar_rows` / `sidebar_row_rect`), and row clicks, drags and renames
+//! are still resolved on the canvas mouse path in `main.rs` against those
+//! same rects. That is deliberate — the rects are the single authority that
+//! keeps painting, hit-testing and PTY resize in agreement, so this tree is
 //! *absolutely positioned to match them* rather than reimplementing layout or
 //! drag-and-drop in gpui's paradigm.
+//!
+//! Interaction is migrating onto the elements themselves, surface by
+//! surface: the page-dot strip ([`App::page_dot_layer`]) and the Sessions
+//! empty state ([`App::render_empty_state`]) are real gpui click targets that
+//! `occlude()` the canvas, so `main.rs` no longer hit-tests their rects.
 //!
 //! Colors come from the live chrome theme ([`crate::ui::theme::Theme`]), never
 //! from the mock's hardcoded palette, so the panel reads correctly in both
@@ -19,8 +24,10 @@
 //! hit test in `main.rs` never disagree.
 
 use gpui::{
-    AnyElement, BoxShadow, Context, FontWeight, Hsla, IntoElement, ParentElement, SharedString,
-    Styled, div, linear_color_stop, linear_gradient, point, prelude::FluentBuilder as _, px,
+    AnyElement, App as GpuiApp, BoxShadow, ClickEvent, Context, FontWeight, Hsla,
+    InteractiveElement, IntoElement, ParentElement, SharedString, StatefulInteractiveElement,
+    Styled, Window, div, linear_color_stop, linear_gradient, point,
+    prelude::FluentBuilder as _, px,
 };
 
 use std::time::SystemTime;
@@ -176,10 +183,134 @@ impl App {
             .child(self.clipped_row_layer(&theme))
             .child(self.drop_feedback_layer(&theme))
             .child(self.header_chips(&theme))
-            .child(self.page_dot_layer(&theme))
+            .child(self.page_dot_layer(&theme, cx.entity().downgrade()))
             .child(self.resize_grip_layer(&theme))
             // Last, so the veil falls over every affordance the panel owns.
             .child(self.overlay_scrim(panel_w))
+            .into_any_element()
+    }
+
+    /// The Sessions empty state: a centered "New group" pill with its ⇧⌘T
+    /// hint, in the terminal area.
+    ///
+    /// Element-owned: the pill is a real gpui button (hover + click resolve
+    /// here, not on the canvas mouse path), positioned at
+    /// [`crate::workspace::empty_state_cta`] / [`empty_state_hint`] so it
+    /// lands exactly where the canvas used to paint it. Returns an empty
+    /// element off the Sessions / Pull Requests pages, or once the workspace
+    /// has a tile.
+    pub fn render_empty_state(&self, cx: &mut Context<Self>) -> AnyElement {
+        // Sessions and Pull Requests share the card sidebar, so both pages
+        // carried the canvas CTA (on Pull Requests it sits under that page's
+        // own content card, exactly as before).
+        if !matches!(self.page, crate::Page::Sessions | crate::Page::PullRequests)
+            || !self.is_empty_state()
+        {
+            return div().into_any_element();
+        }
+        cx.set_global(Theme::from_chrome(crate::theme::current()));
+        let theme = Theme::of(cx).clone();
+
+        // `empty_state_cta` takes device pixels and a scale; this tree is
+        // logical, so hand it the logical surface at scale 1.0 the way
+        // `page_dot_layer` does.
+        let (surface_w, surface_h) = self.renderer.surface_size();
+        let scale = self.scale();
+        let width = (surface_w as f32 / scale).round() as u32;
+        let height = (surface_h as f32 / scale).round() as u32;
+        let cta = crate::workspace::empty_state_cta(width, height, 1.0, self.sidebar_w(), self.right_w());
+        let hint = crate::workspace::empty_state_hint(width, height, 1.0, self.sidebar_w(), self.right_w());
+
+        // Same glass as the canvas `Renderer::pill`: dark chrome lifts the
+        // card fill 30% toward white so it reads as light glass on the
+        // vibrancy ground; the rim is the ink at 0.28.
+        let fill = if theme.dark {
+            let lift = |v: f32| v + (1.0 - v) * 0.30;
+            let rgb = gpui::Rgba::from(theme.card);
+            Hsla::from(gpui::Rgba { r: lift(rgb.r), g: lift(rgb.g), b: lift(rgb.b), a: 1.0 })
+        } else {
+            theme.card
+        };
+        let rim = theme.foreground.opacity(0.28);
+        let font = crate::renderer::chrome_font();
+        let entity = cx.entity().downgrade();
+        // A canvas modal (picker, palette, confirm…) scrims the canvas
+        // beneath this tree, not this tree: veil the pill and hint the same
+        // 30% and drop the click, so the modal keeps the frame.
+        let modal = self.modal_overlay_open();
+        let veil = |r: &crate::workspace::LayoutRect, radius: f32| {
+            div()
+                .absolute()
+                .left(px(r.x))
+                .top(px(r.y))
+                .w(px(r.w))
+                .h(px(r.h))
+                .rounded(px(radius))
+                .occlude()
+                .bg(gpui::hsla(0.0, 0.0, 0.0, SCRIM_ALPHA))
+        };
+
+        div()
+            .absolute()
+            .left(px(0.0))
+            .top(px(0.0))
+            .size_full()
+            .child(
+                div()
+                    .id("empty-state-cta")
+                    .absolute()
+                    .left(px(cta.x))
+                    .top(px(cta.y))
+                    .w(px(cta.w))
+                    .h(px(cta.h))
+                    .occlude()
+                    .when(!modal, |d| d.cursor_pointer())
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(ROW_RADIUS))
+                    .border(px(0.5))
+                    .border_color(rim)
+                    .bg(fill.opacity(0.62))
+                    .hover(move |s| s.bg(fill.opacity(0.85)))
+                    .shadow(vec![BoxShadow {
+                        color: gpui::black().opacity(0.10),
+                        offset: point(px(0.0), px(1.0)),
+                        blur_radius: px(3.0),
+                        spread_radius: px(0.0),
+                        inset: false,
+                    }])
+                    .font_family(crate::renderer::FONT_FAMILY)
+                    .text_size(px(font))
+                    .text_color(theme.foreground)
+                    .child("New group")
+                    .when(!modal, |d| {
+                        d.on_click(move |_ev: &ClickEvent, _win: &mut Window, app: &mut GpuiApp| {
+                            if let Some(entity) = entity.upgrade() {
+                                entity.update(app, |this, cx| {
+                                    this.open_picker();
+                                    cx.notify();
+                                });
+                            }
+                        })
+                    }),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(px(hint.x))
+                    .top(px(hint.y))
+                    .w(px(hint.w))
+                    .h(px(hint.h))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .font_family(crate::renderer::FONT_FAMILY)
+                    .text_size(px(font))
+                    .text_color(theme.muted_foreground.opacity(0.9))
+                    .child("press ⇧⌘T"),
+            )
+            .when(modal, |d| d.child(veil(&cta, ROW_RADIUS)).child(veil(&hint, 0.0)))
             .into_any_element()
     }
 
@@ -330,14 +461,19 @@ impl App {
         // Exactly the panel's rect, corners included: the window gutter around
         // it still shows canvas, which the canvas scrim already dimmed, and
         // laying a second veil there would darken the seam twice over.
+        // Occluding, not just tinting: the page dots below it are element
+        // click targets now, and a veil that let clicks through would switch
+        // pages behind the modal. The canvas path used to swallow those.
         layer.child(
             div()
+                .id("sidebar-modal-scrim")
                 .absolute()
                 .left(px(GUTTER))
                 .top(px(GUTTER))
                 .w(px(panel_w))
                 .bottom(px(GUTTER))
                 .rounded(px(PANEL_RADIUS))
+                .occlude()
                 .bg(gpui::hsla(0.0, 0.0, 0.0, SCRIM_ALPHA)),
         )
     }
@@ -350,9 +486,10 @@ impl App {
     /// exactly [`crate::workspace::page_slot_rect`] — the same rect
     /// `renderer.rs` registers as hot and `main.rs::page_slot_at` hit-tests —
     /// and flag-gated pages (Notes, when the feature is off) drop out of the
-    /// strip entirely so the slot indices keep lining up. No gpui handlers:
-    /// the click still resolves on the canvas mouse path.
-    fn page_dot_layer(&self, theme: &Theme) -> gpui::Div {
+    /// strip entirely so the slot indices keep lining up. Each slot is a real
+    /// gpui click target that switches the page; the hover crossfade target
+    /// (`dot_hover`) is still tracked on the canvas mouse-move path.
+    fn page_dot_layer(&self, theme: &Theme, entity: gpui::WeakEntity<Self>) -> gpui::Div {
         let (_, surface_h) = self.renderer.surface_size();
         // `page_slot_rect` takes device pixels and a scale; gpui works in
         // logical pixels, so hand it the logical height at scale 1.0 the way
@@ -373,7 +510,29 @@ impl App {
                 .copied()
                 .unwrap_or(0.0)
                 .clamp(0.0, 1.0);
-            layer = layer.child(page_slot(theme, &slot, page.glyph(), p));
+            let entity = entity.clone();
+            let page = *page;
+            // While a canvas modal is up the slot keeps painting (the scrim
+            // veil dims and occludes it) but must not act — modality is
+            // still the canvas's to own until the modals themselves move.
+            let modal = self.modal_overlay_open();
+            layer = layer.child(
+                page_slot(theme, &slot, page.glyph(), p)
+                    .id(("page-slot", i))
+                    .occlude()
+                    .when(!modal, |slot| {
+                        slot.cursor_pointer().on_click(
+                            move |_ev: &ClickEvent, _win: &mut Window, app: &mut GpuiApp| {
+                                if let Some(entity) = entity.upgrade() {
+                                    entity.update(app, |this, cx| {
+                                        this.set_page(page);
+                                        cx.notify();
+                                    });
+                                }
+                            },
+                        )
+                    }),
+            );
         }
         layer
     }
@@ -1530,8 +1689,8 @@ fn chip(
 ///
 /// `progress` is the slot's animation position: at 0 the slot is a small
 /// muted dot, at 1 it is the page's glyph, and in between the two crossfade,
-/// exactly the way the canvas painter drew it. No gpui handlers — the canvas
-/// mouse path still owns the click.
+/// exactly the way the canvas painter drew it. The caller attaches the click
+/// handler (`page_dot_layer`).
 fn page_slot(
     theme: &Theme,
     rect: &crate::workspace::LayoutRect,

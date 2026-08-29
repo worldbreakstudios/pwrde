@@ -3231,13 +3231,11 @@ impl App {
             }
         }
 
-        // Empty state (Sessions only): the centered CTA is the only
-        // interactive element in the content area (the placeholder tile must
-        // not arm tab drags). The Settings page keeps its own hit-testing.
+        // Empty state (Sessions only): the centered CTA is an element-tree
+        // button now (`sidebar_ui::render_empty_state`), so the content area
+        // has nothing for the canvas to resolve — and the placeholder tile
+        // must not arm tab drags. The Settings page keeps its own hit-testing.
         if self.page == Page::Sessions && self.is_empty_state() && !sidebar.contains(px, py) {
-            if workspace::empty_state_cta(w, h, scale, self.sidebar_w(), self.right_w()).contains(px, py) {
-                self.open_picker();
-            }
             return;
         }
 
@@ -3278,16 +3276,9 @@ impl App {
                 window.start_window_move();
                 return;
             }
-            // Page-dot strip at the sidebar's bottom: click navigates. The
-            // slot index is into the *visible* pages (flag-gated pages drop
-            // out), matching what the renderer painted and hit-tested.
-            if let Some(i) = self.page_slot_at(px, py) {
-                let visible = Page::visible(crate::features::notes_enabled());
-                if let Some(&page) = visible.get(i) {
-                    self.set_page(page);
-                }
-                return;
-            }
+            // Page-dot strip at the sidebar's bottom: the slots are element
+            // click targets now (`sidebar_ui::page_dot_layer`), which occlude
+            // the canvas, so nothing to resolve here.
             if self.page == Page::Settings {
                 // Search box in the top slot; sections in the rows below it.
                 if workspace::settings_search_rect(scale, self.sidebar_w()).contains(px, py) {
@@ -5637,6 +5628,9 @@ impl Render for App {
             // Returns an empty element when collapsed or on the canvas-sidebar
             // pages.
             .child(self.render_sidebar(cx))
+            // Sessions empty state ("New group" pill + hint): element tree in
+            // the terminal area; its click resolves on the element.
+            .child(self.render_empty_state(cx))
             // Cleanup page overlay: real gpui element tree above the canvas.
             // Skip while a confirm dialog is open so the canvas-painted scrim
             // owns the screen (v1 tradeoff).
@@ -5765,7 +5759,6 @@ impl App {
         let ribbon_tools = self.tools_for(self.page);
         let chrome = renderer::ChromeState {
             page: self.page,
-            notes_enabled: crate::features::notes_enabled(),
             ribbon_tools: &ribbon_tools,
             open_tool: self.open_tool,
             tool_panel_w: self.tool_panel_w,
@@ -5826,8 +5819,12 @@ impl App {
         // The flyover panel lives outside the workspace tree, so its layer is
         // built here from App state and slotted into the frame's flyover
         // fields (painted above tiles/labels, below the modal overlays).
-        // In windowed mode the popout window renders it instead.
-        if self.flyover_anim > 0.0 && !self.flyover_windowed {
+        // In windowed mode the popout window renders it instead. The gate
+        // matches the on_mouse_down hit-test (and sidebar_ui::flyover_ceiling):
+        // with no tabs there is nothing to paint, and an empty card would
+        // otherwise linger over the Sessions empty state during the close
+        // animation.
+        if self.flyover_anim > 0.0 && !self.flyover_tabs.is_empty() && !self.flyover_windowed {
             let panel = self.flyover_rect_now();
             let flyover_cursor = if overlay_open || !matches!(self.drag, Drag::None) {
                 None
