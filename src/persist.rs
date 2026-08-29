@@ -8,8 +8,9 @@
 //! non-git launches keep the unscoped default.
 //!
 //! Schema evolution: `open_db` creates tables with `CREATE TABLE IF NOT EXISTS`
-//! and migrates older DBs by adding `groups.section_id` (duplicate-column
-//! errors are ignored) plus a `sections` table for collapsible sidebar groups.
+//! and migrates older DBs by adding `groups.section_id` and `groups.pinned`
+//! (duplicate-column errors are ignored) plus a `sections` table for collapsible
+//! sidebar groups.
 
 use rusqlite::{Connection, Result as SqlResult};
 use serde::{Deserialize, Serialize};
@@ -40,6 +41,8 @@ pub struct SavedGroup {
     pub tabs: Vec<SavedTab>,
     /// Sidebar section membership, if any.
     pub section_id: Option<u64>,
+    /// Whether this group is pinned to the Sessions sidebar quick-access strip.
+    pub pinned: bool,
 }
 
 /// A saved collapsible sidebar section.
@@ -122,6 +125,8 @@ fn open_db(path: &Path) -> SqlResult<Connection> {
     // Migrate pre-sections DBs: CREATE TABLE IF NOT EXISTS does not add columns
     // to existing tables, so ALTER and ignore the duplicate-column error.
     let _ = conn.execute("ALTER TABLE groups ADD COLUMN section_id INTEGER", []);
+    // Migrate pre-pin DBs; duplicate-column errors are intentionally ignored.
+    let _ = conn.execute("ALTER TABLE groups ADD COLUMN pinned INTEGER", []);
     let _ = conn.execute("ALTER TABLE tabs ADD COLUMN unread INTEGER", []);
     // Migrate pre-attention DBs; duplicate-column errors are intentionally ignored.
     let _ = conn.execute("ALTER TABLE tabs ADD COLUMN unread_at INTEGER", []);
@@ -178,8 +183,8 @@ pub fn save_snapshot(
         });
 
         tx.execute(
-            "INSERT INTO groups (position, name, cwd, focused_tile, layout, section_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO groups (position, name, cwd, focused_tile, layout, section_id, pinned)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             (
                 group.position,
                 &group.name,
@@ -187,6 +192,7 @@ pub fn save_snapshot(
                 group.focused_tile,
                 &layout_json,
                 group.section_id.map(|id| id as i64),
+                if group.pinned { 1 } else { 0 },
             ),
         )?;
 
@@ -270,7 +276,7 @@ fn load_sections(conn: &Connection) -> Vec<SavedSection> {
 
 fn load_groups(conn: &Connection) -> Vec<SavedGroup> {
     let mut stmt = match conn.prepare(
-        "SELECT id, position, name, cwd, focused_tile, layout, section_id
+        "SELECT id, position, name, cwd, focused_tile, layout, section_id, pinned
          FROM groups ORDER BY position",
     ) {
         Ok(s) => s,
@@ -289,6 +295,7 @@ fn load_groups(conn: &Connection) -> Vec<SavedGroup> {
             row.get::<_, usize>(4)?,
             row.get::<_, String>(5)?,
             row.get::<_, Option<i64>>(6)?,
+            row.get::<_, Option<i64>>(7)?,
         ))
     }) {
         Ok(r) => r,
@@ -301,7 +308,7 @@ fn load_groups(conn: &Connection) -> Vec<SavedGroup> {
     let mut groups = Vec::new();
 
     for row_result in rows {
-        let (group_id, position, name, cwd, focused_tile, layout_json, section_id) =
+        let (group_id, position, name, cwd, focused_tile, layout_json, section_id, pinned) =
             match row_result {
                 Ok(r) => r,
                 Err(e) => {
@@ -363,6 +370,8 @@ fn load_groups(conn: &Connection) -> Vec<SavedGroup> {
             layout,
             tabs,
             section_id: section_id.map(|id| id as u64),
+            // NULL (pre-pin rows) and 0 both mean unpinned.
+            pinned: pinned.map(|v| v != 0).unwrap_or(false),
         });
     }
 
@@ -396,6 +405,7 @@ pub fn workspaces_to_saved(workspaces: &[crate::workspace::Workspace]) -> Vec<Sa
                 layout,
                 tabs,
                 section_id: ws.section,
+                pinned: ws.pinned,
             }
         })
         .collect()
@@ -525,6 +535,7 @@ mod tests {
                 unread_at: None,
             }],
             section_id,
+            pinned: false,
         }
     }
 
@@ -599,6 +610,7 @@ mod tests {
                     },
                 ],
                 section_id: None,
+                pinned: false,
             },
             SavedGroup {
                 position: 1,
@@ -616,6 +628,7 @@ mod tests {
                     unread_at: None,
                 }],
                 section_id: None,
+                pinned: false,
             },
         ];
 
@@ -779,6 +792,7 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].name, "legacy");
         assert_eq!(groups[0].section_id, None);
+        assert!(!groups[0].pinned, "pre-pin rows load as pinned=false");
         assert_eq!(groups[0].tabs.len(), 1);
         assert_eq!(
             groups[0].tabs[0].shpool_session,
@@ -791,7 +805,30 @@ mod tests {
         let (groups2, sections2) = load_snapshot(&path);
         assert_eq!(groups2.len(), 1);
         assert_eq!(groups2[0].section_id, None);
+        assert!(!groups2[0].pinned);
         assert!(sections2.is_empty());
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn roundtrip_pinned_flag() {
+        let path = temp_db("pinned-roundtrip");
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+
+        let mut pinned = sample_group(0, "pinned", None);
+        pinned.pinned = true;
+        let unpinned = sample_group(1, "loose", None);
+        save_snapshot(&[pinned, unpinned], &[], &path).unwrap();
+
+        let (loaded, _) = load_snapshot(&path);
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].name, "pinned");
+        assert!(loaded[0].pinned, "pinned group must survive the roundtrip");
+        assert_eq!(loaded[1].name, "loose");
+        assert!(!loaded[1].pinned, "unpinned group stays unpinned");
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
@@ -866,6 +903,7 @@ mod tests {
                 },
             ],
             section_id: None,
+            pinned: false,
         }];
 
         save_snapshot(&groups, &[], &path).unwrap();

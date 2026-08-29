@@ -225,6 +225,9 @@ pub struct Workspace {
     /// Sidebar section this group belongs to, if any. Workspaces sharing a
     /// section id must stay contiguous in the parent `workspaces` Vec.
     pub section: Option<u64>,
+    /// When true, this group also appears in the pinned-bubble strip above the
+    /// Sessions card list (a quick-access duplicate; the normal card row stays).
+    pub pinned: bool,
 }
 
 impl Workspace {
@@ -239,6 +242,7 @@ impl Workspace {
             cwd,
             primary_tile: focused_tile,
             section: None,
+            pinned: false,
         }
     }
 
@@ -309,6 +313,19 @@ impl Workspace {
             t.collapse_anim = 0.0;
         }
     }
+}
+
+/// Indices of pinned workspaces, in the order they appear in `workspaces`.
+///
+/// The Sessions sidebar uses this both to paint the bubble strip and to
+/// hit-test clicks against those bubbles — one order, shared by paint and input.
+pub fn pinned_indices(workspaces: &[Workspace]) -> Vec<usize> {
+    workspaces
+        .iter()
+        .enumerate()
+        .filter(|(_, w)| w.pinned)
+        .map(|(i, _)| i)
+        .collect()
 }
 
 // ─── Layout ─────────────────────────────────────────────────────────────
@@ -621,6 +638,91 @@ pub fn sidebar_rows(workspaces: &[Workspace], sections: &[Section]) -> Vec<Sideb
     rows
 }
 
+/// Column width of one pinned-session bubble in the Sessions strip.
+const PINNED_COL_W: f32 = 84.0;
+/// Diameter of the round avatar disc inside a pinned bubble.
+const PINNED_AVATAR: f32 = 64.0;
+/// Gap between the avatar disc and the name label under it.
+const PINNED_LABEL_GAP: f32 = 5.0;
+/// Text line height under a pinned bubble avatar.
+const PINNED_LABEL_H: f32 = 14.0;
+/// Total height of one pinned-bubble column: avatar + label gap + label.
+const PINNED_COL_H: f32 = PINNED_AVATAR + PINNED_LABEL_GAP + PINNED_LABEL_H; // 83
+/// Horizontal gap between adjacent pinned-bubble columns.
+const PINNED_COL_GAP: f32 = 14.0;
+/// Vertical gap between wrapped rows of pinned bubbles.
+const PINNED_ROW_GAP: f32 = 8.0;
+/// Top padding inside the pinned-bubble strip.
+const PINNED_STRIP_PAD_TOP: f32 = 6.0;
+/// Bottom padding inside the pinned-bubble strip.
+const PINNED_STRIP_PAD_BOTTOM: f32 = 12.0;
+
+/// How many pinned-bubble columns fit across the sidebar's inner width.
+///
+/// Pure floor division on logical px so paint and hit-test wrap at the same
+/// count regardless of the live display scale.
+fn pinned_per_row(sidebar_w: f32) -> usize {
+    let inner_w = (sidebar_w - 2.0 * SIDEBAR_PAD).max(0.0);
+    (((inner_w + PINNED_COL_GAP) / (PINNED_COL_W + PINNED_COL_GAP)).floor() as usize).max(1)
+}
+
+/// Height of the pinned-bubble strip above the section/card list, in device px.
+///
+/// Zero when nothing is pinned so the card ladder keeps its old top. Otherwise
+/// top pad + N rows of 83-tall columns + 8px inter-row gaps + bottom pad, all
+/// scaled — painting and `sidebar_row_rect` both read this so the strip never
+/// collides with the first card.
+pub fn pinned_strip_h(n_pinned: usize, scale: f32, sidebar_w: f32) -> f32 {
+    if n_pinned == 0 {
+        return 0.0;
+    }
+    let per_row = pinned_per_row(sidebar_w);
+    let rows = (n_pinned + per_row - 1) / per_row;
+    let h = PINNED_STRIP_PAD_TOP
+        + (rows as f32) * PINNED_COL_H
+        + ((rows.saturating_sub(1)) as f32) * PINNED_ROW_GAP
+        + PINNED_STRIP_PAD_BOTTOM;
+    h * scale
+}
+
+/// Device-px column rect for the `k`-th pinned bubble in a strip of `n_pinned`.
+///
+/// Columns are 84×83 logical px and lay out left-to-right, wrapping when the
+/// sidebar's inner width cannot hold another; each row is centered on its own
+/// bubble count so a short final row still sits under the middle of the strip.
+/// The strip starts at the same `top0` the card rows used to, plus the strip's
+/// 6px top pad — paint and hit-test share this helper so a click never misses
+/// the disc the user sees.
+pub fn pinned_bubble_rect(k: usize, n_pinned: usize, scale: f32, sidebar_w: f32) -> LayoutRect {
+    let per_row = pinned_per_row(sidebar_w);
+    let r = k / per_row;
+    let c = k % per_row;
+    let row_count = (n_pinned - r * per_row).min(per_row);
+
+    let gap_rows = (TAB_GAP * scale).round();
+    let top0 = (TITLEBAR_H * scale).round() + 2.0 * gap_rows;
+    let strip_top = top0 + PINNED_STRIP_PAD_TOP * scale;
+
+    let col_w = PINNED_COL_W * scale;
+    let col_h = PINNED_COL_H * scale;
+    let col_gap = PINNED_COL_GAP * scale;
+    let row_gap = PINNED_ROW_GAP * scale;
+
+    // Same rounded inset and width `sidebar_row_rect_at` uses, so the strip
+    // and the card ladder share their left and right edges exactly.
+    let pad = (SIDEBAR_PAD * scale).round();
+    let inner_w = ((sidebar_w * scale).round() - 2.0 * pad).max(0.0);
+    let row_w = (row_count as f32) * col_w + ((row_count.saturating_sub(1)) as f32) * col_gap;
+    let row_x0 = (pad + (inner_w - row_w) / 2.0).round();
+
+    LayoutRect {
+        x: row_x0 + (c as f32) * (col_w + col_gap),
+        y: strip_top + (r as f32) * (col_h + row_gap),
+        w: col_w,
+        h: col_h,
+    }
+}
+
 /// Pixel rect for `rows[index]`. Header rows are slimmer; group rows that
 /// belong to a section are indented. Painting, hit-testing, and drop
 /// resolution must all use this so they never disagree.
@@ -656,7 +758,14 @@ fn sidebar_row_rect_at(
     let gap = (TAB_GAP * scale).round();
     // Rows start below the titlebar and the header chip row — exactly where
     // `tab_rect`'s one-line rows start, so every page's ladder shares a top.
-    let top0 = (TITLEBAR_H * scale).round() + 2.0 * gap;
+    // On the Sessions card ladder the pinned-bubble strip (if any) sits above
+    // the cards, so shift `top0` down by its height; Cleanup/Notes/Settings
+    // one-line rows keep the unshifted origin.
+    let mut top0 = (TITLEBAR_H * scale).round() + 2.0 * gap;
+    if card_rows {
+        let n_pinned = workspaces.iter().filter(|w| w.pinned).count();
+        top0 += pinned_strip_h(n_pinned, scale, sidebar_w);
+    }
     let full_w = ((sidebar_w * scale).round() - 2.0 * pad).max(0.0);
     let mut y = top0;
     for (i, row) in rows.iter().enumerate() {
@@ -2511,6 +2620,67 @@ mod tests {
                 SidebarRow::Group { ws_idx: 2 },
             ]
         );
+    }
+
+    /// The pinned strip collapses to nothing when empty and matches the
+    /// pad + rows×83 + gaps formula otherwise — including the wrap at a
+    /// 300px sidebar where four pins become two rows (3 + 1).
+    #[test]
+    fn pinned_strip_h_zero_one_and_wrap() {
+        let sw = 300.0;
+        assert_eq!(pinned_strip_h(0, 1.0, sw), 0.0);
+        // One row: 6 + 83 + 12 = 101.
+        assert_eq!(pinned_strip_h(1, 1.0, sw), 101.0);
+        // 300 inner = 280; per_row = floor((280+14)/(84+14)) = 3, so 4 pins
+        // wrap to 2 rows: 6 + 2*83 + 8 + 12 = 192.
+        assert_eq!(pinned_per_row(sw), 3);
+        assert_eq!(pinned_strip_h(4, 1.0, sw), 192.0);
+        // Scale multiplies the whole strip.
+        assert_eq!(pinned_strip_h(1, 2.0, sw), 202.0);
+    }
+
+    /// Bubbles in a single row are equal-width, non-overlapping, and the
+    /// row is centered in the sidebar (first.x + last.x + col_w ≈ sidebar_w).
+    #[test]
+    fn pinned_bubble_rects_centered_non_overlapping() {
+        let sw = 300.0;
+        let scale = 1.0;
+        let n = 3;
+        let rects: Vec<_> = (0..n)
+            .map(|k| pinned_bubble_rect(k, n, scale, sw))
+            .collect();
+        for r in &rects {
+            assert_eq!(r.w, PINNED_COL_W * scale);
+            assert_eq!(r.h, PINNED_COL_H * scale);
+        }
+        for i in 1..n {
+            assert!(rects[i].x >= rects[i - 1].x + rects[i - 1].w);
+        }
+        // Symmetric about the sidebar midline within 1px.
+        let first = &rects[0];
+        let last = &rects[n - 1];
+        let sum = first.x + last.x + PINNED_COL_W * scale;
+        assert!((sum - sw).abs() < 1.0, "sum={sum} sw={sw}");
+    }
+
+    /// Card rows shift down by exactly the strip height when something is
+    /// pinned; one-line (`card_rows = false`) rows keep their old top.
+    #[test]
+    fn sidebar_row_rect_shifts_for_pinned_strip() {
+        let mut workspaces = vec![ws("a", None), ws("b", None)];
+        let rows = [SidebarRow::Group { ws_idx: 0 }];
+        let (scale, sw) = (1.0, 300.0);
+
+        let card_before = sidebar_row_rect(&rows, 0, &workspaces, scale, sw, true);
+        let line_before = sidebar_row_rect(&rows, 0, &workspaces, scale, sw, false);
+        workspaces[0].pinned = true;
+        let card_after = sidebar_row_rect(&rows, 0, &workspaces, scale, sw, true);
+        let line_after = sidebar_row_rect(&rows, 0, &workspaces, scale, sw, false);
+
+        assert_eq!(card_after.y, card_before.y + pinned_strip_h(1, scale, sw));
+        assert_eq!(line_after.y, line_before.y);
+        // Both ladders share the unshifted origin.
+        assert_eq!(card_before.y, line_before.y);
     }
 
     #[test]
