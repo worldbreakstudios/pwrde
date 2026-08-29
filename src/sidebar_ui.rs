@@ -321,7 +321,7 @@ impl App {
     /// Read every frame rather than cached: `flyover_rect_now` follows the
     /// slide animation, so the sidebar's floor tracks the panel on the way in
     /// and out instead of snapping once it lands.
-    fn flyover_ceiling(&self) -> Option<f32> {
+    pub(crate) fn flyover_ceiling(&self) -> Option<f32> {
         if !self.flyover_open || self.flyover_windowed || self.flyover_tabs.is_empty() {
             return None;
         }

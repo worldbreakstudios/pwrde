@@ -49,6 +49,7 @@ mod settings;
 mod sidebar_card;
 mod sidebar_ui;
 mod term;
+mod tile_ui;
 mod term_theme;
 mod theme;
 // Vendored shadcn-style component copies (see ui/mod.rs). Kept faithful to
@@ -5599,6 +5600,9 @@ impl Render for App {
             // so the canvas underneath keeps resolving every click and drag.
             // Returns an empty element when collapsed or on the canvas-sidebar
             // pages.
+            // Tile tab strips: pixels on the element tree, clipped per
+            // strip; clicks and drags still resolve on the canvas rects.
+            .child(self.render_tile_chrome(cx))
             .child(self.render_sidebar(cx))
             // Sessions empty state ("New group" pill + hint): element tree in
             // the terminal area; its click resolves on the element.
