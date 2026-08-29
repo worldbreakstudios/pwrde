@@ -19,10 +19,11 @@
 //! *around* the strip rather than in it.
 
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use gpui::{
-    AnyElement, Context, Hsla, IntoElement, ParentElement, Styled, div, px,
-    prelude::FluentBuilder as _,
+    AnyElement, App as GpuiApp, Context, Hsla, InteractiveElement, IntoElement, MouseButton,
+    MouseDownEvent, ParentElement, Styled, Window, div, px, prelude::FluentBuilder as _,
 };
 
 use crate::App;
@@ -44,6 +45,7 @@ const ON_ACCENT_INK: (u8, u8, u8) = (255, 255, 255);
 
 /// The colors a strip paints with — resolved from the terminal scheme the
 /// way the canvas did, so strips stay legible on light palettes.
+#[derive(Clone)]
 pub(crate) struct StripStyle {
     pub ink: Hsla,
     pub ink_dim: Hsla,
@@ -87,6 +89,11 @@ impl StripStyle {
     }
 }
 
+/// A press on tab `index` of a strip (`close` when it landed on the ×).
+/// Handlers stop propagation themselves so the canvas mouse path never
+/// re-resolves the press; the canvas still drives any drag that follows.
+pub(crate) type PressHandler = Rc<dyn Fn(usize, bool, &MouseDownEvent, &mut GpuiApp)>;
+
 /// One tab of a strip: its title and the physical-px rects the canvas laid
 /// it out at (the tab and its × button).
 pub(crate) struct StripTab {
@@ -108,6 +115,7 @@ pub(crate) fn tab_strip(
     active: usize,
     hov: &dyn Fn(&LayoutRect) -> bool,
     style: &StripStyle,
+    on_press: PressHandler,
 ) -> gpui::Div {
     let mut strip_el = div()
         .absolute()
@@ -126,13 +134,17 @@ pub(crate) fn tab_strip(
         let (tx, ty, tw, tth) = rel(&tab.tab);
         let (cx_, cy_, cw, ch) = rel(&tab.close);
 
+        let press = on_press.clone();
         let mut tab_el = div()
             .absolute()
             .left(px(tx))
             .top(px(ty))
             .w(px(tw))
             .h(px(tth))
-            .overflow_hidden();
+            .overflow_hidden()
+            .on_mouse_down(MouseButton::Left, move |ev, _win: &mut Window, app: &mut GpuiApp| {
+                press(ti, false, ev, app)
+            });
 
         // Pill: the active tab's (accent when the pane is focused, glass
         // otherwise), or a half-strength preview on hover.
@@ -197,8 +209,10 @@ pub(crate) fn tab_strip(
                 .child(text),
         );
 
-        // × and its hover chip.
+        // × and its hover chip. Its press wins over the tab's: the inner
+        // listener runs first and stops propagation.
         let chip_h = (ch - 2.0 * CHIP_INSET).max(0.0);
+        let press = on_press.clone();
         tab_el = tab_el.child(
             div()
                 .absolute()
@@ -206,6 +220,9 @@ pub(crate) fn tab_strip(
                 .top(px(cy_ - ty))
                 .w(px(cw))
                 .h(px(ch))
+                .on_mouse_down(MouseButton::Left, move |ev, _win: &mut Window, app: &mut GpuiApp| {
+                    press(ti, true, ev, app)
+                })
                 .when(close_hov, |d| {
                     d.child(
                         div()
@@ -284,6 +301,7 @@ impl App {
         };
         let hov = |r: &LayoutRect| cur.is_some_and(|(x, y)| r.contains(x, y));
         let font = crate::renderer::chrome_font();
+        let entity = cx.entity().downgrade();
 
         let mut layer = div()
             .absolute()
@@ -322,8 +340,20 @@ impl App {
                     close: workspace::tile_tab_close_rect(&strip, ti, n, scale, has_caret),
                 })
                 .collect();
-            let style = StripStyle { accent: focused.then_some(accent), ..base };
-            let mut strip_el = tab_strip(&bar, inv, &tabs, tile.active, &hov, &style);
+            let style = StripStyle { accent: focused.then_some(accent), ..base.clone() };
+            let tile_id = *id;
+            let entity = entity.clone();
+            let on_press: PressHandler = Rc::new(move |ti, close, ev, app| {
+                app.stop_propagation();
+                if let Some(entity) = entity.upgrade() {
+                    entity.update(app, |this, cx| {
+                        this.note_pointer(ev);
+                        this.press_tile_tab(tile_id, ti, close, ev.click_count);
+                        cx.notify();
+                    });
+                }
+            });
+            let mut strip_el = tab_strip(&bar, inv, &tabs, tile.active, &hov, &style, on_press);
             if modal {
                 strip_el = strip_el.child(modal_veil(th));
             }

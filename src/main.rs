@@ -955,6 +955,70 @@ impl App {
         self.request_redraw();
     }
 
+    /// A press on tab `ti` of tile `id` — from the strip element or the
+    /// canvas fallback: activate + focus, × closes, a collapsed pane
+    /// expands, a double-click on a split pane collapses it, and otherwise
+    /// the press arms a tab drag.
+    pub(crate) fn press_tile_tab(&mut self, id: u64, ti: usize, close: bool, click_count: usize) {
+        // A fresh click sequence forgets which pane the previous one expanded.
+        if click_count <= 1 {
+            self.just_expanded = None;
+        }
+        let has_caret = workspace::tile_collapse_axis(&self.workspaces[self.active].root)
+            .iter()
+            .any(|(tid, axis)| *tid == id && axis.is_some());
+        let ws = &mut self.workspaces[self.active];
+        let Some(tile) = ws.root.find_tile_mut(id) else { return };
+        // A tab-less tile exists transiently; it still takes focus and arms
+        // the press exactly as the canvas path did.
+        let n = tile.tabs.len();
+        let ti = ti.min(n.saturating_sub(1));
+        tile.active = ti;
+        ws.focused_tile = id;
+        if close && n > 0 {
+            self.close_active_tab();
+            return;
+        }
+        if tile.collapsed {
+            // Clicking a tab name on a collapsed pane expands it.
+            self.set_collapsed(id, false);
+            self.just_expanded = Some(id);
+        } else if has_caret && click_count >= 2 && self.just_expanded != Some(id) {
+            // Double-clicking the tab bar collapses the pane (unless this
+            // same double-click just expanded it).
+            self.set_collapsed(id, true);
+            self.request_redraw();
+            return;
+        }
+        self.drag = Drag::TabPress { tile: id, tab: ti, start: self.cursor };
+        self.sync_layout();
+        self.mark_visible_read();
+        self.request_redraw();
+    }
+
+    /// A press on flyover tab `ti`: activate + focus the panel, or × closes.
+    pub(crate) fn press_flyover_tab(&mut self, ti: usize, close: bool) {
+        if ti >= self.flyover_tabs.len() {
+            return;
+        }
+        if close {
+            self.close_flyover_tab(ti);
+            return;
+        }
+        self.flyover_active = ti;
+        self.flyover_focused = true;
+        self.flyover_mark_read();
+        self.request_redraw();
+    }
+
+    /// Record a pointer position from an element event (logical px) in the
+    /// physical-px form the canvas mouse path keeps.
+    pub(crate) fn note_pointer(&mut self, ev: &MouseDownEvent) {
+        let s = self.scale() as f64;
+        self.cursor = (f64::from(ev.position.x) * s, f64::from(ev.position.y) * s);
+        self.modifiers = ev.modifiers;
+    }
+
     fn close_active_tab(&mut self) {
         let ws = &mut self.workspaces[self.active];
         let focused = ws.focused_tile;
@@ -1334,7 +1398,7 @@ impl App {
 
     /// Toggle the flyover panel between its resizable height and filling the
     /// whole window.
-    fn flyover_toggle_maximized(&mut self) {
+    pub(crate) fn flyover_toggle_maximized(&mut self) {
         self.flyover_maximized = !self.flyover_maximized;
         self.sync_flyover_layout(true);
         self.request_redraw();
@@ -1646,7 +1710,7 @@ impl App {
     /// Toggle the flyover panel open/closed. In windowed mode this shows or
     /// hides the popout window instead (the pump reconciles the actual
     /// window); sessions keep running either way.
-    fn toggle_flyover(&mut self) {
+    pub(crate) fn toggle_flyover(&mut self) {
         if self.flyover_windowed {
             self.flyover_window_visible = !self.flyover_window_visible;
             if self.flyover_window_visible {
@@ -3053,18 +3117,16 @@ impl App {
                         self.flyover_toggle_maximized();
                         return;
                     }
-                    // Determine which tab was clicked; × closes it.
+                    // The tabs and window buttons are element click targets
+                    // (`flyover_ui`) that stop the press first; the bar's
+                    // empty run still selects the nearest tab from here.
                     let maxed = self.flyover_maximized;
                     let tab_rect = workspace::flyover_tab_rect(&panel, 0, n.max(1), scale, maxed);
                     let ti = ((((px - tab_rect.x).max(0.0)) / tab_rect.w).floor() as usize)
                         .min(n.saturating_sub(1));
-                    if workspace::flyover_tab_close_rect(&panel, ti, n, scale, maxed).contains(px, py) {
-                        self.close_flyover_tab(ti);
-                        return;
-                    }
-                    self.flyover_active = ti;
-                    self.flyover_focused = true;
-                    self.flyover_mark_read();
+                    let close =
+                        workspace::flyover_tab_close_rect(&panel, ti, n, scale, maxed).contains(px, py);
+                    self.press_flyover_tab(ti, close);
                 } else {
                     // Click in content area: focus the panel, then either
                     // forward the click to a mouse-tracking TUI or start a
@@ -3333,38 +3395,19 @@ impl App {
                     }
                     return;
                 }
-                if let Some(tile) = ws.root.find_tile_mut(*id) {
+                // The tabs themselves are element click targets (`tile_ui`)
+                // that stop the press before it reaches here; what still
+                // lands on the canvas is the bar's empty run past the last
+                // tab, which selects the nearest tab as it always did.
+                if let Some(tile) = ws.root.find_tile(*id) {
                     let n = tile.tabs.len();
                     let t0 = workspace::tile_tab_rect(&strip, 0, n.max(1), scale, has_caret);
                     let ti =
                         ((((px - t0.x).max(0.0)) / t0.w).floor() as usize).min(n.saturating_sub(1));
-                    tile.active = ti;
-                    ws.focused_tile = *id;
-                    if n > 0
+                    let close = n > 0
                         && workspace::tile_tab_close_rect(&strip, ti, n, scale, has_caret)
-                            .contains(px, py)
-                    {
-                        self.close_active_tab();
-                        return;
-                    }
-                    if tile.collapsed {
-                        // Clicking a tab name on a collapsed pane expands it.
-                        self.set_collapsed(*id, false);
-                        self.just_expanded = Some(*id);
-                    } else if has_caret
-                        && click_count >= 2
-                        && self.just_expanded != Some(*id)
-                    {
-                        // Double-clicking the tab bar collapses the pane
-                        // (unless this same double-click just expanded it).
-                        self.set_collapsed(*id, true);
-                        self.request_redraw();
-                        return;
-                    }
-                    self.drag = Drag::TabPress { tile: *id, tab: ti, start: self.cursor };
-                    self.sync_layout();
-                    self.mark_visible_read();
-                    self.request_redraw();
+                            .contains(px, py);
+                    self.press_tile_tab(*id, ti, close, click_count);
                 }
             } else {
                 ws.focused_tile = *id;
