@@ -22,7 +22,6 @@ use termwiz::surface::CursorVisibility;
 use wezterm_term::color::ColorPalette;
 
 use crate::pages::{self, Page};
-use crate::picker::{ForkPicker, Picker, PickerLayout, PickerRow, ProfilePicker};
 use crate::rect::char_rects;
 use crate::term::Session;
 use crate::theme::Theme;
@@ -51,22 +50,6 @@ pub(crate) const CARD_RADIUS: f32 = 18.0;
 /// row height, so rows paint as fully-rounded iTerm2-style capsules. The
 /// `pill` helper clamps it per-rect, so shorter pills stay capsules too.
 const ROW_RADIUS: f32 = 14.0;
-
-/// Blend `c` 40% toward white — brightens the hovered link color.
-/// Truncate `text` to at most `max_chars` characters, ending in `…` when
-/// anything was cut. Zero (or one) available column yields an empty string
-/// rather than a lone ellipsis.
-fn truncate_chars(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
-    }
-    if max_chars <= 1 {
-        return String::new();
-    }
-    let mut out: String = text.chars().take(max_chars - 1).collect();
-    out.push('…');
-    out
-}
 
 fn brighten(c: (u8, u8, u8)) -> (u8, u8, u8) {
     let blend = |v: u8| v.saturating_add(((255 - v) as f32 * 0.4) as u8);
@@ -214,7 +197,7 @@ pub struct Frame {
     /// Chrome labels (tab titles).
     pub labels: Vec<LabelSpec>,
     /// Flyover panel fills (card background, tab strip, selection rects).
-    /// Painted after labels, before picker_quads so modal overlays sit above.
+    /// Painted after labels, above the tiles.
     pub flyover_quads: Vec<Quad>,
     /// Flyover terminal text runs.
     pub flyover_panes: Vec<PaneText>,
@@ -222,10 +205,6 @@ pub struct Frame {
     pub flyover_fg_quads: Vec<Quad>,
     /// Flyover tab-strip labels.
     pub flyover_labels: Vec<LabelSpec>,
-    /// Picker overlay fills painted over everything else (scrim, panel, rows).
-    pub picker_quads: Vec<Quad>,
-    /// Picker overlay labels, painted last.
-    pub picker_labels: Vec<LabelSpec>,
     /// Collapse carets, painted as rotated chevron paths over the chrome.
     pub carets: Vec<CaretSpec>,
     /// Every interactive rect drawn this frame, in draw order (topmost last).
@@ -474,9 +453,6 @@ impl Renderer {
         drop_hint: Option<LayoutRect>,
         resize_hover: Option<&workspace::ResizeHover>,
         link_hover: Option<(u64, usize, usize)>,
-        picker: Option<&Picker>,
-        fork: Option<&ForkPicker>,
-        profile: Option<&ProfilePicker>,
         chrome: &ChromeState,
     ) -> Frame {
         let th = self.theme();
@@ -537,10 +513,7 @@ impl Renderer {
         // Overlays are modal: while one is up only its elements hover or
         // register as hot; the chrome underneath goes inert (mirroring the
         // click routing in `main.rs`, which sends every click to the overlay).
-        let overlay_open = chrome.element_modal
-            || profile.is_some()
-            || fork.is_some()
-            || picker.is_some();
+        let overlay_open = chrome.element_modal;
         let cur = if overlay_open { None } else { chrome.cursor };
         // Which axis each tile would collapse along (its parent split's dir);
         // `None` = root leaf, which shows no caret and cannot collapse.
@@ -714,10 +687,7 @@ impl Renderer {
                 if !collapsing
                     && let Some(session) = tile.tabs.get(tile.active).map(|t| &t.session)
                 {
-                    let draw_cursor = Some(*id) == focused_tile
-                        && picker.is_none()
-                        && fork.is_none()
-                        && !chrome.element_modal;
+                    let draw_cursor = Some(*id) == focused_tile && !chrome.element_modal;
                     let tile_hover = link_hover
                         .filter(|(hid, _, _)| *hid == *id)
                         .map(|(_, col, row)| (col, row));
@@ -821,28 +791,11 @@ impl Renderer {
             });
         }
 
-        // ── Picker overlay (over everything) ───────────────────────────
+        // ── Modal scoping ────────────────────────────────────────────
         // A modal overlay owns the frame's interactivity: the chrome hot
         // rects collected above go inert, and only overlay elements register.
         if overlay_open {
             hot.clear();
-        }
-        let mut picker_quads: Vec<Quad> = Vec::new();
-        let mut picker_labels: Vec<LabelSpec> = Vec::new();
-        // The confirm dialog and message panel are element modals now
-        // (`modal_ui`); the canvas only paints the pickers, palette and save
-        // modal here.
-        if let Some(pp) = profile {
-            let layout =
-                PickerLayout::compute(width, height, self.scale, pp.rows.len(), pp.selected);
-            picker_labels =
-                self.profile_overlay(pp, &layout, chrome.cursor, &mut picker_quads, &mut hot);
-        } else if let Some(p) = picker {
-            let layout = PickerLayout::compute(width, height, self.scale, p.rows.len(), p.selected);
-            picker_labels =
-                self.picker_overlay(p, &layout, chrome.cursor, &mut picker_quads, &mut hot);
-        } else if let Some(f) = fork {
-            picker_labels = self.fork_overlay(f, chrome.cursor, &mut picker_quads, &mut hot);
         }
 
         Frame {
@@ -854,323 +807,11 @@ impl Renderer {
             flyover_panes: Vec::new(),
             flyover_fg_quads: Vec::new(),
             flyover_labels: Vec::new(),
-            picker_quads,
-            picker_labels,
             carets,
             hot,
         }
     }
 
-
-    fn picker_overlay(
-        &self,
-        picker: &Picker,
-        layout: &PickerLayout,
-        cursor: Option<(f32, f32)>,
-        rects: &mut Vec<Quad>,
-        hot: &mut Vec<LayoutRect>,
-    ) -> Vec<LabelSpec> {
-        let th = self.theme();
-        let scale = self.scale;
-        let pad = (12.0 * scale).round();
-        let mut labels = Vec::new();
-
-        // Full-window dimming scrim behind the popover (light, so the warm
-        // gradient still reads through it).
-        let scrim = LayoutRect { x: 0.0, y: 0.0, w: self.width as f32, h: self.height as f32 };
-        rects.push(self.px_rect(&scrim, th.scrim, 0.30, 0.0));
-
-        // The popover: a floating white card matching the Arc chrome, with an
-        // ink-tinted search field inside it.
-        rects.push(
-            self.px_rect(&layout.panel, th.card, 0.96, (CARD_RADIUS * scale).round())
-                .shadow(Shadow::Card),
-        );
-        rects.push(self.px_rect(&layout.search, th.ink, 0.06, (7.0 * scale).round()));
-
-        // Search text (or placeholder) with a caret trailing the query.
-        let search_top = (layout.search.y + (layout.search.h - self.chrome_cell_height) / 2.0).round();
-        let (text, c) = if picker.query.is_empty() {
-            ("Search repos…".to_string(), th.ink_dim)
-        } else {
-            (picker.query.clone(), th.ink)
-        };
-        labels.push(LabelSpec {
-            text,
-            color: color(c, 1.0),
-            left: layout.search.x + pad,
-            top: search_top,
-            clip: layout.search,
-            size: None,
-        });
-        let caret_x = layout.search.x + pad + picker.query.chars().count() as f32 * self.chrome_cell_width;
-        let caret = LayoutRect {
-            x: caret_x,
-            y: search_top,
-            w: (2.0 * scale).round().max(1.0),
-            h: self.chrome_cell_height,
-        };
-        rects.push(self.px_rect(&caret, th.accent, 1.0, 0.0));
-
-        // Visible rows: headers, selected-row highlight, labels, glyphs.
-        for i in layout.first_visible..(layout.first_visible + layout.visible) {
-            let (Some(row), Some(prow)) = (layout.row_rect(i), picker.rows.get(i)) else {
-                continue;
-            };
-            let top = (row.y + (row.h - self.chrome_cell_height) / 2.0).round();
-            match prow {
-                PickerRow::Header(title) => labels.push(LabelSpec {
-                    text: title.to_string(),
-                    color: color(th.ink_dim, 1.0),
-                    left: row.x + pad,
-                    top,
-                    clip: row,
-                    size: None,
-                }),
-                PickerRow::Entry(entry) => {
-                    let m = (6.0 * scale).round();
-                    let pill = LayoutRect { x: row.x + m, w: (row.w - 2.0 * m).max(0.0), ..row };
-                    if i == picker.selected {
-                        // Accent-tinted rounded pill, inset from the panel edges.
-                        rects.push(self.px_rect(&pill, th.accent, 0.10, (7.0 * scale).round()));
-                    } else if hover(cursor, &row) {
-                        // Hovered row: the selection pill's shape in plain ink,
-                        // dimmer, so it never reads as the keyboard selection.
-                        rects.push(self.px_rect(&pill, th.ink, 0.06, (7.0 * scale).round()));
-                    }
-                    hot.push(row);
-                    // Label, clipped short of the glyph gutter on the right.
-                    let label_bounds =
-                        LayoutRect { w: (row.w - 2.0 * layout.row_h).max(0.0), ..row };
-                    labels.push(LabelSpec {
-                        text: entry.label.clone(),
-                        color: color(th.ink, 1.0),
-                        left: row.x + pad,
-                        top,
-                        clip: label_bounds,
-                        size: None,
-                    });
-                    if entry.is_git {
-                        let gx = row.x + row.w - 2.0 * layout.row_h;
-                        let cell = LayoutRect { x: gx, y: row.y, w: layout.row_h, h: row.h };
-                        labels.push(LabelSpec {
-                            text: "\u{e0a0}".to_string(),
-                            color: color(th.accent, 1.0),
-                            left: gx + (layout.row_h - self.chrome_cell_width) / 2.0,
-                            top,
-                            clip: cell,
-                            size: None,
-                        });
-                    }
-                    if picker.is_pinned(&entry.path) {
-                        let star = layout.star_rect(&row);
-                        labels.push(LabelSpec {
-                            text: "★".to_string(),
-                            color: color((205, 150, 35), 1.0),
-                            left: star.x + (layout.row_h - self.chrome_cell_width) / 2.0,
-                            top,
-                            clip: star,
-                            size: None,
-                        });
-                    }
-                },
-            }
-        }
-        labels
-    }
-
-    /// Step-2 fork-source overlay: a centered, filterable list of the branch /
-    /// worktree choices for the group being forked. Styled like the dir picker.
-    /// TODO(gpui-port): per-scope tag colors and scroll-to-selection.
-    fn fork_overlay(
-        &self,
-        fork: &ForkPicker,
-        cursor: Option<(f32, f32)>,
-        rects: &mut Vec<Quad>,
-        hot: &mut Vec<LayoutRect>,
-    ) -> Vec<LabelSpec> {
-        let th = self.theme();
-        let scale = self.scale;
-        let pad = (12.0 * scale).round();
-        let mut labels = Vec::new();
-
-        // Dimming scrim behind the popover (light, matching the dir picker).
-        let scrim = LayoutRect { x: 0.0, y: 0.0, w: self.width as f32, h: self.height as f32 };
-        rects.push(self.px_rect(&scrim, th.scrim, 0.30, 0.0));
-
-        // Centered panel sized to the (capped) row count: a floating white
-        // card matching the Arc chrome.
-        let row_h = (self.chrome_cell_height + 8.0 * scale).round();
-        let visible = fork.rows.len().min(12);
-        let panel_w = (self.width as f32 * 0.5).min(560.0 * scale).round();
-        let panel_h = (row_h * (visible as f32 + 2.0) + pad * 2.0).round();
-        let panel_x = ((self.width as f32 - panel_w) / 2.0).round();
-        let panel_y = ((self.height as f32 - panel_h) / 3.0).round().max(pad);
-        let panel = LayoutRect { x: panel_x, y: panel_y, w: panel_w, h: panel_h };
-        rects.push(
-            self.px_rect(&panel, th.card, 0.96, (CARD_RADIUS * scale).round())
-                .shadow(Shadow::Card),
-        );
-
-        // Header: "fork <name> from…".
-        let header = LayoutRect { x: panel_x, y: panel_y + pad, w: panel_w, h: row_h };
-        labels.push(LabelSpec {
-            text: format!("fork {} from…", fork.name),
-            color: color(th.ink_dim, 1.0),
-            left: panel_x + pad,
-            top: (header.y + (row_h - self.chrome_cell_height) / 2.0).round(),
-            clip: header,
-            size: None,
-        });
-
-        // Filter box + caret.
-        let search =
-            LayoutRect { x: panel_x + pad, y: panel_y + pad + row_h, w: panel_w - 2.0 * pad, h: row_h };
-        rects.push(self.px_rect(&search, th.ink, 0.06, (7.0 * scale).round()));
-        let search_top = (search.y + (search.h - self.chrome_cell_height) / 2.0).round();
-        let (text, c) = if fork.query.is_empty() {
-            ("Filter branches…".to_string(), th.ink_dim)
-        } else {
-            (fork.query.clone(), th.ink)
-        };
-        labels.push(LabelSpec {
-            text,
-            color: color(c, 1.0),
-            left: search.x + pad,
-            top: search_top,
-            clip: search,
-            size: None,
-        });
-        let caret_x = search.x + pad + fork.query.chars().count() as f32 * self.chrome_cell_width;
-        let caret = LayoutRect {
-            x: caret_x,
-            y: search_top,
-            w: (2.0 * scale).round().max(1.0),
-            h: self.chrome_cell_height,
-        };
-        rects.push(self.px_rect(&caret, th.accent, 1.0, 0.0));
-
-        // Rows.
-        let rows_top = panel_y + pad + row_h * 2.0;
-        for (i, entry) in fork.rows.iter().take(visible).enumerate() {
-            let row = LayoutRect { x: panel_x, y: rows_top + row_h * i as f32, w: panel_w, h: row_h };
-            let top = (row.y + (row.h - self.chrome_cell_height) / 2.0).round();
-            let m = (6.0 * scale).round();
-            let pill = LayoutRect { x: row.x + m, w: (row.w - 2.0 * m).max(0.0), ..row };
-            if i == fork.selected {
-                // Accent-tinted rounded pill, inset from the panel edges.
-                rects.push(self.px_rect(&pill, th.accent, 0.10, (7.0 * scale).round()));
-            } else if hover(cursor, &row) {
-                rects.push(self.px_rect(&pill, th.ink, 0.06, (7.0 * scale).round()));
-            }
-            hot.push(row);
-            labels.push(LabelSpec {
-                text: entry.label.clone(),
-                color: color(th.ink, 1.0),
-                left: row.x + pad,
-                top,
-                clip: LayoutRect { w: panel_w - 2.0 * pad, ..row },
-                size: None,
-            });
-        }
-        labels
-    }
-
-    /// Step-3 workspace-profile overlay: the discovered `.pwrspace.json`
-    /// profiles for the group being created, default row first. Drawn from the
-    /// same [`PickerLayout`] `main.rs` hit-tests (like the command palette) so
-    /// clicks agree with pixels. Each row shows the profile name with its
-    /// description and source dimmed, right-aligned.
-    fn profile_overlay(
-        &self,
-        profile: &ProfilePicker,
-        layout: &PickerLayout,
-        cursor: Option<(f32, f32)>,
-        rects: &mut Vec<Quad>,
-        hot: &mut Vec<LayoutRect>,
-    ) -> Vec<LabelSpec> {
-        let th = self.theme();
-        let scale = self.scale;
-        let pad = (12.0 * scale).round();
-        let mut labels = Vec::new();
-
-        // Scrim + card + search field, matching the dir picker.
-        let scrim = LayoutRect { x: 0.0, y: 0.0, w: self.width as f32, h: self.height as f32 };
-        rects.push(self.px_rect(&scrim, th.scrim, 0.30, 0.0));
-        rects.push(
-            self.px_rect(&layout.panel, th.card, 0.96, (CARD_RADIUS * scale).round())
-                .shadow(Shadow::Card),
-        );
-        rects.push(self.px_rect(&layout.search, th.ink, 0.06, (7.0 * scale).round()));
-
-        // Search text (or a placeholder naming the group) with a caret.
-        let search_top = (layout.search.y + (layout.search.h - self.chrome_cell_height) / 2.0).round();
-        let (text, c) = if profile.query.is_empty() {
-            (format!("Launch {} with…", profile.name), th.ink_dim)
-        } else {
-            (profile.query.clone(), th.ink)
-        };
-        labels.push(LabelSpec {
-            text,
-            color: color(c, 1.0),
-            left: layout.search.x + pad,
-            top: search_top,
-            clip: layout.search,
-            size: None,
-        });
-        let caret_x =
-            layout.search.x + pad + profile.query.chars().count() as f32 * self.chrome_cell_width;
-        let caret = LayoutRect {
-            x: caret_x,
-            y: search_top,
-            w: (2.0 * scale).round().max(1.0),
-            h: self.chrome_cell_height,
-        };
-        rects.push(self.px_rect(&caret, th.accent, 1.0, 0.0));
-
-        // Visible rows: selected pill, profile name, dim detail right-aligned.
-        for i in layout.first_visible..(layout.first_visible + layout.visible) {
-            let (Some(row), Some(entry)) = (layout.row_rect(i), profile.rows.get(i)) else {
-                continue;
-            };
-            let top = (row.y + (row.h - self.chrome_cell_height) / 2.0).round();
-            let m = (6.0 * scale).round();
-            let pill = LayoutRect { x: row.x + m, w: (row.w - 2.0 * m).max(0.0), ..row };
-            if i == profile.selected {
-                rects.push(self.px_rect(&pill, th.accent, 0.10, (7.0 * scale).round()));
-            } else if hover(cursor, &row) {
-                rects.push(self.px_rect(&pill, th.ink, 0.06, (7.0 * scale).round()));
-            }
-            hot.push(row);
-            // The name has priority: the detail only gets the width left over
-            // after it (a long description truncates with an ellipsis rather
-            // than pushing the name out of the row).
-            let label_w = entry.label.chars().count() as f32 * self.chrome_cell_width;
-            let room = row.w - 2.0 * pad - label_w - 2.0 * self.chrome_cell_width;
-            let detail = truncate_chars(&entry.detail, (room / self.chrome_cell_width) as usize);
-            let detail_w = detail.chars().count() as f32 * self.chrome_cell_width;
-            let detail_x = row.x + row.w - pad - detail_w;
-            if !detail.is_empty() {
-                labels.push(LabelSpec {
-                    text: detail,
-                    color: color(th.ink_dim, 1.0),
-                    left: detail_x,
-                    top,
-                    clip: row,
-                    size: None,
-                });
-            }
-            labels.push(LabelSpec {
-                text: entry.label.clone(),
-                color: color(th.ink, 1.0),
-                left: row.x + pad,
-                top,
-                clip: LayoutRect { w: (detail_x - pad - row.x).max(0.0), ..row },
-                size: None,
-            });
-        }
-        labels
-    }
 
     /// The terminal background the active colors want: the selected scheme's
     /// bg, or the chrome theme's terminal background under the adaptive
@@ -1782,18 +1423,6 @@ impl Renderer {
 mod tests {
     use super::*;
 
-    /// Long profile details truncate with an ellipsis instead of overrunning
-    /// the row; degenerate widths drop the detail entirely.
-    #[test]
-    fn truncate_chars_caps_length_with_ellipsis() {
-        assert_eq!(truncate_chars("short", 10), "short");
-        assert_eq!(truncate_chars("exactly-ten", 11), "exactly-ten");
-        assert_eq!(truncate_chars("a long description · user", 10), "a long de…");
-        assert_eq!(truncate_chars("ab", 1), "");
-        assert_eq!(truncate_chars("ab", 0), "");
-        assert_eq!(truncate_chars("", 0), "");
-    }
-
     fn cleanup_chrome() -> ChromeState<'static> {
         ChromeState {
             page: Page::Cleanup,
@@ -1821,7 +1450,7 @@ mod tests {
         chrome.page = Page::Sessions;
         chrome.ribbon_tools = &pages::Tool::ALL;
         let frame = renderer.build_frame(
-            &wss, 0, 240.0, None, None, None, None, None, None, &chrome,
+            &wss, 0, 240.0, None, None, None, &chrome,
         );
         let texts: Vec<&str> = frame.labels.iter().map(|l| l.text.as_str()).collect();
         assert!(!texts.contains(&"Pull Request"));
@@ -1871,7 +1500,7 @@ mod tests {
         chrome.open_tool = Some(pages::Tool::Launch);
         chrome.tool_panel_w = crate::workspace::TOOL_PANEL_DEFAULT_W;
         let frame = renderer.build_frame(
-            &wss, 0, 240.0, None, None, None, None, None, None, &chrome,
+            &wss, 0, 240.0, None, None, None, &chrome,
         );
         let texts: Vec<&str> = frame.labels.iter().map(|l| l.text.as_str()).collect();
         assert!(!texts.contains(&"Launch view coming soon"));
@@ -1903,9 +1532,6 @@ mod tests {
             None,
             Some(&crate::workspace::ResizeHover::ToolPanel),
             None,
-            None,
-            None,
-            None,
             &chrome,
         );
         let line_w = (2.0 * scale).round();
@@ -1925,7 +1551,7 @@ mod tests {
         chrome.open_tool = Some(pages::Tool::Pr);
         chrome.tool_panel_w = crate::workspace::TOOL_PANEL_DEFAULT_W;
         let frame = renderer.build_frame(
-            &wss, 0, 240.0, None, None, None, None, None, None, &chrome,
+            &wss, 0, 240.0, None, None, None, &chrome,
         );
         let texts: Vec<&str> = frame.labels.iter().map(|l| l.text.as_str()).collect();
         assert!(!texts.contains(&"Pull Request"));
@@ -1937,57 +1563,6 @@ mod tests {
         assert!(
             frame.bg_quads.iter().any(|q| q.x == full.x && q.w == full.w),
             "tile card reclaims the ribbon's width"
-        );
-    }
-
-    /// A modal overlay owns the frame's hot list: only its elements register,
-    /// never the chrome underneath.
-    #[test]
-    fn frame_hot_scopes_to_overlay_when_modal() {
-        let scale = 2.0;
-        let renderer = Renderer::new(scale, 18.0, 1600, 1000);
-        let mut chrome = cleanup_chrome();
-        chrome.page = Page::Sessions;
-        let sidebar_w = 240.0;
-        // A real tab, so the tile's tab strip is chrome the canvas still
-        // hit-tests (the empty state and page dots are element-owned now).
-        let wss = [crate::workspace::Workspace::new(
-            "g".into(),
-            crate::workspace::Tile::new(1, crate::term::Session::placeholder()),
-            None,
-        )];
-
-        let plain = renderer.build_frame(
-            &wss, 0, sidebar_w, None, None, None, None, None, None, &chrome,
-        );
-        assert!(!plain.hot.is_empty());
-
-        let profile = crate::picker::ProfilePicker::new("g".into(), Vec::new());
-        let modal = renderer.build_frame(
-            &wss,
-            0,
-            sidebar_w,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(&profile),
-            &chrome,
-        );
-        // Only the picker's own rows are interactive: every hot rect lies
-        // inside its panel, and the chrome's tab strip has dropped out.
-        let layout = crate::picker::PickerLayout::compute(
-            1600,
-            1000,
-            scale,
-            profile.rows.len(),
-            profile.selected,
-        );
-        assert!(!modal.hot.is_empty());
-        assert!(
-            modal.hot.iter().all(|r| layout.panel.contains(r.x + 1.0, r.y + 1.0)),
-            "a modal overlay owns the hot list"
         );
     }
 

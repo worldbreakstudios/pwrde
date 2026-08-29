@@ -14,7 +14,6 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-use crate::workspace::LayoutRect;
 
 /// How many recent directories are remembered.
 const MAX_RECENTS: usize = 8;
@@ -195,16 +194,13 @@ impl ForkPicker {
         picker
     }
 
-    /// Appends a typed character to the query and refilters.
-    pub fn push_char(&mut self, ch: char) {
-        self.query.push(ch);
-        self.selected = 0;
-        self.rebuild();
-    }
-
-    /// Removes the last query character and refilters.
-    pub fn backspace(&mut self) {
-        self.query.pop();
+    /// Replaces the whole query (the search field owns editing) and
+    /// refilters from the top of the list.
+    pub fn set_query(&mut self, query: &str) {
+        if self.query == query {
+            return;
+        }
+        self.query = query.to_string();
         self.selected = 0;
         self.rebuild();
     }
@@ -297,16 +293,13 @@ impl ProfilePicker {
         picker
     }
 
-    /// Appends a typed character to the query and refilters.
-    pub fn push_char(&mut self, ch: char) {
-        self.query.push(ch);
-        self.selected = 0;
-        self.rebuild();
-    }
-
-    /// Removes the last query character and refilters.
-    pub fn backspace(&mut self) {
-        self.query.pop();
+    /// Replaces the whole query (the search field owns editing) and
+    /// refilters from the top of the list.
+    pub fn set_query(&mut self, query: &str) {
+        if self.query == query {
+            return;
+        }
+        self.query = query.to_string();
         self.selected = 0;
         self.rebuild();
     }
@@ -397,16 +390,13 @@ impl Picker {
         picker
     }
 
-    /// Appends a typed character to the query and refilters.
-    pub fn push_char(&mut self, ch: char) {
-        self.query.push(ch);
-        self.selected = 0;
-        self.rebuild();
-    }
-
-    /// Removes the last query character and refilters.
-    pub fn backspace(&mut self) {
-        self.query.pop();
+    /// Replaces the whole query (the search field owns editing) and
+    /// refilters from the top of the list.
+    pub fn set_query(&mut self, query: &str) {
+        if self.query == query {
+            return;
+        }
+        self.query = query.to_string();
         self.selected = 0;
         self.rebuild();
     }
@@ -592,89 +582,55 @@ pub const PANEL_PAD: f32 = 10.0;
 /// How many rows the list shows before it scrolls.
 const MAX_VISIBLE_ROWS: usize = 12;
 
-/// Pixel geometry of the open popover, shared by rendering and hit-testing.
-///
-/// Recomputed from the window size on every frame and on every click, so the
-/// picker itself stores no geometry.
-#[derive(Clone, Debug)]
+/// The visible window of a centered search-list modal (dir picker, profile
+/// picker, command palette): how many rows fit, and which row comes first so
+/// the selection stays on screen. The panel itself is laid out by the element
+/// tree (`palette_ui::SearchModal`) from the same constants.
 pub struct PickerLayout {
-    /// The popover panel, centered in the window.
-    pub panel: LayoutRect,
-    /// The search box at the top of the panel.
-    pub search: LayoutRect,
-    /// Height of one list row, physical px.
-    pub row_h: f32,
-    /// Top of the first visible list row, physical px.
-    pub list_top: f32,
-    /// Index into [`Picker::rows`] of the first row on screen.
+    /// Index into the rows of the first row on screen.
     pub first_visible: usize,
     /// How many rows fit on screen.
     pub visible: usize,
 }
 
 impl PickerLayout {
-    /// Lays the popover out for a `width`×`height` window, scrolled so the
-    /// selected row (of `rows_len` total) is on screen. Shared by both the
-    /// directory and fork-source pickers.
+    /// Sizes the row window for a `width`×`height` (physical px) window,
+    /// scrolled so the selected row (of `rows_len` total) is on screen.
     pub fn compute(width: u32, height: u32, scale: f32, rows_len: usize, selected: usize) -> Self {
-        let (win_w, win_h) = (width as f32, height as f32);
+        let win_h = height as f32;
+        let _ = width;
         let pad = (PANEL_PAD * scale).round();
         let row_h = (ROW_H * scale).round();
         let search_h = (SEARCH_H * scale).round();
-        let panel_w = (PANEL_W * scale).round().min(win_w - 2.0 * pad).max(row_h);
 
         // Rows are capped by both the list length and the window height.
         let room = (((win_h - 4.0 * pad - search_h) / row_h).floor()).max(1.0) as usize;
         let visible = rows_len.min(MAX_VISIBLE_ROWS).min(room);
         let first_visible = (selected + 1).saturating_sub(visible);
-
-        let panel_h = search_h + visible as f32 * row_h + 2.0 * pad;
-        let panel = LayoutRect {
-            x: ((win_w - panel_w) / 2.0).round().max(0.0),
-            y: ((win_h - panel_h) / 2.0).round().max(0.0),
-            w: panel_w,
-            h: panel_h,
-        };
-        let search = LayoutRect {
-            x: panel.x + pad,
-            y: panel.y + pad,
-            w: panel.w - 2.0 * pad,
-            h: search_h,
-        };
-        let list_top = search.y + search_h;
-        Self { panel, search, row_h, list_top, first_visible, visible }
-    }
-
-    /// The rect of row `index` (an index into [`Picker::rows`]), or `None`
-    /// when that row is scrolled out of view.
-    pub fn row_rect(&self, index: usize) -> Option<LayoutRect> {
-        let slot = index.checked_sub(self.first_visible)?;
-        if slot >= self.visible {
-            return None;
-        }
-        Some(LayoutRect {
-            x: self.panel.x,
-            y: self.list_top + slot as f32 * self.row_h,
-            w: self.panel.w,
-            h: self.row_h,
-        })
-    }
-
-    /// The star (pin toggle) hit area at the right end of `row`.
-    pub fn star_rect(&self, row: &LayoutRect) -> LayoutRect {
-        LayoutRect { x: row.x + row.w - self.row_h, y: row.y, w: self.row_h, h: row.h }
-    }
-
-    /// The [`Picker::rows`] index under a click, if any row is there.
-    pub fn row_at(&self, px: f32, py: f32) -> Option<usize> {
-        (self.first_visible..self.first_visible + self.visible)
-            .find(|i| self.row_rect(*i).is_some_and(|r| r.contains(px, py)))
+        Self { first_visible, visible }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The visible-row window: capped by the list, the row cap and the
+    /// window height, and scrolled so the selection is the last row shown.
+    #[test]
+    fn picker_layout_windows_rows_around_the_selection() {
+        let short = PickerLayout::compute(1600, 1000, 2.0, 3, 0);
+        assert_eq!((short.first_visible, short.visible), (0, 3));
+        let long = PickerLayout::compute(1600, 1000, 2.0, 40, 0);
+        assert_eq!(long.first_visible, 0);
+        assert!(long.visible <= MAX_VISIBLE_ROWS && long.visible < 40);
+        let scrolled = PickerLayout::compute(1600, 1000, 2.0, 40, 39);
+        assert_eq!(scrolled.first_visible + scrolled.visible, 40);
+        // A tiny window still shows one row.
+        let tiny = PickerLayout::compute(400, 120, 2.0, 40, 5);
+        assert_eq!(tiny.visible, 1);
+        assert_eq!(tiny.first_visible, 5);
+    }
 
     fn fork_entry(label: &str, from: Option<&str>, scope: ForkScope) -> ForkEntry {
         ForkEntry { label: label.to_string(), from: from.map(str::to_string), path: None, scope }
@@ -713,16 +669,13 @@ mod tests {
     #[test]
     fn fork_picker_filters_by_query() {
         let mut picker = sample_fork_picker();
-        for ch in "tw".chars() {
-            picker.push_char(ch);
-        }
+        picker.set_query("tw");
         assert_eq!(picker.rows.len(), 2, "only the two tw-* branches match");
         assert_eq!(picker.selected, 0);
         assert!(picker.rows.iter().all(|e| e.label.contains("tw-term-features")));
 
         // Clearing the query restores every choice.
-        picker.backspace();
-        picker.backspace();
+        picker.set_query("");
         assert_eq!(picker.rows.len(), 6);
     }
 
@@ -811,20 +764,14 @@ mod tests {
     #[test]
     fn profile_picker_filters_by_query() {
         let mut picker = sample_profile_picker();
-        for ch in "agent".chars() {
-            picker.push_char(ch);
-        }
+        picker.set_query("agent");
         assert_eq!(picker.rows.len(), 1);
         assert_eq!(picker.rows[0].label, "agent-dev");
-        for _ in 0.."agent".len() {
-            picker.backspace();
-        }
+        picker.set_query("");
         assert_eq!(picker.rows.len(), 3);
 
         // Detail text (description/source) matches too.
-        for ch in "lciw".chars() {
-            picker.push_char(ch);
-        }
+        picker.set_query("lciw");
         assert_eq!(picker.rows.len(), 1);
         assert_eq!(picker.rows[0].label, "agent-dev");
     }
