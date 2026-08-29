@@ -26,15 +26,13 @@ use crate::{
     claude_hooks,
     cleanup,
     clipboard,
+    command,
     git,
     git_context,
     local_diff_ui,
     pages,
-    palette,
-    palette_ui,
     persist,
     picker,
-    picker_ui,
     pr_ui,
     pwrspace,
     renderer,
@@ -168,15 +166,6 @@ pub(crate) enum ConfirmAction {
     CleanupDelete { targets: Vec<(String, Vec<String>)> },
 }
 
-/// Discriminates who the directory/fork picker is being opened for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PickerTarget {
-    /// Opening a new group in the workspace tree (default).
-    Group,
-    /// Opening a new tab in the flyover panel.
-    Flyover,
-}
-
 /// A side effect [`App::popout_key`] needs applied to a window other than
 /// the popout itself (entity code can't touch foreign windows directly).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -184,16 +173,6 @@ pub(crate) enum PopoutEffect {
     /// Bring the main window forward (the picker and the docked panel
     /// render there).
     ActivateMain,
-}
-
-/// What confirming the workspace-profile picker continues into: the picker is
-/// interposed *before* the group exists (and, for a `drop` fork, before the
-/// worktree is even provisioned), so the pending creation is carried here.
-pub(crate) enum ProfileNext {
-    /// Open the group directly at `cwd`.
-    Open { name: String, cwd: std::path::PathBuf },
-    /// Provision a `drop` worktree in `repo` (off `from`), then open it.
-    Fork { repo: std::path::PathBuf, name: String, from: Option<String> },
 }
 
 /// The save-as-workspace modal: two text buffers, the focused field, and —
@@ -328,15 +307,6 @@ pub(crate) struct App {
     /// second click's bar double-click-to-collapse is suppressed for it, so
     /// double-clicking a collapsed pane's tab doesn't snap it shut again.
     pub(crate) just_expanded: Option<u64>,
-    /// The open step-1 cwd picker popover, or `None` when closed.
-    pub(crate) picker: Option<picker::Picker>,
-    /// The open step-2 fork-source picker (git repos only), or `None`.
-    pub(crate) fork: Option<picker::ForkPicker>,
-    /// The open workspace-profile picker (shown only when `.pwrspace.json`
-    /// profiles were discovered for the group being created), or `None`.
-    pub(crate) profile_picker: Option<picker::ProfilePicker>,
-    /// The creation the profile picker resolves into; set with `profile_picker`.
-    pub(crate) profile_next: Option<ProfileNext>,
     /// Profile chosen for a group whose `drop` worktree is still provisioning;
     /// applied on `GroupReady`, dropped on `GroupFailed`.
     pub(crate) pending_group_profile: Option<pwrspace::WorkspaceProfile>,
@@ -350,8 +320,14 @@ pub(crate) struct App {
     /// (open, Tab/Enter, a refused empty name): the next render seeds the
     /// inputs from the modal and moves focus to `SaveWorkspaceModal::field`.
     pub(crate) save_sync: bool,
-    /// The open command palette, or `None` when closed.
-    pub(crate) palette: Option<palette::Palette>,
+    /// The unified command palette (root commands and the New-session flow),
+    /// or `None` when closed. See `command` / `command_ui`.
+    pub(crate) command: Option<command::CommandPalette>,
+    /// The palette list's scroll position, so keyboard navigation can keep
+    /// the selected row in view (`command_scroll_to`) while the wheel still
+    /// scrolls freely between key presses.
+    pub(crate) command_scroll: gpui::ScrollHandle,
+    pub(crate) command_scroll_to: Option<usize>,
     /// The search field the element-tree modals share (the command palette
     /// now; the pickers later): an rcn text input whose text an observer
     /// feeds into whichever modal is open.
@@ -461,8 +437,6 @@ pub(crate) struct App {
     /// The main window, so popout-initiated flows (new-tab picker, docking)
     /// can bring it forward.
     pub(crate) main_window: Option<gpui::AnyWindowHandle>,
-    /// Who the picker/fork picker is currently targeting.
-    pub(crate) picker_target: PickerTarget,
     /// Polarity shown in the Appearance preview cards (independent of the
     /// system/user mode setting); seeded from the active polarity at launch.
     pub(crate) preview_dark: bool,
@@ -1296,8 +1270,7 @@ impl App {
     pub(crate) fn on_scroll(&mut self, delta: gpui::ScrollDelta, cell_height: f32) {
         if self.confirm.is_some()
             || self.message.is_some()
-            || self.fork.is_some()
-            || self.picker.is_some()
+            || self.command.is_some()
         {
             return;
         }
@@ -1627,8 +1600,7 @@ impl App {
         if self.page != Page::Sessions
             || self.confirm.is_some()
             || self.message.is_some()
-            || self.fork.is_some()
-            || self.picker.is_some()
+            || self.command.is_some()
         {
             return;
         }
@@ -1702,54 +1674,195 @@ impl App {
 
     // ── cwd picker ──────────────────────────────────────────────────────
 
-    /// Show the directory picker, claiming the shared search field.
-    pub(crate) fn set_picker(&mut self, picker: picker::Picker) {
-        self.picker = Some(picker);
-        self.modal_search_reset = Some(picker_ui::DIR_PLACEHOLDER.into());
-    }
-
-    /// Show the fork-source picker, claiming the shared search field.
-    pub(crate) fn set_fork(&mut self, fork: picker::ForkPicker) {
-        self.fork = Some(fork);
-        self.modal_search_reset = Some(picker_ui::FORK_PLACEHOLDER.into());
-    }
-
-    /// Show the workspace-profile picker, claiming the shared search field.
-    pub(crate) fn set_profile(&mut self, profile: picker::ProfilePicker) {
-        self.modal_search_reset = Some(picker_ui::profile_placeholder(&profile.name));
-        self.profile_picker = Some(profile);
-    }
-
-    /// True while any modal that owns the shared search field is up.
+    /// True while the command palette owns the shared search field.
     pub(crate) fn search_modal_open(&self) -> bool {
-        self.palette.is_some()
-            || self.picker.is_some()
-            || self.fork.is_some()
-            || self.profile_picker.is_some()
+        self.command.is_some()
     }
 
-    /// Close the directory picker without choosing. Cancelling the flyover's
-    /// first-open picker closes the waiting surface too — there is nothing
+    /// Point the shared search field at the palette's current stage: clear
+    /// it, set the stage's placeholder, focus it (consumed in `render`) —
+    /// and, when the stage is the repo step, scan the directories for it
+    /// (the model is filesystem-free; only the app scans).
+    pub(crate) fn claim_command_search(&mut self) {
+        if let Some(pal) = self.command.as_mut()
+            && pal.needs_repo()
+        {
+            pal.provide_repo(picker::Picker::new());
+        }
+        self.command_scroll_to = self.command.as_ref().map(|c| c.selected());
+        self.modal_search_reset = Some(self.command_placeholder().to_string());
+    }
+
+    /// Toggle the palette at its command root (⌘P).
+    pub(crate) fn toggle_command_root(&mut self) {
+        if self.command.is_some() {
+            self.close_command();
+        } else {
+            self.command = Some(command::CommandPalette::root());
+            self.claim_command_search();
+        }
+        self.request_redraw();
+    }
+
+    /// Open the palette with the New-session command already committed —
+    /// the ＋ button and ⇧⌘T — for a group, or for the flyover terminal.
+    pub(crate) fn open_command_new_session(&mut self, for_flyover: bool) {
+        self.command = Some(command::CommandPalette::new_session(for_flyover));
+        self.claim_command_search();
+        self.request_redraw();
+    }
+
+    /// Close the palette without choosing. Cancelling the flyover's
+    /// first-open flow closes the waiting surface too — there is nothing
     /// to show yet.
-    pub(crate) fn cancel_picker(&mut self) {
-        self.picker = None;
-        if self.picker_target == PickerTarget::Flyover && self.flyover_tabs.is_empty() {
+    pub(crate) fn close_command(&mut self) {
+        let for_flyover = self.command.as_ref().is_some_and(|c| c.for_flyover);
+        self.command = None;
+        if for_flyover && self.flyover_tabs.is_empty() {
             self.flyover_open = false;
             self.flyover_focused = false;
             self.flyover_window_visible = false;
         }
+        self.request_redraw();
+    }
+
+    /// ↩ (or a row click) on the palette's current stage.
+    pub(crate) fn command_enter(&mut self) {
+        use command::Outcome;
+        let Some(outcome) = self.command.as_mut().map(|c| c.enter()) else { return };
+        match outcome {
+            Outcome::Nothing => self.claim_command_search(),
+            Outcome::Run(action) => {
+                self.command = None;
+                self.run_action(action);
+            },
+            Outcome::RepoChosen(entry) => {
+                let for_flyover = {
+                    let pal = self.command.as_mut().expect("palette open");
+                    if let Some(p) = pal.repo.as_mut() {
+                        p.record_recent(&entry.path);
+                    }
+                    pal.for_flyover
+                };
+                if for_flyover && !entry.is_git {
+                    self.command = None;
+                    self.spawn_flyover_tab(Some(entry.path));
+                } else if entry.is_git {
+                    let all = build_fork_choices(&entry.path);
+                    let choices = if for_flyover {
+                        all.into_iter()
+                            .filter(|c| {
+                                matches!(
+                                    c.scope,
+                                    picker::ForkScope::RepoRoot | picker::ForkScope::Worktree
+                                )
+                            })
+                            .collect()
+                    } else {
+                        all
+                    };
+                    if let Some(pal) = self.command.as_mut() {
+                        pal.provide_base(picker::ForkPicker::new(entry.path, choices));
+                    }
+                    self.claim_command_search();
+                } else {
+                    let found = pwrspace::discover(&pwrspace::candidate_paths(&entry.path));
+                    if let Some(pal) = self.command.as_mut() {
+                        pal.provide_layout(picker::ProfilePicker::new(found));
+                    }
+                    self.claim_command_search();
+                }
+            },
+            Outcome::BaseChosen(entry) => {
+                let (for_flyover, repo) = {
+                    let pal = self.command.as_ref().expect("palette open");
+                    (pal.for_flyover, pal.base.as_ref().map(|b| b.repo.clone()))
+                };
+                if for_flyover {
+                    self.command = None;
+                    if matches!(entry.scope, picker::ForkScope::RepoRoot | picker::ForkScope::Worktree)
+                    {
+                        self.spawn_flyover_tab(entry.path);
+                    } else if self.flyover_tabs.is_empty() {
+                        self.flyover_open = false;
+                    }
+                } else {
+                    let root = entry.path.clone().or(repo);
+                    let found = root
+                        .map(|p| pwrspace::discover(&pwrspace::candidate_paths(&p)))
+                        .unwrap_or_default();
+                    if let Some(pal) = self.command.as_mut() {
+                        pal.provide_layout(picker::ProfilePicker::new(found));
+                    }
+                    self.claim_command_search();
+                }
+            },
+            Outcome::Launch(session) => {
+                self.command = None;
+                self.launch_new_session(session);
+            },
+            Outcome::Close => self.close_command(),
+        }
+        self.request_redraw();
+    }
+
+    /// ⌫ on an empty query (or the rail's "⌫ back"): pop the last token.
+    pub(crate) fn command_back(&mut self) {
+        let Some(outcome) = self.command.as_mut().map(|c| c.pop()) else { return };
+        if outcome == command::Outcome::Close {
+            self.close_command();
+        } else {
+            self.claim_command_search();
+        }
+        self.request_redraw();
+    }
+
+    /// The Done card's "Start over": back to the repo step, picks cleared.
+    pub(crate) fn command_start_over(&mut self) {
+        let for_flyover = self.command.as_ref().is_some_and(|c| c.for_flyover);
+        self.open_command_new_session(for_flyover);
+    }
+
+    /// Create the group (or flyover tab) the New-session flow described.
+    pub(crate) fn launch_new_session(&mut self, session: command::NewSession) {
+        let command::NewSession { name, repo, base, layout, for_flyover } = session;
+        if for_flyover {
+            let cwd = base.and_then(|b| b.path).or(Some(repo.path));
+            self.spawn_flyover_tab(cwd);
+            return;
+        }
+        let profile = layout.and_then(|l| l.profile);
+        match base {
+            // A plain directory: open it, with the chosen layout.
+            None => match profile {
+                Some(profile) => self.add_group_with_profile(name, Some(repo.path), &profile),
+                None => self.add_group(name, Some(repo.path)),
+            },
+            // The repo root or an existing worktree: open in place.
+            Some(b)
+                if matches!(b.scope, picker::ForkScope::RepoRoot | picker::ForkScope::Worktree) =>
+            {
+                match (b.path, profile) {
+                    (Some(p), Some(profile)) => self.add_group_with_profile(name, Some(p), &profile),
+                    (Some(p), None) => self.add_group(name, Some(p)),
+                    (None, _) => self.add_group(name, None),
+                }
+            },
+            // A fresh worktree off a branch: provision through `drop`, and
+            // apply the layout once the worktree exists.
+            Some(b) => {
+                self.pending_group_profile = profile;
+                self.start_fork(repo.path, name, b.from);
+            },
+        }
     }
 
     pub(crate) fn open_picker(&mut self) {
-        self.picker_target = PickerTarget::Group;
-        self.set_picker(picker::Picker::new());
-        self.request_redraw();
+        self.open_command_new_session(false);
     }
 
     pub(crate) fn open_flyover_picker(&mut self) {
-        self.picker_target = PickerTarget::Flyover;
-        self.set_picker(picker::Picker::new());
-        self.request_redraw();
+        self.open_command_new_session(true);
     }
 
     /// Spawn a new flyover tab with a plain (non-persisted) session at `cwd`.
@@ -1891,103 +2004,6 @@ impl App {
         None
     }
 
-    pub(crate) fn confirm_picker(&mut self) {
-        let Some(picker) = self.picker.as_mut() else { return };
-        let Some(entry) = picker.selected_entry().cloned() else {
-            self.picker = None;
-            // If this was the first-ever flyover open and user escaped, close
-            // whichever surface was waiting on the first tab.
-            if self.picker_target == PickerTarget::Flyover && self.flyover_tabs.is_empty() {
-                self.flyover_open = false;
-                self.flyover_focused = false;
-                self.flyover_window_visible = false;
-            }
-            return;
-        };
-        picker.record_recent(&entry.path);
-        let name = group_name(&entry.path);
-        if self.picker_target == PickerTarget::Flyover {
-            if entry.is_git {
-                // Flyover git dirs: only RepoRoot and Worktree (no drop/create).
-                let all_choices = build_fork_choices(&entry.path);
-                let choices = all_choices
-                    .into_iter()
-                    .filter(|c| matches!(c.scope, picker::ForkScope::RepoRoot | picker::ForkScope::Worktree))
-                    .collect::<Vec<_>>();
-                self.set_fork(picker::ForkPicker::new(entry.path, name, choices));
-                self.picker = None;
-            } else {
-                self.picker = None;
-                self.spawn_flyover_tab(Some(entry.path));
-            }
-        } else if entry.is_git {
-            // Step 2: choose where to fork a drop worktree from.
-            let choices = build_fork_choices(&entry.path);
-            self.set_fork(picker::ForkPicker::new(entry.path, name, choices));
-            self.picker = None;
-        } else {
-            self.picker = None;
-            self.add_group_or_pick_profile(name, entry.path);
-        }
-    }
-
-    /// Step 2: confirm the fork choice. "repo root"/"attach worktree" open the
-    /// group directly; the forking scopes spawn `drop` on a worker thread and
-    /// show a provisioning message until it reports back over `events_tx`.
-    pub(crate) fn confirm_fork(&mut self) {
-        let Some(picker) = self.fork.as_ref() else { return };
-        let Some(entry) = picker.selected_entry() else { return };
-        let repo = picker.repo.clone();
-        let name = picker.name.clone();
-        let scope = entry.scope;
-        let from = entry.from.clone();
-        let path = entry.path.clone();
-
-        if self.picker_target == PickerTarget::Flyover {
-            // Flyover only supports RepoRoot and Worktree (no drop/create).
-            if matches!(scope, picker::ForkScope::RepoRoot | picker::ForkScope::Worktree) {
-                self.fork = None;
-                self.spawn_flyover_tab(path);
-            } else {
-                // Should not happen (filtered above), but be safe.
-                self.fork = None;
-                if self.flyover_tabs.is_empty() {
-                    self.flyover_open = false;
-                }
-            }
-            return;
-        }
-
-        // "repo root" and "attach worktree" skip drop entirely: open the group
-        // directly in that directory (the repo, or the existing worktree).
-        if matches!(scope, picker::ForkScope::RepoRoot | picker::ForkScope::Worktree) {
-            self.fork = None;
-            match path {
-                Some(p) => self.add_group_or_pick_profile(name, p),
-                None => self.add_group(name, None),
-            }
-            return;
-        }
-
-        // Forking scopes: the worktree doesn't exist yet, so profiles are
-        // discovered at the repo root (plus user-level) and the choice is made
-        // *before* provisioning; it is applied when `GroupReady` arrives.
-        let found = pwrspace::discover(&pwrspace::candidate_paths(&repo));
-        if !found.is_empty() {
-            self.fork = None;
-            self.set_profile(picker::ProfilePicker::new(name.clone(), found));
-            self.profile_next = Some(ProfileNext::Fork { repo, name, from });
-            self.request_redraw();
-            return;
-        }
-
-        self.fork = None;
-        self.start_fork(repo, name, from);
-    }
-
-    /// Spawn `drop` on a worker thread and show the provisioning message until
-    /// it reports back over `events_tx` (the tail of the pre-profile
-    /// `confirm_fork`, shared with the profile picker's deferred path).
     pub(crate) fn start_fork(&mut self, repo: std::path::PathBuf, name: String, from: Option<String>) {
         self.message = Some((format!("Provisioning worktree for {name}…"), false));
         self.request_redraw();
@@ -2000,56 +2016,6 @@ impl App {
             };
             let _ = events_tx.send(event);
         });
-    }
-
-    /// Create the group at `cwd` immediately, or interpose the profile picker
-    /// when any `.pwrspace.json` profiles exist for it (dir → repo root → user
-    /// precedence; worktree dirs also see their main checkout's profiles).
-    pub(crate) fn add_group_or_pick_profile(&mut self, name: String, cwd: std::path::PathBuf) {
-        let found = pwrspace::discover(&pwrspace::candidate_paths(&cwd));
-        if found.is_empty() {
-            self.add_group(name, Some(cwd));
-        } else {
-            self.set_profile(picker::ProfilePicker::new(name.clone(), found));
-            self.profile_next = Some(ProfileNext::Open { name, cwd });
-            self.request_redraw();
-        }
-    }
-
-    /// Confirm the highlighted profile row: launch (or provision) the pending
-    /// group with the chosen profile — the default row (`profile: None`)
-    /// keeps today's single-pane behavior.
-    pub(crate) fn confirm_profile(&mut self) {
-        let Some(pp) = self.profile_picker.as_ref() else { return };
-        let Some(entry) = pp.selected_entry().cloned() else { return };
-        self.profile_picker = None;
-        match self.profile_next.take() {
-            Some(ProfileNext::Open { name, cwd }) => match entry.profile {
-                Some(profile) => self.add_group_with_profile(name, Some(cwd), &profile),
-                None => self.add_group(name, Some(cwd)),
-            },
-            Some(ProfileNext::Fork { repo, name, from }) => {
-                self.pending_group_profile = entry.profile;
-                self.start_fork(repo, name, from);
-            },
-            None => {},
-        }
-        self.request_redraw();
-    }
-
-    /// Escape/outside-click on the profile picker: step back to the picker it
-    /// came from — the fork picker for a pending `drop` fork, else the dir
-    /// picker (matching how the fork picker itself steps back).
-    pub(crate) fn cancel_profile(&mut self) {
-        self.profile_picker = None;
-        match self.profile_next.take() {
-            Some(ProfileNext::Fork { repo, name, .. }) => {
-                let choices = build_fork_choices(&repo);
-                self.set_fork(picker::ForkPicker::new(repo, name, choices));
-            },
-            _ => self.set_picker(picker::Picker::new()),
-        }
-        self.request_redraw();
     }
 
     pub(crate) fn new_tile_in(&mut self, cwd: Option<&std::path::Path>) -> Tile {
@@ -3093,10 +3059,7 @@ impl App {
         self.confirm.is_some()
             || self.message.is_some()
             || self.save_ws.is_some()
-            || self.profile_picker.is_some()
-            || self.fork.is_some()
-            || self.picker.is_some()
-            || self.palette.is_some()
+            || self.command.is_some()
     }
 
     /// Right/middle button press: forward it to a mouse-tracking pane under the
@@ -3134,10 +3097,7 @@ impl App {
         if self.confirm.is_some()
             || self.message.is_some()
             || self.save_ws.is_some()
-            || self.profile_picker.is_some()
-            || self.fork.is_some()
-            || self.picker.is_some()
-            || self.palette.is_some()
+            || self.command.is_some()
         {
             // Every modal is an element tree now (modal_ui / save_ui /
             // palette_ui / picker_ui): its occluding scrim keeps the click
@@ -3494,9 +3454,7 @@ impl App {
                 // on_mouse_down exactly via workspace::resize_hover_at.
                 let hover = if self.confirm.is_some()
                     || self.message.is_some()
-                    || self.fork.is_some()
-                    || self.picker.is_some()
-                    || self.palette.is_some()
+                    || self.command.is_some()
                 {
                     None
                 } else if self.flyover_open
@@ -3547,9 +3505,7 @@ impl App {
                 let link_hover = if self.page != Page::Sessions
                     || self.confirm.is_some()
                     || self.message.is_some()
-                    || self.fork.is_some()
-                    || self.picker.is_some()
-                    || self.palette.is_some()
+                    || self.command.is_some()
                 {
                     None
                 } else {
@@ -3684,10 +3640,7 @@ impl App {
         if self.confirm.is_some()
             || self.message.is_some()
             || self.save_ws.is_some()
-            || self.profile_picker.is_some()
-            || self.fork.is_some()
-            || self.picker.is_some()
-            || self.palette.is_some()
+            || self.command.is_some()
         {
             self.handle_picker_key(ev);
             return;
@@ -3816,101 +3769,26 @@ impl App {
             self.handle_save_key(ev);
             return;
         }
-        // Step 3: the workspace-profile picker. Escape steps back.
-        if self.profile_picker.is_some() {
-            match key {
-                "escape" => self.cancel_profile(),
-                "enter" => self.confirm_profile(),
-                "up" => {
-                    if let Some(pp) = self.profile_picker.as_mut() {
-                        pp.move_selection(-1);
-                    }
-                },
-                "down" => {
-                    if let Some(pp) = self.profile_picker.as_mut() {
-                        pp.move_selection(1);
-                    }
-                },
-                // Editing keys belong to the focused search field.
-                _ => {},
-            }
-            self.request_redraw();
-            return;
-        }
-        // Step 2: the fork picker. Escape steps back to the dir picker.
-        if self.fork.is_some() {
-            match key {
-                "escape" => {
-                    self.fork = None;
-                    self.set_picker(picker::Picker::new());
-                },
-                "enter" => self.confirm_fork(),
-                "up" => {
-                    if let Some(f) = self.fork.as_mut() {
-                        f.move_selection(-1);
-                    }
-                },
-                "down" => {
-                    if let Some(f) = self.fork.as_mut() {
-                        f.move_selection(1);
-                    }
-                },
-                // Editing keys belong to the focused search field.
-                _ => {},
-            }
-            self.request_redraw();
-            return;
-        }
-        // Step 1: the dir picker. Escape closes the overlay entirely.
-        if self.picker.is_some() {
-            match key {
-                "escape" => self.cancel_picker(),
-                "enter" => self.confirm_picker(),
-                "up" => {
-                    if let Some(p) = self.picker.as_mut() {
-                        p.move_selection(-1);
-                    }
-                },
-                "down" => {
-                    if let Some(p) = self.picker.as_mut() {
-                        p.move_selection(1);
-                    }
-                },
-                // Editing keys belong to the focused search field.
-                _ => {},
-            }
-        } else if self.palette.is_some() {
-            // The palette's own chord closes it again — the overlay owns the
-            // keyboard, so the toggle in run_action is unreachable from here.
+        // The unified command palette: navigation here, editing in the
+        // shared Input (the root listener still fires while it is focused,
+        // and never stops it).
+        if let Some(pal) = self.command.as_ref() {
+            let query_empty = pal.query().is_empty();
             if Action::CommandPalette.binding().matches(&ev.keystroke) {
-                self.palette = None;
-                self.request_redraw();
-                return;
-            }
-            match key {
-                "escape" => self.palette = None,
-                "enter" => {
-                    let action = self
-                        .palette
-                        .as_ref()
-                        .and_then(|p| p.selected_action());
-                    self.palette = None;
-                    if let Some(action) = action {
-                        self.run_action(action);
-                    }
-                },
-                "up" => {
-                    if let Some(p) = self.palette.as_mut() {
-                        p.move_selection(-1);
-                    }
-                },
-                "down" => {
-                    if let Some(p) = self.palette.as_mut() {
-                        p.move_selection(1);
-                    }
-                },
-                // Editing keys belong to the focused search field.
-                _ => {},
+                self.close_command();
+            } else {
+                match key {
+                    "escape" => self.close_command(),
+                    "enter" => self.command_enter(),
+                    "up" | "down" => {
+                        if let Some(c) = self.command.as_mut() {
+                            c.move_selection(if key == "up" { -1 } else { 1 });
+                            self.command_scroll_to = Some(c.selected());
+                        }
+                    },
+                    "backspace" if query_empty => self.command_back(),
+                    _ => {},
+                }
             }
         }
         self.request_redraw();
@@ -4129,12 +4007,7 @@ impl App {
             Action::OpenSettings => return self.set_page(Page::Settings),
             Action::Quit => std::process::exit(0),
             Action::CommandPalette => {
-                if self.palette.is_some() {
-                    self.palette = None;
-                } else {
-                    self.palette = Some(palette::Palette::new());
-                    self.modal_search_reset = Some(palette_ui::PALETTE_PLACEHOLDER.into());
-                }
+                self.toggle_command_root();
                 return;
             },
             Action::IncreaseFontSize => return self.zoom_font(renderer::FONT_SIZE_STEP),
@@ -4683,7 +4556,20 @@ impl App {
                         .file_name()
                         .map(|s| s.to_string_lossy().into_owned())
                         .unwrap_or_else(|| cwd.to_string_lossy().into_owned());
-                    self.add_group_or_pick_profile(name, cwd);
+                    let found = pwrspace::discover(&pwrspace::candidate_paths(&cwd));
+                    if found.is_empty() {
+                        self.add_group(name, Some(cwd));
+                    } else {
+                        // Profiles exist for it: let the palette's layout
+                        // step choose one.
+                        let label = name.clone();
+                        let entry = picker::PickerEntry::new(cwd, label);
+                        self.command = Some(command::CommandPalette::for_directory(
+                            entry,
+                            picker::ProfilePicker::new(found),
+                        ));
+                        self.claim_command_search();
+                    }
                     redraw = true;
                 },
                 TermEvent::CleanupScanned(worktrees) => {
@@ -4938,17 +4824,6 @@ impl App {
             tab.session.begin_frame();
         }
     }
-}
-
-/// Human-friendly group name for a cwd: `~` for the home dir, else the last
-/// path component.
-pub(crate) fn group_name(dir: &std::path::Path) -> String {
-    if dirs::home_dir().is_some_and(|home| home == dir) {
-        return "~".into();
-    }
-    dir.file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| dir.to_string_lossy().into_owned())
 }
 
 /// Abbreviate `path` with `~` for display.
@@ -5480,8 +5355,7 @@ impl Render for App {
             .child(self.render_ribbon_presses(cx))
             // Command palette and the pickers (element trees; see
             // `palette_ui` / `picker_ui`).
-            .child(self.render_palette(cx))
-            .child(self.render_pickers(cx))
+            .child(self.render_command(cx))
             // Save-as-workspace modal (element tree; see `save_ui`).
             .child(self.render_save(cx))
             // Modal overlays (confirm dialog, message panel): last, so they
@@ -5528,9 +5402,7 @@ impl App {
         // hovering leaves resize_hover stale, so overlays suppress it here too.
         let overlay_open = self.confirm.is_some()
             || self.message.is_some()
-            || self.fork.is_some()
-            || self.picker.is_some()
-            || self.palette.is_some();
+            || self.command.is_some();
         let resize_hover = if overlay_open
             || !matches!(
                 self.drag,
@@ -6661,13 +6533,8 @@ pub fn run_native() {
                         cursor: (0.0, 0.0),
                         drag: Drag::None,
                         just_expanded: None,
-                        picker: None,
-                        fork: None,
-                        profile_picker: None,
-                        profile_next: None,
                         pending_group_profile: None,
                         save_ws: None,
-                        palette: None,
                         message: None,
                         confirm: None,
                         pending_primary_cmd: std::collections::HashMap::new(),
@@ -6737,6 +6604,9 @@ pub fn run_native() {
                             input
                         },
                         save_sync: false,
+                        command: None,
+                        command_scroll: gpui::ScrollHandle::new(),
+                        command_scroll_to: None,
                         modal_search: {
                             let input = cx.new(|cx| {
                                 let mut input = crate::ui::Input::new(cx);
@@ -6745,19 +6615,8 @@ pub fn run_native() {
                             });
                             cx.observe(&input, |this: &mut App, input, cx| {
                                 let text = input.read(cx).text().to_string();
-                                // Whichever search modal is up (profile over
-                                // fork over dir over palette, the canvas's
-                                // paint order) takes the query.
-                                let changed = if let Some(p) = this.profile_picker.as_mut() {
-                                    p.set_query(&text);
-                                    true
-                                } else if let Some(f) = this.fork.as_mut() {
-                                    f.set_query(&text);
-                                    true
-                                } else if let Some(p) = this.picker.as_mut() {
-                                    p.set_query(&text);
-                                    true
-                                } else if let Some(p) = this.palette.as_mut() {
+                                // The palette's current stage takes the query.
+                                let changed = if let Some(p) = this.command.as_mut() {
                                     p.set_query(&text);
                                     true
                                 } else {
@@ -6818,7 +6677,6 @@ pub fn run_native() {
                         flyover_window_visible: false,
                         flyover_window: None,
                         main_window: None,
-                        picker_target: PickerTarget::Group,
                         preview_dark: theme::dark_active(),
                         appearance_menu: None,
                         open_tool: settings::get_str("toolpanel.tool").and_then(|s| {

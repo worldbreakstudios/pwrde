@@ -17,8 +17,8 @@ by hand, and what the next steps look like. Step numbers refer to the audit's
 | 06 | `rcn/08-save-modal` | 6b | save-as-workspace modal | rcn `Input` fields + element rows (`save_ui`), per-render focus reconcile |
 | 07 | `rcn/09-tile-tabs` | 10a | tile tab strips (pixels) | clipped element strips (`tile_ui`); hit rects stay canvas |
 | 08 | `rcn/10-header-chips` | — | sidebar ⇤ / ＋ chips | element click targets |
-| 09 | `rcn/05-palette` | 8 | command palette | shared rcn `Input` (`App::modal_search`) + element rows (`palette_ui`) |
-| 10 | `rcn/06-pickers` | 7 | directory / fork / profile pickers | `SearchModal` element trees (`picker_ui`); the canvas picker layer is deleted |
+| 09 | `rcn/05-palette` | 8 | command palette | shared rcn `Input` (`App::modal_search`) + element rows (`palette_ui`) — superseded by `command_ui` |
+| 10 | `rcn/06-pickers` | 7 | directory / fork / profile pickers | `SearchModal` element trees (`picker_ui`); the canvas picker layer is deleted — superseded by the palette's New-session flow (`command.rs` / `command_ui.rs`) |
 | 11 | `rcn/11-flyover-strip` | 11a | flyover tab strip (pixels) | shared `tab_strip` element (`flyover_ui`); popout window unchanged |
 | 12 | `rcn/12-window-drag` | — | titlebar / folded-corner window drag | one element whose press calls `start_window_move` |
 | 13 | `rcn/13-resize-handles` | 12 | sidebar edge, dividers, tool-panel edge, flyover top edge | element handles own cursor, grip and drag start (`resize_ui`) |

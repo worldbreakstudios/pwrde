@@ -21,7 +21,7 @@ use gpui::{
 
 use crate::App;
 use crate::renderer::color;
-use crate::tile_ui::{PressHandler, StripStyle, StripTab, modal_veil, tab_strip};
+use crate::tile_ui::{PressHandler, StripStyle, StripTab, tab_strip};
 use crate::ui::theme::Theme;
 use crate::workspace::{self, LayoutRect};
 
@@ -144,8 +144,6 @@ impl App {
                         ),
                 );
             }
-        } else {
-            strip_el = strip_el.child(modal_veil(th));
         }
 
         div()
