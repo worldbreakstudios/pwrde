@@ -46,13 +46,6 @@ use crate::workspace::{TITLEBAR_H, TRAFFIC_LIGHT_SAFE_W};
 /// gutter). The panel floats inside it, Apple Messages style.
 const GUTTER: f32 = 3.0;
 
-/// Thickness of the sidebar's width-resize grip line, matching the canvas's
-/// 2 logical px.
-const GRIP_W: f32 = 2.0;
-
-/// Length of the grip's centered pill, matching `renderer.rs`'s 28px.
-const GRIP_PILL_H: f32 = 28.0;
-
 /// Opacity of the modal scrim. `renderer.rs` paints the chrome `scrim` token
 /// at the same 0.30 over the rest of the window.
 const SCRIM_ALPHA: f32 = 0.30;
@@ -180,7 +173,6 @@ impl App {
             .child(self.drop_feedback_layer(&theme))
             .child(self.header_chips(&theme, cx.entity().downgrade()))
             .child(self.page_dot_layer(&theme, cx.entity().downgrade()))
-            .child(self.resize_grip_layer(&theme))
             // Last, so the veil falls over every affordance the panel owns.
             .child(self.overlay_scrim(panel_w))
             .into_any_element()
@@ -408,64 +400,6 @@ impl App {
                 .border_1()
                 .border_color(theme.primary.opacity(0.75))
         })
-    }
-
-    /// The sidebar's width-resize grip: a slim ink line down the panel's
-    /// right edge with a centered pill, shown while the pointer is on the
-    /// handle (or mid-drag).
-    ///
-    /// The canvas drew it centered on `x = sidebar_w`, but the panel's right
-    /// edge sits a gutter further left, so the panel swallowed the inner half
-    /// and only a sliver survived. Only the pixels moved: it now hugs the
-    /// panel edge at `sidebar_w - GUTTER`. The hit-test is untouched — the
-    /// press still lands on `workspace::resize_hover_at`'s band around
-    /// `sidebar_w` and still starts [`crate::Drag::Sidebar`].
-    fn resize_grip_layer(&self, theme: &Theme) -> gpui::Div {
-        let layer = div().absolute().left(px(0.0)).top(px(0.0)).size_full();
-        // Same suppression the cursor uses: an overlay opened by keyboard
-        // while hovering leaves the hover stale, and an unrelated drag owns
-        // the pointer.
-        if self.modal_overlay_open()
-            || !matches!(
-                self.drag,
-                crate::Drag::None
-                    | crate::Drag::Sidebar
-                    | crate::Drag::Divider { .. }
-                    | crate::Drag::ToolPanelResize
-            )
-            || self.resize_hover != Some(crate::workspace::ResizeHover::Sidebar)
-        {
-            return layer;
-        }
-        let (_, surface_h) = self.renderer.surface_size();
-        let height = (surface_h as f32 / self.scale()).round();
-        // Top of the tile area down to its bottom inset, exactly the span the
-        // canvas grip covered.
-        let top = TITLEBAR_H;
-        let bottom = (height - crate::workspace::AREA_PAD).max(top);
-        let x = (self.sidebar_w() - GUTTER - GRIP_W / 2.0).max(0.0);
-        let pill_h = GRIP_PILL_H.min(bottom - top);
-        layer
-            .child(
-                div()
-                    .absolute()
-                    .left(px(x))
-                    .top(px(top))
-                    .w(px(GRIP_W))
-                    .h(px(bottom - top))
-                    .rounded(px(GRIP_W / 2.0))
-                    .bg(theme.foreground.opacity(0.14)),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .left(px(x))
-                    .top(px(top + ((bottom - top - pill_h) / 2.0).max(0.0)))
-                    .w(px(GRIP_W))
-                    .h(px(pill_h))
-                    .rounded(px(GRIP_W / 2.0))
-                    .bg(theme.foreground.opacity(0.45)),
-            )
     }
 
     /// The modal scrim, over the panel.

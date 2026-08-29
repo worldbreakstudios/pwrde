@@ -47,6 +47,7 @@ mod picker_ui;
 mod pwrspace;
 mod rect;
 mod renderer;
+mod resize_ui;
 mod save_ui;
 mod settings;
 mod sidebar_card;
@@ -83,7 +84,7 @@ use workspace::{Dir, Node, Tab, Tile, Workspace};
 // ── Layout / interaction constants (logical px) ──────────────────────────
 
 /// Grab tolerance (logical px) for divider / sidebar-edge hits.
-const GRAB: f32 = 4.0;
+pub(crate) const GRAB: f32 = 4.0;
 /// Pointer travel (logical px) before a tab press becomes a drag.
 const DRAG_THRESHOLD: f64 = 6.0;
 /// How often the sidebar cards are topped up while the user stays inside one
@@ -3006,7 +3007,6 @@ impl App {
         let scale = self.renderer.scale;
         let (px, py) = (self.cursor.0 as f32, self.cursor.1 as f32);
         let (w, h) = self.renderer.surface_size();
-        let grab = GRAB * scale;
 
         // A fresh click sequence forgets which pane the previous one expanded.
         if click_count <= 1 {
@@ -3038,14 +3038,8 @@ impl App {
         // Flyover panel hit-testing: after modal-overlay check, before sidebar/tiles.
         if self.flyover_open && !self.flyover_tabs.is_empty() {
             let panel = self.flyover_rect_now();
-            // Top-edge grab zone starts a height-resize drag (not when
-            // maximized — there's no meaningful height to drag).
-            let grab = (workspace::FLYOVER_RESIZE_GRAB * scale).max(1.0);
-            if !self.flyover_maximized && (py - panel.y).abs() <= grab {
-                self.drag = Drag::FlyoverResize;
-                self.request_redraw();
-                return;
-            }
+            // The top-edge height-resize grab is an element handle now
+            // (`resize_ui`), which arms `Drag::FlyoverResize` itself.
             if panel.contains(px, py) {
                 let tab_bar = workspace::flyover_tab_bar(&panel, scale);
                 let n = self.flyover_tabs.len();
@@ -3105,13 +3099,9 @@ impl App {
             return;
         }
 
-        // Sidebar edge → resize sidebar (every page shares the width).
-        // Collapsed there is no edge to grab (sidebar.w is 0).
-        if sidebar.w > 0.0 && (px - sidebar.w).abs() <= grab {
-            self.drag = Drag::Sidebar;
-            self.resize_hover = Some(workspace::ResizeHover::Sidebar);
-            return;
-        }
+        // The sidebar edge, the tile dividers and the tool panel edge are
+        // element handles now (`resize_ui`): they arm their drags and stop
+        // the press, so none of them reach here.
 
         // Window drags (the titlebar strip, or the traffic-light corner
         // while the sidebar is folded) start from an element now
@@ -3124,16 +3114,9 @@ impl App {
         let ribbon_tools = self.tools_for(self.page);
         if !ribbon_tools.is_empty() {
             if self.visible_tool().is_some() {
-                let panel = workspace::tool_panel(w, h, scale, self.tool_panel_w, self.tool_panel_floating);
-                let pgrab = (workspace::TOOL_PANEL_RESIZE_GRAB * scale).max(1.0);
-                if (px - panel.x).abs() <= pgrab && py >= panel.y && py <= panel.y + panel.h {
-                    self.drag = Drag::ToolPanelResize;
-                    self.resize_hover = Some(workspace::ResizeHover::ToolPanel);
-                    self.request_redraw();
-                    return;
-                }
                 // The panel body itself is an element tree (pr_ui /
-                // local_diff_ui / launch_ui) and resolves its own clicks.
+                // local_diff_ui / launch_ui) and resolves its own clicks; its
+                // resize edge is an element handle (`resize_ui`).
             }
             if workspace::ribbon(w, h, scale).contains(px, py) {
                 for (i, tool) in ribbon_tools.iter().enumerate() {
@@ -3163,18 +3146,6 @@ impl App {
             return;
         }
 
-        if self.page == Page::Sessions {
-            let ws = &self.workspaces[self.active];
-            let (_, dividers) = workspace::layout_tiles(&ws.root, self.area(), scale);
-            if let Some(d) = dividers.iter().find(|d| d.rect.inflate(grab).contains(px, py)) {
-                self.drag = Drag::Divider { path: d.path.clone() };
-                self.resize_hover = Some(workspace::ResizeHover::Divider {
-                    path: d.path.clone(),
-                    dir: d.dir,
-                });
-                return;
-            }
-        }
 
         // Sidebar: titlebar strip = traffic lights + window drag handle.
         if sidebar.contains(px, py) {
@@ -5518,6 +5489,10 @@ impl Render for App {
                 self.visible_tool() == Some(pages::Tool::Launch) && !self.modal_overlay_open(),
                 |el| el.child(self.render_launch(cx)),
             )
+            // Resize handles (sidebar edge, dividers, tool panel edge, flyover
+            // top edge): elements own the cursor and the drag start; the
+            // canvas still drives the drag (`resize_ui`).
+            .child(self.render_resize_handles(cx))
             // Command palette and the pickers (element trees; see
             // `palette_ui` / `picker_ui`).
             .child(self.render_palette(cx))
@@ -5665,7 +5640,6 @@ impl App {
             self.active,
             self.sidebar_w(),
             drop_hint,
-            resize_hover,
             link_hover_suppressed,
             &chrome,
         );
