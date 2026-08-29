@@ -308,7 +308,7 @@ impl Action {
             Action::SplitRight => "Split side-by-side",
             Action::SplitDown => "Split stacked",
             Action::NewTab => "New tab",
-            Action::NewGroup => "New group",
+            Action::NewGroup => "New session…",
             Action::Copy => "Copy selection",
             Action::Paste => "Paste",
             Action::CloseTab => "Close tab",

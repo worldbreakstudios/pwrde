@@ -254,17 +254,6 @@ pub(crate) fn tab_strip(
     strip_el
 }
 
-/// A 30% veil over a strip while a canvas modal owns the frame: the canvas
-/// scrim dims the canvas beneath this tree, not this tree.
-pub(crate) fn modal_veil(th: &crate::theme::Theme) -> gpui::Div {
-    div()
-        .absolute()
-        .left(px(0.0))
-        .top(px(0.0))
-        .size_full()
-        .bg(color(th.scrim, 0.30))
-}
-
 impl App {
     /// Every tile's tab strip, or an empty element off the Sessions page.
     pub fn render_tile_chrome(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -399,9 +388,6 @@ impl App {
                             }
                         }),
                 );
-            }
-            if modal {
-                strip_el = strip_el.child(modal_veil(th));
             }
             layer = layer.child(strip_el);
         }

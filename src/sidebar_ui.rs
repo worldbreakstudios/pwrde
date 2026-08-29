@@ -46,10 +46,6 @@ use crate::workspace::{TITLEBAR_H, TRAFFIC_LIGHT_SAFE_W};
 /// gutter). The panel floats inside it, Apple Messages style.
 const GUTTER: f32 = 3.0;
 
-/// Opacity of the modal scrim. `renderer.rs` paints the chrome `scrim` token
-/// at the same 0.30 over the rest of the window.
-const SCRIM_ALPHA: f32 = 0.30;
-
 /// Panel corner radius (`--radius-l` in the spec's token set).
 const PANEL_RADIUS: f32 = 18.0;
 
@@ -198,8 +194,6 @@ impl App {
             .child(self.drop_feedback_layer(&theme))
             .child(self.header_chips(&theme, cx.entity().downgrade()))
             .child(self.page_dot_layer(&theme, cx.entity().downgrade()))
-            // Last, so the veil falls over every affordance the panel owns.
-            .child(self.overlay_scrim(panel_w))
             .into_any_element()
     }
 
@@ -276,21 +270,9 @@ impl App {
         let rim = theme.foreground.opacity(0.28);
         let font = crate::renderer::chrome_font();
         let entity = cx.entity().downgrade();
-        // A canvas modal (picker, palette, confirm…) scrims the canvas
-        // beneath this tree, not this tree: veil the pill and hint the same
-        // 30% and drop the click, so the modal keeps the frame.
+        // A modal's own scrim sits above this tree; the pill only goes
+        // inert underneath it.
         let modal = self.modal_overlay_open();
-        let veil = |r: &crate::workspace::LayoutRect, radius: f32| {
-            div()
-                .absolute()
-                .left(px(r.x))
-                .top(px(r.y))
-                .w(px(r.w))
-                .h(px(r.h))
-                .rounded(px(radius))
-                .occlude()
-                .bg(gpui::hsla(0.0, 0.0, 0.0, SCRIM_ALPHA))
-        };
 
         div()
             .absolute()
@@ -352,7 +334,6 @@ impl App {
                     .text_color(theme.muted_foreground.opacity(0.9))
                     .child("press ⇧⌘T"),
             )
-            .when(modal, |d| d.child(veil(&cta, ROW_RADIUS)).child(veil(&hint, 0.0)))
             .into_any_element()
     }
 
@@ -425,41 +406,6 @@ impl App {
                 .border_1()
                 .border_color(theme.primary.opacity(0.75))
         })
-    }
-
-    /// The modal scrim, over the panel.
-    ///
-    /// `renderer.rs` dims the whole window behind the picker, palette and the
-    /// confirm/message dialogs, but the panel is an opaque element sibling
-    /// painted after the canvas, so the sidebar alone stayed bright while
-    /// something else owned the clicks. This lays the same 30% black over the
-    /// sidebar column whenever [`crate::App::modal_overlay_open`] holds — the
-    /// exact overlay set the canvas scrims — so the panel dims with the rest
-    /// of the window. The chrome `scrim` token is black in every theme, so
-    /// this is black too.
-    fn overlay_scrim(&self, panel_w: f32) -> gpui::Div {
-        let layer = div().absolute().left(px(0.0)).top(px(0.0)).size_full();
-        if !self.modal_overlay_open() {
-            return layer;
-        }
-        // Exactly the panel's rect, corners included: the window gutter around
-        // it still shows canvas, which the canvas scrim already dimmed, and
-        // laying a second veil there would darken the seam twice over.
-        // Occluding, not just tinting: the page dots below it are element
-        // click targets now, and a veil that let clicks through would switch
-        // pages behind the modal. The canvas path used to swallow those.
-        layer.child(
-            div()
-                .id("sidebar-modal-scrim")
-                .absolute()
-                .left(px(GUTTER))
-                .top(px(GUTTER))
-                .w(px(panel_w))
-                .bottom(px(GUTTER))
-                .rounded(px(PANEL_RADIUS))
-                .occlude()
-                .bg(gpui::hsla(0.0, 0.0, 0.0, SCRIM_ALPHA)),
-        )
     }
 
     /// The page-dot strip along the bottom of the panel.
