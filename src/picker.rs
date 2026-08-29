@@ -175,8 +175,6 @@ pub struct ForkEntry {
 pub struct ForkPicker {
     /// The git repo whose worktree we'll create.
     pub repo: PathBuf,
-    /// The group name to use once the worktree exists (the repo's basename).
-    pub name: String,
     /// Every fork choice, in display order (default, locals, remotes).
     pub entries: Vec<ForkEntry>,
     pub query: String,
@@ -186,10 +184,9 @@ pub struct ForkPicker {
 }
 
 impl ForkPicker {
-    /// Open the fork picker over `repo`, naming the eventual group `name`.
-    pub fn new(repo: PathBuf, name: String, entries: Vec<ForkEntry>) -> Self {
-        let mut picker =
-            Self { repo, name, entries, query: String::new(), selected: 0, rows: Vec::new() };
+    /// Open the fork picker over `repo`.
+    pub fn new(repo: PathBuf, entries: Vec<ForkEntry>) -> Self {
+        let mut picker = Self { repo, entries, query: String::new(), selected: 0, rows: Vec::new() };
         picker.rebuild();
         picker
     }
@@ -254,13 +251,20 @@ pub struct ProfileEntry {
     pub profile: Option<crate::pwrspace::WorkspaceProfile>,
 }
 
+/// Manual equality: `WorkspaceProfile` is a full serialized layout payload that
+/// deliberately does not implement `PartialEq`, so entries compare by their
+/// visible fields (label + detail) — enough for selection state and tests.
+impl PartialEq for ProfileEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.label == other.label && self.detail == other.detail
+    }
+}
+
 /// The workspace-profile picker: the third step of group creation, shown only
 /// when at least one profile was discovered for the target directory. The
 /// "Default — single pane" row sits first so Enter with no filter keeps
 /// today's behavior one keystroke away.
 pub struct ProfilePicker {
-    /// The name the group will get once launched.
-    pub name: String,
     /// Every choice, default row first.
     pub entries: Vec<ProfileEntry>,
     pub query: String,
@@ -270,9 +274,9 @@ pub struct ProfilePicker {
 }
 
 impl ProfilePicker {
-    /// Build the picker over `profiles` (discovered, already deduped), naming
-    /// the eventual group `name`. Prepends the default row.
-    pub fn new(name: String, profiles: Vec<(crate::pwrspace::WorkspaceProfile, String)>) -> Self {
+    /// Build the picker over `profiles` (discovered, already deduped).
+    /// Prepends the default row.
+    pub fn new(profiles: Vec<(crate::pwrspace::WorkspaceProfile, String)>) -> Self {
         let mut entries = vec![ProfileEntry {
             label: "Default — single pane".into(),
             detail: String::new(),
@@ -287,8 +291,7 @@ impl ProfilePicker {
             },
             profile: Some(profile),
         }));
-        let mut picker =
-            Self { name, entries, query: String::new(), selected: 0, rows: Vec::new() };
+        let mut picker = Self { entries, query: String::new(), selected: 0, rows: Vec::new() };
         picker.rebuild();
         picker
     }
@@ -379,6 +382,22 @@ impl Picker {
                 entries.push(PickerEntry::new(path.clone(), label));
             }
         }
+        let mut picker = Self {
+            entries,
+            store,
+            query: String::new(),
+            selected: 0,
+            rows: Vec::new(),
+        };
+        picker.rebuild();
+        picker
+    }
+
+    /// Builds a picker from an explicit entry list (no filesystem scan, no
+    /// store load). Tests and embedded flows use this to avoid touching the
+    /// real home directory.
+    #[cfg(test)]
+    pub fn from_entries(entries: Vec<PickerEntry>, store: PickerStore) -> Self {
         let mut picker = Self {
             entries,
             store,
@@ -571,67 +590,12 @@ fn scan_children(dir: &Path) -> Vec<PickerEntry> {
     kids
 }
 
-/// Popover width, logical px.
-pub const PANEL_W: f32 = 420.0;
-/// Height of one list row, logical px.
-pub const ROW_H: f32 = 28.0;
-/// Height of the search box, logical px.
-pub const SEARCH_H: f32 = 38.0;
-/// Padding inside the popover panel, logical px.
-pub const PANEL_PAD: f32 = 10.0;
-/// How many rows the list shows before it scrolls.
-const MAX_VISIBLE_ROWS: usize = 12;
-
-/// The visible window of a centered search-list modal (dir picker, profile
-/// picker, command palette): how many rows fit, and which row comes first so
-/// the selection stays on screen. The panel itself is laid out by the element
-/// tree (`palette_ui::SearchModal`) from the same constants.
-pub struct PickerLayout {
-    /// Index into the rows of the first row on screen.
-    pub first_visible: usize,
-    /// How many rows fit on screen.
-    pub visible: usize,
-}
-
-impl PickerLayout {
-    /// Sizes the row window for a `width`×`height` (physical px) window,
-    /// scrolled so the selected row (of `rows_len` total) is on screen.
-    pub fn compute(width: u32, height: u32, scale: f32, rows_len: usize, selected: usize) -> Self {
-        let win_h = height as f32;
-        let _ = width;
-        let pad = (PANEL_PAD * scale).round();
-        let row_h = (ROW_H * scale).round();
-        let search_h = (SEARCH_H * scale).round();
-
-        // Rows are capped by both the list length and the window height.
-        let room = (((win_h - 4.0 * pad - search_h) / row_h).floor()).max(1.0) as usize;
-        let visible = rows_len.min(MAX_VISIBLE_ROWS).min(room);
-        let first_visible = (selected + 1).saturating_sub(visible);
-        Self { first_visible, visible }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// The visible-row window: capped by the list, the row cap and the
     /// window height, and scrolled so the selection is the last row shown.
-    #[test]
-    fn picker_layout_windows_rows_around_the_selection() {
-        let short = PickerLayout::compute(1600, 1000, 2.0, 3, 0);
-        assert_eq!((short.first_visible, short.visible), (0, 3));
-        let long = PickerLayout::compute(1600, 1000, 2.0, 40, 0);
-        assert_eq!(long.first_visible, 0);
-        assert!(long.visible <= MAX_VISIBLE_ROWS && long.visible < 40);
-        let scrolled = PickerLayout::compute(1600, 1000, 2.0, 40, 39);
-        assert_eq!(scrolled.first_visible + scrolled.visible, 40);
-        // A tiny window still shows one row.
-        let tiny = PickerLayout::compute(400, 120, 2.0, 40, 5);
-        assert_eq!(tiny.visible, 1);
-        assert_eq!(tiny.first_visible, 5);
-    }
-
     fn fork_entry(label: &str, from: Option<&str>, scope: ForkScope) -> ForkEntry {
         ForkEntry { label: label.to_string(), from: from.map(str::to_string), path: None, scope }
     }
@@ -650,7 +614,7 @@ mod tests {
             fork_entry("local   tw-term-features", Some("tw-term-features"), ForkScope::Local),
             fork_entry("remote  origin/tw-term-features", Some("origin/tw-term-features"), ForkScope::Remote),
         ];
-        ForkPicker::new(PathBuf::from("/repo"), "repo".into(), entries)
+        ForkPicker::new(PathBuf::from("/repo"), entries)
     }
 
     /// The default fork source is the first row and starts selected, so hitting
@@ -730,7 +694,6 @@ mod tests {
 
     fn sample_profile_picker() -> ProfilePicker {
         ProfilePicker::new(
-            "repo".into(),
             vec![
                 (profile("agent-dev", "claude + sub0 + lciw"), "repo".into()),
                 (profile("review", ""), "user".into()),
