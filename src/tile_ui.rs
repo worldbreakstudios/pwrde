@@ -1,7 +1,8 @@
-//! Tile tab strips as a gpui element tree over the canvas.
+//! Tab strips as a gpui element tree over the canvas: every tile's strip
+//! here, and — through [`tab_strip`] — the flyover panel's in `flyover_ui`.
 //!
-//! The tab pills, titles, × buttons and unread dots of every tile's strip
-//! used to be canvas quads and labels (`Renderer::build_frame`). Only the
+//! The tab pills, titles, × buttons and unread dots used to be canvas quads
+//! and labels (`Renderer::build_frame` / `flyover_overlay`). Only the
 //! *pixels* have moved here: geometry still comes from [`crate::workspace`]
 //! (`layout_tiles` / `tab_strip_rect` / `tile_tab_rect` /
 //! `tile_tab_close_rect`), and every click, drag and drop is still resolved
@@ -41,6 +42,212 @@ const DOT_GAP: f32 = 5.0;
 /// The on-accent ink for the focused pane's active tab.
 const ON_ACCENT_INK: (u8, u8, u8) = (255, 255, 255);
 
+/// The colors a strip paints with — resolved from the terminal scheme the
+/// way the canvas did, so strips stay legible on light palettes.
+pub(crate) struct StripStyle {
+    pub ink: Hsla,
+    pub ink_dim: Hsla,
+    pub pill_rgb: (u8, u8, u8),
+    pub pill_alpha: f32,
+    /// `Some(accent)`: the active tab wears a solid accent pill with
+    /// on-accent ink (a focused tile). `None`: glass, as the flyover does.
+    pub accent: Option<Hsla>,
+    pub unread: Hsla,
+    /// `Some(r)` for a fixed pill radius; `None` for a capsule.
+    pub pill_radius: Option<f32>,
+    /// `Some(r)` for a fixed × chip radius; `None` for a capsule.
+    pub chip_radius: Option<f32>,
+}
+
+impl StripStyle {
+    /// The canvas's scheme mapping: a selected terminal scheme drives the
+    /// ink and pill, the adaptive default keeps the chrome theme's colors
+    /// (`default_pill_alpha` differs between tiles and the flyover).
+    pub(crate) fn from_scheme(th: &crate::theme::Theme, default_pill_alpha: f32) -> Self {
+        let scheme = crate::term_theme::selected(crate::theme::dark_active());
+        let (ink, ink_dim, pill_rgb, pill_alpha) = match scheme {
+            Some(t) => (color(t.fg, 1.0), color(t.fg, 0.55), t.fg, 0.12),
+            None => (
+                color(th.text_bright, 1.0),
+                color(th.text_dim, 1.0),
+                (255, 255, 255),
+                default_pill_alpha,
+            ),
+        };
+        Self {
+            ink,
+            ink_dim,
+            pill_rgb,
+            pill_alpha,
+            accent: None,
+            unread: color(th.accent, 1.0),
+            pill_radius: None,
+            chip_radius: None,
+        }
+    }
+}
+
+/// One tab of a strip: its title and the physical-px rects the canvas laid
+/// it out at (the tab and its × button).
+pub(crate) struct StripTab {
+    pub title: String,
+    pub unread: bool,
+    pub tab: LayoutRect,
+    pub close: LayoutRect,
+}
+
+/// The strip box for `bar` (physical px, converted with `inv`) holding the
+/// tabs: active/hover pills, titles clipped short of ×, unread dots, and the
+/// × with its hover chip. Returns the absolutely positioned, clipped box so
+/// the caller can append controls of its own (the flyover's window buttons)
+/// before mounting it.
+pub(crate) fn tab_strip(
+    bar: &LayoutRect,
+    inv: f32,
+    tabs: &[StripTab],
+    active: usize,
+    hov: &dyn Fn(&LayoutRect) -> bool,
+    style: &StripStyle,
+) -> gpui::Div {
+    let mut strip_el = div()
+        .absolute()
+        .left(px(bar.x * inv))
+        .top(px(bar.y * inv))
+        .w(px(bar.w * inv))
+        .h(px(bar.h * inv))
+        .overflow_hidden();
+
+    for (ti, tab) in tabs.iter().enumerate() {
+        let is_active = ti == active;
+        let close_hov = hov(&tab.close);
+        let tab_hov = hov(&tab.tab) && !close_hov;
+        // Rects relative to the strip box, in logical px.
+        let rel = |r: &LayoutRect| ((r.x - bar.x) * inv, (r.y - bar.y) * inv, r.w * inv, r.h * inv);
+        let (tx, ty, tw, tth) = rel(&tab.tab);
+        let (cx_, cy_, cw, ch) = rel(&tab.close);
+
+        let mut tab_el = div()
+            .absolute()
+            .left(px(tx))
+            .top(px(ty))
+            .w(px(tw))
+            .h(px(tth))
+            .overflow_hidden();
+
+        // Pill: the active tab's (accent when the pane is focused, glass
+        // otherwise), or a half-strength preview on hover.
+        if is_active || tab_hov {
+            let pill_h = (tth - 2.0 * PILL_INSET).max(0.0);
+            let mut pill = div()
+                .absolute()
+                .left(px(PILL_INSET))
+                .top(px(PILL_INSET))
+                .w(px((tw - 2.0 * PILL_INSET).max(0.0)))
+                .h(px(pill_h))
+                .rounded(px(style.pill_radius.unwrap_or(pill_h / 2.0)));
+            pill = match (is_active, style.accent) {
+                (true, Some(accent)) => pill.bg(accent),
+                (true, None) => glass(
+                    pill,
+                    color(style.pill_rgb, style.pill_alpha),
+                    color_alpha(style.ink, 0.18),
+                ),
+                _ => glass(
+                    pill,
+                    color(style.pill_rgb, style.pill_alpha * 0.55),
+                    color_alpha(style.ink, 0.10),
+                ),
+            };
+            tab_el = tab_el.child(pill);
+        }
+
+        // Title (with the unread dot before it), clipped short of ×.
+        let text = if tab.title.is_empty() { "shell".to_string() } else { tab.title.clone() };
+        let text_color = match (is_active, style.accent) {
+            (true, Some(_)) => color(ON_ACCENT_INK, 1.0),
+            (true, None) => style.ink,
+            _ => style.ink_dim,
+        };
+        let mut text_left = TEXT_PAD;
+        if tab.unread {
+            tab_el = tab_el.child(
+                div()
+                    .absolute()
+                    .left(px(text_left))
+                    .top(px(((tth - DOT) / 2.0).round()))
+                    .w(px(DOT))
+                    .h(px(DOT))
+                    .rounded(px(DOT / 2.0))
+                    .bg(style.unread),
+            );
+            text_left += DOT + DOT_GAP;
+        }
+        tab_el = tab_el.child(
+            div()
+                .absolute()
+                .left(px(text_left))
+                .top(px(0.0))
+                .h(px(tth))
+                .w(px((cx_ - tx - text_left).max(0.0)))
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .flex()
+                .items_center()
+                .text_color(text_color)
+                .child(text),
+        );
+
+        // × and its hover chip.
+        let chip_h = (ch - 2.0 * CHIP_INSET).max(0.0);
+        tab_el = tab_el.child(
+            div()
+                .absolute()
+                .left(px(cx_ - tx))
+                .top(px(cy_ - ty))
+                .w(px(cw))
+                .h(px(ch))
+                .when(close_hov, |d| {
+                    d.child(
+                        div()
+                            .absolute()
+                            .left(px(CHIP_INSET))
+                            .top(px(CHIP_INSET))
+                            .w(px((cw - 2.0 * CHIP_INSET).max(0.0)))
+                            .h(px(chip_h))
+                            .rounded(px(style.chip_radius.unwrap_or(chip_h / 2.0)))
+                            .bg(color(style.pill_rgb, (style.pill_alpha * 2.0).min(1.0))),
+                    )
+                })
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(0.0))
+                        .top(px(0.0))
+                        .size_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_color(if close_hov { style.ink } else { style.ink_dim })
+                        .child("×"),
+                ),
+        );
+
+        strip_el = strip_el.child(tab_el);
+    }
+    strip_el
+}
+
+/// A 30% veil over a strip while a canvas modal owns the frame: the canvas
+/// scrim dims the canvas beneath this tree, not this tree.
+pub(crate) fn modal_veil(th: &crate::theme::Theme) -> gpui::Div {
+    div()
+        .absolute()
+        .left(px(0.0))
+        .top(px(0.0))
+        .size_full()
+        .bg(color(th.scrim, 0.30))
+}
+
 impl App {
     /// Every tile's tab strip, or an empty element off the Sessions page.
     pub fn render_tile_chrome(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -64,15 +271,8 @@ impl App {
         let axis_map: HashMap<u64, Option<workspace::Dir>> =
             workspace::tile_collapse_axis(&ws.root).into_iter().collect();
 
-        // Pane chrome follows the terminal scheme so strips stay legible on
-        // light palettes; the adaptive default keeps the chrome theme's ink.
-        let scheme = crate::term_theme::selected(crate::theme::dark_active());
-        let (ink, ink_dim, pill_rgb, pill_alpha) = match scheme {
-            Some(t) => (color(t.fg, 1.0), color(t.fg, 0.55), t.fg, 0.12),
-            None => (color(th.text_bright, 1.0), color(th.text_dim, 1.0), (255, 255, 255), 0.13),
-        };
+        let base = StripStyle::from_scheme(th, 0.13);
         let accent = color(crate::theme::gantry_accent(th.dark), 1.0);
-        let unread = color(th.accent, 1.0);
 
         // Hover in physical px, like the canvas: none while dragging or
         // under a modal.
@@ -111,142 +311,21 @@ impl App {
             let strip = workspace::tab_strip_rect(area, rect, scale, sidebar_w);
             let bar = workspace::tile_tab_bar(&strip, scale);
             let n = tile.tabs.len();
-
-            let mut strip_el = div()
-                .absolute()
-                .left(px(bar.x * inv))
-                .top(px(bar.y * inv))
-                .w(px(bar.w * inv))
-                .h(px(bar.h * inv))
-                .overflow_hidden();
-
-            for (ti, tab) in tile.tabs.iter().enumerate() {
-                let tr = workspace::tile_tab_rect(&strip, ti, n, scale, has_caret);
-                let close = workspace::tile_tab_close_rect(&strip, ti, n, scale, has_caret);
-                let active = ti == tile.active;
-                let close_hov = hov(&close);
-                let tab_hov = hov(&tr) && !close_hov;
-                // Rects relative to the strip box, in logical px.
-                let rel = |r: &LayoutRect| {
-                    ((r.x - bar.x) * inv, (r.y - bar.y) * inv, r.w * inv, r.h * inv)
-                };
-                let (tx, ty, tw, tth) = rel(&tr);
-                let (cx_, cy_, cw, ch) = rel(&close);
-
-                let mut tab_el = div()
-                    .absolute()
-                    .left(px(tx))
-                    .top(px(ty))
-                    .w(px(tw))
-                    .h(px(tth))
-                    .overflow_hidden();
-
-                // Pill: the active tab's (accent when the pane is focused,
-                // glass otherwise), or a half-strength preview on hover.
-                if active || tab_hov {
-                    let pill_h = (tth - 2.0 * PILL_INSET).max(0.0);
-                    let mut pill = div()
-                        .absolute()
-                        .left(px(PILL_INSET))
-                        .top(px(PILL_INSET))
-                        .w(px((tw - 2.0 * PILL_INSET).max(0.0)))
-                        .h(px(pill_h))
-                        .rounded(px(pill_h / 2.0));
-                    pill = if active && focused {
-                        pill.bg(accent)
-                    } else if active {
-                        glass(pill, color(pill_rgb, pill_alpha), color_alpha(ink, 0.18))
-                    } else {
-                        glass(pill, color(pill_rgb, pill_alpha * 0.55), color_alpha(ink, 0.10))
-                    };
-                    tab_el = tab_el.child(pill);
-                }
-
-                // Title (with the unread dot before it), clipped short of ×.
-                let title = tab.session.title();
-                let text = if title.is_empty() { "shell".to_string() } else { title };
-                let text_color = match (active, focused) {
-                    (true, true) => color(ON_ACCENT_INK, 1.0),
-                    (true, false) => ink,
-                    _ => ink_dim,
-                };
-                let mut text_left = TEXT_PAD;
-                if tab.unread {
-                    tab_el = tab_el.child(
-                        div()
-                            .absolute()
-                            .left(px(text_left))
-                            .top(px(((tth - DOT) / 2.0).round()))
-                            .w(px(DOT))
-                            .h(px(DOT))
-                            .rounded(px(DOT / 2.0))
-                            .bg(unread),
-                    );
-                    text_left += DOT + DOT_GAP;
-                }
-                tab_el = tab_el.child(
-                    div()
-                        .absolute()
-                        .left(px(text_left))
-                        .top(px(0.0))
-                        .h(px(tth))
-                        .w(px((cx_ - tx - text_left).max(0.0)))
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .flex()
-                        .items_center()
-                        .text_color(text_color)
-                        .child(text),
-                );
-
-                // × and its hover chip.
-                tab_el = tab_el.child(
-                    div()
-                        .absolute()
-                        .left(px(cx_ - tx))
-                        .top(px(cy_ - ty))
-                        .w(px(cw))
-                        .h(px(ch))
-                        .when(close_hov, |d| {
-                            d.child(
-                                div()
-                                    .absolute()
-                                    .left(px(CHIP_INSET))
-                                    .top(px(CHIP_INSET))
-                                    .w(px((cw - 2.0 * CHIP_INSET).max(0.0)))
-                                    .h(px((ch - 2.0 * CHIP_INSET).max(0.0)))
-                                    .rounded(px((ch - 2.0 * CHIP_INSET).max(0.0) / 2.0))
-                                    .bg(color(pill_rgb, (pill_alpha * 2.0).min(1.0))),
-                            )
-                        })
-                        .child(
-                            div()
-                                .absolute()
-                                .left(px(0.0))
-                                .top(px(0.0))
-                                .size_full()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .text_color(if close_hov { ink } else { ink_dim })
-                                .child("×"),
-                        ),
-                );
-
-                strip_el = strip_el.child(tab_el);
-            }
-
-            // A canvas modal scrims the canvas beneath this tree, not this
-            // tree: veil the strip the same 30% so it dims with the rest.
+            let tabs: Vec<StripTab> = tile
+                .tabs
+                .iter()
+                .enumerate()
+                .map(|(ti, tab)| StripTab {
+                    title: tab.session.title(),
+                    unread: tab.unread,
+                    tab: workspace::tile_tab_rect(&strip, ti, n, scale, has_caret),
+                    close: workspace::tile_tab_close_rect(&strip, ti, n, scale, has_caret),
+                })
+                .collect();
+            let style = StripStyle { accent: focused.then_some(accent), ..base };
+            let mut strip_el = tab_strip(&bar, inv, &tabs, tile.active, &hov, &style);
             if modal {
-                strip_el = strip_el.child(
-                    div()
-                        .absolute()
-                        .left(px(0.0))
-                        .top(px(0.0))
-                        .size_full()
-                        .bg(color(th.scrim, 0.30)),
-                );
+                strip_el = strip_el.child(modal_veil(th));
             }
             layer = layer.child(strip_el);
         }
