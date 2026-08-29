@@ -217,9 +217,6 @@ pub struct SaveModalView<'a> {
 /// inline editors ever reach the canvas.
 pub struct ChromeState<'a> {
     pub page: Page,
-    /// Whether the experimental `features.notes` flag is on. Gates the Notes
-    /// page out of the dot strip entirely when off.
-    pub notes_enabled: bool,
     /// Tools registered for this page/group, in ribbon slot order (resolved
     /// by `App::tools_for`). Empty hides the ribbon and its inset entirely.
     pub ribbon_tools: &'a [pages::Tool],
@@ -591,50 +588,15 @@ impl Renderer {
         // ── Sidebar chrome (identical geometry on every page) ──────────
         // The window gradient is painted by `main.rs` before these quads;
         // the sidebar itself is transparent — its rounded rows float on it.
-        // `sidebar_w == 0.0` means collapsed: skip all of it (the empty-state
-        // CTA still paints — it is positioned off `terminal_area`).
-        let collapsed = sidebar_w == 0.0;
         let row_r = (ROW_RADIUS * self.scale).round();
         // Traffic lights are the native macOS buttons now (transparent titlebar),
         // so we no longer draw our own here.
         match chrome.page {
             // The Pull Requests page shares the Sessions sidebar (its list is
             // scoped to the active group's repo, so group switching applies).
-            Page::Sessions | Page::PullRequests => {
-                if empty {
-                    // Empty state: a centered CTA in the terminal area. The
-                    // sidebar itself (rows, sections, header buttons) is a
-                    // gpui element tree now — see `sidebar_ui::render_sidebar`.
-                    let cta = workspace::empty_state_cta(width, height, self.scale, sidebar_w, right_w);
-                    let hint = workspace::empty_state_hint(width, height, self.scale, sidebar_w, right_w);
-                    let hov = hover(cur, &cta);
-                    bg_quads.push(
-                        self.pill(&cta, th, if hov { 0.85 } else { 0.62 }, row_r)
-                            .shadow(Shadow::Soft),
-                    );
-                    hot.push(cta);
-                    let cta_text = "New group";
-                    let cta_w = cta_text.chars().count() as f32 * self.chrome_cell_width;
-                    labels.push(LabelSpec {
-                        text: cta_text.into(),
-                        color: color(th.ink, 1.0),
-                        left: (cta.x + ((cta.w - cta_w) / 2.0).max(0.0)).round(),
-                        top: (cta.y + (cta.h - self.chrome_cell_height) / 2.0).round(),
-                        clip: cta,
-                        size: None,
-                    });
-                    let hint_text = "press ⇧⌘T";
-                    let hint_w = hint_text.chars().count() as f32 * self.chrome_cell_width;
-                    labels.push(LabelSpec {
-                        text: hint_text.into(),
-                        color: color(th.ink_dim, 0.9),
-                        left: (hint.x + ((hint.w - hint_w) / 2.0).max(0.0)).round(),
-                        top: (hint.y + (hint.h - self.chrome_cell_height) / 2.0).round(),
-                        clip: hint,
-                        size: None,
-                    });
-                }
-            },
+            // The Sessions/PR empty state (centered "New group" pill + hint)
+            // is an element tree now — see `sidebar_ui::render_empty_state`.
+            Page::Sessions | Page::PullRequests => {}
             // Every other page's sidebar rows live in the element tree now
             // (`sidebar_ui::render_sidebar`), so the canvas paints nothing
             // for them here — only the page-dot strip below.
@@ -642,20 +604,8 @@ impl Renderer {
         }
 
         // ── Page-dot strip (bottom of the sidebar, every page) ─────────
-        // The dots themselves are painted by the element tree now
-        // (`sidebar_ui::page_dot_layer`), which would occlude anything the
-        // canvas drew here anyway. What stays is the *hit* registration: the
-        // slots are still interactive rects, so they belong in `hot` for the
-        // pointing-hand cursor, and `main.rs::page_slot_at` still resolves
-        // the click. Flag-gated pages (Notes) drop out of the strip entirely
-        // so the slots stay contiguous with what the element tree paints.
-        if !collapsed {
-            let pages = Page::visible(chrome.notes_enabled);
-            let n_pages = pages.len();
-            for i in 0..n_pages {
-                hot.push(workspace::page_slot_rect(i, n_pages, height, self.scale, sidebar_w));
-            }
-        }
+        // Painted *and* clicked by the element tree now
+        // (`sidebar_ui::page_dot_layer`); the canvas registers nothing here.
 
         let card_r = (CARD_RADIUS * self.scale).round();
 
@@ -1937,8 +1887,11 @@ impl Renderer {
             });
         }
 
-        // Minimize / maximize buttons at the bar's right edge.
-        if show_window_buttons {
+        // Minimize / maximize buttons at the bar's right edge. `draw_cursor`
+        // is the interactivity gate (false while a modal overlay owns the
+        // frame), so the inert controls must not paint there — otherwise a
+        // picker would float over decoy window buttons.
+        if show_window_buttons && draw_cursor {
             let bar_h = tab_bar.h;
             for (rect, glyph) in [
                 (crate::workspace::flyover_minimize_rect(panel_rect, scale), "–"),
@@ -2394,7 +2347,6 @@ mod tests {
     fn cleanup_chrome() -> ChromeState<'static> {
         ChromeState {
             page: Page::Cleanup,
-            notes_enabled: false,
             ribbon_tools: &[],
             open_tool: None,
             tool_panel_w: 0.0,
@@ -2552,9 +2504,11 @@ mod tests {
         let mut chrome = cleanup_chrome();
         chrome.page = Page::Sessions;
         let sidebar_w = 240.0;
+        // A real tab, so the tile's tab strip is chrome the canvas still
+        // hit-tests (the empty state and page dots are element-owned now).
         let wss = [crate::workspace::Workspace::new(
             "g".into(),
-            crate::workspace::Tile::empty(1),
+            crate::workspace::Tile::new(1, crate::term::Session::placeholder()),
             None,
         )];
 
@@ -2584,7 +2538,9 @@ mod tests {
     }
 
     /// Hovering a flyover tab's × registers it hot and paints the chip; with
-    /// no cursor the strip stays in its resting style.
+    /// no cursor the strip stays in its resting style. While a modal overlay
+    /// owns the frame (`draw_cursor == false`) the inert window buttons must
+    /// drop out of the hot list entirely.
     #[test]
     fn flyover_close_hover_paints_chip_and_registers_hot() {
         let scale = 2.0;
@@ -2595,7 +2551,7 @@ mod tests {
 
         let mut hot = Vec::new();
         let (resting_quads, ..) = renderer
-            .flyover_overlay(&tabs, 0, &panel, true, false, true, false, None, &mut hot);
+            .flyover_overlay(&tabs, 0, &panel, true, true, true, false, None, &mut hot);
         // Tab, its ×, and the two window buttons are all interactive.
         assert_eq!(hot.len(), 4, "tab + close + minimize + maximize are hot");
         assert!(hot.iter().any(|r| r.x == close.x && r.y == close.y));
@@ -2603,12 +2559,25 @@ mod tests {
         let cursor = Some((close.x + close.w / 2.0, close.y + close.h / 2.0));
         let mut hot2 = Vec::new();
         let (hovered_quads, ..) = renderer
-            .flyover_overlay(&tabs, 0, &panel, true, false, true, false, cursor, &mut hot2);
+            .flyover_overlay(&tabs, 0, &panel, true, true, true, false, cursor, &mut hot2);
         assert_eq!(
             hovered_quads.len(),
             resting_quads.len() + 1,
             "hovering the × adds exactly the chip quad"
         );
+
+        // A modal overlay owns the frame: minimize/maximize become inert and
+        // must not register as clickable above the overlay.
+        let mut hot3 = Vec::new();
+        renderer
+            .flyover_overlay(&tabs, 0, &panel, true, false, true, false, None, &mut hot3);
+        assert_eq!(
+            hot3.len(),
+            2,
+            "overlay-open frame keeps only tab + close hot"
+        );
+        let minr = crate::workspace::flyover_minimize_rect(&panel, scale);
+        assert!(!hot3.iter().any(|r| r.x == minr.x && r.y == minr.y));
     }
 
 
