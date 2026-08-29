@@ -321,8 +321,31 @@ impl App {
             let axis = axis_map.get(id).copied().flatten();
             let has_caret = axis.is_some();
             let collapsing = has_caret && (tile.collapsed || tile.collapse_anim > 0.0);
-            // A sideways strip shows only its caret, which stays on the canvas.
+            let tile_id = *id;
+            // A sideways strip shows only its caret (canvas-painted); the
+            // whole bare card is one press target that expands it.
             if axis == Some(workspace::Dir::Row) && collapsing {
+                if tile.collapsed {
+                    let entity = entity.clone();
+                    layer = layer.child(
+                        div()
+                            .absolute()
+                            .left(px(rect.x * inv))
+                            .top(px(rect.y * inv))
+                            .w(px(rect.w * inv))
+                            .h(px(rect.h * inv))
+                            .on_mouse_down(MouseButton::Left, move |ev: &MouseDownEvent, _win: &mut Window, app: &mut GpuiApp| {
+                                app.stop_propagation();
+                                if let Some(entity) = entity.upgrade() {
+                                    entity.update(app, |this, cx| {
+                                        this.note_pointer(ev);
+                                        this.press_tile_expand(tile_id);
+                                        cx.notify();
+                                    });
+                                }
+                            }),
+                    );
+                }
                 continue;
             }
             let focused = ws.focused_tile == *id;
@@ -341,11 +364,10 @@ impl App {
                 })
                 .collect();
             let style = StripStyle { accent: focused.then_some(accent), ..base.clone() };
-            let tile_id = *id;
-            let entity = entity.clone();
+            let press_entity = entity.clone();
             let on_press: PressHandler = Rc::new(move |ti, close, ev, app| {
                 app.stop_propagation();
-                if let Some(entity) = entity.upgrade() {
+                if let Some(entity) = press_entity.upgrade() {
                     entity.update(app, |this, cx| {
                         this.note_pointer(ev);
                         this.press_tile_tab(tile_id, ti, close, ev.click_count);
@@ -354,6 +376,30 @@ impl App {
                 }
             });
             let mut strip_el = tab_strip(&bar, inv, &tabs, tile.active, &hov, &style, on_press);
+            // The collapse caret: canvas-painted (a rotating chevron), but its
+            // press is an element target at the same square.
+            if has_caret {
+                let cr = workspace::tile_caret_rect(rect, scale);
+                let entity = entity.clone();
+                strip_el = strip_el.child(
+                    div()
+                        .absolute()
+                        .left(px((cr.x - bar.x) * inv))
+                        .top(px((cr.y - bar.y) * inv))
+                        .w(px(cr.w * inv))
+                        .h(px(cr.h * inv))
+                        .on_mouse_down(MouseButton::Left, move |ev: &MouseDownEvent, _win: &mut Window, app: &mut GpuiApp| {
+                            app.stop_propagation();
+                            if let Some(entity) = entity.upgrade() {
+                                entity.update(app, |this, cx| {
+                                    this.note_pointer(ev);
+                                    this.press_tile_caret(tile_id, ev.click_count);
+                                    cx.notify();
+                                });
+                            }
+                        }),
+                );
+            }
             if modal {
                 strip_el = strip_el.child(modal_veil(th));
             }
