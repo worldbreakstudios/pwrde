@@ -365,6 +365,11 @@ struct App {
     /// rcn Input entity for the Settings → Sessions primary-command row,
     /// created at App construction and seeded from settings.
     command_input: gpui::Entity<crate::ui::Input>,
+    /// The Settings sidebar's search field: a real rcn text input. Its text
+    /// is mirrored into `settings_query` (an observer keeps them in step) so
+    /// gpui-free readers keep working, and its focus is reflected into
+    /// `settings_search_focus` once per render.
+    settings_search: gpui::Entity<crate::ui::Input>,
     /// Search query in the Settings sidebar search box.
     settings_query: String,
     /// Whether the Settings sidebar search box has keyboard focus.
@@ -3280,23 +3285,11 @@ impl App {
             // click targets now (`sidebar_ui::page_dot_layer`), which occlude
             // the canvas, so nothing to resolve here.
             if self.page == Page::Settings {
-                // Search box in the top slot; sections in the rows below it.
-                if workspace::settings_search_rect(scale, self.sidebar_w()).contains(px, py) {
-                    self.settings_search_focus = true;
-                    self.recording = None;
-                    self.request_redraw();
-                    return;
-                }
-                self.settings_search_focus = false;
-                for (i, section) in Section::ALL.iter().enumerate() {
-                    if workspace::tab_rect(i + 1, scale, self.sidebar_w()).contains(px, py) {
-                        self.section = *section;
-                        self.settings_query.clear();
-                        self.recording = None;
-                        self.request_redraw();
-                        return;
-                    }
-                }
+                // The search field and the section rows are element click
+                // targets now (`sidebar_ui::settings_row_layer`), occluding
+                // the canvas; a click anywhere else in the sidebar only blurs
+                // the search field, as it always did.
+                self.blur_settings_search(window, cx);
                 return;
             }
             if self.page == Page::Notes {
@@ -4244,6 +4237,19 @@ impl App {
     /// Keyboard routing while the Settings page is up. A recording keyboard
     /// row captures the next ⌘ chord as its new binding; otherwise ⌘
     /// shortcuts still dispatch and plain typing is swallowed.
+    /// Empty the Settings search field (entity and mirror together).
+    pub(crate) fn clear_settings_search(&mut self, cx: &mut Context<Self>) {
+        self.settings_query.clear();
+        self.settings_search.update(cx, |input, cx| input.set_text("", cx));
+    }
+
+    /// Move keyboard focus off the Settings search field, if it has it.
+    pub(crate) fn blur_settings_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings_search.read(cx).focus_handle(cx).is_focused(window) {
+            window.focus(&self.focus_handle, cx);
+        }
+    }
+
     fn handle_settings_key(
         &mut self,
         ev: &KeyDownEvent,
@@ -4255,35 +4261,22 @@ impl App {
         // over a still-focused primary-command Input (clicking the search box
         // doesn't blur the Input's own focus handle), so typing can't land in
         // both.
-        if self.settings_search_focus {
-            if self.command_input.read(cx).focus_handle(cx).is_focused(window) {
-                window.focus(&self.focus_handle, cx);
-            }
+        if self.settings_search.read(cx).focus_handle(cx).is_focused(window) {
+            // The rcn Input owns editing (chars, backspace, selection,
+            // clipboard); only the two commands are handled here.
             match ev.keystroke.key.as_str() {
                 "escape" => {
-                    self.settings_query.clear();
-                    self.settings_search_focus = false;
+                    self.clear_settings_search(cx);
+                    window.focus(&self.focus_handle, cx);
                 },
                 "enter" => {
                     if let Some(entry) = pages::search_settings(&self.settings_query).first() {
                         self.section = entry.section;
                     }
-                    self.settings_query.clear();
-                    self.settings_search_focus = false;
+                    self.clear_settings_search(cx);
+                    window.focus(&self.focus_handle, cx);
                 },
-                "backspace" => {
-                    self.settings_query.pop();
-                },
-                _ => {
-                    if !ev.keystroke.modifiers.control
-                        && !ev.keystroke.modifiers.platform
-                        && let Some(text) = ev.keystroke.key_char.as_deref()
-                    {
-                        for ch in text.chars().filter(|c| !c.is_control()) {
-                            self.settings_query.push(ch);
-                        }
-                    }
-                },
+                _ => {},
             }
             self.request_redraw();
             return;
@@ -5523,7 +5516,22 @@ fn key_to_bytes(ks: &Keystroke) -> Option<Vec<u8>> {
 // ── gpui Render / Element wiring ──────────────────────────────────────────
 
 impl Render for App {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Settings search field: focus lives in the window, so reflect it
+        // into the flag the sidebar styles from, and drop it (and any stale
+        // query) the moment the field is off screen — leaving Settings must
+        // not leave a hidden field eating keystrokes.
+        let search_focused = self.settings_search.read(cx).focus_handle(cx).is_focused(window);
+        if self.page != Page::Settings {
+            if search_focused {
+                window.focus(&self.focus_handle, cx);
+            }
+            if !self.settings_search.read(cx).text().is_empty() {
+                self.clear_settings_search(cx);
+            }
+        }
+        self.settings_search_focus = self.page == Page::Settings && search_focused;
+
         // A full-window canvas element that paints the terminal frame.
         let view = cx.entity();
         div()
@@ -6883,6 +6891,24 @@ fn main() {
                             })
                         },
                         settings_query: String::new(),
+                        settings_search: {
+                            let input = cx.new(|cx| {
+                                let mut input = crate::ui::Input::new(cx);
+                                input.set_bare(true);
+                                input.placeholder(sidebar_ui::SEARCH_SETTINGS_PLACEHOLDER);
+                                input
+                            });
+                            cx.observe(&input, |this: &mut App, input, cx| {
+                                let text = input.read(cx).text().to_string();
+                                if this.settings_query != text {
+                                    this.settings_query = text;
+                                    this.request_redraw();
+                                    cx.notify();
+                                }
+                            })
+                            .detach();
+                            input
+                        },
                         settings_search_focus: false,
                         editing_section: None,
                         // Single focus handle, minted once; focused below.

@@ -8,6 +8,9 @@
 //! Unlike the RenderOnce components, `Input` is an entity — create it with
 //! `cx.new(|cx| Input::new(cx))`, render the `Entity<Input>` directly, and
 //! call [`Input::register_key_bindings`] once at app startup.
+//!
+//! Local addition: [`Input::set_text_size`] overrides the 14px type size so
+//! a bare field can sit inside a sidebar row at the row's text size.
 
 use std::ops::Range;
 
@@ -49,6 +52,9 @@ pub struct Input {
     /// Render without the input chrome (border/height/padding) so wrappers
     /// like Textarea and InputGroup can supply their own shell.
     bare: bool,
+    /// Local addition: override the shadcn `text-sm` (14px) type size, so a
+    /// bare input can match the text of the row it is embedded in.
+    text_size: Option<Pixels>,
     selected_range: Range<usize>,
     selection_reversed: bool,
     marked_range: Option<Range<usize>>,
@@ -65,6 +71,7 @@ impl Input {
             placeholder: "".into(),
             disabled: false,
             bare: false,
+            text_size: None,
             selected_range: 0..0,
             selection_reversed: false,
             marked_range: None,
@@ -104,6 +111,13 @@ impl Input {
 
     pub fn set_bare(&mut self, bare: bool) {
         self.bare = bare;
+    }
+
+    /// Local addition: use `size` instead of the default 14px type size
+    /// (`None` restores the default). Does not notify — call it from a
+    /// render pass or before the field is shown.
+    pub fn set_text_size(&mut self, size: Option<Pixels>) {
+        self.text_size = size;
     }
 
     pub fn text(&self) -> &str {
@@ -678,7 +692,7 @@ impl Render for Input {
             .flex_row()
             .items_center()
             .w_full()
-            .text_size(px(14.))
+            .text_size(self.text_size.unwrap_or(px(14.)))
             .line_height(px(20.))
             .text_color(theme.foreground)
             .when(!self.bare, |el| {
