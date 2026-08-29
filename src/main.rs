@@ -3113,12 +3113,10 @@ impl App {
             return;
         }
 
-        // Collapsed sidebar: the traffic-light corner (which the top-left
-        // tile's tab strip cedes via `tab_strip_rect`) drags the window.
-        if self.sidebar_collapsed && workspace::collapsed_drag_zone(scale).contains(px, py) {
-            window.start_window_move();
-            return;
-        }
+        // Window drags (the titlebar strip, or the traffic-light corner
+        // while the sidebar is folded) start from an element now
+        // (`sidebar_ui::render_window_drag_zones`), which stops the press,
+        // so nothing reaches here from those regions.
 
         // Tool ribbon / panel (right edge, pages/groups with registered
         // tools). Panel edge resizes, ribbon slots toggle their tool; both
@@ -3185,14 +3183,6 @@ impl App {
             // (`sidebar_ui::header_chips`), so a press that reaches here is
             // never on one of them. (Sections are made by dragging one group
             // onto another, not by a button.)
-            // Window-drag is scoped to the titlebar strip ONLY so that clicks on
-            // tile tab strips are never treated as a window move.
-            if workspace::titlebar(scale, self.sidebar_w()).contains(px, py) {
-                // Native traffic-light buttons handle their own clicks; a press
-                // anywhere else in the strip drags the window (we own the drag).
-                window.start_window_move();
-                return;
-            }
             // Page-dot strip at the sidebar's bottom: the slots are element
             // click targets now (`sidebar_ui::page_dot_layer`), which occlude
             // the canvas, so nothing to resolve here.
@@ -5486,6 +5476,9 @@ impl Render for App {
             // so the canvas underneath keeps resolving every click and drag.
             // Returns an empty element when collapsed or on the canvas-sidebar
             // pages.
+            // Window-drag region (titlebar strip / folded traffic-light
+            // corner): an element that starts the native window move.
+            .child(self.render_window_drag_zones())
             // Tile tab strips: pixels on the element tree, clipped per
             // strip; clicks and drags still resolve on the canvas rects.
             .child(self.render_tile_chrome(cx))
