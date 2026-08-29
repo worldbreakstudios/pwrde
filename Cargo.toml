@@ -4,16 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-glyphon = "0.12.0"
-wgpu = "30.0.0"
-winit = "0.30.13"
-pollster = "0.4"
-portable-pty = "0.9.0"
 # wezterm-term isn't published to crates.io; pull it (and termwiz, so the
 # cell/color types are the same version) from the wezterm repo.
 wezterm-term = { git = "https://github.com/wezterm/wezterm", branch = "main" }
 termwiz = { git = "https://github.com/wezterm/wezterm", branch = "main" }
-bytemuck = { version = "1.25.2", features = ["derive"] }
 # gpui — Zed's UI framework — is the sole renderer + windowing layer. Not on
 # crates.io; pull it from the zed repo pinned to a rev for reproducibility.
 # NB: no `rev` here on purpose. gpui-component depends on gpui with a *bare*
@@ -25,24 +19,9 @@ bytemuck = { version = "1.25.2", features = ["derive"] }
 # gpui API still matches this codebase). Re-pin with:
 #   cargo update -p gpui --precise <sha> && cargo update -p gpui_platform --precise <sha>
 gpui = { git = "https://github.com/zed-industries/zed", package = "gpui" }
-# The platform layer was split into gpui_platform; current_platform() builds the
-# real macOS platform to hand to Application::with_platform (as in zed's own main).
-# `font-kit` is REQUIRED: without it gpui_macos installs gpui::NoopTextSystem and
-# NO glyphs render (quads still do). With it we get the real CoreText MacTextSystem.
-gpui_platform = { git = "https://github.com/zed-industries/zed", package = "gpui_platform", features = ["font-kit"] }
-arboard = "3.6.1"
-# Both already in gpui's dependency tree at these versions; used to reach the
-# NSWindow and hide AppKit's titlebar top-highlight hairline (see main.rs).
-# `localtime_r`, for the sidebar's Messages-style day buckets: they are
-# wall-clock ideas, so a UTC-only day boundary would misfile an evening stamp
-# as `Yesterday` west of Greenwich. Already in gpui's tree at this version.
-libc = "0.2"
-objc = "0.2"
-raw-window-handle = "0.6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dirs = "6"
-rusqlite = { version = "0.32", features = ["bundled"] }
 unicode-segmentation = "1"
 # Syntax highlighting for the PR / local-diff viewers. Pure-Rust regex engine
 # (fancy-regex) so there's no C `onig` build under sccache; `default-fancy`
@@ -60,6 +39,36 @@ pulldown-cmark = { version = "0.12", default-features = false }
 # the whole graph resolves to ONE gpui — otherwise gpui's Window/App types would
 # not unify across the crate boundary and nothing would compile.
 gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "f3ba893bd6a996ab0699266ba774b5bbb7f0ca1c" }
+
+# Native-only. The wasm32 build under `web/` compiles this library without
+# these — it brings its own gpui platform (gpui_web) and, for now, stubs the
+# rest (see `docs/web-build.md` for what each is replaced with):
+#   gpui_platform  — current_platform() for the macOS window (`app::run_native`).
+#                    `font-kit` is REQUIRED: without it gpui_macos installs
+#                    gpui::NoopTextSystem and NO glyphs render (quads still do).
+#   portable-pty   — the kernel PTY behind every `term::Session`.
+#   arboard        — system clipboard (`clipboard` module).
+#   rusqlite       — session persistence (`persist` module).
+#   libc           — `localtime_r` for the sidebar's wall-clock day buckets.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+gpui_platform = { git = "https://github.com/zed-industries/zed", package = "gpui_platform", features = ["font-kit"] }
+portable-pty = "0.9.0"
+arboard = "3.6.1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+libc = "0.2"
+
+# Both already in gpui's dependency tree at these versions; used to reach the
+# NSWindow and hide AppKit's titlebar top-highlight hairline (see app.rs).
+[target.'cfg(target_os = "macos")'.dependencies]
+objc = "0.2"
+raw-window-handle = "0.6"
+
+# wasm32-unknown-unknown has no ambient randomness: crates deep in the wezterm
+# tree (uuid via wezterm-blob-leases) need the browser backend named here, and
+# `web/.cargo/config.toml` sets the matching `--cfg getrandom_backend="wasm_js"`.
+[target.'cfg(target_family = "wasm")'.dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }
+uuid = { version = "1", features = ["js"] }
 
 # objc 0.2's msg_send! probes `feature = "cargo-clippy"` inside its expansion,
 # which rustc's check-cfg would flag at every call site. Registering the value

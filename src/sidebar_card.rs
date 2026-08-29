@@ -104,6 +104,7 @@ fn epoch_seconds(t: SystemTime) -> i64 {
 /// `localtime_r` rather than a fixed offset because `tm_gmtoff` already folds
 /// in whichever DST rule was in force *at that instant* — a card stamped in
 /// July still buckets correctly when read in December.
+#[cfg(not(target_family = "wasm"))]
 fn local_offset(t: SystemTime) -> i64 {
     let clock = epoch_seconds(t) as libc::time_t;
     // SAFETY: `localtime_r` writes through the out-pointer and reads nothing
@@ -116,6 +117,13 @@ fn local_offset(t: SystemTime) -> i64 {
         }
         tm.tm_gmtoff as i64
     }
+}
+
+/// wasm32 has no `localtime_r`; buckets fall back to UTC until the web entry
+/// point supplies the browser's timezone offset.
+#[cfg(target_family = "wasm")]
+fn local_offset(_t: SystemTime) -> i64 {
+    0
 }
 
 /// Days since 1970-01-01 *in local time*, flooring so pre-epoch instants keep

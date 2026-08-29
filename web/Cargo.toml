@@ -1,0 +1,61 @@
+# Standalone workspace: the wasm build needs nightly + atomics rustflags +
+# build-std (see .cargo/config.toml here), which must not leak into the native
+# macOS build of the parent workspace. Mirrors gpui_web's hello_web example and
+# rcn's web/ storybook. Build and serve with `trunk serve` from this directory;
+# `scripts/web-screenshot.sh` drives it headlessly.
+[workspace]
+
+[package]
+name = "pwrde-web"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Boot-path smoke test: gpui's web platform + the pwrde library (chrome theme
+# and rcn components). Booting the full `App` follows — see docs/web-build.md.
+[[bin]]
+name = "pwrde-web"
+path = "main.rs"
+
+[dependencies]
+pwrde = { path = ".." }
+# Bare specs on purpose, like the parent crate: a `rev` here would be a
+# different SourceId from pwrde's own gpui dep and give two incompatible gpui
+# copies. Cargo.lock pins the rev.
+gpui = { git = "https://github.com/zed-industries/zed", package = "gpui" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", package = "gpui_platform" }
+web-sys = { version = "0.3", features = ["Location", "Window"] }
+
+# This workspace has its own Cargo.lock, seeded from the parent's so zed (and
+# wezterm) resolve to the same revs; it is committed. Re-pin the same way as
+# the parent: `cargo update -p gpui --precise <sha>` here too.
+
+# wezterm's terminal crates need four small cfg fixes to compile for wasm32
+# (web/patches/wezterm-wasm.patch). Every wezterm workspace crate in the graph
+# is redirected together so the whole tree stays one consistent rev; the fork
+# branch is upstream fe3006aefcdc4c22924e7bce966b2c430dade4f1 + the patch. Create it with
+# `scripts/web-wezterm-fork.sh`.
+[patch."https://github.com/wezterm/wezterm"]
+termwiz = { git = "https://github.com/a1re1/wezterm", branch = "pwrde-wasm-patches" }
+vtparse = { git = "https://github.com/a1re1/wezterm", branch = "pwrde-wasm-patches" }
+wezterm-bidi = { git = "https://github.com/a1re1/wezterm", branch = "pwrde-wasm-patches" }
+wezterm-blob-leases = { git = "https://github.com/a1re1/wezterm", branch = "pwrde-wasm-patches" }
+wezterm-cell = { git = "https://github.com/a1re1/wezterm", branch = "pwrde-wasm-patches" }
+wezterm-char-props = { git = "https://github.com/a1re1/wezterm", branch = "pwrde-wasm-patches" }
+wezterm-color-types = { git = "https://github.com/a1re1/wezterm", branch = "pwrde-wasm-patches" }
+wezterm-dynamic = { git = "https://github.com/a1re1/wezterm", branch = "pwrde-wasm-patches" }
+wezterm-dynamic-derive = { git = "https://github.com/a1re1/wezterm", branch = "pwrde-wasm-patches" }
+wezterm-escape-parser = { git = "https://github.com/a1re1/wezterm", branch = "pwrde-wasm-patches" }
+wezterm-input-types = { git = "https://github.com/a1re1/wezterm", branch = "pwrde-wasm-patches" }
+wezterm-surface = { git = "https://github.com/a1re1/wezterm", branch = "pwrde-wasm-patches" }
+wezterm-term = { git = "https://github.com/a1re1/wezterm", branch = "pwrde-wasm-patches" }
+
+# Dependencies are optimized even in dev so the page is usable while iterating
+# (same policy as the parent workspace).
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3

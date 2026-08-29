@@ -12,6 +12,7 @@
 //! (duplicate-column errors are ignored) plus a `sections` table for collapsible
 //! sidebar groups.
 
+#[cfg(not(target_family = "wasm"))]
 use rusqlite::{Connection, Result as SqlResult};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -82,6 +83,7 @@ pub fn db_path_in(data_dir: &Path, scope: Option<&str>) -> PathBuf {
 
 /// Location of the persisted DB: `<data_dir>/pwrde/state.db`, or
 /// `<data_dir>/pwrde/worktrees/<slug>/state.db` when launched from a linked worktree.
+#[cfg(not(target_family = "wasm"))]
 fn db_path() -> Option<PathBuf> {
     let data_dir = dirs::data_dir()?;
     let scope = crate::git::worktree_scope();
@@ -89,6 +91,7 @@ fn db_path() -> Option<PathBuf> {
 }
 
 /// Open the DB at `path`, creating tables if needed. Never panics on corrupt DB.
+#[cfg(not(target_family = "wasm"))]
 fn open_db(path: &Path) -> SqlResult<Connection> {
     // Create parent directory if missing
     if let Some(dir) = path.parent() {
@@ -149,6 +152,7 @@ fn open_db(path: &Path) -> SqlResult<Connection> {
 
 /// Save a snapshot to the DB, rewriting all groups and sections in one transaction.
 /// Returns Ok(()) on success, Err on DB failure. Never panics.
+#[cfg(not(target_family = "wasm"))]
 pub fn save_snapshot(
     groups: &[SavedGroup],
     sections: &[SavedSection],
@@ -222,6 +226,7 @@ pub fn save_snapshot(
 
 /// Load the snapshot from the DB, returning saved groups and sections.
 /// Returns empty vectors on missing/corrupt DB. Never panics.
+#[cfg(not(target_family = "wasm"))]
 pub fn load_snapshot(path: &Path) -> (Vec<SavedGroup>, Vec<SavedSection>) {
     let conn = match open_db(path) {
         Ok(c) => c,
@@ -236,6 +241,7 @@ pub fn load_snapshot(path: &Path) -> (Vec<SavedGroup>, Vec<SavedSection>) {
     (groups, sections)
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn load_sections(conn: &Connection) -> Vec<SavedSection> {
     let mut stmt = match conn.prepare(
         "SELECT id, position, name, emoji, collapsed, anchor_tile FROM sections ORDER BY position",
@@ -274,6 +280,7 @@ fn load_sections(conn: &Connection) -> Vec<SavedSection> {
     sections
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn load_groups(conn: &Connection) -> Vec<SavedGroup> {
     let mut stmt = match conn.prepare(
         "SELECT id, position, name, cwd, focused_tile, layout, section_id, pinned
@@ -483,6 +490,7 @@ fn node_to_layout_rec(node: &crate::workspace::Node, tabs: &mut Vec<SavedTab>) -
 }
 
 /// Public API using the default DB path.
+#[cfg(not(target_family = "wasm"))]
 pub fn save_snapshot_default(
     groups: &[SavedGroup],
     sections: &[SavedSection],
@@ -496,7 +504,18 @@ pub fn save_snapshot_default(
     }
 }
 
+/// wasm32 has no SQLite (and no data dir): nothing is persisted, and a fresh
+/// page always starts empty.
+#[cfg(target_family = "wasm")]
+pub fn save_snapshot_default(
+    _groups: &[SavedGroup],
+    _sections: &[SavedSection],
+) -> Result<(), String> {
+    Ok(())
+}
+
 /// Public API using the default DB path.
+#[cfg(not(target_family = "wasm"))]
 pub fn load_snapshot_default() -> (Vec<SavedGroup>, Vec<SavedSection>) {
     match db_path() {
         Some(path) => load_snapshot(&path),
@@ -505,6 +524,12 @@ pub fn load_snapshot_default() -> (Vec<SavedGroup>, Vec<SavedSection>) {
             (Vec::new(), Vec::new())
         }
     }
+}
+
+/// See [`save_snapshot_default`]: no persistence on wasm32.
+#[cfg(target_family = "wasm")]
+pub fn load_snapshot_default() -> (Vec<SavedGroup>, Vec<SavedSection>) {
+    (Vec::new(), Vec::new())
 }
 
 #[cfg(test)]

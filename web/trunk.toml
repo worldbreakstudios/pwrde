@@ -1,0 +1,7 @@
+[serve]
+addresses = ["127.0.0.1"]
+port = 8090
+open = false
+
+# Headers required for WebGPU / SharedArrayBuffer (wasm threads) support.
+headers = { "Cross-Origin-Embedder-Policy" = "require-corp", "Cross-Origin-Opener-Policy" = "same-origin" }

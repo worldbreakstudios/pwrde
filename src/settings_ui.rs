@@ -1175,13 +1175,8 @@ fn render_appearance(app: &App, theme: &Theme, entity: gpui::WeakEntity<App>) ->
         .child("Import from clipboard")
         .on_click(move |_ev: &ClickEvent, _win: &mut Window, gpui_app: &mut GpuiApp| {
             gpui_app.stop_propagation();
-            if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                if let Some(tokens) = clipboard
-                    .get_text()
-                    .ok()
-                    .as_deref()
-                    .and_then(crate::theme::parse_tokens)
-                {
+            if let crate::clipboard::Contents::Text(text) = crate::clipboard::contents() {
+                if let Some(tokens) = crate::theme::parse_tokens(&text) {
                     let dark = crate::theme::is_dark_color(tokens[0]);
                     if let Some(e) = import_e.upgrade() {
                         e.update(gpui_app, move |_this, cx| {
@@ -1207,9 +1202,7 @@ fn render_appearance(app: &App, theme: &Theme, entity: gpui::WeakEntity<App>) ->
         .child("Copy theme tokens")
         .on_click(move |_ev: &ClickEvent, _win: &mut Window, gpui_app: &mut GpuiApp| {
             gpui_app.stop_propagation();
-            if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                let _ = clipboard.set_text(crate::theme::export_current());
-            }
+            crate::clipboard::set_text(crate::theme::export_current());
             if let Some(e) = copy_e.upgrade() {
                 e.update(gpui_app, |_this, cx| {
                     cx.notify();

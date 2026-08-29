@@ -75,6 +75,7 @@ const ROW_RADIUS: f32 = 14.0;
 const ROW_INDENT: f32 = 14.0;
 
 /// What the Settings search field shows while it is empty.
+#[cfg_attr(target_family = "wasm", allow(dead_code))] // only `app` reads it, dead on wasm for now
 pub(crate) const SEARCH_SETTINGS_PLACEHOLDER: &str = "Search settings";
 
 /// Diameter of an idle page-dot — the resting state of a page-strip slot,

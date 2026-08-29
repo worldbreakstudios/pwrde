@@ -9,11 +9,14 @@
 //!   isn't already pending — `cat huge.txt` produces a handful of wakeups, not
 //!   thousands.
 
-use std::io::{Read, Write};
+#[cfg(not(target_family = "wasm"))]
+use std::io::Read;
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
+#[cfg(not(target_family = "wasm"))]
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use wezterm_term::color::ColorPalette;
 use wezterm_term::{
@@ -462,6 +465,9 @@ pub struct Session {
     pub id: u64,
     pub term: Arc<Mutex<Terminal>>,
     writer: PtyWriter,
+    /// The PTY master, for resizes. Absent on wasm32, where there is no PTY
+    /// and a session is fed bytes directly (see `docs/web-build.md`).
+    #[cfg(not(target_family = "wasm"))]
     master: Box<dyn MasterPty + Send>,
     redraw_pending: Arc<AtomicBool>,
     /// Lines scrolled up from the live bottom (0 = following new output).
@@ -489,6 +495,7 @@ pub struct Session {
 impl Session {
     /// Spawn the user's shell on a fresh PTY. `cwd` sets the shell's working
     /// directory; `None` inherits pwrde's own working directory.
+    #[cfg(not(target_family = "wasm"))]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: u64,
@@ -646,6 +653,56 @@ impl Session {
             proc_title_misses: AtomicUsize::new(0),
             shpool_session: shpool_name,
             child_pid,
+        }
+    }
+
+    /// wasm32 has no PTY: the grid exists and can be fed bytes (`term`), the
+    /// writer is a sink, and no shell runs. `cwd`/`shpool_session` are
+    /// accepted for signature parity with the native constructor so `App`
+    /// compiles unchanged; fixture playback builds on this.
+    #[cfg(target_family = "wasm")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        id: u64,
+        cols: usize,
+        rows: usize,
+        cell_width: u16,
+        cell_height: u16,
+        dpi: u32,
+        _cwd: Option<&std::path::Path>,
+        events: Sender<TermEvent>,
+        _shpool_session: Option<String>,
+    ) -> Self {
+        let writer = PtyWriter(Arc::new(Mutex::new(Box::new(std::io::sink()))));
+        let term_size = TerminalSize {
+            rows,
+            cols,
+            pixel_width: cols * cell_width as usize,
+            pixel_height: rows * cell_height as usize,
+            dpi,
+        };
+        let mut term = Terminal::new(
+            term_size,
+            Arc::new(TermConfig),
+            "pwrde",
+            env!("CARGO_PKG_VERSION"),
+            Box::new(writer.clone()),
+        );
+        term.set_notification_handler(Box::new(AttentionHandler { id, sender: events.clone() }));
+        term.advance_bytes(b"pwrde web: no PTY on wasm32 \x1b[2m(fixture playback goes here)\x1b[0m\r\n");
+        let redraw_pending = Arc::new(AtomicBool::new(true));
+        let _ = events.send(TermEvent::Wakeup(id));
+        Self {
+            id,
+            term: Arc::new(Mutex::new(term)),
+            writer,
+            redraw_pending,
+            scroll_offset: AtomicUsize::new(0),
+            selection: Mutex::new(None),
+            proc_title: Mutex::new(None),
+            proc_title_misses: AtomicUsize::new(0),
+            shpool_session: None,
+            child_pid: None,
         }
     }
 
@@ -939,6 +996,7 @@ impl Session {
         if cols == 0 || rows == 0 {
             return;
         }
+        #[cfg(not(target_family = "wasm"))]
         let _ = self.master.resize(PtySize {
             rows: rows as u16,
             cols: cols as u16,

@@ -1821,8 +1821,6 @@ dependencies = [
 [[package]]
 name = "filedescriptor"
 version = "0.8.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e40758ed24c9b2eeb76c35fb0aebc66c626084edd827e07e1552279814c6682d"
 dependencies = [
  "libc",
  "thiserror 1.0.69",
@@ -1832,7 +1830,8 @@ dependencies = [
 [[package]]
 name = "filedescriptor"
 version = "0.8.3"
-source = "git+https://github.com/wezterm/wezterm?branch=main#fe3006aefcdc4c22924e7bce966b2c430dade4f1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e40758ed24c9b2eeb76c35fb0aebc66c626084edd827e07e1552279814c6682d"
 dependencies = [
  "libc",
  "thiserror 1.0.69",
@@ -5232,6 +5231,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pwrde-web"
+version = "0.1.0"
+dependencies = [
+ "gpui",
+ "gpui_platform",
+ "pwrde",
+ "web-sys",
+]
+
+[[package]]
 name = "pxfm"
 version = "0.1.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6925,12 +6934,11 @@ dependencies = [
 [[package]]
 name = "termwiz"
 version = "0.24.0"
-source = "git+https://github.com/wezterm/wezterm?branch=main#fe3006aefcdc4c22924e7bce966b2c430dade4f1"
 dependencies = [
  "anyhow",
  "bitflags 2.13.1",
  "fancy-regex 0.14.0",
- "filedescriptor 0.8.3 (git+https://github.com/wezterm/wezterm?branch=main)",
+ "filedescriptor 0.8.3",
  "finl_unicode",
  "fixedbitset 0.4.2",
  "image",
@@ -7679,7 +7687,6 @@ dependencies = [
 [[package]]
 name = "vtparse"
 version = "0.7.0"
-source = "git+https://github.com/wezterm/wezterm?branch=main#fe3006aefcdc4c22924e7bce966b2c430dade4f1"
 dependencies = [
  "utf8parse",
 ]
@@ -7844,7 +7851,6 @@ checksum = "a28ac98ddc8b9274cb41bb4d9d4d5c425b6020c50c46f25559911905610b4a88"
 [[package]]
 name = "wezterm-bidi"
 version = "0.2.3"
-source = "git+https://github.com/wezterm/wezterm?branch=main#fe3006aefcdc4c22924e7bce966b2c430dade4f1"
 dependencies = [
  "log",
  "wezterm-dynamic",
@@ -7853,7 +7859,6 @@ dependencies = [
 [[package]]
 name = "wezterm-blob-leases"
 version = "0.1.1"
-source = "git+https://github.com/wezterm/wezterm?branch=main#fe3006aefcdc4c22924e7bce966b2c430dade4f1"
 dependencies = [
  "getrandom 0.3.4",
  "sha2 0.10.9",
@@ -7864,7 +7869,6 @@ dependencies = [
 [[package]]
 name = "wezterm-cell"
 version = "0.1.0"
-source = "git+https://github.com/wezterm/wezterm?branch=main#fe3006aefcdc4c22924e7bce966b2c430dade4f1"
 dependencies = [
  "finl_unicode",
  "image",
@@ -7883,7 +7887,6 @@ dependencies = [
 [[package]]
 name = "wezterm-char-props"
 version = "0.1.3"
-source = "git+https://github.com/wezterm/wezterm?branch=main#fe3006aefcdc4c22924e7bce966b2c430dade4f1"
 dependencies = [
  "phf 0.11.3",
  "serde",
@@ -7893,7 +7896,6 @@ dependencies = [
 [[package]]
 name = "wezterm-color-types"
 version = "0.3.0"
-source = "git+https://github.com/wezterm/wezterm?branch=main#fe3006aefcdc4c22924e7bce966b2c430dade4f1"
 dependencies = [
  "csscolorparser",
  "deltae",
@@ -7905,7 +7907,6 @@ dependencies = [
 [[package]]
 name = "wezterm-dynamic"
 version = "0.2.1"
-source = "git+https://github.com/wezterm/wezterm?branch=main#fe3006aefcdc4c22924e7bce966b2c430dade4f1"
 dependencies = [
  "log",
  "ordered-float",
@@ -7917,7 +7918,6 @@ dependencies = [
 [[package]]
 name = "wezterm-dynamic-derive"
 version = "0.1.1"
-source = "git+https://github.com/wezterm/wezterm?branch=main#fe3006aefcdc4c22924e7bce966b2c430dade4f1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -7927,7 +7927,6 @@ dependencies = [
 [[package]]
 name = "wezterm-escape-parser"
 version = "0.1.0"
-source = "git+https://github.com/wezterm/wezterm?branch=main#fe3006aefcdc4c22924e7bce966b2c430dade4f1"
 dependencies = [
  "base64",
  "bitflags 2.13.1",
@@ -7953,7 +7952,6 @@ dependencies = [
 [[package]]
 name = "wezterm-input-types"
 version = "0.1.0"
-source = "git+https://github.com/wezterm/wezterm?branch=main#fe3006aefcdc4c22924e7bce966b2c430dade4f1"
 dependencies = [
  "bitflags 1.3.2",
  "euclid",
@@ -7964,7 +7962,6 @@ dependencies = [
 [[package]]
 name = "wezterm-surface"
 version = "0.1.0"
-source = "git+https://github.com/wezterm/wezterm?branch=main#fe3006aefcdc4c22924e7bce966b2c430dade4f1"
 dependencies = [
  "bitflags 2.13.1",
  "fancy-regex 0.14.0",
@@ -7985,7 +7982,6 @@ dependencies = [
 [[package]]
 name = "wezterm-term"
 version = "0.1.0"
-source = "git+https://github.com/wezterm/wezterm?branch=main#fe3006aefcdc4c22924e7bce966b2c430dade4f1"
 dependencies = [
  "anyhow",
  "bitflags 1.3.2",
