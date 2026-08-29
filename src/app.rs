@@ -45,7 +45,7 @@ use crate::{
 };
 
 use std::sync::mpsc::{Receiver, Sender};
-use std::time::SystemTime;
+use web_time::SystemTime;
 
 use gpui::{
     canvas, div, px, App as GpuiApp, AppContext, Bounds, Context, CursorStyle,
@@ -72,18 +72,18 @@ const DRAG_THRESHOLD: f64 = 6.0;
 /// group. Comfortably longer than the cache's `FRESH_WINDOW`, so a tick only
 /// walks entries that have actually aged out; a tick with nothing stale hands
 /// the worker slot straight back.
-const GIT_CTX_POLL: std::time::Duration = std::time::Duration::from_secs(6);
+const GIT_CTX_POLL: web_time::Duration = web_time::Duration::from_secs(6);
 /// How often panes that still have *no name at all* — no emulator title and no
 /// process-derived one — are looked up. Short, because this is exactly the
 /// window after a restart in which restored shpool tabs would otherwise read
 /// "wezterm", and it costs nothing once every pane has been named.
-const PROC_TITLE_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+const PROC_TITLE_POLL: web_time::Duration = web_time::Duration::from_secs(2);
 /// How often already-named title-less panes are re-resolved, so a tab follows
 /// the program running in it. Much slower than the first-name poll: a pane
 /// whose shell never sets a title stays in this sweep for the life of the app,
 /// and `ps -axE` dumps every process's environment, so the steady-state cost
 /// has to be an occasional sweep rather than a treadmill.
-const PROC_TITLE_REFRESH: std::time::Duration = std::time::Duration::from_secs(15);
+const PROC_TITLE_REFRESH: web_time::Duration = web_time::Duration::from_secs(15);
 /// Consecutive sweeps a pane may fail to resolve before it drops off the fast
 /// tick. Some panes can never be named — a detached shpool session whose shell
 /// is gone — and they must not hold the 2s sweep open for the whole session.
@@ -92,8 +92,8 @@ const PROC_TITLE_MISS_LIMIT: usize = 3;
 /// Whether a process-title sweep is due, and whether it should also re-resolve
 /// the panes that already have a name (`Some(renew)`). Pure, for tests.
 fn proc_title_due(
-    since_poll: std::time::Duration,
-    since_renew: std::time::Duration,
+    since_poll: web_time::Duration,
+    since_renew: web_time::Duration,
 ) -> Option<bool> {
     (since_poll >= PROC_TITLE_POLL).then_some(since_renew >= PROC_TITLE_REFRESH)
 }
@@ -252,7 +252,7 @@ impl MouseReport {
 
 /// The whole application state. Under gpui this is the `Entity` that owns the
 /// terminal `Element` and all workspaces.
-pub(crate) struct App {
+pub struct App {
     /// Wakeups from PTY reader threads are drained from here per frame.
     pub(crate) events_rx: Receiver<TermEvent>,
     /// Cloned into each spawned `Session` so its reader thread can wake us.
@@ -278,14 +278,14 @@ pub(crate) struct App {
     /// When the periodic sidebar-card poll last fired. Cards quote a working
     /// tree that changes under us (commits, dirty counts), so a group the user
     /// never leaves still has to be topped up on a timer.
-    pub(crate) git_ctx_polled_at: std::time::Instant,
+    pub(crate) git_ctx_polled_at: web_time::Instant,
     /// True while the process-title sweep is alive, so the throttle can never
     /// stack `ps` sweeps on top of each other.
     pub(crate) proc_title_busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// When the first-name process-title poll last fired.
-    pub(crate) proc_title_polled_at: std::time::Instant,
+    pub(crate) proc_title_polled_at: web_time::Instant,
     /// When the slower re-resolve of already-named title-less panes last fired.
-    pub(crate) proc_title_refreshed_at: std::time::Instant,
+    pub(crate) proc_title_refreshed_at: web_time::Instant,
     pub(crate) next_session_id: u64,
     pub(crate) next_tile_id: u64,
     /// Sidebar width when expanded, logical px (user-resizable).
@@ -583,7 +583,7 @@ impl App {
     /// session so it survives app restarts.
     pub(crate) fn spawn_session_in(&mut self, cwd: Option<&std::path::Path>) -> Session {
         let shpool_session = if settings::get_bool("terminal.persist", false) {
-            use std::time::{SystemTime, UNIX_EPOCH};
+            use web_time::{SystemTime, UNIX_EPOCH};
             let nanos = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -1252,7 +1252,7 @@ impl App {
                 let count: usize = targets.iter().map(|(_, ids)| ids.len()).sum();
                 self.message = Some((format!("Deleting {count} worktree(s)…"), false));
                 let tx = self.events_tx.clone();
-                std::thread::spawn(move || {
+                crate::bg::spawn(move || {
                     let (removed, failed, error) = run_drop_rm(targets);
                     let _ = tx.send(TermEvent::CleanupRemoved { removed, failed, error });
                 });
@@ -2009,7 +2009,7 @@ impl App {
         self.request_redraw();
 
         let events_tx = self.events_tx.clone();
-        std::thread::spawn(move || {
+        crate::bg::spawn(move || {
             let event = match run_drop(&repo, from.as_deref()) {
                 Ok(cwd) => TermEvent::GroupReady { name, cwd },
                 Err(message) => TermEvent::GroupFailed { message },
@@ -4192,7 +4192,7 @@ impl App {
         }
     }
 
-    pub(crate) fn set_page(&mut self, page: Page) {
+    pub fn set_page(&mut self, page: Page) {
         // Notes is experimental: with the flag off it is not reachable at all.
         if page == Page::Notes && !crate::features::notes_enabled() {
             self.set_page(Page::Sessions);
@@ -4349,7 +4349,7 @@ impl App {
         }
         let tx = self.events_tx.clone();
         let busy = self.git_ctx_busy.clone();
-        std::thread::spawn(move || {
+        crate::bg::spawn(move || {
             // Clear the flag on the way out however we leave, so a panic in a
             // shell-out can't wedge refreshes off for the rest of the session.
             struct Clear(std::sync::Arc<std::sync::atomic::AtomicBool>);
@@ -4374,7 +4374,7 @@ impl App {
     pub(crate) fn spawn_cleanup_scan(&mut self) {
         self.cleanup.set_scanning();
         let tx = self.events_tx.clone();
-        std::thread::spawn(move || {
+        crate::bg::spawn(move || {
             let event = match run_drop_status() {
                 Ok(worktrees) => TermEvent::CleanupScanned(worktrees),
                 Err(e) => TermEvent::CleanupScanFailed(e),
@@ -4432,7 +4432,7 @@ impl App {
         }
         let tx = self.events_tx.clone();
         let busy = self.proc_title_busy.clone();
-        std::thread::spawn(move || {
+        crate::bg::spawn(move || {
             // Clear the flag however we leave, so a panic in a shell-out can't
             // wedge title refreshes off for the rest of the session.
             struct Clear(std::sync::Arc<std::sync::atomic::AtomicBool>);
@@ -4724,7 +4724,7 @@ impl App {
             && !self.sidebar_collapsed
             && self.git_ctx_polled_at.elapsed() >= GIT_CTX_POLL
         {
-            self.git_ctx_polled_at = std::time::Instant::now();
+            self.git_ctx_polled_at = web_time::Instant::now();
             self.spawn_git_context_refresh();
         }
         // Name the panes the emulator hasn't named. Not gated on the sidebar
@@ -4734,14 +4734,14 @@ impl App {
             self.proc_title_polled_at.elapsed(),
             self.proc_title_refreshed_at.elapsed(),
         ) {
-            self.proc_title_polled_at = std::time::Instant::now();
+            self.proc_title_polled_at = web_time::Instant::now();
             // Panes that already have a name only ride along on the slow tick,
             // so the steady state is a sweep every `PROC_TITLE_REFRESH`.
             // Only credit the slow tick once the sweep is actually running:
             // a `renew` swallowed by a still-busy slot would otherwise not be
             // retried for another `PROC_TITLE_REFRESH`.
             if self.spawn_proc_title_refresh(renew) && renew {
-                self.proc_title_refreshed_at = std::time::Instant::now();
+                self.proc_title_refreshed_at = web_time::Instant::now();
             }
         }
         redraw || self.dirty
@@ -5389,10 +5389,22 @@ impl App {
             let chrome_cw = renderer::measure_cell_width(window, scale, chrome_font);
             self.renderer.update_metrics(scale, term_font, term_cw, chrome_font, chrome_cw);
         }
+        // The sidebar's row and page-dot layers size themselves from
+        // `surface_size()` during `render`, which ran before this paint — so a
+        // surface that changed here (the first frame on a platform whose
+        // window has no size until the canvas is laid out, or a resize) needs
+        // one more render to catch up.
+        let resized = (phys_w.max(1), phys_h.max(1)) != self.renderer.surface_size();
         self.renderer.resize(phys_w, phys_h);
         self.sync_layout_impl(rescaled);
         if rescaled {
             self.sync_flyover_layout(true);
+        }
+        if resized {
+            // Re-render right away: the element layers measured against the
+            // old surface. (`dirty` is cleared at the end of this paint, so
+            // the flag alone would not survive; see the bottom of the fn.)
+            window.refresh();
         }
         self.begin_frame();
 
@@ -5719,7 +5731,9 @@ impl App {
             //    are element trees now — nothing paints above the flyover here.
         });
 
-        self.dirty = false;
+        // A frame whose surface size just changed leaves the next render to
+        // catch up (the drain loop notifies while `dirty` is set).
+        self.dirty = resized;
     }
 }
 
@@ -6399,13 +6413,371 @@ pub(crate) fn parse_open_dir(url: &str) -> Option<std::path::PathBuf> {
     path.is_dir().then_some(path)
 }
 
+impl App {
+    /// Open the main window and build the `App` entity inside it. Shared by the
+    /// native boot (`run_native`) and the wasm32 entry point in `web/main.rs`,
+    /// which differ only in platform, window options, and what fills the
+    /// workspace afterwards (shells vs. fixtures). `events` is the wakeup
+    /// channel every session and background worker reports on.
+    pub fn open_main_window(
+        cx: &mut GpuiApp,
+        options: WindowOptions,
+        events: (Sender<TermEvent>, Receiver<TermEvent>),
+    ) -> gpui::WindowHandle<App> {
+        let (events_tx, events_rx) = events;
+        let main_window = cx
+            .open_window(
+                options,
+        |window, cx| {
+            #[cfg(target_os = "macos")]
+            hide_titlebar_decoration(window);
+
+            let scale = window.scale_factor();
+            // Measure a monospace cell at the default font size; the first
+            // paint re-measures against the live terminal/chrome font
+            // settings and reflows if they differ.
+            let cell_width = renderer::measure_cell_width(window, scale, renderer::FONT_SIZE);
+            let phys_w = (f32::from(window.viewport_size().width) * scale) as u32;
+            let phys_h = (f32::from(window.viewport_size().height) * scale) as u32;
+            let renderer = Renderer::new(scale, cell_width, phys_w.max(1), phys_h.max(1));
+
+            let entity = cx.new(|cx| App::new(events_tx.clone(), events_rx, renderer, cx));
+            // Track macOS dark/light for the "System" appearance mode:
+            // seed from the window's current appearance, then follow
+            // changes live (themes re-resolve on the next paint).
+            let is_dark = |a: gpui::WindowAppearance| {
+                matches!(
+                    a,
+                    gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark
+                )
+            };
+            theme::set_system_dark(is_dark(window.appearance()));
+            window
+                .observe_window_appearance({
+                    let entity = entity.clone();
+                    move |window, cx| {
+                        theme::set_system_dark(is_dark(window.appearance()));
+                        entity.update(cx, |app, cx| {
+                            app.request_redraw();
+                            cx.notify();
+                        });
+                    }
+                })
+                .detach();
+
+            // Establish keyboard focus so key events reach the terminal.
+            let handle = entity.read(cx).focus_handle.clone();
+            window.focus(&handle, cx);
+            entity
+        },
+            )
+            .expect("open window");
+        // Remember the main window so popout flows can bring it forward.
+        let _ = main_window.update(cx, |app, _, _| app.main_window = Some(main_window.into()));
+        main_window
+    }
+
+    /// The app state for a freshly opened window: empty state or the restored
+    /// session, plus the foreground drain that turns PTY wakeups into repaints.
+    pub fn new(
+        events_tx: Sender<TermEvent>,
+        events_rx: Receiver<TermEvent>,
+        renderer: Renderer,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut app = App {
+            events_rx,
+            events_tx: events_tx.clone(),
+            renderer,
+            workspaces: Vec::new(),
+            active: 0,
+            sections: Vec::new(),
+            next_section_id: 0,
+            git_contexts: git_context::GitContextCache::new(),
+            git_ctx_busy: std::sync::Arc::new(
+                std::sync::atomic::AtomicBool::new(false),
+            ),
+            git_ctx_pending: false,
+            // Backdated a full interval so the first foreground
+            // drain walks the groups immediately. Starting at
+            // `now()` would leave every card showing its bare
+            // title for the first `GIT_CTX_POLL` after launch,
+            // which is exactly when the user is looking at them.
+            git_ctx_polled_at: web_time::Instant::now()
+                .checked_sub(GIT_CTX_POLL)
+                .unwrap_or_else(web_time::Instant::now),
+            proc_title_busy: std::sync::Arc::new(
+                std::sync::atomic::AtomicBool::new(false),
+            ),
+            // Backdated for the same reason: restored panes are
+            // named on the first drain rather than after a beat of
+            // showing the stock "wezterm".
+            proc_title_polled_at: web_time::Instant::now()
+                .checked_sub(PROC_TITLE_POLL)
+                .unwrap_or_else(web_time::Instant::now),
+            proc_title_refreshed_at: web_time::Instant::now(),
+            next_session_id: 0,
+            next_tile_id: 0,
+            sidebar_expanded_w: workspace::SIDEBAR_DEFAULT_W,
+            sidebar_collapsed: false,
+            modifiers: Modifiers::default(),
+            mouse_report: None,
+            title: String::new(),
+            cursor: (0.0, 0.0),
+            drag: Drag::None,
+            just_expanded: None,
+            pending_group_profile: None,
+            save_ws: None,
+            message: None,
+            confirm: None,
+            pending_primary_cmd: std::collections::HashMap::new(),
+            command_input: {
+                let seed = settings::primary_command();
+                cx.new(|cx| {
+                    let mut input = crate::ui::Input::new(cx);
+                    input.set_text(seed, cx);
+                    input
+                })
+            },
+            settings_query: String::new(),
+            settings_search: {
+                let input = cx.new(|cx| {
+                    let mut input = crate::ui::Input::new(cx);
+                    input.set_bare(true);
+                    input.placeholder(sidebar_ui::SEARCH_SETTINGS_PLACEHOLDER);
+                    input
+                });
+                cx.observe(&input, |this: &mut App, input, cx| {
+                    let text = input.read(cx).text().to_string();
+                    if this.settings_query != text {
+                        this.settings_query = text;
+                        this.request_redraw();
+                        cx.notify();
+                    }
+                })
+                .detach();
+                input
+            },
+            save_name: {
+                let input = cx.new(|cx| {
+                    let mut input = crate::ui::Input::new(cx);
+                    input.set_bare(true);
+                    input
+                });
+                cx.observe(&input, |this: &mut App, input, cx| {
+                    let text = input.read(cx).text().to_string();
+                    if let Some(m) = this.save_ws.as_mut()
+                        && m.name != text
+                    {
+                        m.name = text;
+                        this.request_redraw();
+                        cx.notify();
+                    }
+                })
+                .detach();
+                input
+            },
+            save_desc: {
+                let input = cx.new(|cx| {
+                    let mut input = crate::ui::Input::new(cx);
+                    input.set_bare(true);
+                    input
+                });
+                cx.observe(&input, |this: &mut App, input, cx| {
+                    let text = input.read(cx).text().to_string();
+                    if let Some(m) = this.save_ws.as_mut()
+                        && m.description != text
+                    {
+                        m.description = text;
+                        this.request_redraw();
+                        cx.notify();
+                    }
+                })
+                .detach();
+                input
+            },
+            save_sync: false,
+            command: None,
+            command_scroll: gpui::ScrollHandle::new(),
+            command_scroll_to: None,
+            modal_search: {
+                let input = cx.new(|cx| {
+                    let mut input = crate::ui::Input::new(cx);
+                    input.set_bare(true);
+                    input
+                });
+                cx.observe(&input, |this: &mut App, input, cx| {
+                    let text = input.read(cx).text().to_string();
+                    // The palette's current stage takes the query.
+                    let changed = if let Some(p) = this.command.as_mut() {
+                        p.set_query(&text);
+                        true
+                    } else {
+                        false
+                    };
+                    if changed {
+                        this.request_redraw();
+                        cx.notify();
+                    }
+                })
+                .detach();
+                input
+            },
+            modal_search_reset: None,
+            settings_search_focus: false,
+            editing_section: None,
+            // Single focus handle, minted once; focused below.
+            focus_handle: cx.focus_handle(),
+            dirty: true,
+            scroll_accum: 0.0,
+            page: Page::Sessions,
+            section: Section::Keyboard,
+            recording: None,
+            // The active page's slot starts fully glyphed.
+            dot_anim: {
+                let mut v = vec![0.0; Page::ALL.len()];
+                v[Page::Sessions.index()] = 1.0;
+                v
+            },
+            dot_hover: None,
+            resize_hover: None,
+            cleanup: cleanup::Cleanup::default(),
+            notes_active_vault: 0,
+            notes_docs: Vec::new(),
+            notes_selected: None,
+            notes_edit_mode: false,
+            notes_editor: None,
+            notes_add_input: cx.new(|cx| {
+                let mut input = crate::ui::Input::new(cx);
+                input.placeholder("Path to a notes folder…");
+                input
+            }),
+            notes_adding_vault: false,
+            notes_status: None,
+            link_hover: None,
+            hot_rects: Vec::new(),
+            ui_hover: None,
+            flyover_tabs: Vec::new(),
+            flyover_active: 0,
+            flyover_open: false,
+            flyover_anim: 0.0,
+            flyover_focused: false,
+            flyover_height_frac: settings::get_str("flyover.height")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(workspace::FLYOVER_DEFAULT_FRAC),
+            flyover_maximized: false,
+            flyover_windowed: false,
+            flyover_window_visible: false,
+            flyover_window: None,
+            main_window: None,
+            preview_dark: theme::dark_active(),
+            appearance_menu: None,
+            open_tool: settings::get_str("toolpanel.tool").and_then(|s| {
+                pages::Tool::ALL.iter().copied().find(|t| t.name() == s)
+            }),
+            tool_panel_w: settings::get_str("toolpanel.width")
+                .and_then(|s| s.parse::<f32>().ok())
+                .map(|w| w.max(workspace::TOOL_PANEL_MIN_W))
+                .unwrap_or(workspace::TOOL_PANEL_DEFAULT_W),
+            tool_panel_floating: settings::get_bool("toolpanel.floating", false),
+            git_cwd_cache: Default::default(),
+            pr: pr_ui::PrState::default(),
+            local_diff: local_diff_ui::LocalDiffState::default(),
+            pr_comment_input: cx.new(|cx| {
+                let mut input = crate::ui::Input::new(cx);
+                input.placeholder("Leave a comment…");
+                input
+            }),
+            _lfg_events_child: crate::lfg::spawn_event_stream(events_tx.clone()),
+        };
+        // With persistence on, reattach to the previous session's
+        // groups; otherwise launch into the empty state — no shell
+        // is spawned until the user starts a group (CTA or ⇧⌘T).
+        if !(settings::get_bool("terminal.persist", false)
+            && app.restore_workspaces())
+        {
+            app.workspaces.push(Workspace::placeholder());
+        }
+        app.sync_layout();
+        // Cards launch empty otherwise: without a first walk the
+        // sidebar shows the bare `Workspace::title()` fallback —
+        // no branch or diffstat — until the user happens to switch
+        // groups. This only enqueues the serial worker.
+        app.spawn_git_context_refresh();
+
+        // Drain PTY wakeups on the foreground executor: poll the
+        // mpsc channel and notify when a redraw is needed. This
+        // preserves the old coalescing (begin_frame per paint).
+        let handle = cx.entity().downgrade();
+        cx.spawn(async move |_this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(web_time::Duration::from_millis(16))
+                    .await;
+                let Some(app) = handle.upgrade() else { break };
+                let (redraw, want_popout, popout) =
+                    app.update(cx, |app: &mut App, cx| {
+                        let redraw = app.drain_events();
+                        if redraw {
+                            cx.notify();
+                        }
+                        (
+                            redraw,
+                            app.flyover_windowed && app.flyover_window_visible,
+                            app.flyover_window,
+                        )
+                    });
+                // Reconcile the popout window with the desired
+                // state — window lifecycle stays here, on the
+                // foreground executor, so entity code never has
+                // to touch a window it doesn't own.
+                match (want_popout, popout) {
+                    // Desired but not open: spawn it.
+                    (true, None) => {
+                        let app_entity = app.clone();
+                        let _ =
+                            cx.update(|cx| open_flyover_window(app_entity, cx));
+                    },
+                    // Open but no longer desired: close it.
+                    (false, Some(w)) => {
+                        let _ =
+                            w.update(cx, |_, window, _| window.remove_window());
+                        let _ = app.update(cx, |app: &mut App, _| {
+                            app.flyover_window = None;
+                        });
+                    },
+                    // Steady state: forward redraws to the popout.
+                    (_, Some(w)) => {
+                        if redraw {
+                            let _ = w.update(cx, |_, _, cx| cx.notify());
+                        }
+                    },
+                    (false, None) => {},
+                }
+            }
+        })
+        .detach();
+
+        app
+    }
+}
+
+/// App-wide globals every entry point seeds before opening a window: the rcn
+/// Theme global (so `Theme::of` never panics; Cleanup re-syncs it each frame
+/// from chrome tokens), the Input component's key bindings, and gpui-component
+/// (theme + text/textarea bindings) for the experimental Notes page.
+pub fn init_globals(cx: &mut GpuiApp) {
+    cx.set_global(ui::theme::Theme::from_chrome(crate::theme::current()));
+    crate::ui::Input::register_key_bindings(cx);
+    gpui_component::init(cx);
+}
+
 /// Boot the native macOS app: settings, Claude hooks, the gpui platform, and
 /// the main window. The wasm32 entry point under `web/` boots differently.
 #[cfg(not(target_family = "wasm"))]
 pub fn run_native() {
     use gpui::{Application, QuitMode};
     use std::sync::mpsc;
-    use std::time::Duration;
 
     // Settings must be in memory before anything reads a binding or theme.
     settings::init();
@@ -6442,13 +6814,7 @@ pub fn run_native() {
     });
 
     app.run(move |cx: &mut GpuiApp| {
-        // Seed the rcn Theme global before any window opens so Theme::of
-        // never panics; Cleanup re-syncs it each frame from chrome tokens.
-        cx.set_global(ui::theme::Theme::from_chrome(crate::theme::current()));
-        crate::ui::Input::register_key_bindings(cx);
-        // Initialize gpui-component (theme + text/textarea key bindings) for the
-        // experimental Notes page's markdown viewer and editor.
-        gpui_component::init(cx);
+        init_globals(cx);
         let bounds = Bounds::centered(None, gpui::size(px(1200.0), px(720.0)), cx);
 
         // `pwrde /some/dir` from a shell: open the argv path the same way.
@@ -6459,346 +6825,29 @@ pub fn run_native() {
             }
         }
 
-        let main_window = cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                // A transparent native titlebar keeps OS edge-resize and the
-                // native traffic-light buttons, while our content draws under a
-                // full-size content view. `app_owns_titlebar_drag` stops AppKit
-                // from dragging the window off the whole top bar — we move it
-                // ourselves from the sidebar strip via `start_window_move`, so
-                // dragging a tile's tab no longer moves the window.
-                titlebar: Some(gpui::TitlebarOptions {
-                    title: None,
-                    appears_transparent: true,
-                    traffic_light_position: None,
-                }),
-                is_resizable: true,
-                app_owns_titlebar_drag: true,
-                window_background: gpui::WindowBackgroundAppearance::Blurred,
-                ..Default::default()
-            },
-            |window, cx| {
-                #[cfg(target_os = "macos")]
-                hide_titlebar_decoration(window);
-
-                let scale = window.scale_factor();
-                // Measure a monospace cell at the default font size; the first
-                // paint re-measures against the live terminal/chrome font
-                // settings and reflows if they differ.
-                let cell_width = renderer::measure_cell_width(window, scale, renderer::FONT_SIZE);
-                let phys_w = (f32::from(window.viewport_size().width) * scale) as u32;
-                let phys_h = (f32::from(window.viewport_size().height) * scale) as u32;
-                let renderer = Renderer::new(scale, cell_width, phys_w.max(1), phys_h.max(1));
-
-                let entity = cx.new(|cx| {
-                    let mut app = App {
-                        events_rx,
-                        events_tx: events_tx.clone(),
-                        renderer,
-                        workspaces: Vec::new(),
-                        active: 0,
-                        sections: Vec::new(),
-                        next_section_id: 0,
-                        git_contexts: git_context::GitContextCache::new(),
-                        git_ctx_busy: std::sync::Arc::new(
-                            std::sync::atomic::AtomicBool::new(false),
-                        ),
-                        git_ctx_pending: false,
-                        // Backdated a full interval so the first foreground
-                        // drain walks the groups immediately. Starting at
-                        // `now()` would leave every card showing its bare
-                        // title for the first `GIT_CTX_POLL` after launch,
-                        // which is exactly when the user is looking at them.
-                        git_ctx_polled_at: std::time::Instant::now()
-                            .checked_sub(GIT_CTX_POLL)
-                            .unwrap_or_else(std::time::Instant::now),
-                        proc_title_busy: std::sync::Arc::new(
-                            std::sync::atomic::AtomicBool::new(false),
-                        ),
-                        // Backdated for the same reason: restored panes are
-                        // named on the first drain rather than after a beat of
-                        // showing the stock "wezterm".
-                        proc_title_polled_at: std::time::Instant::now()
-                            .checked_sub(PROC_TITLE_POLL)
-                            .unwrap_or_else(std::time::Instant::now),
-                        proc_title_refreshed_at: std::time::Instant::now(),
-                        next_session_id: 0,
-                        next_tile_id: 0,
-                        sidebar_expanded_w: workspace::SIDEBAR_DEFAULT_W,
-                        sidebar_collapsed: false,
-                        modifiers: Modifiers::default(),
-                        mouse_report: None,
-                        title: String::new(),
-                        cursor: (0.0, 0.0),
-                        drag: Drag::None,
-                        just_expanded: None,
-                        pending_group_profile: None,
-                        save_ws: None,
-                        message: None,
-                        confirm: None,
-                        pending_primary_cmd: std::collections::HashMap::new(),
-                        command_input: {
-                            let seed = settings::primary_command();
-                            cx.new(|cx| {
-                                let mut input = crate::ui::Input::new(cx);
-                                input.set_text(seed, cx);
-                                input
-                            })
-                        },
-                        settings_query: String::new(),
-                        settings_search: {
-                            let input = cx.new(|cx| {
-                                let mut input = crate::ui::Input::new(cx);
-                                input.set_bare(true);
-                                input.placeholder(sidebar_ui::SEARCH_SETTINGS_PLACEHOLDER);
-                                input
-                            });
-                            cx.observe(&input, |this: &mut App, input, cx| {
-                                let text = input.read(cx).text().to_string();
-                                if this.settings_query != text {
-                                    this.settings_query = text;
-                                    this.request_redraw();
-                                    cx.notify();
-                                }
-                            })
-                            .detach();
-                            input
-                        },
-                        save_name: {
-                            let input = cx.new(|cx| {
-                                let mut input = crate::ui::Input::new(cx);
-                                input.set_bare(true);
-                                input
-                            });
-                            cx.observe(&input, |this: &mut App, input, cx| {
-                                let text = input.read(cx).text().to_string();
-                                if let Some(m) = this.save_ws.as_mut()
-                                    && m.name != text
-                                {
-                                    m.name = text;
-                                    this.request_redraw();
-                                    cx.notify();
-                                }
-                            })
-                            .detach();
-                            input
-                        },
-                        save_desc: {
-                            let input = cx.new(|cx| {
-                                let mut input = crate::ui::Input::new(cx);
-                                input.set_bare(true);
-                                input
-                            });
-                            cx.observe(&input, |this: &mut App, input, cx| {
-                                let text = input.read(cx).text().to_string();
-                                if let Some(m) = this.save_ws.as_mut()
-                                    && m.description != text
-                                {
-                                    m.description = text;
-                                    this.request_redraw();
-                                    cx.notify();
-                                }
-                            })
-                            .detach();
-                            input
-                        },
-                        save_sync: false,
-                        command: None,
-                        command_scroll: gpui::ScrollHandle::new(),
-                        command_scroll_to: None,
-                        modal_search: {
-                            let input = cx.new(|cx| {
-                                let mut input = crate::ui::Input::new(cx);
-                                input.set_bare(true);
-                                input
-                            });
-                            cx.observe(&input, |this: &mut App, input, cx| {
-                                let text = input.read(cx).text().to_string();
-                                // The palette's current stage takes the query.
-                                let changed = if let Some(p) = this.command.as_mut() {
-                                    p.set_query(&text);
-                                    true
-                                } else {
-                                    false
-                                };
-                                if changed {
-                                    this.request_redraw();
-                                    cx.notify();
-                                }
-                            })
-                            .detach();
-                            input
-                        },
-                        modal_search_reset: None,
-                        settings_search_focus: false,
-                        editing_section: None,
-                        // Single focus handle, minted once; focused below.
-                        focus_handle: cx.focus_handle(),
-                        dirty: true,
-                        scroll_accum: 0.0,
-                        page: Page::Sessions,
-                        section: Section::Keyboard,
-                        recording: None,
-                        // The active page's slot starts fully glyphed.
-                        dot_anim: {
-                            let mut v = vec![0.0; Page::ALL.len()];
-                            v[Page::Sessions.index()] = 1.0;
-                            v
-                        },
-                        dot_hover: None,
-                        resize_hover: None,
-                        cleanup: cleanup::Cleanup::default(),
-                        notes_active_vault: 0,
-                        notes_docs: Vec::new(),
-                        notes_selected: None,
-                        notes_edit_mode: false,
-                        notes_editor: None,
-                        notes_add_input: cx.new(|cx| {
-                            let mut input = crate::ui::Input::new(cx);
-                            input.placeholder("Path to a notes folder…");
-                            input
-                        }),
-                        notes_adding_vault: false,
-                        notes_status: None,
-                        link_hover: None,
-                        hot_rects: Vec::new(),
-                        ui_hover: None,
-                        flyover_tabs: Vec::new(),
-                        flyover_active: 0,
-                        flyover_open: false,
-                        flyover_anim: 0.0,
-                        flyover_focused: false,
-                        flyover_height_frac: settings::get_str("flyover.height")
-                            .and_then(|s| s.parse().ok())
-                            .unwrap_or(workspace::FLYOVER_DEFAULT_FRAC),
-                        flyover_maximized: false,
-                        flyover_windowed: false,
-                        flyover_window_visible: false,
-                        flyover_window: None,
-                        main_window: None,
-                        preview_dark: theme::dark_active(),
-                        appearance_menu: None,
-                        open_tool: settings::get_str("toolpanel.tool").and_then(|s| {
-                            pages::Tool::ALL.iter().copied().find(|t| t.name() == s)
-                        }),
-                        tool_panel_w: settings::get_str("toolpanel.width")
-                            .and_then(|s| s.parse::<f32>().ok())
-                            .map(|w| w.max(workspace::TOOL_PANEL_MIN_W))
-                            .unwrap_or(workspace::TOOL_PANEL_DEFAULT_W),
-                        tool_panel_floating: settings::get_bool("toolpanel.floating", false),
-                        git_cwd_cache: Default::default(),
-                        pr: pr_ui::PrState::default(),
-                        local_diff: local_diff_ui::LocalDiffState::default(),
-                        pr_comment_input: cx.new(|cx| {
-                            let mut input = crate::ui::Input::new(cx);
-                            input.placeholder("Leave a comment…");
-                            input
-                        }),
-                        _lfg_events_child: crate::lfg::spawn_event_stream(events_tx.clone()),
-                    };
-                    // With persistence on, reattach to the previous session's
-                    // groups; otherwise launch into the empty state — no shell
-                    // is spawned until the user starts a group (CTA or ⇧⌘T).
-                    if !(settings::get_bool("terminal.persist", false)
-                        && app.restore_workspaces())
-                    {
-                        app.workspaces.push(Workspace::placeholder());
-                    }
-                    app.sync_layout();
-                    // Cards launch empty otherwise: without a first walk the
-                    // sidebar shows the bare `Workspace::title()` fallback —
-                    // no branch or diffstat — until the user happens to switch
-                    // groups. This only enqueues the serial worker.
-                    app.spawn_git_context_refresh();
-
-                    // Drain PTY wakeups on the foreground executor: poll the
-                    // mpsc channel and notify when a redraw is needed. This
-                    // preserves the old coalescing (begin_frame per paint).
-                    let handle = cx.entity().downgrade();
-                    cx.spawn(async move |_this, cx| {
-                        loop {
-                            cx.background_executor()
-                                .timer(Duration::from_millis(16))
-                                .await;
-                            let Some(app) = handle.upgrade() else { break };
-                            let (redraw, want_popout, popout) =
-                                app.update(cx, |app: &mut App, cx| {
-                                    let redraw = app.drain_events();
-                                    if redraw {
-                                        cx.notify();
-                                    }
-                                    (
-                                        redraw,
-                                        app.flyover_windowed && app.flyover_window_visible,
-                                        app.flyover_window,
-                                    )
-                                });
-                            // Reconcile the popout window with the desired
-                            // state — window lifecycle stays here, on the
-                            // foreground executor, so entity code never has
-                            // to touch a window it doesn't own.
-                            match (want_popout, popout) {
-                                // Desired but not open: spawn it.
-                                (true, None) => {
-                                    let app_entity = app.clone();
-                                    let _ =
-                                        cx.update(|cx| open_flyover_window(app_entity, cx));
-                                },
-                                // Open but no longer desired: close it.
-                                (false, Some(w)) => {
-                                    let _ =
-                                        w.update(cx, |_, window, _| window.remove_window());
-                                    let _ = app.update(cx, |app: &mut App, _| {
-                                        app.flyover_window = None;
-                                    });
-                                },
-                                // Steady state: forward redraws to the popout.
-                                (_, Some(w)) => {
-                                    if redraw {
-                                        let _ = w.update(cx, |_, _, cx| cx.notify());
-                                    }
-                                },
-                                (false, None) => {},
-                            }
-                        }
-                    })
-                    .detach();
-
-                    app
-                });
-                // Track macOS dark/light for the "System" appearance mode:
-                // seed from the window's current appearance, then follow
-                // changes live (themes re-resolve on the next paint).
-                let is_dark = |a: gpui::WindowAppearance| {
-                    matches!(
-                        a,
-                        gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark
-                    )
-                };
-                theme::set_system_dark(is_dark(window.appearance()));
-                window
-                    .observe_window_appearance({
-                        let entity = entity.clone();
-                        move |window, cx| {
-                            theme::set_system_dark(is_dark(window.appearance()));
-                            entity.update(cx, |app, cx| {
-                                app.request_redraw();
-                                cx.notify();
-                            });
-                        }
-                    })
-                    .detach();
-
-                // Establish keyboard focus so key events reach the terminal.
-                let handle = entity.read(cx).focus_handle.clone();
-                window.focus(&handle, cx);
-                entity
-            },
-        )
-        .expect("open window");
-        // Remember the main window so popout flows can bring it forward.
-        let _ = main_window.update(cx, |app, _, _| app.main_window = Some(main_window.into()));
+        let main_window = App::open_main_window(
+            cx,
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            // A transparent native titlebar keeps OS edge-resize and the
+            // native traffic-light buttons, while our content draws under a
+            // full-size content view. `app_owns_titlebar_drag` stops AppKit
+            // from dragging the window off the whole top bar — we move it
+            // ourselves from the sidebar strip via `start_window_move`, so
+            // dragging a tile's tab no longer moves the window.
+            titlebar: Some(gpui::TitlebarOptions {
+                title: None,
+                appears_transparent: true,
+                traffic_light_position: None,
+            }),
+            is_resizable: true,
+            app_owns_titlebar_drag: true,
+            window_background: gpui::WindowBackgroundAppearance::Blurred,
+            ..Default::default()
+        },
+            (events_tx, events_rx),
+        );
+        let _ = main_window;
 
         cx.activate(true);
     });
@@ -6941,12 +6990,12 @@ mod open_url_tests {
 #[cfg(test)]
 mod proc_title_tests {
     use super::{PROC_TITLE_POLL, PROC_TITLE_REFRESH, proc_title_due};
-    use std::time::Duration;
+    use web_time::Duration;
 
     /// Nothing is due until the fast tick elapses, however stale the slow one.
     #[test]
     fn no_sweep_before_the_fast_tick() {
-        assert_eq!(proc_title_due(std::time::Duration::ZERO, PROC_TITLE_REFRESH), None);
+        assert_eq!(proc_title_due(web_time::Duration::ZERO, PROC_TITLE_REFRESH), None);
         assert_eq!(
             proc_title_due(PROC_TITLE_POLL - Duration::from_millis(1), PROC_TITLE_REFRESH),
             None

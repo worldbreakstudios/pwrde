@@ -175,7 +175,7 @@ mod tests {
         let key = ensure("sequenceDiagram\n  A->>B: hi\n  B-->>A: yo\n", true);
         for _ in 0..150 {
             match state(key) {
-                Render::Pending => std::thread::sleep(std::time::Duration::from_millis(100)),
+                Render::Pending => std::thread::sleep(web_time::Duration::from_millis(100)),
                 Render::Ready(path) => {
                     assert!(path.exists(), "Ready but PNG missing");
                     assert!(std::fs::metadata(&path).unwrap().len() > 0, "empty PNG");

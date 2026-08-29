@@ -23,6 +23,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dirs = "6"
 unicode-segmentation = "1"
+# Clocks that also work on wasm32 (`std::time::Instant::now` panics there).
+# On native these are the std types re-exported, so nothing changes.
+web-time = "1"
 # Syntax highlighting for the PR / local-diff viewers. Pure-Rust regex engine
 # (fancy-regex) so there's no C `onig` build under sccache; `default-fancy`
 # bundles the default syntax + theme sets.

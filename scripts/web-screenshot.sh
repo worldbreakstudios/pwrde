@@ -9,8 +9,8 @@
 #   query    appended to the URL, e.g. '?backend=webgl'
 #
 # Env: PWRDE_CHROME (headless Chromium binary; defaults to Playwright's
-# chrome-headless-shell), PWRDE_WEB_PORT (8090), PWRDE_WEB_SIZE (1200,720),
-# PWRDE_WEB_BUDGET_MS (virtual time to let the wasm boot and paint, 15000),
+# chrome-headless-shell), PWRDE_WEB_PORT (8090), PWRDE_WEB_SIZE (1200x720),
+# PWRDE_WEB_SETTLE_MS (real time to let the wasm boot and paint, 6000),
 # PWRDE_WEB_RELEASE=1 for an optimized build, PWRDE_WEZTERM_LOCAL=1 to build
 # against the local wezterm checkout from scripts/web-wezterm-fork.sh instead
 # of the published fork branch (trunk cannot pass cargo `--config`, so the
@@ -27,6 +27,7 @@ CHROME=${PWRDE_CHROME:-$(ls -d "$HOME"/Library/Caches/ms-playwright/chromium_hea
     echo "no headless Chromium found; set PWRDE_CHROME or run: npx playwright install chromium" >&2
     exit 1
 }
+command -v node >/dev/null || { echo "node (22+) is required for the DevTools capture" >&2; exit 1; }
 mkdir -p "$(dirname "$OUT")" "$ROOT/target"
 
 cd "$ROOT/web"
@@ -41,6 +42,12 @@ trap cleanup EXIT
 if [ "${PWRDE_WEZTERM_LOCAL:-}" = 1 ]; then
     PATCH_CFG="$ROOT/target/wezterm-fork-patch.toml"
     [ -f "$PATCH_CFG" ] || "$ROOT/scripts/web-wezterm-fork.sh" >/dev/null
+    # A run that was killed before its cleanup leaves the block behind; drop
+    # it so it is never backed up or appended twice.
+    if grep -q '^# temporary — scripts/web-screenshot.sh' .cargo/config.toml; then
+        sed -i '' '/^# temporary — scripts\/web-screenshot.sh/,$d' .cargo/config.toml
+        sed -i '' -e :a -e '/^\n*$/{$d;N;ba' -e '}' .cargo/config.toml
+    fi
     CONFIG_BAK="$ROOT/target/web-cargo-config.bak"
     cp .cargo/config.toml "$CONFIG_BAK"
     { echo; echo "# temporary — scripts/web-screenshot.sh (PWRDE_WEZTERM_LOCAL) restores this file"; cat "$PATCH_CFG"; } >> .cargo/config.toml
@@ -60,13 +67,8 @@ for _ in $(seq 1 3000); do
     sleep 0.2
 done
 
-# SwiftShader gives headless Chromium a software WebGL/WebGPU device; the
-# virtual time budget lets the wasm module boot and paint before the capture.
-"$CHROME" \
-    --headless=new --no-sandbox --hide-scrollbars \
-    --window-size="${PWRDE_WEB_SIZE:-1200,720}" \
-    --use-angle=swiftshader --enable-unsafe-swiftshader --enable-unsafe-webgpu \
-    --virtual-time-budget="${PWRDE_WEB_BUDGET_MS:-15000}" \
-    --screenshot="$OUT" \
-    "http://127.0.0.1:$PORT/$QUERY" 2>>"$ROOT/target/web-serve.log"
-echo "$OUT"
+# Drive Chromium over DevTools (scripts/web-screenshot.mjs): navigate, let the
+# wasm module boot and paint a few real frames, capture. Page console output
+# lands in the log next to trunk's.
+node "$ROOT/scripts/web-screenshot.mjs" "$CHROME" "http://127.0.0.1:$PORT/$QUERY" "$OUT" \
+    "${PWRDE_WEB_SIZE:-1200x720}" "${PWRDE_WEB_SETTLE_MS:-6000}" 2>>"$ROOT/target/web-serve.log"

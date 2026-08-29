@@ -1,5 +1,5 @@
 diff --git a/filedescriptor/src/lib.rs b/filedescriptor/src/lib.rs
-index c050c48..3ea08b4 100644
+index c050c48e..3ea08b49 100644
 --- a/filedescriptor/src/lib.rs
 +++ b/filedescriptor/src/lib.rs
 @@ -94,314 +94,21 @@
@@ -335,7 +335,7 @@ index c050c48..3ea08b4 100644
 +pub use wasm::*;
 diff --git a/filedescriptor/src/native.rs b/filedescriptor/src/native.rs
 new file mode 100644
-index 0000000..1d69fc6
+index 00000000..1d69fc6a
 --- /dev/null
 +++ b/filedescriptor/src/native.rs
 @@ -0,0 +1,314 @@
@@ -653,8 +653,68 @@ index 0000000..1d69fc6
 +pub fn socketpair() -> Result<(FileDescriptor, FileDescriptor)> {
 +    socketpair_impl()
 +}
+diff --git a/term/src/terminalstate/mod.rs b/term/src/terminalstate/mod.rs
+index ac2a6022..b5a5c4c6 100644
+--- a/term/src/terminalstate/mod.rs
++++ b/term/src/terminalstate/mod.rs
+@@ -9,6 +9,7 @@ use num_traits::ToPrimitive;
+ use std::collections::HashMap;
+ use std::io::{BufWriter, Write};
+ use std::num::NonZeroUsize;
++#[cfg(any(unix, windows))]
+ use std::sync::mpsc::{channel, Sender};
+ use std::sync::Arc;
+ use terminfo::{Database, Value};
+@@ -444,14 +445,39 @@ fn default_color_map() -> HashMap<u16, RgbColor> {
+ /// and we're in control of the write side, which represents
+ /// input from the interactive user, or pastes.
+ struct ThreadedWriter {
++    #[cfg(any(unix, windows))]
+     sender: Sender<WriterMessage>,
++    /// Targets without threads (wasm32) write synchronously; the writer there
++    /// is an in-memory sink or a browser callback, never a blocking pty.
++    #[cfg(not(any(unix, windows)))]
++    writer: Box<dyn std::io::Write + Send>,
+ }
+ 
++#[cfg(any(unix, windows))]
+ enum WriterMessage {
+     Data(Vec<u8>),
+     Flush,
+ }
+ 
++#[cfg(not(any(unix, windows)))]
++impl ThreadedWriter {
++    fn new(writer: Box<dyn std::io::Write + Send>) -> Self {
++        Self { writer }
++    }
++}
++
++#[cfg(not(any(unix, windows)))]
++impl std::io::Write for ThreadedWriter {
++    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
++        self.writer.write(buf)
++    }
++
++    fn flush(&mut self) -> std::io::Result<()> {
++        self.writer.flush()
++    }
++}
++
++#[cfg(any(unix, windows))]
+ impl ThreadedWriter {
+     fn new(mut writer: Box<dyn std::io::Write + Send>) -> Self {
+         let (sender, receiver) = channel::<WriterMessage>();
+@@ -477,6 +503,7 @@ impl ThreadedWriter {
+     }
+ }
+ 
++#[cfg(any(unix, windows))]
+ impl std::io::Write for ThreadedWriter {
+     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+         self.sender
 diff --git a/termwiz/src/lineedit/mod.rs b/termwiz/src/lineedit/mod.rs
-index 5ffba06..8d55a76 100644
+index 5ffba063..8d55a76b 100644
 --- a/termwiz/src/lineedit/mod.rs
 +++ b/termwiz/src/lineedit/mod.rs
 @@ -41,7 +41,9 @@ use crate::caps::{Capabilities, ProbeHints};
@@ -677,7 +737,7 @@ index 5ffba06..8d55a76 100644
      let hints = ProbeHints::new_from_env().mouse_reporting(Some(false));
      let caps = Capabilities::new_with_hints(hints)?;
 diff --git a/termwiz/src/terminal/mod.rs b/termwiz/src/terminal/mod.rs
-index 7195198..cb4dd28 100644
+index 7195198b..cb4dd284 100644
 --- a/termwiz/src/terminal/mod.rs
 +++ b/termwiz/src/terminal/mod.rs
 @@ -105,6 +105,7 @@ pub trait Terminal {
@@ -697,7 +757,7 @@ index 7195198..cb4dd28 100644
      SystemTerminal::new(caps)
  }
 diff --git a/wezterm-escape-parser/src/apc.rs b/wezterm-escape-parser/src/apc.rs
-index 96cd96c..23ae477 100644
+index 96cd96c3..23ae477f 100644
 --- a/wezterm-escape-parser/src/apc.rs
 +++ b/wezterm-escape-parser/src/apc.rs
 @@ -262,6 +262,20 @@ impl KittyImageData {

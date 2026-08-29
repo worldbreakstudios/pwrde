@@ -14,7 +14,7 @@
 // pass; until then every item here is legitimately unused.
 #![allow(dead_code)]
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use web_time::{SystemTime, UNIX_EPOCH};
 
 use crate::git::DirtyStats;
 use crate::git_context::{GitContext, PrRollup, derive_rollup};
@@ -426,7 +426,7 @@ fn uncommitted_phrase(files: u32) -> String {
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use std::time::Duration;
+    use web_time::Duration;
 
     use crate::gh::{Check, CheckStatus, PrSummary};
     use crate::git::DirtyStats;
@@ -578,7 +578,7 @@ mod tests {
         // day earlier must land in adjacent buckets — this is what the UTC-only
         // arithmetic got wrong, misfiling an evening stamp as `Yesterday`.
         let now = SystemTime::now();
-        let a_day = std::time::Duration::from_secs(86_400);
+        let a_day = web_time::Duration::from_secs(86_400);
         assert_eq!(relative_time(now - a_day, now), "Yesterday");
         // And "now" is always today, which a UTC day boundary cannot promise.
         assert!(

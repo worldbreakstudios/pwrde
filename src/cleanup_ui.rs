@@ -5,7 +5,7 @@
 //! [`workspace::terminal_area`]. Confirm dialogs stay on the canvas path, so
 //! the overlay is skipped while one is open.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use web_time::{SystemTime, UNIX_EPOCH};
 
 use gpui::{
     div, px, AnyElement, App as GpuiApp, ClickEvent, Context, InteractiveElement, IntoElement,

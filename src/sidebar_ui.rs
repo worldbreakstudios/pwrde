@@ -32,7 +32,7 @@ use gpui::{
     prelude::FluentBuilder as _, px,
 };
 
-use std::time::SystemTime;
+use web_time::SystemTime;
 
 use crate::App;
 use crate::git_context::{PrRollup, derive_rollup};
@@ -1846,7 +1846,7 @@ mod tests {
             }),
             pr: None,
             pr_error: None,
-            fetched_at: std::time::UNIX_EPOCH,
+            fetched_at: web_time::UNIX_EPOCH,
         };
         let line = crate::sidebar_card::diffstat_line(&c).expect("a dirty tree has a diffstat");
 

@@ -689,9 +689,7 @@ impl Session {
             Box::new(writer.clone()),
         );
         term.set_notification_handler(Box::new(AttentionHandler { id, sender: events.clone() }));
-        term.advance_bytes(b"pwrde web: no PTY on wasm32 \x1b[2m(fixture playback goes here)\x1b[0m\r\n");
-        let redraw_pending = Arc::new(AtomicBool::new(true));
-        let _ = events.send(TermEvent::Wakeup(id));
+        let redraw_pending = Arc::new(AtomicBool::new(false));
         Self {
             id,
             term: Arc::new(Mutex::new(term)),
@@ -733,6 +731,14 @@ impl Session {
             shpool_session: None,
             child_pid: None,
         }
+    }
+
+    /// Advance the grid with `bytes` as if they had arrived from the PTY, and
+    /// request a redraw. This is how fixtures (the web build, tests) put
+    /// content on screen without a shell.
+    pub fn feed(&self, bytes: &[u8]) {
+        self.term.lock().unwrap().advance_bytes(bytes);
+        self.redraw_pending.store(true, Ordering::Release);
     }
 
     /// Write user input to the PTY.
@@ -1121,7 +1127,7 @@ mod tests {
                 if dump().contains(needle) {
                     return true;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(5));
+                std::thread::sleep(web_time::Duration::from_millis(5));
             }
             false
         };
@@ -1137,7 +1143,7 @@ mod tests {
             false,
         ))
         .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::thread::sleep(web_time::Duration::from_millis(50));
         assert!(dump().is_empty(), "ungrabbed terminal must stay silent, got {:?}", dump());
 
         // Opt in to button tracking (1002) with SGR encoding (1006).

@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::io::Read;
 use std::process::{Command, Output, Stdio};
-use std::time::{Duration, Instant};
+use web_time::{Duration, Instant};
 
 use crate::diff::{DiffFile, DiffHunk, DiffLine, FileStatus, LineKind};
 

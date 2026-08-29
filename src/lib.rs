@@ -9,6 +9,7 @@
 //! handling; everything else is the module map described in `CLAUDE.md`.
 
 pub mod app;
+pub mod bg;
 pub mod claude_hooks;
 pub mod clipboard;
 pub mod cleanup;
@@ -18,6 +19,7 @@ pub mod command_ui;
 pub mod diff;
 pub mod features;
 pub mod file_tree;
+pub mod fixture;
 pub mod flyover_ui;
 pub mod gh;
 pub mod git;

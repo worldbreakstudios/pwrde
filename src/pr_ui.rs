@@ -168,7 +168,7 @@ impl App {
         self.pr.branch = branch.clone();
         self.pr.branch_list = Load::Loading;
         let tx = self.events_tx.clone();
-        std::thread::spawn(move || {
+        crate::bg::spawn(move || {
             let result = match branch {
                 Some(b) => gh::pr_list_for_branch(&dir, &b),
                 None => Ok(Vec::new()),
@@ -183,7 +183,7 @@ impl App {
         let Some(dir) = self.active_repo_dir() else { return };
         self.pr.all_list = Load::Loading;
         let tx = self.events_tx.clone();
-        std::thread::spawn(move || {
+        crate::bg::spawn(move || {
             let _ = tx.send(crate::term::TermEvent::PrListLoaded { all: true, result: gh::pr_list(&dir) });
         });
         self.request_redraw();
@@ -240,7 +240,7 @@ impl App {
         self.pr.detail = Load::Loading;
         self.pr.conversation = None;
         let tx = self.events_tx.clone();
-        std::thread::spawn(move || {
+        crate::bg::spawn(move || {
             let result = gh::pr_detail(&dir, number);
             let _ = tx.send(crate::term::TermEvent::PrDetailLoaded { number, result });
         });
@@ -252,7 +252,7 @@ impl App {
         self.pr.diff = Load::Loading;
         let tx = self.events_tx.clone();
         let dark = crate::theme::dark_active();
-        std::thread::spawn(move || {
+        crate::bg::spawn(move || {
             // Fetch, parse, and syntax-highlight entirely off the UI thread so
             // the render path never touches syntect.
             let result = gh::pr_diff(&dir, number)
@@ -268,7 +268,7 @@ impl App {
         self.pr.acting = true;
         self.pr.action_msg = None;
         let tx = self.events_tx.clone();
-        std::thread::spawn(move || {
+        crate::bg::spawn(move || {
             let _ = tx.send(crate::term::TermEvent::PrActionDone(gh::run_action(
                 &dir, number, &action,
             )));
@@ -2733,8 +2733,8 @@ fn relative_time(iso: &str) -> String {
     let Some(then) = epoch_secs(iso) else {
         return String::new();
     };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    let now = web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     format_ago(now - then)

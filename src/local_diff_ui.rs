@@ -47,7 +47,7 @@ impl App {
         self.local_diff.data = Load::Loading;
         let tx = self.events_tx.clone();
         let dark = crate::theme::dark_active();
-        std::thread::spawn(move || {
+        crate::bg::spawn(move || {
             // Gather, parse, and highlight off-thread; the UI only stores the
             // ready-to-render result.
             let result = crate::git::local_diff(&dir, mode, None).map(|ld| LocalDiffRender {

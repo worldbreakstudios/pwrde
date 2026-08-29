@@ -1,0 +1,16 @@
+[1;32mtyler[0m@[1;34mstudio[0m [36m~/src/pwrde[0m [35m(main)[0m [1m$[0m ls
+[1;34mdocs[0m      [1;34mresources[0m  [1;34mscripts[0m  [1;34msrc[0m  [1;34mweb[0m
+CLAUDE.md  Cargo.lock  Cargo.toml  README.md  rcn.toml
+[1;32mtyler[0m@[1;34mstudio[0m [36m~/src/pwrde[0m [35m(main)[0m [1m$[0m git status --short
+ [31mM[0m src/app.rs
+ [31mM[0m src/lib.rs
+[32mA[0m  src/fixture.rs
+[31m??[0m src/fixtures/
+[1;32mtyler[0m@[1;34mstudio[0m [36m~/src/pwrde[0m [35m(main)[0m [1m$[0m cargo test 2>&1 | tail -2
+test result: [32mok[0m. 402 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.15s
+
+[1;32mtyler[0m@[1;34mstudio[0m [36m~/src/pwrde[0m [35m(main)[0m [1m$[0m scripts/web-screenshot.sh
+[2m2026-08-29T14:49:59Z  INFO ✅ success[0m
+[2m2026-08-29T14:49:59Z  INFO 📡 server listening at: http://127.0.0.1:8090/[0m
+/Users/tyler/src/pwrde/target/web-screenshot.png
+[1;32mtyler[0m@[1;34mstudio[0m [36m~/src/pwrde[0m [35m(main)[0m [1m$[0m 

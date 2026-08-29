@@ -5227,6 +5227,7 @@ dependencies = [
  "termwiz",
  "unicode-segmentation",
  "uuid",
+ "web-time",
  "wezterm-term",
 ]
 
@@ -5236,6 +5237,7 @@ version = "0.1.0"
 dependencies = [
  "gpui",
  "gpui_platform",
+ "log",
  "pwrde",
  "web-sys",
 ]

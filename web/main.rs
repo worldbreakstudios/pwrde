@@ -1,117 +1,128 @@
-//! pwrde in a browser: the pwrde library booted through gpui's web platform
-//! (gpui_web + gpui_wgpu) and drawn to a full-page canvas with WebGPU (or
-//! WebGL as a fallback). Build and serve with `trunk serve` from this
-//! directory, or let `scripts/web-screenshot.sh` drive it headlessly.
+//! pwrde in a browser: the same `App` the macOS binary runs, booted through
+//! gpui's web platform (gpui_web + gpui_wgpu) and drawn to a full-page canvas
+//! with WebGPU (or WebGL as a fallback). There is no PTY on wasm32, so the
+//! workspace is seeded from recorded transcripts (`pwrde::fixture`) instead of
+//! shells. Build and serve with `trunk serve` from this directory, or let
+//! `scripts/web-screenshot.sh` drive it headlessly.
 //!
-//! Today this is the boot-path smoke test — the chrome theme and the vendored
-//! rcn components, proving the whole lib links and paints on wasm32. Booting
-//! the real `pwrde::app::App` (with PTY-less fixture sessions) is the next
-//! step; see `docs/web-build.md`.
+//! Query parameters, all optional:
+//!   `?page=sessions|settings|cleanup|…`  open on that page (see `pages::Page`)
+//!   `?dark=1` / `?dark=0`                force the appearance polarity
+//!   `?fixture=none`                      skip the demo workspace (empty state)
+//!   `?backend=webgpu` / `?backend=webgl` force a renderer (default: auto)
 
-use gpui::{
-    App, AppContext, Bounds, Context, ParentElement, Render, Styled, Window, WindowBounds,
-    WindowOptions, div, prelude::*, px, size,
-};
+use gpui::{App as GpuiApp, Bounds, WindowBounds, WindowOptions, px, size};
 
-use pwrde::ui::theme::Theme;
-use pwrde::ui::{
-    Badge, Button, ButtonSize, ButtonVariant, Card, CardDescription, CardHeader, CardTitle, Input,
-};
+use pwrde::app::App;
+use pwrde::pages::Page;
+use std::borrow::Cow;
 
-/// `?backend=webgpu` / `?backend=webgl` force a renderer; default auto-detects
-/// (WebGPU where available, WebGL otherwise).
-fn requested_backend() -> gpui_platform::WebBackendPreference {
-    let search = web_sys::window()
-        .and_then(|window| window.location().search().ok())
-        .unwrap_or_default();
-    let has = |needle: &str| search.trim_start_matches('?').split('&').any(|p| p == needle);
-    if has("backend=webgpu") {
-        gpui_platform::WebBackendPreference::WebGpu
-    } else if has("backend=webgl") {
-        gpui_platform::WebBackendPreference::WebGl
-    } else {
-        gpui_platform::WebBackendPreference::Auto
+/// The faces `web/fonts/README.md` describes.
+const FONTS: &[&[u8]] = &[
+    include_bytes!("fonts/JetBrainsMonoNerdFontMono-Regular.ttf"),
+    include_bytes!("fonts/JetBrainsMonoNerdFontMono-Bold.ttf"),
+    include_bytes!("fonts/JetBrainsMonoNerdFontMono-Italic.ttf"),
+];
+
+/// The URL's query string, split into `key=value` pairs.
+struct Query(Vec<(String, String)>);
+
+impl Query {
+    fn from_location() -> Self {
+        let search = web_sys::window()
+            .and_then(|window| window.location().search().ok())
+            .unwrap_or_default();
+        Self(
+            search
+                .trim_start_matches('?')
+                .split('&')
+                .filter(|p| !p.is_empty())
+                .map(|p| match p.split_once('=') {
+                    Some((k, v)) => (k.to_string(), v.to_string()),
+                    None => (p.to_string(), String::new()),
+                })
+                .collect(),
+        )
     }
-}
 
-struct Smoke;
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+    }
 
-impl Render for Smoke {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::of(cx);
-        let (bg, fg, muted) = (theme.background, theme.foreground, theme.muted_foreground);
-        div()
-            .size_full()
-            .bg(bg)
-            .text_color(fg)
-            .flex()
-            .items_center()
-            .justify_center()
-            .child(div().w(px(420.0)).child(
-                Card::new()
-                    .child(
-                        CardHeader::new()
-                            .child(CardTitle::new().child("pwrde web smoke"))
-                            .child(CardDescription::new().child(
-                                "gpui_web + the pwrde library, painted from the chrome theme.",
-                            )),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_3()
-                            .px_6()
-                            .pb_6()
-                            .child(
-                                div()
-                                    .flex()
-                                    .gap_2()
-                                    .child(Badge::new().child("wasm32"))
-                                    .child(Badge::new().child(format!("theme: {}", pwrde::theme::current().name))),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .gap_2()
-                                    .child(Button::new("primary").size(ButtonSize::Sm).child("Primary"))
-                                    .child(
-                                        Button::new("outline")
-                                            .variant(ButtonVariant::Outline)
-                                            .size(ButtonSize::Sm)
-                                            .child("Outline"),
-                                    ),
-                            )
-                            .child(div().text_sm().text_color(muted).child(
-                                "If you can read this in a headless Chromium screenshot, the toolchain works.",
-                            )),
-                    ),
-            ))
+    fn backend(&self) -> gpui_platform::WebBackendPreference {
+        match self.get("backend") {
+            Some("webgpu") => gpui_platform::WebBackendPreference::WebGpu,
+            Some("webgl") => gpui_platform::WebBackendPreference::WebGl,
+            _ => gpui_platform::WebBackendPreference::Auto,
+        }
+    }
+
+    /// `?page=settings` → `Page::Settings`; the names are the variants,
+    /// case-insensitively.
+    fn page(&self) -> Option<Page> {
+        let want = self.get("page")?;
+        Page::ALL.iter().copied().find(|p| format!("{p:?}").eq_ignore_ascii_case(want))
+    }
+
+    fn dark(&self) -> Option<bool> {
+        match self.get("dark") {
+            Some("1") | Some("true") => Some(true),
+            Some("0") | Some("false") => Some(false),
+            _ => None,
+        }
+    }
+
+    fn fixture(&self) -> bool {
+        !matches!(self.get("fixture"), Some("none") | Some("0"))
     }
 }
 
 fn main() {
     gpui_platform::web_init();
+    let query = Query::from_location();
+
+    // Same order as the native boot: settings first. There is no settings
+    // file on the web, so this is the empty store and every default — and a
+    // `?dark=` override lands in the store as the appearance mode (the write
+    // to disk fails silently), which is what the window's own appearance
+    // tracking would otherwise keep overriding.
+    pwrde::settings::init();
+    if let Some(dark) = query.dark() {
+        pwrde::settings::set("appearance.mode", if dark { "dark" } else { "light" }.into());
+    }
+
+    let (events_tx, events_rx) = std::sync::mpsc::channel();
     // On wasm the browser owns the run loop: Platform::run returns immediately,
     // so `Application::run`'s stack frame — which keeps the App alive on native
     // — would drop the whole app right after launch. run_embedded returns a
     // handle instead; leak it so the app lives for the lifetime of the page.
-    let app = gpui_platform::application_with_web_backend(requested_backend())
+    let app = gpui_platform::application_with_web_backend(query.backend())
         .with_assets(pwrde::ui::assets::Assets)
-        .run_embedded(|cx: &mut App| {
-            // Same seeding as the native boot: the rcn Theme global tracks the
-            // chrome theme, and the Input component wants its key bindings.
-            cx.set_global(Theme::from_chrome(pwrde::theme::current()));
-            Input::register_key_bindings(cx);
-            let bounds = Bounds::centered(None, size(px(1200.0), px(720.0)), cx);
-            cx.open_window(
+        .run_embedded(move |cx: &mut GpuiApp| {
+            // gpui_web knows only its own embedded faces; register the family
+            // the renderer and chrome name before anything measures a cell.
+            if let Err(err) = cx.text_system().add_fonts(FONTS.iter().map(|f| Cow::Borrowed(*f)).collect()) {
+                log::warn!("could not register embedded fonts: {err}");
+            }
+            pwrde::app::init_globals(cx);
+            let bounds = Bounds::centered(None, size(px(1280.0), px(800.0)), cx);
+            let window = App::open_main_window(
+                cx,
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     ..Default::default()
                 },
-                |_, cx| cx.new(|_| Smoke),
-            )
-            .expect("failed to open window");
+                (events_tx, events_rx),
+            );
+            let _ = window.update(cx, |app, _window, cx| {
+                if query.fixture() {
+                    pwrde::fixture::seed(app, pwrde::fixture::DEMO);
+                }
+                if let Some(page) = query.page() {
+                    app.set_page(page);
+                }
+                cx.notify();
+            });
             cx.activate(true);
         });
     std::mem::forget(app);

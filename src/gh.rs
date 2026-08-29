@@ -65,7 +65,7 @@ fn run(mut cmd: Command) -> Result<String, String> {
 /// stay distinguishable in the message — `is not installed` (ENOENT), `timed
 /// out` (deadline), and the CLI's own stderr for everything else (auth, no
 /// remote), which `is_auth_failure` can recognize.
-fn run_within(mut cmd: Command, limit: std::time::Duration) -> Result<String, String> {
+fn run_within(mut cmd: Command, limit: web_time::Duration) -> Result<String, String> {
     let out = crate::git::output_within(&mut cmd, limit).map_err(|e| e.to_string())?;
     finish(out)
 }

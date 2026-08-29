@@ -45,7 +45,7 @@ pub struct Tab {
     /// card can still say how long ago that was. Set by the mark-unread paths
     /// and by an on-screen pane's attention signal, which stamps without
     /// dotting — so a stamp does not imply the tab is currently unread.
-    pub unread_at: Option<std::time::SystemTime>,
+    pub unread_at: Option<web_time::SystemTime>,
 }
 
 impl Tab {
@@ -292,7 +292,7 @@ impl Workspace {
     /// those tabs (ignoring missing timestamps). Otherwise it is the newest
     /// timestamp across all tabs, retained after tabs are read. Returns
     /// `None` when no tab has ever been marked unread.
-    pub fn attention_at(&self) -> Option<std::time::SystemTime> {
+    pub fn attention_at(&self) -> Option<web_time::SystemTime> {
         let tabs = self.root.tiles().into_iter().flat_map(|tile| tile.tabs.iter());
         let unread = tabs.clone().filter(|tab| tab.unread).filter_map(|tab| tab.unread_at);
         if let Some(oldest) = unread.min() {
@@ -2042,7 +2042,7 @@ mod tests {
         use crate::term::Session;
         let mut tab = Tab::new(Session::placeholder());
         tab.unread = unread;
-        tab.unread_at = Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds));
+        tab.unread_at = Some(web_time::UNIX_EPOCH + web_time::Duration::from_secs(seconds));
         tab
     }
 
@@ -2058,7 +2058,7 @@ mod tests {
         tile.tabs.push(tab_with_attention(true, 30));
         tile.tabs.push(tab_with_attention(true, 10));
         let ws = Workspace::new("g".into(), tile, None);
-        let expected = std::time::UNIX_EPOCH + std::time::Duration::from_secs(10);
+        let expected = web_time::UNIX_EPOCH + web_time::Duration::from_secs(10);
         assert_eq!(ws.attention_at(), Some(expected));
     }
 
@@ -2068,7 +2068,7 @@ mod tests {
         tile.tabs.push(tab_with_attention(false, 5));
         tile.tabs.push(tab_with_attention(true, 20));
         let ws = Workspace::new("g".into(), tile, None);
-        assert_eq!(ws.attention_at(), Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(20)));
+        assert_eq!(ws.attention_at(), Some(web_time::UNIX_EPOCH + web_time::Duration::from_secs(20)));
     }
 
     #[test]
@@ -2077,7 +2077,7 @@ mod tests {
         tile.tabs.push(tab_with_attention(false, 5));
         tile.tabs.push(tab_with_attention(false, 20));
         let ws = Workspace::new("g".into(), tile, None);
-        assert_eq!(ws.attention_at(), Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(20)));
+        assert_eq!(ws.attention_at(), Some(web_time::UNIX_EPOCH + web_time::Duration::from_secs(20)));
     }
 
     #[test]

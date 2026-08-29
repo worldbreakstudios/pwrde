@@ -1,0 +1,24 @@
+# wasm threads (gpui_web's multithreaded executor via wasm_thread) require
+# shared memory + atomics, which in turn require rebuilding std with these
+# target features enabled. Copied from gpui_web's hello_web example, plus the
+# getrandom backend selector that wezterm's uuid dependency needs on wasm32.
+[target.wasm32-unknown-unknown]
+rustflags = [
+    "-C", "target-feature=+atomics,+bulk-memory,+mutable-globals",
+    "-C", "link-arg=--shared-memory",
+    "-C", "link-arg=--max-memory=1073741824",
+    "-C", "link-arg=--import-memory",
+    "-C", "link-arg=--export=__wasm_init_tls",
+    "-C", "link-arg=--export=__tls_size",
+    "-C", "link-arg=--export=__tls_align",
+    "-C", "link-arg=--export=__tls_base",
+    "--cfg", "getrandom_backend=\"wasm_js\"",
+]
+
+[unstable]
+build-std = ["std,panic_abort"]
+
+# The parent workspace routes rustc through sccache; build-std on nightly is
+# not something we want in that cache, so this workspace compiles directly.
+[build]
+rustc-wrapper = ""

@@ -32,6 +32,7 @@ const LINE_HEIGHT_FACTOR: f32 = 1.25;
 /// Concrete monospace family. Naming a real installed font (not the generic
 /// `Family::Monospace`) skips per-word font-fallback resolution, and the Nerd
 /// Font glyph coverage keeps fallback from firing on powerline/icon glyphs.
+/// Also the family `web/fonts/` embeds, since gpui_web has no system fonts.
 pub const FONT_FAMILY: &str = "JetBrainsMono Nerd Font Mono";
 /// Content inset inside each tile's terminal region, logical px. Generous
 /// enough that the card's rounded corners never clip glyphs.

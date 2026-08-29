@@ -16,7 +16,7 @@
 use rusqlite::{Connection, Result as SqlResult};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use web_time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Serializable layout tree mirroring workspace::Node without live state.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

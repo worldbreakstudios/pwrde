@@ -15,7 +15,7 @@ There are three top-level pages (see `pages.rs`): **Sessions** (the terminal wor
 - `cargo test <name>` — run a single test or filter by substring.
 - `scripts/make-app.sh` — assemble `target/release/Pwrde.app` (requires `cargo build --release` first).
 - `scripts/deploy.sh` — pull main, build, bundle, install to `/Applications`. Refuses to run off the `main` branch.
-- `scripts/web-screenshot.sh [out.png] [query]` — build the wasm32 page under `web/`, serve it, and screenshot it with headless Chromium. `cd web && trunk serve` for a live page on :8090. Needs the patched wezterm branch (`scripts/web-wezterm-fork.sh --push`, once) — see `docs/web-build.md`.
+- `scripts/web-screenshot.sh [out.png] [query]` — build the wasm32 page under `web/`, serve it, and screenshot it with headless Chromium (driven over DevTools by `scripts/web-screenshot.mjs`, node 22+). The page is the real app seeded from `src/fixture.rs`; `?page=settings&dark=1` picks what to capture. `cd web && trunk serve` for a live page on :8090. Needs the patched wezterm branch (`scripts/web-wezterm-fork.sh --push`, once) or `PWRDE_WEZTERM_LOCAL=1` — see `docs/web-build.md`.
 
 Builds compile through **sccache** (`.cargo/config.toml` sets `rustc-wrapper`), so a fresh worktree's first build pulls the gpui dependency tree from cache instead of recompiling it. sccache must be installed (`brew install sccache`) or cargo fails with "could not execute process `sccache`".
 
@@ -51,7 +51,7 @@ Painting happens inside a single custom gpui `Element`'s `paint()` in `app.rs`. 
 
 ### Web build (wasm32)
 
-`web/` is a standalone cargo workspace (nightly + `build-std`, kept out of the native build) that boots the `pwrde` library through `gpui_web` + `gpui_wgpu` and paints to a browser canvas, so browser automation can screenshot and drive the UI. Native-only dependencies (`portable-pty`, `rusqlite`, `arboard`, `libc`, `gpui_platform`) sit under `[target.'cfg(not(target_family = "wasm"))'.dependencies]` and their call sites are cfg-gated; the wezterm crates need `web/patches/wezterm-wasm.patch` (four cfg fixes, carried on a fork branch). `docs/web-build.md` has the status table, what each native piece is replaced with, and the steps left before the real `App` boots on the web. When adding a native-only dependency, gate it the same way so the wasm check keeps passing.
+`web/` is a standalone cargo workspace (nightly + `build-std`, kept out of the native build) that boots the `pwrde` library through `gpui_web` + `gpui_wgpu` and paints to a browser canvas, so browser automation can screenshot and drive the UI. Native-only dependencies (`portable-pty`, `rusqlite`, `arboard`, `libc`, `gpui_platform`) sit under `[target.'cfg(not(target_family = "wasm"))'.dependencies]` and their call sites are cfg-gated; the wezterm crates need `web/patches/wezterm-wasm.patch` (four cfg fixes, carried on a fork branch). The real `App` boots there (`App::open_main_window` / `App::new` are shared with `run_native`), seeded from `fixture::DEMO`; clocks go through `web_time`, workers through `bg::spawn`. `docs/web-build.md` has the status table, what each native piece is replaced with, and what is next. When adding a native-only dependency or a `std::thread::spawn`, gate it the same way so the wasm check keeps passing.
 
 ### Module map
 
@@ -59,6 +59,8 @@ Painting happens inside a single custom gpui `Element`'s `paint()` in `app.rs`. 
 - `main.rs` — the native binary: `fn main` calls `pwrde::app::run_native()`, nothing else.
 - `app.rs` — the gpui `App` entity: window boot (`run_native`), the terminal `Element`, keyboard/mouse handling, tab drag & drop (`DropTarget`/`Drag`). Items are `pub(crate)` because the UI modules reach into it.
 - `clipboard.rs` — the system clipboard behind one seam (`arboard` natively, no-ops on wasm32).
+- `bg.rs` — off-thread work behind one seam (`std::thread::spawn` natively; dropped on wasm32, where threads panic). Use it for fire-and-forget workers that report back over `TermEvent`.
+- `fixture.rs` — deterministic demo workspace for the web build and tests: groups/splits/tabs whose sessions are fed the recorded transcripts in `src/fixtures/*.vt` via `Session::feed`.
 - `workspace.rs` — group/split-tree/tile/tab model plus pure layout math over the window size, so drawing and hit-testing/PTY-resize always agree.
 - `term.rs` — `Session`: PTY (portable-pty) + VT emulation (wezterm-term) + reader thread.
 - `renderer.rs` — stateless frame building (see above).

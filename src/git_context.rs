@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use web_time::{Duration, SystemTime};
 
 use crate::gh::{self, CheckStatus, PrSummary};
 use crate::git::{self, DirtyStats};
