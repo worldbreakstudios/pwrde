@@ -178,16 +178,6 @@ pub struct CaretSpec {
     pub color: Hsla,
 }
 
-/// Button labels of the confirm dialog (shared by layout and drawing).
-const CONFIRM_CANCEL: &str = "Cancel";
-
-/// The confirm dialog's rects, in physical px.
-pub struct ConfirmLayout {
-    pub panel: LayoutRect,
-    pub cancel: LayoutRect,
-    pub close: LayoutRect,
-}
-
 /// Geometry of the save-workspace modal (panel, both text fields, destination
 /// rows), shared by drawing and `main.rs` hit-testing.
 pub struct SaveLayout {
@@ -230,6 +220,10 @@ pub struct ChromeState<'a> {
     /// Physical-pixel cursor position for hover painting. `None` while any
     /// drag is active so hover highlights are suppressed mid-drag.
     pub cursor: Option<(f32, f32)>,
+    /// An element-tree modal (confirm dialog / message panel, `modal_ui`)
+    /// owns the window: the canvas chrome goes inert and the terminal cursor
+    /// hides, exactly as for the canvas-painted overlays.
+    pub element_modal: bool,
 }
 
 /// Everything `main.rs`'s terminal `Element` needs to paint one frame — all
@@ -510,8 +504,6 @@ impl Renderer {
         profile: Option<&ProfilePicker>,
         save: Option<&SaveModalView>,
         palette: Option<&Palette>,
-        message: Option<&(String, bool)>,
-        confirm: Option<(&str, &str)>,
         chrome: &ChromeState,
     ) -> Frame {
         let th = self.theme();
@@ -572,8 +564,7 @@ impl Renderer {
         // Overlays are modal: while one is up only its elements hover or
         // register as hot; the chrome underneath goes inert (mirroring the
         // click routing in `main.rs`, which sends every click to the overlay).
-        let overlay_open = confirm.is_some()
-            || message.is_some()
+        let overlay_open = chrome.element_modal
             || save.is_some()
             || profile.is_some()
             || fork.is_some()
@@ -813,8 +804,7 @@ impl Renderer {
                         && picker.is_none()
                         && fork.is_none()
                         && palette.is_none()
-                        && message.is_none()
-                        && confirm.is_none();
+                        && !chrome.element_modal;
                     let tile_hover = link_hover
                         .filter(|(hid, _, _)| *hid == *id)
                         .map(|(_, col, row)| (col, row));
@@ -1009,10 +999,10 @@ impl Renderer {
         }
         let mut picker_quads: Vec<Quad> = Vec::new();
         let mut picker_labels: Vec<LabelSpec> = Vec::new();
-        if let Some((text, accept)) = confirm {
-            picker_labels =
-                self.confirm_overlay(text, accept, chrome.cursor, &mut picker_quads, &mut hot);
-        } else if let Some(s) = save {
+        // The confirm dialog and message panel are element modals now
+        // (`modal_ui`); the canvas only paints the pickers, palette and save
+        // modal here.
+        if let Some(s) = save {
             let layout = self.save_layout(s.dest.map_or(0, |(rows, _)| rows.len()));
             picker_labels =
                 self.save_overlay(s, &layout, chrome.cursor, &mut picker_quads, &mut hot);
@@ -1032,8 +1022,6 @@ impl Renderer {
                 PickerLayout::compute(width, height, self.scale, pal.rows.len(), pal.selected);
             picker_labels =
                 self.palette_overlay(pal, &layout, chrome.cursor, &mut picker_quads, &mut hot);
-        } else if let Some((text, _)) = message {
-            picker_labels = self.message_overlay(text, &mut picker_quads);
         }
 
         Frame {
@@ -1600,126 +1588,6 @@ impl Renderer {
             }
         }
         labels
-    }
-
-    /// Geometry of the confirm dialog (panel + buttons), shared by drawing and
-    /// `main.rs` hit-testing so clicks always agree with pixels.
-    pub fn confirm_layout(&self, text: &str, accept: &str) -> ConfirmLayout {
-        let scale = self.scale;
-        let pad = (16.0 * scale).round();
-        let gap = (10.0 * scale).round();
-        let btn_pad = (14.0 * scale).round();
-        let btn_h = (self.chrome_cell_height + 10.0 * scale).round();
-        let text_w = text.chars().count() as f32 * self.chrome_cell_width;
-        let cancel_w =
-            (CONFIRM_CANCEL.chars().count() as f32 * self.chrome_cell_width + 2.0 * btn_pad).round();
-        let close_w = (accept.chars().count() as f32 * self.chrome_cell_width + 2.0 * btn_pad).round();
-        let w = (text_w.max(cancel_w + gap + close_w) + 2.0 * pad)
-            .min(self.width as f32 - 2.0 * pad);
-        let h = (self.chrome_cell_height + gap + btn_h + 2.0 * pad).round();
-        let x = ((self.width as f32 - w) / 2.0).round();
-        let y = ((self.height as f32 - h) / 2.0).round();
-        let by = (y + pad + self.chrome_cell_height + gap).round();
-        let close_x = (x + w - pad - close_w).round();
-        let cancel_x = (close_x - gap - cancel_w).round();
-        ConfirmLayout {
-            panel: LayoutRect { x, y, w, h },
-            cancel: LayoutRect { x: cancel_x, y: by, w: cancel_w, h: btn_h },
-            close: LayoutRect { x: close_x, y: by, w: close_w, h: btn_h },
-        }
-    }
-
-    /// Centered confirm dialog: a message line over Cancel / accept buttons.
-    /// Styled like the message panel; the destructive accept button carries
-    /// the accent fill.
-    fn confirm_overlay(
-        &self,
-        text: &str,
-        accept: &str,
-        cursor: Option<(f32, f32)>,
-        rects: &mut Vec<Quad>,
-        hot: &mut Vec<LayoutRect>,
-    ) -> Vec<LabelSpec> {
-        let th = self.theme();
-        let scale = self.scale;
-        let pad = (16.0 * scale).round();
-        let btn_r = (7.0 * scale).round();
-        let layout = self.confirm_layout(text, accept);
-
-        let scrim = LayoutRect { x: 0.0, y: 0.0, w: self.width as f32, h: self.height as f32 };
-        rects.push(self.px_rect(&scrim, th.scrim, 0.30, 0.0));
-        rects.push(
-            self.px_rect(&layout.panel, th.card, 0.96, (CARD_RADIUS * scale).round())
-                .shadow(Shadow::Card),
-        );
-
-        let mut labels = vec![LabelSpec {
-            text: text.to_string(),
-            color: color(th.ink, 1.0),
-            left: layout.panel.x + pad,
-            top: (layout.panel.y + pad).round(),
-            clip: layout.panel,
-            size: None,
-        }];
-        for (rect, label, danger) in
-            [(&layout.cancel, CONFIRM_CANCEL, false), (&layout.close, accept, true)]
-        {
-            let hov = hover(cursor, rect);
-            rects.push(
-                self.px_rect(
-                    rect,
-                    if danger { th.accent } else { th.ink },
-                    if danger {
-                        if hov { 1.0 } else { 0.9 }
-                    } else if hov {
-                        0.14
-                    } else {
-                        0.08
-                    },
-                    btn_r,
-                )
-                .shadow(if hov { Shadow::Soft } else { Shadow::None }),
-            );
-            hot.push(*rect);
-            let w = label.chars().count() as f32 * self.chrome_cell_width;
-            labels.push(LabelSpec {
-                text: label.into(),
-                color: color(if danger { (255, 255, 255) } else { th.ink }, 1.0),
-                left: (rect.x + (rect.w - w) / 2.0).round(),
-                top: (rect.y + (rect.h - self.chrome_cell_height) / 2.0).round(),
-                clip: *rect,
-                size: None,
-            });
-        }
-        labels
-    }
-
-    /// Centered one-line message panel (worktree provisioning / failure note).
-    fn message_overlay(&self, text: &str, rects: &mut Vec<Quad>) -> Vec<LabelSpec> {
-        let th = self.theme();
-        let scale = self.scale;
-        let pad = (16.0 * scale).round();
-        let scrim = LayoutRect { x: 0.0, y: 0.0, w: self.width as f32, h: self.height as f32 };
-        rects.push(self.px_rect(&scrim, th.scrim, 0.30, 0.0));
-
-        let w = (text.chars().count() as f32 * self.chrome_cell_width + pad * 2.0)
-            .min(self.width as f32 - pad * 2.0);
-        let h = (self.chrome_cell_height + pad * 2.0).round();
-        let x = ((self.width as f32 - w) / 2.0).round();
-        let y = ((self.height as f32 - h) / 2.0).round();
-        let panel = LayoutRect { x, y, w, h };
-        rects.push(
-            self.px_rect(&panel, th.card, 0.96, (CARD_RADIUS * scale).round())
-                .shadow(Shadow::Card),
-        );
-        vec![LabelSpec {
-            text: text.to_string(),
-            color: color(th.ink, 1.0),
-            left: x + pad,
-            top: (y + (h - self.chrome_cell_height) / 2.0).round(),
-            clip: panel,
-            size: None,
-        }]
     }
 
     /// The terminal background the active colors want: the selected scheme's
@@ -2352,6 +2220,7 @@ mod tests {
             tool_panel_w: 0.0,
         tool_panel_floating: false,
             cursor: None,
+            element_modal: false,
         }
     }
 
@@ -2370,7 +2239,7 @@ mod tests {
         chrome.page = Page::Sessions;
         chrome.ribbon_tools = &pages::Tool::ALL;
         let frame = renderer.build_frame(
-            &wss, 0, 240.0, None, None, None, None, None, None, None, None, None, None, &chrome,
+            &wss, 0, 240.0, None, None, None, None, None, None, None, None, &chrome,
         );
         let texts: Vec<&str> = frame.labels.iter().map(|l| l.text.as_str()).collect();
         assert!(!texts.contains(&"Pull Request"));
@@ -2421,7 +2290,7 @@ mod tests {
         chrome.open_tool = Some(pages::Tool::Launch);
         chrome.tool_panel_w = crate::workspace::TOOL_PANEL_DEFAULT_W;
         let frame = renderer.build_frame(
-            &wss, 0, 240.0, None, None, None, None, None, None, None, None, None, None, &chrome,
+            &wss, 0, 240.0, None, None, None, None, None, None, None, None, &chrome,
         );
         let texts: Vec<&str> = frame.labels.iter().map(|l| l.text.as_str()).collect();
         assert!(texts.contains(&"Launch"));
@@ -2459,8 +2328,6 @@ mod tests {
             None,
             None,
             None,
-            None,
-            None,
             &chrome,
         );
         let line_w = (2.0 * scale).round();
@@ -2480,7 +2347,7 @@ mod tests {
         chrome.open_tool = Some(pages::Tool::Pr);
         chrome.tool_panel_w = crate::workspace::TOOL_PANEL_DEFAULT_W;
         let frame = renderer.build_frame(
-            &wss, 0, 240.0, None, None, None, None, None, None, None, None, None, None, &chrome,
+            &wss, 0, 240.0, None, None, None, None, None, None, None, None, &chrome,
         );
         let texts: Vec<&str> = frame.labels.iter().map(|l| l.text.as_str()).collect();
         assert!(!texts.contains(&"Pull Request"));
@@ -2513,11 +2380,12 @@ mod tests {
         )];
 
         let plain = renderer.build_frame(
-            &wss, 0, sidebar_w, None, None, None, None, None, None, None, None, None, None, &chrome,
+            &wss, 0, sidebar_w, None, None, None, None, None, None, None, None, &chrome,
         );
         assert!(!plain.hot.is_empty());
 
-        let confirm = renderer.build_frame(
+        let palette = crate::palette::Palette::new();
+        let modal = renderer.build_frame(
             &wss,
             0,
             sidebar_w,
@@ -2528,13 +2396,49 @@ mod tests {
             None,
             None,
             None,
-            None,
-            None,
-            Some(("Close tab?", "Close")),
+            Some(&palette),
             &chrome,
         );
-        // Exactly the dialog's Cancel and accept buttons are interactive.
-        assert_eq!(confirm.hot.len(), 2, "confirm dialog exposes only its two buttons");
+        // Only the palette's own rows are interactive: every hot rect lies
+        // inside its panel, and the chrome's tab strip has dropped out.
+        let layout = crate::picker::PickerLayout::compute(
+            1600,
+            1000,
+            scale,
+            palette.rows.len(),
+            palette.selected,
+        );
+        assert!(!modal.hot.is_empty());
+        assert!(
+            modal.hot.iter().all(|r| layout.panel.contains(r.x + 1.0, r.y + 1.0)),
+            "a modal overlay owns the hot list"
+        );
+    }
+
+    /// An element-tree modal (`modal_ui`) owns the window exactly like a
+    /// canvas overlay: the chrome's hot rects drop out so nothing under the
+    /// scrim can hover or show a pointing hand.
+    #[test]
+    fn element_modal_clears_chrome_hot_rects() {
+        let scale = 2.0;
+        let renderer = Renderer::new(scale, 18.0, 1600, 1000);
+        let mut chrome = cleanup_chrome();
+        chrome.page = Page::Sessions;
+        let wss = [crate::workspace::Workspace::new(
+            "g".into(),
+            crate::workspace::Tile::new(1, crate::term::Session::placeholder()),
+            None,
+        )];
+        let plain = renderer.build_frame(
+            &wss, 0, 240.0, None, None, None, None, None, None, None, None, &chrome,
+        );
+        assert!(!plain.hot.is_empty(), "tab strip registers hot rects");
+
+        chrome.element_modal = true;
+        let modal = renderer.build_frame(
+            &wss, 0, 240.0, None, None, None, None, None, None, None, None, &chrome,
+        );
+        assert!(modal.hot.is_empty(), "an element modal leaves no chrome hot");
     }
 
     /// Hovering a flyover tab's × registers it hot and paints the chip; with
