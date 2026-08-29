@@ -49,16 +49,13 @@ impl Palette {
         palette
     }
 
-    /// Appends a typed character to the query and refilters.
-    pub fn push_char(&mut self, ch: char) {
-        self.query.push(ch);
-        self.selected = 0;
-        self.rebuild();
-    }
-
-    /// Removes the last query character and refilters.
-    pub fn backspace(&mut self) {
-        self.query.pop();
+    /// Replaces the whole query (the search field owns editing) and
+    /// refilters from the top of the list.
+    pub fn set_query(&mut self, query: &str) {
+        if self.query == query {
+            return;
+        }
+        self.query = query.to_string();
         self.selected = 0;
         self.rebuild();
     }
@@ -114,6 +111,19 @@ mod tests {
         assert!(!palette.rows.contains(&Action::CommandPalette));
     }
 
+    /// Replacing the query refilters and resets the highlight to the top.
+    #[test]
+    fn set_query_refilters_and_resets_selection() {
+        let mut palette = Palette::new();
+        palette.move_selection(3);
+        palette.set_query("split");
+        assert_eq!(palette.selected, 0);
+        assert!(!palette.rows.is_empty());
+        assert!(palette.rows.iter().all(|a| fuzzy_match(a.label(), "split")));
+        palette.set_query("");
+        assert_eq!(palette.rows.len(), Action::ALL.len() - 1);
+    }
+
     /// Fuzzy subsequence: query chars must appear in order in the label.
     #[test]
     fn fuzzy_match_subsequence() {
@@ -138,9 +148,7 @@ mod tests {
     fn palette_filters_by_query() {
         let mut palette = Palette::new();
         // "spl" should match "Split side-by-side" and "Split top/bottom"
-        for ch in "spl".chars() {
-            palette.push_char(ch);
-        }
+        palette.set_query("spl");
         assert!(!palette.rows.is_empty());
         for action in &palette.rows {
             assert!(
@@ -150,10 +158,8 @@ mod tests {
                 action.label()
             );
         }
-        // 'xyz' matches nothing
-        for ch in "xyz".chars() {
-            palette.push_char(ch);
-        }
+        // 'splxyz' matches nothing
+        palette.set_query("splxyz");
         assert!(palette.rows.is_empty());
     }
 
@@ -167,30 +173,23 @@ mod tests {
         assert_eq!(last, palette.rows.len() - 1);
 
         // Now filter to a shorter list
-        for ch in "spl".chars() {
-            palette.push_char(ch);
-        }
+        palette.set_query("spl");
         // selected must be within the new (shorter) rows
         assert!(palette.selected < palette.rows.len().max(1));
     }
 
-    /// Backspace restores rows when the query is cleared.
+    /// Clearing the query restores the full list.
     #[test]
-    fn backspace_restores_rows() {
+    fn clearing_the_query_restores_rows() {
         let mut palette = Palette::new();
         let full_count = palette.rows.len();
 
-        for ch in "spl".chars() {
-            palette.push_char(ch);
-        }
+        palette.set_query("spl");
         let filtered_count = palette.rows.len();
         assert!(filtered_count < full_count);
 
-        // Backspace three times to clear "spl"
-        palette.backspace();
-        palette.backspace();
-        palette.backspace();
-        assert_eq!(palette.rows.len(), full_count, "backspace should restore full list");
+        palette.set_query("");
+        assert_eq!(palette.rows.len(), full_count, "an empty query restores the full list");
     }
 
     /// selected_action returns the highlighted action.

@@ -582,13 +582,13 @@ fn scan_children(dir: &Path) -> Vec<PickerEntry> {
 }
 
 /// Popover width, logical px.
-const PANEL_W: f32 = 420.0;
+pub const PANEL_W: f32 = 420.0;
 /// Height of one list row, logical px.
-const ROW_H: f32 = 28.0;
+pub const ROW_H: f32 = 28.0;
 /// Height of the search box, logical px.
-const SEARCH_H: f32 = 38.0;
+pub const SEARCH_H: f32 = 38.0;
 /// Padding inside the popover panel, logical px.
-const PANEL_PAD: f32 = 10.0;
+pub const PANEL_PAD: f32 = 10.0;
 /// How many rows the list shows before it scrolls.
 const MAX_VISIBLE_ROWS: usize = 12;
 

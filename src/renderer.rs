@@ -22,7 +22,6 @@ use termwiz::surface::CursorVisibility;
 use wezterm_term::color::ColorPalette;
 
 use crate::pages::{self, Page};
-use crate::palette::Palette;
 use crate::picker::{ForkPicker, Picker, PickerLayout, PickerRow, ProfilePicker};
 use crate::rect::char_rects;
 use crate::term::Session;
@@ -478,7 +477,6 @@ impl Renderer {
         picker: Option<&Picker>,
         fork: Option<&ForkPicker>,
         profile: Option<&ProfilePicker>,
-        palette: Option<&Palette>,
         chrome: &ChromeState,
     ) -> Frame {
         let th = self.theme();
@@ -542,8 +540,7 @@ impl Renderer {
         let overlay_open = chrome.element_modal
             || profile.is_some()
             || fork.is_some()
-            || picker.is_some()
-            || palette.is_some();
+            || picker.is_some();
         let cur = if overlay_open { None } else { chrome.cursor };
         // Which axis each tile would collapse along (its parent split's dir);
         // `None` = root leaf, which shows no caret and cannot collapse.
@@ -720,7 +717,6 @@ impl Renderer {
                     let draw_cursor = Some(*id) == focused_tile
                         && picker.is_none()
                         && fork.is_none()
-                        && palette.is_none()
                         && !chrome.element_modal;
                     let tile_hover = link_hover
                         .filter(|(hid, _, _)| *hid == *id)
@@ -847,11 +843,6 @@ impl Renderer {
                 self.picker_overlay(p, &layout, chrome.cursor, &mut picker_quads, &mut hot);
         } else if let Some(f) = fork {
             picker_labels = self.fork_overlay(f, chrome.cursor, &mut picker_quads, &mut hot);
-        } else if let Some(pal) = palette {
-            let layout =
-                PickerLayout::compute(width, height, self.scale, pal.rows.len(), pal.selected);
-            picker_labels =
-                self.palette_overlay(pal, &layout, chrome.cursor, &mut picker_quads, &mut hot);
         }
 
         Frame {
@@ -984,94 +975,6 @@ impl Renderer {
                     }
                 },
             }
-        }
-        labels
-    }
-
-    /// Command-palette overlay: a filterable list of every rebindable action,
-    /// with its current ⌘ binding right-aligned in the row. Painted from the
-    /// same [`PickerLayout`] `main.rs` hit-tests so clicks agree with pixels.
-    fn palette_overlay(
-        &self,
-        palette: &Palette,
-        layout: &PickerLayout,
-        cursor: Option<(f32, f32)>,
-        rects: &mut Vec<Quad>,
-        hot: &mut Vec<LayoutRect>,
-    ) -> Vec<LabelSpec> {
-        let th = self.theme();
-        let scale = self.scale;
-        let pad = (12.0 * scale).round();
-        let mut labels = Vec::new();
-
-        // Scrim + card + search field, matching the dir picker.
-        let scrim = LayoutRect { x: 0.0, y: 0.0, w: self.width as f32, h: self.height as f32 };
-        rects.push(self.px_rect(&scrim, th.scrim, 0.30, 0.0));
-        rects.push(
-            self.px_rect(&layout.panel, th.card, 0.96, (CARD_RADIUS * scale).round())
-                .shadow(Shadow::Card),
-        );
-        rects.push(self.px_rect(&layout.search, th.ink, 0.06, (7.0 * scale).round()));
-
-        // Search text (or placeholder) with a caret trailing the query.
-        let search_top = (layout.search.y + (layout.search.h - self.chrome_cell_height) / 2.0).round();
-        let (text, c) = if palette.query.is_empty() {
-            ("Run a command…".to_string(), th.ink_dim)
-        } else {
-            (palette.query.clone(), th.ink)
-        };
-        labels.push(LabelSpec {
-            text,
-            color: color(c, 1.0),
-            left: layout.search.x + pad,
-            top: search_top,
-            clip: layout.search,
-            size: None,
-        });
-        let caret_x = layout.search.x + pad + palette.query.chars().count() as f32 * self.chrome_cell_width;
-        let caret = LayoutRect {
-            x: caret_x,
-            y: search_top,
-            w: (2.0 * scale).round().max(1.0),
-            h: self.chrome_cell_height,
-        };
-        rects.push(self.px_rect(&caret, th.accent, 1.0, 0.0));
-
-        // Visible rows: selected-row highlight, action label, binding hint.
-        for i in layout.first_visible..(layout.first_visible + layout.visible) {
-            let (Some(row), Some(action)) = (layout.row_rect(i), palette.rows.get(i)) else {
-                continue;
-            };
-            let top = (row.y + (row.h - self.chrome_cell_height) / 2.0).round();
-            let m = (6.0 * scale).round();
-            let pill = LayoutRect { x: row.x + m, w: (row.w - 2.0 * m).max(0.0), ..row };
-            if i == palette.selected {
-                // Accent-tinted rounded pill, inset from the panel edges.
-                rects.push(self.px_rect(&pill, th.accent, 0.10, (7.0 * scale).round()));
-            } else if hover(cursor, &row) {
-                rects.push(self.px_rect(&pill, th.ink, 0.06, (7.0 * scale).round()));
-            }
-            hot.push(row);
-            // Current binding, right-aligned; the label clips short of it.
-            let binding = action.binding().display();
-            let binding_w = binding.chars().count() as f32 * self.chrome_cell_width;
-            let binding_x = row.x + row.w - pad - binding_w;
-            labels.push(LabelSpec {
-                text: binding,
-                color: color(th.ink_dim, 1.0),
-                left: binding_x,
-                top,
-                clip: row,
-                size: None,
-            });
-            labels.push(LabelSpec {
-                text: action.label().to_string(),
-                color: color(th.ink, 1.0),
-                left: row.x + pad,
-                top,
-                clip: LayoutRect { w: (binding_x - pad - row.x).max(0.0), ..row },
-                size: None,
-            });
         }
         labels
     }
@@ -1918,7 +1821,7 @@ mod tests {
         chrome.page = Page::Sessions;
         chrome.ribbon_tools = &pages::Tool::ALL;
         let frame = renderer.build_frame(
-            &wss, 0, 240.0, None, None, None, None, None, None, None, &chrome,
+            &wss, 0, 240.0, None, None, None, None, None, None, &chrome,
         );
         let texts: Vec<&str> = frame.labels.iter().map(|l| l.text.as_str()).collect();
         assert!(!texts.contains(&"Pull Request"));
@@ -1968,7 +1871,7 @@ mod tests {
         chrome.open_tool = Some(pages::Tool::Launch);
         chrome.tool_panel_w = crate::workspace::TOOL_PANEL_DEFAULT_W;
         let frame = renderer.build_frame(
-            &wss, 0, 240.0, None, None, None, None, None, None, None, &chrome,
+            &wss, 0, 240.0, None, None, None, None, None, None, &chrome,
         );
         let texts: Vec<&str> = frame.labels.iter().map(|l| l.text.as_str()).collect();
         assert!(!texts.contains(&"Launch view coming soon"));
@@ -2003,7 +1906,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             &chrome,
         );
         let line_w = (2.0 * scale).round();
@@ -2023,7 +1925,7 @@ mod tests {
         chrome.open_tool = Some(pages::Tool::Pr);
         chrome.tool_panel_w = crate::workspace::TOOL_PANEL_DEFAULT_W;
         let frame = renderer.build_frame(
-            &wss, 0, 240.0, None, None, None, None, None, None, None, &chrome,
+            &wss, 0, 240.0, None, None, None, None, None, None, &chrome,
         );
         let texts: Vec<&str> = frame.labels.iter().map(|l| l.text.as_str()).collect();
         assert!(!texts.contains(&"Pull Request"));
@@ -2056,11 +1958,11 @@ mod tests {
         )];
 
         let plain = renderer.build_frame(
-            &wss, 0, sidebar_w, None, None, None, None, None, None, None, &chrome,
+            &wss, 0, sidebar_w, None, None, None, None, None, None, &chrome,
         );
         assert!(!plain.hot.is_empty());
 
-        let palette = crate::palette::Palette::new();
+        let profile = crate::picker::ProfilePicker::new("g".into(), Vec::new());
         let modal = renderer.build_frame(
             &wss,
             0,
@@ -2070,18 +1972,17 @@ mod tests {
             None,
             None,
             None,
-            None,
-            Some(&palette),
+            Some(&profile),
             &chrome,
         );
-        // Only the palette's own rows are interactive: every hot rect lies
+        // Only the picker's own rows are interactive: every hot rect lies
         // inside its panel, and the chrome's tab strip has dropped out.
         let layout = crate::picker::PickerLayout::compute(
             1600,
             1000,
             scale,
-            palette.rows.len(),
-            palette.selected,
+            profile.rows.len(),
+            profile.selected,
         );
         assert!(!modal.hot.is_empty());
         assert!(
