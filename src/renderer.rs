@@ -178,28 +178,6 @@ pub struct CaretSpec {
     pub color: Hsla,
 }
 
-/// Geometry of the save-workspace modal (panel, both text fields, destination
-/// rows), shared by drawing and `main.rs` hit-testing.
-pub struct SaveLayout {
-    pub panel: LayoutRect,
-    pub name: LayoutRect,
-    pub desc: LayoutRect,
-    /// One rect per destination choice; empty while the fields are edited.
-    pub rows: Vec<LayoutRect>,
-}
-
-/// Snapshot of the save-workspace modal for painting: field buffers, which
-/// field holds the caret, and — once the modal reaches the destination stage —
-/// the destination row labels with the selected index.
-pub struct SaveModalView<'a> {
-    pub name: &'a str,
-    pub description: &'a str,
-    /// 0 = Name focused, 1 = Description.
-    pub field: usize,
-    /// `Some((row_labels, selected))` in the destination stage, else `None`.
-    pub dest: Option<(&'a [String], usize)>,
-}
-
 /// Per-frame page/navigation state the renderer needs beyond the workspaces:
 /// which page is up, the dot-strip animation progresses (0..1 per page) and
 /// the tool ribbon/panel. No sidebar rows live here any more — every page's
@@ -502,7 +480,6 @@ impl Renderer {
         picker: Option<&Picker>,
         fork: Option<&ForkPicker>,
         profile: Option<&ProfilePicker>,
-        save: Option<&SaveModalView>,
         palette: Option<&Palette>,
         chrome: &ChromeState,
     ) -> Frame {
@@ -565,7 +542,6 @@ impl Renderer {
         // register as hot; the chrome underneath goes inert (mirroring the
         // click routing in `main.rs`, which sends every click to the overlay).
         let overlay_open = chrome.element_modal
-            || save.is_some()
             || profile.is_some()
             || fork.is_some()
             || picker.is_some()
@@ -980,11 +956,7 @@ impl Renderer {
         // The confirm dialog and message panel are element modals now
         // (`modal_ui`); the canvas only paints the pickers, palette and save
         // modal here.
-        if let Some(s) = save {
-            let layout = self.save_layout(s.dest.map_or(0, |(rows, _)| rows.len()));
-            picker_labels =
-                self.save_overlay(s, &layout, chrome.cursor, &mut picker_quads, &mut hot);
-        } else if let Some(pp) = profile {
+        if let Some(pp) = profile {
             let layout =
                 PickerLayout::compute(width, height, self.scale, pp.rows.len(), pp.selected);
             picker_labels =
@@ -1413,157 +1385,6 @@ impl Renderer {
                 clip: LayoutRect { w: (detail_x - pad - row.x).max(0.0), ..row },
                 size: None,
             });
-        }
-        labels
-    }
-
-    /// Geometry of the save-workspace modal, shared by drawing and `main.rs`
-    /// hit-testing. `dest_rows` is the number of destination choices shown
-    /// (0 while the name/description fields are being edited).
-    pub fn save_layout(&self, dest_rows: usize) -> SaveLayout {
-        let scale = self.scale;
-        let pad = (12.0 * scale).round();
-        let row_h = (self.chrome_cell_height + 8.0 * scale).round();
-        let caption_h = (self.chrome_cell_height + 4.0 * scale).round();
-
-        let panel_w = (self.width as f32 * 0.5).min(560.0 * scale).round();
-        let dest_h = if dest_rows > 0 { caption_h + dest_rows as f32 * row_h } else { 0.0 };
-        let panel_h = (pad * 2.0 + row_h + 2.0 * (caption_h + row_h) + dest_h).round();
-        let panel_x = ((self.width as f32 - panel_w) / 2.0).round();
-        let panel_y = ((self.height as f32 - panel_h) / 3.0).round().max(pad);
-        let panel = LayoutRect { x: panel_x, y: panel_y, w: panel_w, h: panel_h };
-
-        let field_w = panel_w - 2.0 * pad;
-        let name_y = panel_y + pad + row_h + caption_h;
-        let name = LayoutRect { x: panel_x + pad, y: name_y, w: field_w, h: row_h };
-        let desc_y = name_y + row_h + caption_h;
-        let desc = LayoutRect { x: panel_x + pad, y: desc_y, w: field_w, h: row_h };
-
-        let rows_top = desc_y + row_h + caption_h;
-        let rows = (0..dest_rows)
-            .map(|i| LayoutRect {
-                x: panel_x,
-                y: rows_top + i as f32 * row_h,
-                w: panel_w,
-                h: row_h,
-            })
-            .collect();
-        SaveLayout { panel, name, desc, rows }
-    }
-
-    /// Save-workspace modal: Name and Description fields, then (once both are
-    /// entered) the destination rows. The focused field carries the caret; the
-    /// selected destination row carries the accent pill.
-    fn save_overlay(
-        &self,
-        view: &SaveModalView,
-        layout: &SaveLayout,
-        cursor: Option<(f32, f32)>,
-        rects: &mut Vec<Quad>,
-        hot: &mut Vec<LayoutRect>,
-    ) -> Vec<LabelSpec> {
-        let th = self.theme();
-        let scale = self.scale;
-        let pad = (12.0 * scale).round();
-        let mut labels = Vec::new();
-
-        let scrim = LayoutRect { x: 0.0, y: 0.0, w: self.width as f32, h: self.height as f32 };
-        rects.push(self.px_rect(&scrim, th.scrim, 0.30, 0.0));
-        rects.push(
-            self.px_rect(&layout.panel, th.card, 0.96, (CARD_RADIUS * scale).round())
-                .shadow(Shadow::Card),
-        );
-
-        // Title.
-        labels.push(LabelSpec {
-            text: "Save as workspace".into(),
-            color: color(th.ink_dim, 1.0),
-            left: layout.panel.x + pad,
-            top: (layout.panel.y + pad).round(),
-            clip: layout.panel,
-            size: None,
-        });
-
-        // Fields: caption above each box; the focused one is brighter and
-        // carries the caret (only while still in the field-editing stage).
-        let editing_fields = view.dest.is_none();
-        for (i, (caption, value, rect)) in [
-            ("Name", view.name, &layout.name),
-            ("Description", view.description, &layout.desc),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            labels.push(LabelSpec {
-                text: caption.into(),
-                color: color(th.ink_dim, 1.0),
-                left: rect.x,
-                top: (rect.y - self.chrome_cell_height - 2.0 * scale).round(),
-                clip: layout.panel,
-                size: None,
-            });
-            let focused = editing_fields && view.field == i;
-            // Hover matches the focused tint — clicking would focus the field.
-            let hov = hover(cursor, rect);
-            rects.push(self.px_rect(
-                rect,
-                th.ink,
-                if focused || hov { 0.10 } else { 0.06 },
-                (7.0 * scale).round(),
-            ));
-            hot.push(*rect);
-            let top = (rect.y + (rect.h - self.chrome_cell_height) / 2.0).round();
-            labels.push(LabelSpec {
-                text: value.to_string(),
-                color: color(th.ink, 1.0),
-                left: rect.x + pad,
-                top,
-                clip: *rect,
-                size: None,
-            });
-            if focused {
-                let caret_x = rect.x + pad + value.chars().count() as f32 * self.chrome_cell_width;
-                let caret = LayoutRect {
-                    x: caret_x,
-                    y: top,
-                    w: (2.0 * scale).round().max(1.0),
-                    h: self.chrome_cell_height,
-                };
-                rects.push(self.px_rect(&caret, th.accent, 1.0, 0.0));
-            }
-        }
-
-        // Destination rows.
-        if let Some((dest_labels, selected)) = view.dest {
-            if let Some(first) = layout.rows.first() {
-                labels.push(LabelSpec {
-                    text: "Save to".into(),
-                    color: color(th.ink_dim, 1.0),
-                    left: layout.panel.x + pad,
-                    top: (first.y - self.chrome_cell_height - 2.0 * scale).round(),
-                    clip: layout.panel,
-                    size: None,
-                });
-            }
-            for (i, (text, row)) in dest_labels.iter().zip(layout.rows.iter()).enumerate() {
-                let top = (row.y + (row.h - self.chrome_cell_height) / 2.0).round();
-                let m = (6.0 * scale).round();
-                let pill = LayoutRect { x: row.x + m, w: (row.w - 2.0 * m).max(0.0), ..*row };
-                if i == selected {
-                    rects.push(self.px_rect(&pill, th.accent, 0.10, (7.0 * scale).round()));
-                } else if hover(cursor, row) {
-                    rects.push(self.px_rect(&pill, th.ink, 0.06, (7.0 * scale).round()));
-                }
-                hot.push(*row);
-                labels.push(LabelSpec {
-                    text: text.clone(),
-                    color: color(th.ink, 1.0),
-                    left: row.x + pad,
-                    top,
-                    clip: LayoutRect { w: row.w - 2.0 * pad, ..*row },
-                    size: None,
-                });
-            }
         }
         labels
     }
@@ -2217,7 +2038,7 @@ mod tests {
         chrome.page = Page::Sessions;
         chrome.ribbon_tools = &pages::Tool::ALL;
         let frame = renderer.build_frame(
-            &wss, 0, 240.0, None, None, None, None, None, None, None, None, &chrome,
+            &wss, 0, 240.0, None, None, None, None, None, None, None, &chrome,
         );
         let texts: Vec<&str> = frame.labels.iter().map(|l| l.text.as_str()).collect();
         assert!(!texts.contains(&"Pull Request"));
@@ -2267,7 +2088,7 @@ mod tests {
         chrome.open_tool = Some(pages::Tool::Launch);
         chrome.tool_panel_w = crate::workspace::TOOL_PANEL_DEFAULT_W;
         let frame = renderer.build_frame(
-            &wss, 0, 240.0, None, None, None, None, None, None, None, None, &chrome,
+            &wss, 0, 240.0, None, None, None, None, None, None, None, &chrome,
         );
         let texts: Vec<&str> = frame.labels.iter().map(|l| l.text.as_str()).collect();
         assert!(!texts.contains(&"Launch view coming soon"));
@@ -2303,7 +2124,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             &chrome,
         );
         let line_w = (2.0 * scale).round();
@@ -2323,7 +2143,7 @@ mod tests {
         chrome.open_tool = Some(pages::Tool::Pr);
         chrome.tool_panel_w = crate::workspace::TOOL_PANEL_DEFAULT_W;
         let frame = renderer.build_frame(
-            &wss, 0, 240.0, None, None, None, None, None, None, None, None, &chrome,
+            &wss, 0, 240.0, None, None, None, None, None, None, None, &chrome,
         );
         let texts: Vec<&str> = frame.labels.iter().map(|l| l.text.as_str()).collect();
         assert!(!texts.contains(&"Pull Request"));
@@ -2356,7 +2176,7 @@ mod tests {
         )];
 
         let plain = renderer.build_frame(
-            &wss, 0, sidebar_w, None, None, None, None, None, None, None, None, &chrome,
+            &wss, 0, sidebar_w, None, None, None, None, None, None, None, &chrome,
         );
         assert!(!plain.hot.is_empty());
 
@@ -2365,7 +2185,6 @@ mod tests {
             &wss,
             0,
             sidebar_w,
-            None,
             None,
             None,
             None,
@@ -2389,32 +2208,6 @@ mod tests {
             modal.hot.iter().all(|r| layout.panel.contains(r.x + 1.0, r.y + 1.0)),
             "a modal overlay owns the hot list"
         );
-    }
-
-    /// An element-tree modal (`modal_ui`) owns the window exactly like a
-    /// canvas overlay: the chrome's hot rects drop out so nothing under the
-    /// scrim can hover or show a pointing hand.
-    #[test]
-    fn element_modal_clears_chrome_hot_rects() {
-        let scale = 2.0;
-        let renderer = Renderer::new(scale, 18.0, 1600, 1000);
-        let mut chrome = cleanup_chrome();
-        chrome.page = Page::Sessions;
-        let wss = [crate::workspace::Workspace::new(
-            "g".into(),
-            crate::workspace::Tile::new(1, crate::term::Session::placeholder()),
-            None,
-        )];
-        let plain = renderer.build_frame(
-            &wss, 0, 240.0, None, None, None, None, None, None, None, None, &chrome,
-        );
-        assert!(!plain.hot.is_empty(), "tab strip registers hot rects");
-
-        chrome.element_modal = true;
-        let modal = renderer.build_frame(
-            &wss, 0, 240.0, None, None, None, None, None, None, None, None, &chrome,
-        );
-        assert!(modal.hot.is_empty(), "an element modal leaves no chrome hot");
     }
 
     /// Hovering a flyover tab's × registers it hot and paints the chip; with

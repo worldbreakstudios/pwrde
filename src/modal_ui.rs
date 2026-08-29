@@ -159,7 +159,11 @@ impl App {
 
 /// The panel treatment both modals share: the canvas painted `th.card` at
 /// 96% with the tile-card radius and `Shadow::Card`, content-sized.
-fn panel_style(dialog: AlertDialog, theme: &Theme, chrome: &crate::theme::Theme) -> AlertDialog {
+pub(crate) fn panel_style(
+    dialog: AlertDialog,
+    theme: &Theme,
+    chrome: &crate::theme::Theme,
+) -> AlertDialog {
     dialog
         .w_auto()
         .p(px(PAD))

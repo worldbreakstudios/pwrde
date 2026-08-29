@@ -44,6 +44,7 @@ mod picker;
 mod pwrspace;
 mod rect;
 mod renderer;
+mod save_ui;
 mod settings;
 mod sidebar_card;
 mod sidebar_ui;
@@ -353,6 +354,14 @@ struct App {
     pending_group_profile: Option<pwrspace::WorkspaceProfile>,
     /// The open save-as-workspace modal, or `None`.
     save_ws: Option<SaveWorkspaceModal>,
+    /// The save modal's Name / Description fields: rcn text inputs whose
+    /// text is mirrored into `save_ws` (see `save_ui`).
+    save_name: gpui::Entity<crate::ui::Input>,
+    save_desc: gpui::Entity<crate::ui::Input>,
+    /// Raised whenever the save modal's state changes under the fields
+    /// (open, Tab/Enter, a refused empty name): the next render seeds the
+    /// inputs from the modal and moves focus to `SaveWorkspaceModal::field`.
+    save_sync: bool,
     /// The open command palette, or `None` when closed.
     palette: Option<palette::Palette>,
     /// A centered one-line message. `bool` is `dismissable`: false while `drop`
@@ -2031,6 +2040,7 @@ impl App {
             dest_labels,
             dest_paths,
         });
+        self.save_sync = true;
         self.request_redraw();
     }
 
@@ -2043,6 +2053,7 @@ impl App {
         if name.is_empty() {
             self.save_ws =
                 Some(SaveWorkspaceModal { field: 0, dest_selected: None, ..modal });
+            self.save_sync = true;
             return;
         }
         let Some(path) = modal.dest_selected.and_then(|i| modal.dest_paths.get(i)) else {
@@ -2793,31 +2804,9 @@ impl App {
             return;
         }
 
-        // Save-as-workspace modal: a click focuses a field, picks a
-        // destination row (which saves), or cancels when outside the panel.
-        if let Some(modal) = self.save_ws.as_ref() {
-            let dest_rows =
-                if modal.dest_selected.is_some() { modal.dest_labels.len() } else { 0 };
-            let layout = self.renderer.save_layout(dest_rows);
-            if !layout.panel.contains(px, py) {
-                self.save_ws = None;
-            } else if layout.name.contains(px, py) {
-                if let Some(m) = self.save_ws.as_mut() {
-                    m.field = 0;
-                    m.dest_selected = None;
-                }
-            } else if layout.desc.contains(px, py) {
-                if let Some(m) = self.save_ws.as_mut() {
-                    m.field = 1;
-                    m.dest_selected = None;
-                }
-            } else if let Some(i) = layout.rows.iter().position(|r| r.contains(px, py)) {
-                if let Some(m) = self.save_ws.as_mut() {
-                    m.dest_selected = Some(i);
-                }
-                self.commit_save_workspace();
-            }
-            self.request_redraw();
+        // The save-as-workspace modal is an element tree (`save_ui`): its
+        // occluding scrim keeps every click off the canvas.
+        if self.save_ws.is_some() {
             return;
         }
 
@@ -4121,7 +4110,10 @@ impl App {
         if let Some(modal) = self.save_ws.as_mut() {
             if let Some(sel) = modal.dest_selected {
                 match key {
-                    "escape" => modal.dest_selected = None,
+                    "escape" => {
+                        modal.dest_selected = None;
+                        self.save_sync = true;
+                    },
                     "up" => modal.dest_selected = Some(sel.saturating_sub(1)),
                     "down" => {
                         let last = modal.dest_labels.len().saturating_sub(1);
@@ -4131,9 +4123,14 @@ impl App {
                     _ => {},
                 }
             } else {
+                // Editing keys (chars, backspace, selection, clipboard) belong
+                // to the focused rcn Input; only navigation is handled here.
                 match key {
                     "escape" => close = true,
-                    "tab" => modal.field = (modal.field + 1) % 2,
+                    "tab" => {
+                        modal.field = (modal.field + 1) % 2;
+                        self.save_sync = true;
+                    },
                     "enter" => {
                         if modal.field == 0 {
                             modal.field = 1;
@@ -4143,27 +4140,9 @@ impl App {
                         } else {
                             modal.dest_selected = Some(0);
                         }
+                        self.save_sync = true;
                     },
-                    "backspace" => {
-                        let buf =
-                            if modal.field == 0 { &mut modal.name } else { &mut modal.description };
-                        buf.pop();
-                    },
-                    _ => {
-                        if !ev.keystroke.modifiers.control
-                            && !ev.keystroke.modifiers.platform
-                            && let Some(text) = ev.keystroke.key_char.as_deref()
-                        {
-                            let buf = if modal.field == 0 {
-                                &mut modal.name
-                            } else {
-                                &mut modal.description
-                            };
-                            for ch in text.chars().filter(|c| !c.is_control()) {
-                                buf.push(ch);
-                            }
-                        }
-                    },
+                    _ => {},
                 }
             }
         }
@@ -5515,6 +5494,7 @@ impl Render for App {
             }
         }
         self.settings_search_focus = self.page == Page::Settings && search_focused;
+        self.sync_save_focus(window, cx);
 
         // A full-window canvas element that paints the terminal frame.
         let view = cx.entity();
@@ -5653,6 +5633,8 @@ impl Render for App {
                 self.visible_tool() == Some(pages::Tool::Launch) && !self.modal_overlay_open(),
                 |el| el.child(self.render_launch(cx)),
             )
+            // Save-as-workspace modal (element tree; see `save_ui`).
+            .child(self.render_save(cx))
             // Modal overlays (confirm dialog, message panel): last, so they
             // sit above every page overlay; the canvas flyover is painted
             // inside the canvas element, so they cover it too.
@@ -5759,7 +5741,9 @@ impl App {
             // for the chrome under an open flyover panel — clicks inside the
             // panel never fall through, so hover mustn't either. Modal
             // overlays sit above the flyover, so they keep the live cursor.
-            element_modal: self.confirm.is_some() || self.message.is_some(),
+            element_modal: self.confirm.is_some()
+                || self.message.is_some()
+                || self.save_ws.is_some(),
             cursor: {
                 let (cx, cy) = (self.cursor.0 as f32, self.cursor.1 as f32);
                 let flyover_covers = !overlay_open
@@ -5785,12 +5769,6 @@ impl App {
         if resize_hover.is_none() && link_hover_suppressed.is_some() && self.modifiers.platform {
             window.set_window_cursor_style(CursorStyle::PointingHand);
         }
-        let save_view = self.save_ws.as_ref().map(|m| renderer::SaveModalView {
-            name: &m.name,
-            description: &m.description,
-            field: m.field,
-            dest: m.dest_selected.map(|sel| (m.dest_labels.as_slice(), sel)),
-        });
         let mut frame = self.renderer.build_frame(
 
             &self.workspaces,
@@ -5802,7 +5780,6 @@ impl App {
             self.picker.as_ref(),
             self.fork.as_ref(),
             self.profile_picker.as_ref(),
-            save_view.as_ref(),
             self.palette.as_ref(),
             &chrome,
         );
@@ -6891,6 +6868,45 @@ fn main() {
                             .detach();
                             input
                         },
+                        save_name: {
+                            let input = cx.new(|cx| {
+                                let mut input = crate::ui::Input::new(cx);
+                                input.set_bare(true);
+                                input
+                            });
+                            cx.observe(&input, |this: &mut App, input, cx| {
+                                let text = input.read(cx).text().to_string();
+                                if let Some(m) = this.save_ws.as_mut()
+                                    && m.name != text
+                                {
+                                    m.name = text;
+                                    this.request_redraw();
+                                    cx.notify();
+                                }
+                            })
+                            .detach();
+                            input
+                        },
+                        save_desc: {
+                            let input = cx.new(|cx| {
+                                let mut input = crate::ui::Input::new(cx);
+                                input.set_bare(true);
+                                input
+                            });
+                            cx.observe(&input, |this: &mut App, input, cx| {
+                                let text = input.read(cx).text().to_string();
+                                if let Some(m) = this.save_ws.as_mut()
+                                    && m.description != text
+                                {
+                                    m.description = text;
+                                    this.request_redraw();
+                                    cx.notify();
+                                }
+                            })
+                            .detach();
+                            input
+                        },
+                        save_sync: false,
                         settings_search_focus: false,
                         editing_section: None,
                         // Single focus handle, minted once; focused below.
