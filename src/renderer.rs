@@ -40,8 +40,6 @@ pub const FONT_FAMILY: &str = "JetBrainsMono Nerd Font Mono";
 const PANE_PAD: f32 = 8.0;
 // All chrome colors live in `theme::Theme` presets (Arc-style dark cards on a
 // gradient by default); the renderer reads the active theme each frame.
-/// Ink for text sitting on the accent fill (the focused pane's active tab).
-const ON_ACCENT_INK: (u8, u8, u8) = (255, 255, 255);
 
 /// Corner radius of the floating tile cards and chrome panels, logical px.
 ///
@@ -657,42 +655,7 @@ impl Renderer {
                         LayoutRect { x: rect.x, y: bar.y + bar.h - hair, w: rect.w, h: hair };
                     bg_quads.push(self.px_rect(&divider, pane_divider.0, pane_divider.1, 0.0));
                 }
-                if !side_strip {
-                    // Active tab: a subtle rounded pill inside the strip (white
-                    // works on every theme's dark card).
-                    let tr = workspace::tile_tab_rect(
-                        &strip,
-                        tile.active,
-                        tile.tabs.len(),
-                        self.scale,
-                        axis.is_some(),
-                    );
-                    let m = (4.0 * self.scale).round();
-                    let pill = LayoutRect {
-                        x: tr.x + m,
-                        y: tr.y + m,
-                        w: (tr.w - 2.0 * m).max(0.0),
-                        h: (tr.h - 2.0 * m).max(0.0),
-                    };
-                    if is_focused {
-                        // The focused pane's tab wears the accent, exactly like
-                        // the sidebar's selected group card.
-                        bg_quads.push(self.px_rect(
-                            &pill,
-                            crate::theme::gantry_accent(th.dark),
-                            1.0,
-                            pill.h / 2.0,
-                        ));
-                    } else {
-                        bg_quads.push(self.glass(
-                            &pill,
-                            pane_pill.0,
-                            pane_pill.1,
-                            pill.h / 2.0,
-                            color(pane_ink.0, 0.18),
-                        ));
-                    }
-                } else {
+                if side_strip {
                     // A sideways-collapsed strip is one big "expand" target:
                     // any click reopens it, so the whole bare card hovers.
                     if hover(cur, rect) {
@@ -781,100 +744,17 @@ impl Renderer {
                     continue;
                 }
 
-                // Tab labels for this tile's tab strip.
-                let tile_focused = Some(*id) == focused_tile;
+                // The strip's pixels — pills, titles, × buttons, unread dots
+                // — are an element tree now (`tile_ui`). The canvas keeps
+                // only the hit rects: the close rect after its tab so
+                // reverse iteration (topmost wins) resolves × over the tab.
                 let strip = workspace::tab_strip_rect(area, rect, self.scale, sidebar_w);
-                let tab_text_pad = (8.0 * self.scale).round();
-                for (ti, tab) in tile.tabs.iter().enumerate() {
+                for ti in 0..tile.tabs.len() {
                     let tr = workspace::tile_tab_rect(&strip, ti, tile.tabs.len(), self.scale, has_caret);
                     let close =
                         workspace::tile_tab_close_rect(&strip, ti, tile.tabs.len(), self.scale, has_caret);
-                    let close_hov = hover(cur, &close);
-                    if ti != tile.active && hover(cur, &tr) && !close_hov {
-                        // Hovered inactive tab: the active pill's geometry at
-                        // about half strength, so it previews without claiming
-                        // to be selected.
-                        let m = (4.0 * self.scale).round();
-                        let pill = LayoutRect {
-                            x: tr.x + m,
-                            y: tr.y + m,
-                            w: (tr.w - 2.0 * m).max(0.0),
-                            h: (tr.h - 2.0 * m).max(0.0),
-                        };
-                        bg_quads.push(self.glass(
-                            &pill,
-                            pane_pill.0,
-                            pane_pill.1 * 0.55,
-                            pill.h / 2.0,
-                            color(pane_ink.0, 0.10),
-                        ));
-                    }
-                    if close_hov {
-                        // Browser-tab style: a small rounded chip behind the ×.
-                        let inset = (3.0 * self.scale).round();
-                        let chip = LayoutRect {
-                            x: close.x + inset,
-                            y: close.y + inset,
-                            w: (close.w - 2.0 * inset).max(0.0),
-                            h: (close.h - 2.0 * inset).max(0.0),
-                        };
-                        bg_quads.push(self.px_rect(
-                            &chip,
-                            pane_pill.0,
-                            (pane_pill.1 * 2.0).min(1.0),
-                            chip.h / 2.0,
-                        ));
-                    }
-                    // The close rect is hot after its tab so reverse iteration
-                    // (topmost wins) resolves × over the tab it sits in.
                     hot.push(tr);
                     hot.push(close);
-                    let title = tab.session.title();
-                    let text = if title.is_empty() { "shell".to_string() } else { title };
-                    // Unread: an accent dot before the title, which shifts
-                    // right to make room (the clip's right edge is unchanged).
-                    let mut text_left = tr.x + tab_text_pad;
-                    if tab.unread {
-                        let ds = (6.0 * self.scale).round();
-                        let dot = LayoutRect {
-                            x: text_left,
-                            y: (tr.y + (tr.h - ds) / 2.0).round(),
-                            w: ds,
-                            h: ds,
-                        };
-                        fg_quads.push(self.px_rect(&dot, th.accent, 1.0, ds / 2.0));
-                        text_left += ds + (5.0 * self.scale).round();
-                    }
-                    labels.push(LabelSpec {
-                        text,
-                        color: match (ti == tile.active, tile_focused) {
-                            // On the accent pill the scheme's ink would be
-                            // unreadable, so the active tab of the focused pane
-                            // takes the on-accent treatment.
-                            (true, true) => color(ON_ACCENT_INK, 1.0),
-                            (true, false) => color(pane_ink.0, pane_ink.1),
-                            _ => color(pane_ink_dim.0, pane_ink_dim.1),
-                        },
-                        left: text_left,
-                        top: (tr.y + (tr.h - self.chrome_cell_height) / 2.0).round(),
-                        clip: LayoutRect {
-                            w: (close.x - tr.x - tab_text_pad).max(0.0),
-                            ..tr
-                        },
-                        size: None,
-                    });
-                    labels.push(LabelSpec {
-                        text: "×".to_string(),
-                        color: if close_hov {
-                            color(pane_ink.0, pane_ink.1)
-                        } else {
-                            color(pane_ink_dim.0, pane_ink_dim.1)
-                        },
-                        left: close.x + ((close.w - self.chrome_cell_width) / 2.0).round(),
-                        top: (tr.y + (tr.h - self.chrome_cell_height) / 2.0).round(),
-                        clip: tr,
-                        size: None,
-                    });
                 }
             }
 

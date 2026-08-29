@@ -1,0 +1,264 @@
+//! Tile tab strips as a gpui element tree over the canvas.
+//!
+//! The tab pills, titles, × buttons and unread dots of every tile's strip
+//! used to be canvas quads and labels (`Renderer::build_frame`). Only the
+//! *pixels* have moved here: geometry still comes from [`crate::workspace`]
+//! (`layout_tiles` / `tab_strip_rect` / `tile_tab_rect` /
+//! `tile_tab_close_rect`), and every click, drag and drop is still resolved
+//! on the canvas mouse path in `main.rs` against those same rects — the
+//! same first step the sidebar took. What the element tree buys is
+//! clipping: each strip is an `overflow_hidden` box, so a title can never
+//! bleed past its tab or its card, and the strip sits in the tree's
+//! z-order (under the sidebar and the modals) instead of in the canvas's
+//! hand-kept paint order.
+//!
+//! Still canvas-painted, deliberately: the collapse caret (a rotating
+//! chevron the canvas draws as line segments), the card divider, the
+//! side-strip hover fill, and the drag-and-drop hints — all of which sit
+//! *around* the strip rather than in it.
+
+use std::collections::HashMap;
+
+use gpui::{
+    AnyElement, Context, Hsla, IntoElement, ParentElement, Styled, div, px,
+    prelude::FluentBuilder as _,
+};
+
+use crate::App;
+use crate::renderer::color;
+use crate::ui::theme::Theme;
+use crate::workspace::{self, LayoutRect};
+
+/// Inset of the active/hover pill from its tab's edges.
+const PILL_INSET: f32 = 4.0;
+/// Inset of the × hover chip from the close rect.
+const CHIP_INSET: f32 = 3.0;
+/// Left padding of a tab's title.
+const TEXT_PAD: f32 = 8.0;
+/// Unread dot diameter and the gap after it.
+const DOT: f32 = 6.0;
+const DOT_GAP: f32 = 5.0;
+/// The on-accent ink for the focused pane's active tab.
+const ON_ACCENT_INK: (u8, u8, u8) = (255, 255, 255);
+
+impl App {
+    /// Every tile's tab strip, or an empty element off the Sessions page.
+    pub fn render_tile_chrome(&self, cx: &mut Context<Self>) -> AnyElement {
+        if self.page != crate::Page::Sessions || self.is_empty_state() {
+            return div().into_any_element();
+        }
+        // The flyover is canvas-painted and slides over the bottom of the
+        // tiles; stop this layer above it exactly as the sidebar does.
+        let ceiling = self.flyover_ceiling();
+        if ceiling == Some(0.0) {
+            return div().into_any_element();
+        }
+        cx.set_global(Theme::from_chrome(crate::theme::current()));
+        let th = crate::theme::current();
+        let scale = self.scale();
+        let inv = 1.0 / scale;
+        let ws = &self.workspaces[self.active];
+        let area = self.area();
+        let sidebar_w = self.sidebar_w();
+        let (tiles, _) = workspace::layout_tiles(&ws.root, area, scale);
+        let axis_map: HashMap<u64, Option<workspace::Dir>> =
+            workspace::tile_collapse_axis(&ws.root).into_iter().collect();
+
+        // Pane chrome follows the terminal scheme so strips stay legible on
+        // light palettes; the adaptive default keeps the chrome theme's ink.
+        let scheme = crate::term_theme::selected(crate::theme::dark_active());
+        let (ink, ink_dim, pill_rgb, pill_alpha) = match scheme {
+            Some(t) => (color(t.fg, 1.0), color(t.fg, 0.55), t.fg, 0.12),
+            None => (color(th.text_bright, 1.0), color(th.text_dim, 1.0), (255, 255, 255), 0.13),
+        };
+        let accent = color(crate::theme::gantry_accent(th.dark), 1.0);
+        let unread = color(th.accent, 1.0);
+
+        // Hover in physical px, like the canvas: none while dragging or
+        // under a modal.
+        let modal = self.modal_overlay_open();
+        let cur = if matches!(self.drag, crate::Drag::None) && !modal {
+            Some((self.cursor.0 as f32, self.cursor.1 as f32))
+        } else {
+            None
+        };
+        let hov = |r: &LayoutRect| cur.is_some_and(|(x, y)| r.contains(x, y));
+        let font = crate::renderer::chrome_font();
+
+        let mut layer = div()
+            .absolute()
+            .left(px(0.0))
+            .top(px(0.0))
+            .w_full()
+            .overflow_hidden()
+            .map(|d| match ceiling {
+                Some(limit) => d.h(px(limit)),
+                None => d.h_full(),
+            })
+            .font_family(crate::renderer::FONT_FAMILY)
+            .text_size(px(font));
+
+        for (id, rect) in &tiles {
+            let Some(tile) = ws.root.find_tile(*id) else { continue };
+            let axis = axis_map.get(id).copied().flatten();
+            let has_caret = axis.is_some();
+            let collapsing = has_caret && (tile.collapsed || tile.collapse_anim > 0.0);
+            // A sideways strip shows only its caret, which stays on the canvas.
+            if axis == Some(workspace::Dir::Row) && collapsing {
+                continue;
+            }
+            let focused = ws.focused_tile == *id;
+            let strip = workspace::tab_strip_rect(area, rect, scale, sidebar_w);
+            let bar = workspace::tile_tab_bar(&strip, scale);
+            let n = tile.tabs.len();
+
+            let mut strip_el = div()
+                .absolute()
+                .left(px(bar.x * inv))
+                .top(px(bar.y * inv))
+                .w(px(bar.w * inv))
+                .h(px(bar.h * inv))
+                .overflow_hidden();
+
+            for (ti, tab) in tile.tabs.iter().enumerate() {
+                let tr = workspace::tile_tab_rect(&strip, ti, n, scale, has_caret);
+                let close = workspace::tile_tab_close_rect(&strip, ti, n, scale, has_caret);
+                let active = ti == tile.active;
+                let close_hov = hov(&close);
+                let tab_hov = hov(&tr) && !close_hov;
+                // Rects relative to the strip box, in logical px.
+                let rel = |r: &LayoutRect| {
+                    ((r.x - bar.x) * inv, (r.y - bar.y) * inv, r.w * inv, r.h * inv)
+                };
+                let (tx, ty, tw, tth) = rel(&tr);
+                let (cx_, cy_, cw, ch) = rel(&close);
+
+                let mut tab_el = div()
+                    .absolute()
+                    .left(px(tx))
+                    .top(px(ty))
+                    .w(px(tw))
+                    .h(px(tth))
+                    .overflow_hidden();
+
+                // Pill: the active tab's (accent when the pane is focused,
+                // glass otherwise), or a half-strength preview on hover.
+                if active || tab_hov {
+                    let pill_h = (tth - 2.0 * PILL_INSET).max(0.0);
+                    let mut pill = div()
+                        .absolute()
+                        .left(px(PILL_INSET))
+                        .top(px(PILL_INSET))
+                        .w(px((tw - 2.0 * PILL_INSET).max(0.0)))
+                        .h(px(pill_h))
+                        .rounded(px(pill_h / 2.0));
+                    pill = if active && focused {
+                        pill.bg(accent)
+                    } else if active {
+                        glass(pill, color(pill_rgb, pill_alpha), color_alpha(ink, 0.18))
+                    } else {
+                        glass(pill, color(pill_rgb, pill_alpha * 0.55), color_alpha(ink, 0.10))
+                    };
+                    tab_el = tab_el.child(pill);
+                }
+
+                // Title (with the unread dot before it), clipped short of ×.
+                let title = tab.session.title();
+                let text = if title.is_empty() { "shell".to_string() } else { title };
+                let text_color = match (active, focused) {
+                    (true, true) => color(ON_ACCENT_INK, 1.0),
+                    (true, false) => ink,
+                    _ => ink_dim,
+                };
+                let mut text_left = TEXT_PAD;
+                if tab.unread {
+                    tab_el = tab_el.child(
+                        div()
+                            .absolute()
+                            .left(px(text_left))
+                            .top(px(((tth - DOT) / 2.0).round()))
+                            .w(px(DOT))
+                            .h(px(DOT))
+                            .rounded(px(DOT / 2.0))
+                            .bg(unread),
+                    );
+                    text_left += DOT + DOT_GAP;
+                }
+                tab_el = tab_el.child(
+                    div()
+                        .absolute()
+                        .left(px(text_left))
+                        .top(px(0.0))
+                        .h(px(tth))
+                        .w(px((cx_ - tx - text_left).max(0.0)))
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .flex()
+                        .items_center()
+                        .text_color(text_color)
+                        .child(text),
+                );
+
+                // × and its hover chip.
+                tab_el = tab_el.child(
+                    div()
+                        .absolute()
+                        .left(px(cx_ - tx))
+                        .top(px(cy_ - ty))
+                        .w(px(cw))
+                        .h(px(ch))
+                        .when(close_hov, |d| {
+                            d.child(
+                                div()
+                                    .absolute()
+                                    .left(px(CHIP_INSET))
+                                    .top(px(CHIP_INSET))
+                                    .w(px((cw - 2.0 * CHIP_INSET).max(0.0)))
+                                    .h(px((ch - 2.0 * CHIP_INSET).max(0.0)))
+                                    .rounded(px((ch - 2.0 * CHIP_INSET).max(0.0) / 2.0))
+                                    .bg(color(pill_rgb, (pill_alpha * 2.0).min(1.0))),
+                            )
+                        })
+                        .child(
+                            div()
+                                .absolute()
+                                .left(px(0.0))
+                                .top(px(0.0))
+                                .size_full()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_color(if close_hov { ink } else { ink_dim })
+                                .child("×"),
+                        ),
+                );
+
+                strip_el = strip_el.child(tab_el);
+            }
+
+            // A canvas modal scrims the canvas beneath this tree, not this
+            // tree: veil the strip the same 30% so it dims with the rest.
+            if modal {
+                strip_el = strip_el.child(
+                    div()
+                        .absolute()
+                        .left(px(0.0))
+                        .top(px(0.0))
+                        .size_full()
+                        .bg(color(th.scrim, 0.30)),
+                );
+            }
+            layer = layer.child(strip_el);
+        }
+        layer.into_any_element()
+    }
+}
+
+/// The canvas `glass` treatment: a fill with a half-pixel rim.
+fn glass(d: gpui::Div, fill: Hsla, rim: Hsla) -> gpui::Div {
+    d.bg(fill).border(px(0.5)).border_color(rim)
+}
+
+fn color_alpha(c: Hsla, a: f32) -> Hsla {
+    Hsla { a, ..c }
+}
