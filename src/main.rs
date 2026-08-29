@@ -38,6 +38,7 @@ mod pr_ui;
 mod settings_ui;
 mod links;
 mod pages;
+mod palette_ui;
 mod palette;
 mod persist;
 mod picker;
@@ -365,6 +366,14 @@ struct App {
     save_sync: bool,
     /// The open command palette, or `None` when closed.
     palette: Option<palette::Palette>,
+    /// The search field the element-tree modals share (the command palette
+    /// now; the pickers later): an rcn text input whose text an observer
+    /// feeds into whichever modal is open.
+    modal_search: gpui::Entity<crate::ui::Input>,
+    /// `Some(placeholder)` right after a modal opened: the next render clears
+    /// the field, sets that placeholder and focuses it (opening happens in
+    /// handlers without a `Window`).
+    modal_search_reset: Option<&'static str>,
     /// A centered one-line message. `bool` is `dismissable`: false while `drop`
     /// provisions (input swallowed), true for a failure note the user can close.
     message: Option<(String, bool)>,
@@ -2878,23 +2887,10 @@ impl App {
             return;
         }
 
-        // Command palette: click a row to run the action, click outside to close.
-        if let Some(palette) = &mut self.palette {
-            let layout = picker::PickerLayout::compute(width, height, scale, palette.rows.len(), palette.selected);
-            if !layout.panel.contains(px, py) {
-                self.palette = None;
-                self.request_redraw();
-                return;
-            }
-            if let Some(index) = layout.row_at(px, py) {
-                palette.select(index);
-                let action = palette.selected_action();
-                self.palette = None;
-                if let Some(action) = action {
-                    self.run_action(action);
-                }
-            }
-            self.request_redraw();
+        // The command palette is an element tree (`palette_ui`): its
+        // occluding scrim keeps every click off the canvas.
+        if self.palette.is_some() {
+            return;
         }
     }
 
@@ -4071,21 +4067,8 @@ impl App {
                         p.move_selection(1);
                     }
                 },
-                "backspace" => {
-                    if let Some(p) = self.palette.as_mut() {
-                        p.backspace();
-                    }
-                },
-                _ => {
-                    if !ev.keystroke.modifiers.control
-                        && let Some(text) = ev.keystroke.key_char.as_deref()
-                        && let Some(p) = self.palette.as_mut()
-                    {
-                        for ch in text.chars().filter(|c| !c.is_control()) {
-                            p.push_char(ch);
-                        }
-                    }
-                },
+                // Editing keys belong to the focused search field.
+                _ => {},
             }
         }
         self.request_redraw();
@@ -4308,6 +4291,7 @@ impl App {
                     self.palette = None;
                 } else {
                     self.palette = Some(palette::Palette::new());
+                    self.modal_search_reset = Some(palette_ui::PALETTE_PLACEHOLDER);
                 }
                 return;
             },
@@ -5487,6 +5471,19 @@ impl Render for App {
         }
         self.settings_search_focus = self.page == Page::Settings && search_focused;
         self.sync_save_focus(window, cx);
+        // Shared modal search field: a freshly opened modal claims it (clear,
+        // placeholder, focus); a closed one releases it back to the app.
+        if let Some(placeholder) = self.modal_search_reset.take() {
+            self.modal_search.update(cx, |input, cx| {
+                input.placeholder(placeholder);
+                input.set_text("", cx);
+            });
+            window.focus(&self.modal_search.read(cx).focus_handle(cx), cx);
+        } else if self.palette.is_none()
+            && self.modal_search.read(cx).focus_handle(cx).is_focused(window)
+        {
+            window.focus(&self.focus_handle, cx);
+        }
 
         // A full-window canvas element that paints the terminal frame.
         let view = cx.entity();
@@ -5628,6 +5625,8 @@ impl Render for App {
                 self.visible_tool() == Some(pages::Tool::Launch) && !self.modal_overlay_open(),
                 |el| el.child(self.render_launch(cx)),
             )
+            // Command palette (element tree; see `palette_ui`).
+            .child(self.render_palette(cx))
             // Save-as-workspace modal (element tree; see `save_ui`).
             .child(self.render_save(cx))
             // Modal overlays (confirm dialog, message panel): last, so they
@@ -5738,7 +5737,8 @@ impl App {
             // overlays sit above the flyover, so they keep the live cursor.
             element_modal: self.confirm.is_some()
                 || self.message.is_some()
-                || self.save_ws.is_some(),
+                || self.save_ws.is_some()
+                || self.palette.is_some(),
             cursor: {
                 let (cx, cy) = (self.cursor.0 as f32, self.cursor.1 as f32);
                 let flyover_covers = !overlay_open
@@ -5775,7 +5775,6 @@ impl App {
             self.picker.as_ref(),
             self.fork.as_ref(),
             self.profile_picker.as_ref(),
-            self.palette.as_ref(),
             &chrome,
         );
         // The flyover panel lives outside the workspace tree, so its layer is
@@ -6902,6 +6901,26 @@ fn main() {
                             input
                         },
                         save_sync: false,
+                        modal_search: {
+                            let input = cx.new(|cx| {
+                                let mut input = crate::ui::Input::new(cx);
+                                input.set_bare(true);
+                                input
+                            });
+                            cx.observe(&input, |this: &mut App, input, cx| {
+                                let text = input.read(cx).text().to_string();
+                                if let Some(p) = this.palette.as_mut()
+                                    && p.query != text
+                                {
+                                    p.set_query(&text);
+                                    this.request_redraw();
+                                    cx.notify();
+                                }
+                            })
+                            .detach();
+                            input
+                        },
+                        modal_search_reset: None,
                         settings_search_focus: false,
                         editing_section: None,
                         // Single focus handle, minted once; focused below.
