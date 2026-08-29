@@ -27,8 +27,8 @@
 
 use gpui::{
     AnyElement, App as GpuiApp, BoxShadow, ClickEvent, Context, FontWeight, Hsla,
-    InteractiveElement, IntoElement, ParentElement, SharedString, StatefulInteractiveElement,
-    MouseButton, Styled, Window, div, linear_color_stop, linear_gradient, point,
+    InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, SharedString,
+    StatefulInteractiveElement, Styled, Window, div, linear_color_stop, linear_gradient, point,
     prelude::FluentBuilder as _, px,
 };
 
@@ -113,6 +113,31 @@ fn font_scale() -> f32 {
 /// `value`, written at the default font size, scaled by [`font_scale`].
 fn scaled(value: f32) -> f32 {
     value * font_scale()
+}
+
+/// A left-press handler for a sidebar row: stops the press at the element
+/// (so the canvas mouse path never re-resolves it), records the pointer the
+/// way the canvas does, commits an open section rename first — a click
+/// anywhere always did, so the editor never lingers and swallows keystrokes
+/// — then runs `act` on the app. Any drag the press arms is still driven by
+/// the canvas `on_mouse_move` / `on_mouse_up`.
+fn press(
+    entity: gpui::WeakEntity<App>,
+    act: impl Fn(&mut App, &MouseDownEvent, &mut Context<App>) + 'static,
+) -> impl Fn(&MouseDownEvent, &mut Window, &mut GpuiApp) + 'static {
+    move |ev, _win, app| {
+        app.stop_propagation();
+        if let Some(entity) = entity.upgrade() {
+            entity.update(app, |this, cx| {
+                this.note_pointer(ev);
+                if this.editing_section.is_some() {
+                    this.commit_section_rename();
+                }
+                act(this, ev, cx);
+                cx.notify();
+            });
+        }
+    }
 }
 
 impl App {
@@ -593,12 +618,13 @@ impl App {
     /// rects `main.rs` already hit-tests for those pages. The split is
     /// [`App::card_rows`], the same predicate the geometry helpers take.
     fn sidebar_row_layer(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
+        let entity = cx.entity().downgrade();
         if self.card_rows() {
-            return self.card_row_layer(theme);
+            return self.card_row_layer(theme, entity);
         }
         match self.page {
-            crate::Page::Cleanup => self.cleanup_row_layer(theme),
-            crate::Page::Notes => self.notes_row_layer(theme),
+            crate::Page::Cleanup => self.cleanup_row_layer(theme, entity),
+            crate::Page::Notes => self.notes_row_layer(theme, entity),
             crate::Page::Settings => self.settings_row_layer(theme, cx),
             // Any page without rows of its own still gets the shell.
             _ => div().absolute().left(px(0.0)).top(px(0.0)).size_full(),
@@ -703,7 +729,7 @@ impl App {
     /// the same three ranges `main.rs`'s `Page::Notes` mouse branch walks.
     /// [`notes_row`] owns the index → row mapping, so paint and hit-test read
     /// one table rather than two hand-kept-in-sync loops.
-    fn notes_row_layer(&self, theme: &Theme) -> gpui::Div {
+    fn notes_row_layer(&self, theme: &Theme, entity: gpui::WeakEntity<Self>) -> gpui::Div {
         let w = self.sidebar_w();
         let vaults = crate::notes::vaults();
         let (n_vaults, n_docs) = (vaults.len(), self.notes_docs.len());
@@ -712,6 +738,7 @@ impl App {
         for i in 0..(n_vaults + n_docs + 1) {
             let Some(row) = notes_row(i, n_vaults, n_docs) else { break };
             let rect = crate::workspace::tab_rect(i, 1.0, w);
+            let on_press = press(entity.clone(), move |this, _ev, cx| this.press_notes_row(i, cx));
             layer = layer.child(match row {
                 // A vault row keeps full-strength ink even when inactive: the
                 // vault list is the page's primary navigation. Docs and the
@@ -732,7 +759,7 @@ impl App {
                 NotesRow::AddVault => {
                     self.simple_row(theme, &rect, ADD_VAULT_LABEL, false, false, true)
                 },
-            });
+            }.on_mouse_down(MouseButton::Left, on_press));
         }
         layer
     }
@@ -743,12 +770,17 @@ impl App {
     /// filters to the `j`th repo. The labels and the active row both come from
     /// [`cleanup_rows`], so the painted order cannot drift from the order the
     /// mouse path walks.
-    fn cleanup_row_layer(&self, theme: &Theme) -> gpui::Div {
+    fn cleanup_row_layer(&self, theme: &Theme, entity: gpui::WeakEntity<Self>) -> gpui::Div {
         let w = self.sidebar_w();
         let mut layer = div().absolute().left(px(0.0)).top(px(0.0)).size_full();
         for (i, (label, active)) in cleanup_rows(&self.cleanup).into_iter().enumerate() {
             let rect = crate::workspace::tab_rect(i, 1.0, w);
-            layer = layer.child(self.simple_row(theme, &rect, label, active, false, true));
+            layer = layer.child(
+                self.simple_row(theme, &rect, label, active, false, true).on_mouse_down(
+                    MouseButton::Left,
+                    press(entity.clone(), move |this, _ev, _cx| this.press_cleanup_row(i)),
+                ),
+            );
         }
         layer
     }
@@ -759,7 +791,7 @@ impl App {
     /// that looks like it landed on a row *is* that row as far as hit-testing
     /// is concerned. Scale is 1.0 because gpui already works in logical
     /// pixels; the canvas passes the device scale instead.
-    fn card_row_layer(&self, theme: &Theme) -> gpui::Div {
+    fn card_row_layer(&self, theme: &Theme, entity: gpui::WeakEntity<Self>) -> gpui::Div {
         let rows = crate::workspace::sidebar_rows(&self.workspaces, &self.sections);
         let w = self.sidebar_w();
         let hover = self.sidebar_cursor();
@@ -773,16 +805,27 @@ impl App {
             match *row {
                 crate::workspace::SidebarRow::SectionHeader { section_idx } => {
                     if let Some(section) = self.sections.get(section_idx) {
-                        layer =
-                            layer.child(self.section_header_row(theme, section, &rect, hover));
+                        let section_id = section.id;
+                        layer = layer.child(
+                            self.section_header_row(theme, section, &rect, hover, entity.clone())
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    press(entity.clone(), move |this, ev, _cx| {
+                                        this.press_section_header(section_id, false, ev.click_count)
+                                    }),
+                                ),
+                        );
                     }
                 }
                 crate::workspace::SidebarRow::Group { ws_idx } => {
                     if let Some(ws) = self.workspaces.get(ws_idx) {
                         let selected = active == Some(i);
-                        layer = layer.child(self.group_card(
-                            theme, ws, ws_idx, &rect, selected, hover,
-                        ));
+                        layer = layer.child(
+                            self.group_card(theme, ws, ws_idx, &rect, selected, hover).on_mouse_down(
+                                MouseButton::Left,
+                                press(entity.clone(), move |this, _ev, _cx| this.press_group_row(ws_idx)),
+                            ),
+                        );
                     }
                 }
             }
@@ -799,7 +842,10 @@ impl App {
                 continue;
             };
             let rect = crate::workspace::pinned_bubble_rect(k, pinned.len(), 1.0, w);
-            layer = layer.child(self.pinned_bubble(theme, ws, ws_idx, &rect));
+            layer = layer.child(self.pinned_bubble(theme, ws, ws_idx, &rect).on_mouse_down(
+                MouseButton::Left,
+                press(entity.clone(), move |this, _ev, _cx| this.press_pinned(ws_idx)),
+            ));
         }
         layer
     }
@@ -1024,7 +1070,9 @@ impl App {
         section: &crate::workspace::Section,
         rect: &crate::workspace::LayoutRect,
         hover: Option<(f32, f32)>,
+        entity: gpui::WeakEntity<Self>,
     ) -> gpui::Div {
+        let section_id = section.id;
         let members = self
             .workspaces
             .iter()
@@ -1125,6 +1173,14 @@ impl App {
                         .top(px(del.y - rect.y))
                         .w(px(del.w))
                         .h(px(del.h))
+                        // The chip's press wins over the header's: the inner
+                        // listener runs first and stops propagation.
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            press(entity.clone(), move |this, ev, _cx| {
+                                this.press_section_header(section_id, true, ev.click_count)
+                            }),
+                        )
                         .flex()
                         .items_center()
                         .justify_center()
