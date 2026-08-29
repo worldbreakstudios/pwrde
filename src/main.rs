@@ -48,6 +48,7 @@ mod pwrspace;
 mod rect;
 mod renderer;
 mod resize_ui;
+mod ribbon_ui;
 mod save_ui;
 mod settings;
 mod sidebar_card;
@@ -1049,6 +1050,26 @@ impl App {
     /// mouse-up if the drag threshold is never crossed (mirrors TabPress).
     pub(crate) fn press_group_row(&mut self, ws_idx: usize) {
         self.drag = Drag::GroupPress { ws: ws_idx, start: self.cursor };
+    }
+
+    /// A press on a tile's collapse caret toggles the pane — only on the
+    /// first click of a double, or the second would snap it straight back.
+    pub(crate) fn press_tile_caret(&mut self, id: u64, click_count: usize) {
+        if click_count > 1 {
+            return;
+        }
+        let collapsed =
+            self.workspaces[self.active].root.find_tile(id).is_some_and(|t| t.collapsed);
+        self.set_collapsed(id, !collapsed);
+        self.request_redraw();
+    }
+
+    /// A press anywhere on a sideways-collapsed strip expands and focuses it.
+    pub(crate) fn press_tile_expand(&mut self, id: u64) {
+        self.set_collapsed(id, false);
+        self.just_expanded = Some(id);
+        self.workspaces[self.active].focused_tile = id;
+        self.request_redraw();
     }
 
     /// A press on flyover tab `ti`: activate + focus the panel, or × closes.
@@ -3325,23 +3346,17 @@ impl App {
             if axis == Some(Dir::Row)
                 && ws.root.find_tile(*id).is_some_and(|t| t.collapsed)
             {
-                self.set_collapsed(*id, false);
-                self.just_expanded = Some(*id);
-                self.workspaces[self.active].focused_tile = *id;
-                self.request_redraw();
+                // Element-owned too (`tile_ui`); kept for a press that slips
+                // past the element (it never should).
+                self.press_tile_expand(*id);
                 return;
             }
             let bar = workspace::tile_tab_bar(&strip, scale);
             if bar.contains(px, py) {
                 let has_caret = axis.is_some();
                 if has_caret && workspace::tile_caret_rect(rect, scale).contains(px, py) {
-                    // Only the first click of a double toggles — the second
-                    // would just snap it straight back.
-                    if click_count <= 1 {
-                        let collapsed = ws.root.find_tile(*id).is_some_and(|t| t.collapsed);
-                        self.set_collapsed(*id, !collapsed);
-                        self.request_redraw();
-                    }
+                    // Element-owned too (`tile_ui`).
+                    self.press_tile_caret(*id, click_count);
                     return;
                 }
                 // The tabs themselves are element click targets (`tile_ui`)
@@ -4239,7 +4254,7 @@ impl App {
     }
 
     /// Toggle the given tool panel open/closed (clicking the active tool closes it).
-    fn toggle_tool(&mut self, tool: pages::Tool) {
+    pub(crate) fn toggle_tool(&mut self, tool: pages::Tool) {
         if self.open_tool == Some(tool) {
             self.open_tool = None;
             settings::set("toolpanel.tool", "".into());
@@ -5485,6 +5500,8 @@ impl Render for App {
             // top edge): elements own the cursor and the drag start; the
             // canvas still drives the drag (`resize_ui`).
             .child(self.render_resize_handles(cx))
+            // Ribbon slot presses (the glyphs stay canvas-painted).
+            .child(self.render_ribbon_presses(cx))
             // Command palette and the pickers (element trees; see
             // `palette_ui` / `picker_ui`).
             .child(self.render_palette(cx))
