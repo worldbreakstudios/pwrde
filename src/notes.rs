@@ -85,6 +85,17 @@ pub struct NoteDoc {
 /// `.obsidian`) are skipped.  Unreadable directories are simply omitted.
 pub fn scan_vault(dir: &Path) -> Vec<NoteDoc> {
     let mut out = Vec::new();
+    // wasm32: the vault is whatever the storage seam holds under `dir`.
+    #[cfg(target_family = "wasm")]
+    {
+        for path in crate::storage::list_files(dir) {
+            if is_markdown(&path) {
+                out.push(note_doc(dir, path));
+            }
+        }
+        out.sort_by(|a, b| a.rel.cmp(&b.rel));
+        return out;
+    }
     // Canonical paths of directories already entered — the cycle guard that
     // lets us follow symlinks (so shared/linked-in notes still show up)
     // without a self-referential link recursing until the stack overflows.
@@ -120,17 +131,23 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<NoteDoc>, visited: &mut HashSet<P
         if is_dir {
             walk(root, &path, out, visited);
         } else if is_markdown(&path) {
-            let rel = path
-                .strip_prefix(root)
-                .unwrap_or(&path)
-                .components()
-                .map(|c| c.as_os_str().to_string_lossy().into_owned())
-                .collect::<Vec<_>>()
-                .join("/");
-            let title = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-            out.push(NoteDoc { path, title, rel });
+            out.push(note_doc(root, path));
         }
     }
+}
+
+/// A doc entry for `path` under `root`: the vault-relative `rel` and a title
+/// from the file stem.
+fn note_doc(root: &Path, path: PathBuf) -> NoteDoc {
+    let rel = path
+        .strip_prefix(root)
+        .unwrap_or(&path)
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/");
+    let title = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    NoteDoc { path, title, rel }
 }
 
 fn is_markdown(p: &Path) -> bool {
@@ -144,14 +161,12 @@ fn is_markdown(p: &Path) -> bool {
 // ---------------------------------------------------------------------------
 
 pub fn read_doc(p: &Path) -> std::io::Result<String> {
-    std::fs::read_to_string(p)
+    crate::storage::read_text(p)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, p.display().to_string()))
 }
 
 pub fn write_doc(p: &Path, content: &str) -> std::io::Result<()> {
-    if let Some(parent) = p.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(p, content)
+    crate::storage::write_text(p, content)
 }
 
 // ---------------------------------------------------------------------------

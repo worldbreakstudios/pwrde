@@ -49,6 +49,7 @@ pub mod save_ui;
 pub mod settings;
 pub mod sidebar_card;
 pub mod sidebar_ui;
+pub mod storage;
 pub mod term;
 pub mod tile_ui;
 pub mod term_theme;

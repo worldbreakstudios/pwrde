@@ -211,10 +211,10 @@ pub fn seed(app: &mut App, groups: &[Group]) {
         // keyed by the group's cwd; this is the snapshot the worker would
         // have produced (and on wasm never will).
         app.git_contexts.insert(&cwd, git_context(&cwd, group.name, &group.repo));
-        // Sessions tools (PR, local diff) are offered per group only when its
-        // cwd is a git checkout; that probe caches per path, and the fixture's
-        // directories exist nowhere, so answer it here.
-        app.git_cwd_cache.borrow_mut().insert(cwd.clone(), true);
+        // The checkout probe and the git commands the New-session flow runs
+        // (default branch, branch list, worktrees) answer from here on wasm32.
+        #[cfg(target_family = "wasm")]
+        crate::git::canned::register(cwd.clone(), git_answers(&cwd, group));
         // `add_group` queues the primary command (`claude` by default) for the
         // founding pane's first wakeup. A transcript already shows a program
         // running, so nothing should be typed over it.
@@ -246,8 +246,69 @@ pub fn seed(app: &mut App, groups: &[Group]) {
     }
     app.switch_workspace(0);
     crate::bg::answer_requests_with(app.events_tx.clone(), worker_answers(groups));
+    #[cfg(target_family = "wasm")]
+    seed_storage(groups);
     app.request_redraw();
 }
+
+/// stdout of the git commands `build_fork_choices` runs in `cwd`.
+#[cfg(target_family = "wasm")]
+fn git_answers(cwd: &std::path::Path, group: &Group) -> Vec<(String, String)> {
+    use crate::git::canned::key;
+    let branch = group.repo.branch;
+    let mut branches = String::from("*\t");
+    branches.push_str(branch);
+    branches.push('\n');
+    if branch != "main" {
+        branches.push_str(" \tmain\n");
+    }
+    branches.push_str(" \tremotes/origin/HEAD -> origin/main\n \tremotes/origin/main\n");
+    if branch != "main" {
+        branches.push_str(&format!(" \tremotes/origin/{branch}\n"));
+    }
+    let mut worktrees = format!("worktree {}\nHEAD 1d4b1560000\nbranch refs/heads/{branch}\n\n", cwd.display());
+    if group.name == "pwrde" {
+        worktrees.push_str(&format!(
+            "worktree {}/.worktrees/60f3fbe1\nHEAD c556a0e0000\nbranch refs/heads/navis/palette-session-picker\n\n",
+            cwd.display()
+        ));
+    }
+    vec![
+        (key(cwd, "git", &["symbolic-ref", "refs/remotes/origin/HEAD"]), "refs/remotes/origin/main\n".to_string()),
+        (key(cwd, "git", &["branch", "-a", "--format=%(HEAD)\t%(refname:short)"]), branches),
+        (key(cwd, "git", &["worktree", "list", "--porcelain"]), worktrees),
+    ]
+}
+
+/// What the user's files would hold: the picker's pins and recents (the New
+/// session flow), and a notes vault with a few docs. Only on wasm32, where
+/// the storage seam is the page's `localStorage` — natively this would write
+/// into the real home directory.
+#[cfg(target_family = "wasm")]
+fn seed_storage(groups: &[Group]) {
+    let dirs: Vec<PathBuf> = groups.iter().map(|g| PathBuf::from(g.cwd)).collect();
+    let store = crate::picker::PickerStore {
+        pinned: dirs.iter().take(1).cloned().collect(),
+        recents: dirs.iter().rev().cloned().collect(),
+    };
+    store.save();
+
+    let vault = PathBuf::from("/Users/tyler/notes");
+    for (rel, text) in NOTES {
+        let _ = crate::notes::write_doc(&vault.join(rel), text);
+    }
+    if !crate::notes::vaults().contains(&vault) {
+        crate::notes::add_vault(vault);
+    }
+}
+
+/// The demo vault's docs, vault-relative.
+#[cfg(target_family = "wasm")]
+const NOTES: &[(&str, &str)] = &[
+    ("web build.md", "# Web build\n\nThe browser runs the same `App`; only the platform seams differ.\n\n- PTY → `EchoShell`\n- threads → `bg::spawn`\n- files → `storage`\n"),
+    ("parity/checklist.md", "# Parity checklist\n\n- [x] sidebar cards\n- [x] PR page\n- [x] cleanup scan\n- [ ] drag & drop capture\n"),
+    ("ideas.md", "# Ideas\n\n> Screenshots instead of screen recordings.\n\nRecord a `.vt` per scenario and diff the captures in CI.\n"),
+];
 
 #[cfg(test)]
 mod tests {

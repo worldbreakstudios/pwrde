@@ -11,8 +11,9 @@
 # Env: PWRDE_CHROME (headless Chromium binary; defaults to Playwright's
 # chrome-headless-shell), PWRDE_WEB_PORT (8090), PWRDE_WEB_SIZE (1200x720),
 # PWRDE_WEB_SETTLE_MS (real time to let the wasm boot and paint, 6000),
-# PWRDE_WEB_CLICKS ("x,y;x,y" clicked after the settle), PWRDE_WEB_KEYS (text
-# typed after the clicks; \n = Enter, \b = Backspace, \M-p = ⌘P),
+# PWRDE_WEB_CLICKS ("x,y;x,y" clicked after the settle), PWRDE_WEB_DRAGS
+# ("x1,y1>x2,y2" press-move-release), PWRDE_WEB_WHEEL ("x,y,dy"), PWRDE_WEB_KEYS
+# (text typed last; \n = Enter, \b = Backspace, \M-p = ⌘P),
 # PWRDE_WEB_RELEASE=1 for an optimized build, PWRDE_WEZTERM_LOCAL=1 to build
 # against the local wezterm checkout from scripts/web-wezterm-fork.sh instead
 # of the published fork branch (trunk cannot pass cargo `--config`, so the
@@ -73,4 +74,5 @@ done
 # wasm module boot and paint a few real frames, capture. Page console output
 # lands in the log next to trunk's.
 node "$ROOT/scripts/web-screenshot.mjs" "$CHROME" "http://127.0.0.1:$PORT/$QUERY" "$OUT" \
-    "${PWRDE_WEB_SIZE:-1200x720}" "${PWRDE_WEB_SETTLE_MS:-6000}" "${PWRDE_WEB_KEYS:-}" "${PWRDE_WEB_CLICKS:-}" 2>>"$ROOT/target/web-serve.log"
+    "${PWRDE_WEB_SIZE:-1200x720}" "${PWRDE_WEB_SETTLE_MS:-6000}" "${PWRDE_WEB_KEYS:-}" "${PWRDE_WEB_CLICKS:-}" \
+    "${PWRDE_WEB_DRAGS:-}" "${PWRDE_WEB_WHEEL:-}" 2>>"$ROOT/target/web-serve.log"

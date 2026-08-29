@@ -526,7 +526,7 @@ impl App {
         if let Some(&hit) = self.git_cwd_cache.borrow().get(&cwd) {
             return hit;
         }
-        let hit = cwd.ancestors().any(|a| a.join(".git").exists());
+        let hit = cwd.ancestors().any(git::is_checkout);
         self.git_cwd_cache.borrow_mut().insert(cwd, hit);
         hit
     }

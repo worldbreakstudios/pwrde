@@ -124,7 +124,8 @@ discipline (`term::EchoShell`) stands in for the shell — it echoes, edits the
 line on Backspace, starts a fresh prompt on Enter and ^C, clears on ^L, and
 answers `echo`/`clear`; anything else is echoed back as "not run". For an
 unattended check, `PWRDE_WEB_CLICKS="x,y;x,y"` and
-`PWRDE_WEB_KEYS='echo hi\n'` drive the capture (`\M-p` sends ⌘P).
+`PWRDE_WEB_KEYS='echo hi\n'` drive the capture (`\M-p` sends ⌘P), as do
+`PWRDE_WEB_DRAGS="x1,y1>x2,y2"` (a tab drag) and `PWRDE_WEB_WHEEL="x,y,dy"`.
 
 Browser limits, not app ones: Chrome reserves ⌘T, ⌘W, ⌘N and ⌘Q for itself
 (no page can preventDefault those), so use the command palette or the sidebar
@@ -167,10 +168,11 @@ On top of the patch, wasm32 needs a randomness backend spelled out:
 | `objc` / `raw-window-handle` — titlebar hairline hack | `app.rs` | already `cfg(target_os = "macos")` |
 | `std::thread::spawn` — git/PR/cleanup/ps workers | `bg.rs` | the job is dropped and the fixture's canned answers (`bg::answer_requests_with`) are sent instead: the PR lists and detail, the cleanup scan |
 | `arboard` — system clipboard | `clipboard.rs` | `navigator.clipboard.writeText` plus an in-page copy for the synchronous read, so ⌘C/⌘V round-trip |
-| `~/.pwrde/settings.json` | `settings.rs` | the same JSON in `localStorage`, keyed by the path it would have had — reloads keep Settings changes |
+| the user's files — settings, the picker's pins/recents, `.pwrspace.json` profiles, notes vaults | `storage.rs` | the same text in `localStorage`, keyed by the path the file would have had; a reload keeps them, and the fixture seeds picker recents and a notes vault |
+| `git` / `gh` run synchronously (default branch, branch list, worktrees) | `git.rs` `canned` | the fixture registers each checkout and the stdout of the commands the New-session flow runs in it; anything unregistered behaves like a missing binary |
 | `open <url>` | `links.rs` | `window.open(url, "_blank")` |
 | the flyover's popout window | `app.rs` | a page is one window: the popout stays docked, the toggle just raises the panel |
-| `.git` probe behind the tool ribbon (`active_cwd_is_git`) | `fixture.rs` | the per-path cache is pre-filled for the fixture groups |
+| `<dir>/.git` probes (tool ribbon, picker entries) | `git::is_checkout` | answered from the registered checkouts |
 | `std::time::Instant` / `SystemTime` | everywhere | `web_time` (std re-exported natively, `performance.now()` on wasm) |
 | system fonts | `web/main.rs` | `web/fonts/` registered via `text_system().add_fonts` (the terminal family plus Noto symbol/emoji fallbacks) |
 | the shell behind a pane | `term.rs` | `EchoShell`, a line discipline that echoes input on wasm32 |
@@ -212,9 +214,12 @@ writer) and are filled with `Session::feed(bytes)`.
   the gstack `/browse` skill against `trunk serve`, and grow
   `scripts/web-screenshot.sh` into a small flow runner (navigate, click,
   capture) for review threads.
-- Notes vaults and the New-session directory picker read the filesystem;
-  on wasm they come up empty (no vaults, no directories to pick). A
-  fixture-backed vault and picker recents are the next seams.
+- Group persistence (`persist.rs`, SQLite) stays a no-op on wasm32: a reload
+  starts from the fixture again. Restoring a layout of echo-shell panes would
+  be possible over the storage seam, but nothing a browser test needs yet.
+- Provisioning (`drop`), PR write actions (`gh`), and mermaid (`mmdc`) are
+  not canned: they fail the way a machine without those binaries does, and
+  the app shows that message.
 - Group names in cards: the fixture could set an OSC 0 title per pane so
   cards read `pwrde` / `rcn` rather than `zsh`.
 - Grow `EchoShell` only if a test needs it (a canned `ls`, say); it is a

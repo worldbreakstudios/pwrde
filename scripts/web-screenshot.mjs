@@ -5,9 +5,11 @@
 // before the wasm app has laid itself out. Dependency-free: Node's built-in
 // WebSocket and fetch (Node 22+).
 //
-//   web-screenshot.mjs <chromium> <url> <out.png> [WxH] [settle-ms] [keys] [clicks]
+//   web-screenshot.mjs <chromium> <url> <out.png> [WxH] [settle-ms] [keys] [clicks] [drags] [wheel]
 //
-// `clicks` ("x,y;x,y", page pixels) are performed after the settle, then
+// `clicks` ("x,y;x,y", page pixels) are performed after the settle, `drags`
+// ("x1,y1>x2,y2;…") press, move in steps, and release, `wheel` ("x,y,dy")
+// scrolls at a point; then
 // `keys` is typed (each char as a key press; `\n` is Enter, `\b` Backspace,
 // `\x03` ^C, `\M-p` Meta+p — the ⌘ shortcuts on a Mac browser), and the
 // capture waits another second — enough to verify an interactive path without
@@ -21,7 +23,7 @@ import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-const [chrome, url, out, sizeArg = "1200x720", settleArg = "6000", keys = "", clicks = ""] = process.argv.slice(2);
+const [chrome, url, out, sizeArg = "1200x720", settleArg = "6000", keys = "", clicks = "", drags = "", wheel = ""] = process.argv.slice(2);
 if (!chrome || !url || !out) {
     console.error("usage: web-screenshot.mjs <chromium> <url> <out.png> [WxH] [settle-ms]");
     process.exit(2);
@@ -118,6 +120,24 @@ if (clicks) {
         await click(x, y);
     }
 }
+for (const drag of drags.split(";").filter(Boolean)) {
+    const [[x1, y1], [x2, y2]] = drag.split(">").map((p) => p.split(",").map(Number));
+    await send("Input.dispatchMouseEvent", { type: "mouseMoved", x: x1, y: y1 });
+    await send("Input.dispatchMouseEvent", { type: "mousePressed", x: x1, y: y1, button: "left", clickCount: 1 });
+    for (let i = 1; i <= 12; i++) {
+        const x = x1 + ((x2 - x1) * i) / 12, y = y1 + ((y2 - y1) * i) / 12;
+        await send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y, button: "left", buttons: 1 });
+        await new Promise((r) => setTimeout(r, 40));
+    }
+    await send("Input.dispatchMouseEvent", { type: "mouseReleased", x: x2, y: y2, button: "left", clickCount: 1 });
+    await new Promise((r) => setTimeout(r, 300));
+}
+if (wheel) {
+    const [x, y, dy] = wheel.split(",").map(Number);
+    await send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
+    await send("Input.dispatchMouseEvent", { type: "mouseWheel", x, y, deltaX: 0, deltaY: dy });
+    await new Promise((r) => setTimeout(r, 300));
+}
 if (keys) {
     // Nothing clicked yet: click the canvas so gpui focuses the window.
     if (!clicks) await click(width / 2, height / 2);
@@ -137,9 +157,18 @@ if (keys) {
         await new Promise((r) => setTimeout(r, 30));
     }
 }
-if (clicks || keys) await new Promise((r) => setTimeout(r, 1000));
-const { data } = await send("Page.captureScreenshot", { format: "png" });
-writeFileSync(out, Buffer.from(data, "base64"));
+if (clicks || keys || drags || wheel) await new Promise((r) => setTimeout(r, 1000));
+// A near-empty PNG means the canvas had not painted yet (the dev wasm is
+// large and boots after the load event); give it a few more seconds.
+let png;
+for (let attempt = 0; attempt < 4; attempt++) {
+    const { data } = await send("Page.captureScreenshot", { format: "png" });
+    png = Buffer.from(data, "base64");
+    if (png.length > 8192) break;
+    console.error(`[capture] ${png.length} bytes, waiting for the first paint…`);
+    await new Promise((r) => setTimeout(r, 4000));
+}
+writeFileSync(out, png);
 ws.close();
 console.log(out);
 process.exit(0);

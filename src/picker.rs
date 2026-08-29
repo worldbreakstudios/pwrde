@@ -32,7 +32,7 @@ pub struct PickerEntry {
 impl PickerEntry {
     /// Builds an entry for `path`, probing `<path>/.git` for the git flag.
     pub fn new(path: PathBuf, label: String) -> Self {
-        let is_git = path.join(".git").exists();
+        let is_git = crate::git::is_checkout(&path);
         Self {
             path,
             label,
@@ -80,7 +80,7 @@ impl PickerStore {
         let Some(path) = store_path() else {
             return Self::default();
         };
-        let Ok(text) = std::fs::read_to_string(path) else {
+        let Some(text) = crate::storage::read_text(&path) else {
             return Self::default();
         };
         serde_json::from_str(&text).unwrap_or_default()
@@ -91,15 +91,10 @@ impl PickerStore {
         let Some(path) = store_path() else {
             return;
         };
-        if let Some(parent) = path.parent()
-            && std::fs::create_dir_all(parent).is_err()
-        {
-            return;
-        }
         let Ok(text) = serde_json::to_string_pretty(self) else {
             return;
         };
-        let _ = std::fs::write(path, text);
+        let _ = crate::storage::write_text(&path, &text);
     }
 
     /// Records `dir` as the most recent choice (deduped, capped) and persists.
@@ -565,8 +560,12 @@ fn label_for(path: &Path, home: Option<&Path>) -> String {
         .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
-/// Location of the persisted store: `<data_dir>/pwrde/groups.json`.
+/// Location of the persisted store: `<data_dir>/pwrde/groups.json` (on
+/// wasm32 there is no data dir, so the key is a fixed `/pwrde/groups.json`).
 fn store_path() -> Option<PathBuf> {
+    #[cfg(target_family = "wasm")]
+    return Some(PathBuf::from("/pwrde/groups.json"));
+    #[cfg(not(target_family = "wasm"))]
     Some(dirs::data_dir()?.join("pwrde").join("groups.json"))
 }
 

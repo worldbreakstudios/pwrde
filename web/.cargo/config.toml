@@ -22,3 +22,19 @@ build-std = ["std,panic_abort"]
 # not something we want in that cache, so this workspace compiles directly.
 [build]
 rustc-wrapper = ""
+
+# temporary — scripts/web-screenshot.sh (PWRDE_WEZTERM_LOCAL) restores this file
+[patch."https://github.com/wezterm/wezterm"]
+termwiz = { path = "/Users/tylerwhitehurst/src/pwrde/.worktrees/60f3fbe1/target/wezterm-fork/termwiz" }
+vtparse = { path = "/Users/tylerwhitehurst/src/pwrde/.worktrees/60f3fbe1/target/wezterm-fork/vtparse" }
+wezterm-bidi = { path = "/Users/tylerwhitehurst/src/pwrde/.worktrees/60f3fbe1/target/wezterm-fork/bidi" }
+wezterm-blob-leases = { path = "/Users/tylerwhitehurst/src/pwrde/.worktrees/60f3fbe1/target/wezterm-fork/wezterm-blob-leases" }
+wezterm-cell = { path = "/Users/tylerwhitehurst/src/pwrde/.worktrees/60f3fbe1/target/wezterm-fork/wezterm-cell" }
+wezterm-char-props = { path = "/Users/tylerwhitehurst/src/pwrde/.worktrees/60f3fbe1/target/wezterm-fork/wezterm-char-props" }
+wezterm-color-types = { path = "/Users/tylerwhitehurst/src/pwrde/.worktrees/60f3fbe1/target/wezterm-fork/color-types" }
+wezterm-dynamic = { path = "/Users/tylerwhitehurst/src/pwrde/.worktrees/60f3fbe1/target/wezterm-fork/wezterm-dynamic" }
+wezterm-dynamic-derive = { path = "/Users/tylerwhitehurst/src/pwrde/.worktrees/60f3fbe1/target/wezterm-fork/wezterm-dynamic/derive" }
+wezterm-escape-parser = { path = "/Users/tylerwhitehurst/src/pwrde/.worktrees/60f3fbe1/target/wezterm-fork/wezterm-escape-parser" }
+wezterm-input-types = { path = "/Users/tylerwhitehurst/src/pwrde/.worktrees/60f3fbe1/target/wezterm-fork/wezterm-input-types" }
+wezterm-surface = { path = "/Users/tylerwhitehurst/src/pwrde/.worktrees/60f3fbe1/target/wezterm-fork/wezterm-surface" }
+wezterm-term = { path = "/Users/tylerwhitehurst/src/pwrde/.worktrees/60f3fbe1/target/wezterm-fork/term" }

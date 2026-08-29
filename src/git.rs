@@ -119,6 +119,23 @@ pub fn output_within(cmd: &mut Command, limit: Duration) -> Result<Output, Comma
     const POLL: Duration = Duration::from_millis(5);
 
     let program = cmd.get_program().to_string_lossy().into_owned();
+    // wasm32 cannot run anything: the fixture's canned outputs answer instead.
+    #[cfg(target_family = "wasm")]
+    {
+        let _ = limit;
+        return canned::answer(cmd).ok_or(CommandError::NotInstalled(program));
+    }
+    #[cfg(not(target_family = "wasm"))]
+    output_within_native(cmd, limit, program, POLL)
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn output_within_native(
+    cmd: &mut Command,
+    limit: Duration,
+    program: String,
+    poll: Duration,
+) -> Result<Output, CommandError> {
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => CommandError::NotInstalled(program.clone()),
@@ -157,7 +174,68 @@ pub fn output_within(cmd: &mut Command, limit: Duration) -> Result<Output, Comma
             let _ = child.wait();
             return Err(CommandError::TimedOut(program));
         }
-        std::thread::sleep(POLL);
+        std::thread::sleep(poll);
+    }
+}
+
+/// Whether `path` is the root of a git checkout (`<path>/.git` exists).
+pub fn is_checkout(path: &Path) -> bool {
+    #[cfg(target_family = "wasm")]
+    return canned::is_checkout(path);
+    #[cfg(not(target_family = "wasm"))]
+    path.join(".git").exists()
+}
+
+/// wasm32 stand-in for the git and gh binaries: a fixture registers the
+/// checkouts it describes and the stdout of the commands the app runs in
+/// them (keyed by working directory, program name, and arguments). Anything
+/// unregistered behaves like a missing binary, which every caller tolerates.
+#[cfg(target_family = "wasm")]
+pub mod canned {
+    use std::cell::RefCell;
+    use std::collections::{HashMap, HashSet};
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, ExitStatus, Output};
+
+    #[derive(Default)]
+    struct Registry {
+        checkouts: HashSet<PathBuf>,
+        outputs: HashMap<String, String>,
+    }
+
+    thread_local! {
+        static REGISTRY: RefCell<Registry> = RefCell::new(Registry::default());
+    }
+
+    /// The lookup key for `program args…` run in `cwd`.
+    pub fn key(cwd: &Path, program: &str, args: &[&str]) -> String {
+        format!("{}$ {program} {}", cwd.display(), args.join(" "))
+    }
+
+    /// Register a checkout and the outputs of commands run inside it.
+    pub fn register(checkout: PathBuf, outputs: Vec<(String, String)>) {
+        REGISTRY.with(|r| {
+            let mut r = r.borrow_mut();
+            r.checkouts.insert(checkout);
+            r.outputs.extend(outputs);
+        });
+    }
+
+    pub fn is_checkout(path: &Path) -> bool {
+        REGISTRY.with(|r| r.borrow().checkouts.contains(path))
+    }
+
+    /// The canned output for `cmd`, if its (cwd, program, args) is registered.
+    pub fn answer(cmd: &Command) -> Option<Output> {
+        let cwd = cmd.get_current_dir()?;
+        let program = Path::new(cmd.get_program())
+            .file_name()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let stdout = REGISTRY.with(|r| r.borrow().outputs.get(&key(cwd, &program, &args)).cloned())?;
+        Some(Output { status: ExitStatus::default(), stdout: stdout.into_bytes(), stderr: Vec::new() })
     }
 }
 
@@ -194,9 +272,10 @@ pub fn default_remote_branch(repo: &Path) -> Option<String> {
 /// is unavailable or the directory is not a repo.
 pub fn list_branches(repo: &Path) -> Vec<Branch> {
     let def = default_remote_branch(repo);
-    let Ok(out) =
-        git(repo).args(["branch", "-a", "--format=%(HEAD)\t%(refname:short)"]).output()
-    else {
+    let Ok(out) = output_within(
+        git(repo).args(["branch", "-a", "--format=%(HEAD)\t%(refname:short)"]),
+        TIMEOUT_REF,
+    ) else {
         return Vec::new();
     };
     let text = String::from_utf8_lossy(&out.stdout);

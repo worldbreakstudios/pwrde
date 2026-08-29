@@ -6,4 +6,4 @@
 [33mwarning[0m: unused variable: `scale`
   [1;34m-->[0m src/renderer.rs:412:9
 [1;32m    Finished[0m `release` profile [optimized] target(s) in 1m 04s
-[1;32mtyler[0m@[1;34mstudio[0m [36m~/src/pwrde[0m [35m(navis/web-build)[0m [1m$[0m 
+[1;32mtyler[0m@[1;34mstudio[0m [36m~/src/pwrde[0m [35m(navis/web-build)[0m [1m$[0m ]9;Build finished\

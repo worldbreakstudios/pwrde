@@ -99,7 +99,7 @@ fn is_zero(v: &usize) -> bool {
 /// A missing or corrupt file returns an empty `Vec` — never panics or returns
 /// an error that would prevent group creation.
 pub fn load_profiles(path: &Path) -> Vec<WorkspaceProfile> {
-    let Ok(text) = std::fs::read_to_string(path) else {
+    let Some(text) = crate::storage::read_text(path) else {
         return Vec::new();
     };
     match serde_json::from_str::<ProfileFile>(&text) {
@@ -129,11 +129,8 @@ pub fn save_profile(path: &Path, profile: &WorkspaceProfile) -> std::io::Result<
 
 /// Write `ProfileFile` to `path` as pretty-printed JSON, creating parents.
 fn write_profile_file(path: &Path, pf: &ProfileFile) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
     let text = serde_json::to_string_pretty(pf)?;
-    std::fs::write(path, text)
+    crate::storage::write_text(path, &text)
 }
 
 // ---------------------------------------------------------------------------
