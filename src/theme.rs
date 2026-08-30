@@ -169,9 +169,13 @@ pub fn accent_setting() -> Accent {
 /// AppKit observer wired for it). `None` until seeded, or off macOS.
 static SYSTEM_ACCENT: RwLock<Option<(u8, u8, u8)>> = RwLock::new(None);
 
+/// Record a fresh OS reading. A failed read (`None`) keeps the last known
+/// value rather than clearing it, so a transient AppKit nil can't flash the
+/// chrome back to the Blue fallback for a frame.
 pub fn set_system_accent(rgb: Option<(u8, u8, u8)>) {
+    let Some(rgb) = rgb else { return };
     if let Ok(mut slot) = SYSTEM_ACCENT.write() {
-        *slot = rgb;
+        *slot = Some(rgb);
     }
 }
 
@@ -376,6 +380,13 @@ mod tests {
         assert_eq!(resolve_accent(Accent::Purple, os), Accent::Purple.rgb().unwrap());
         assert_eq!(resolve_accent(Accent::System, os), (1, 2, 3));
         assert_eq!(resolve_accent(Accent::System, None), Accent::Blue.rgb().unwrap());
+    }
+
+    #[test]
+    fn failed_os_reading_keeps_the_last_known_accent() {
+        set_system_accent(Some((9, 9, 9)));
+        set_system_accent(None);
+        assert_eq!(system_accent(), Some((9, 9, 9)));
     }
 
     #[test]
