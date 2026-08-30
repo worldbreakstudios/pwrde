@@ -110,11 +110,9 @@ impl Section {
 
 // ── Appearance page layout ──────────────────────────────────────────────
 
-/// The four dropdown selectors on the Appearance page.
+/// The terminal-color dropdown selectors on the Appearance page.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AppearanceDropdown {
-    ThemeLight,
-    ThemeDark,
     TermLight,
     TermDark,
 }
@@ -122,24 +120,8 @@ pub enum AppearanceDropdown {
 impl AppearanceDropdown {
     /// Whether this dropdown controls the dark-polarity slot.
     pub fn dark(self) -> bool {
-        matches!(self, AppearanceDropdown::ThemeDark | AppearanceDropdown::TermDark)
+        matches!(self, AppearanceDropdown::TermDark)
     }
-}
-
-/// All app-theme options for the given slot: every built-in and imported
-/// custom theme — mixing polarities is allowed (a dark chrome in the light
-/// slot, or vice versa) — with the slot's own polarity sorted first for
-/// easier choosing.
-pub fn theme_options(dark: bool) -> Vec<&'static crate::theme::Theme> {
-    let mut v = Vec::new();
-    for matching in [true, false] {
-        let want = if matching { dark } else { !dark };
-        v.extend(crate::theme::ALL.iter().copied().filter(|t| t.dark == want));
-        if let Some(t) = crate::theme::custom(want) {
-            v.push(t);
-        }
-    }
-    v
 }
 
 /// All terminal-scheme options for the given slot: `None` (the adaptive
@@ -611,23 +593,8 @@ pub fn settings_index() -> Vec<SettingsEntry> {
     });
     out.push(SettingsEntry {
         section: Section::Appearance,
-        label: "Theme",
-        keywords: "theme color scheme",
-    });
-    out.push(SettingsEntry {
-        section: Section::Appearance,
         label: "Terminal colors",
         keywords: "terminal colors palette",
-    });
-    out.push(SettingsEntry {
-        section: Section::Appearance,
-        label: "Import theme",
-        keywords: "import theme file load",
-    });
-    out.push(SettingsEntry {
-        section: Section::Appearance,
-        label: "Export theme",
-        keywords: "export theme file save",
     });
 
     // Tools
@@ -712,27 +679,8 @@ mod tests {
 
     #[test]
     fn appearance_dropdown_dark_polarity() {
-        assert!(!AppearanceDropdown::ThemeLight.dark());
-        assert!(AppearanceDropdown::ThemeDark.dark());
         assert!(!AppearanceDropdown::TermLight.dark());
         assert!(AppearanceDropdown::TermDark.dark());
-    }
-
-    /// Both polarities' dropdowns list every theme (mix-and-match is
-    /// allowed), with the slot's own polarity sorted to the top.
-    #[test]
-    fn theme_options_list_everything_matching_polarity_first() {
-        for dark in [false, true] {
-            let opts = super::theme_options(dark);
-            // The test store holds no custom token strings, so only presets.
-            assert_eq!(opts.len(), crate::theme::ALL.len(), "theme_options({dark}) incomplete");
-            let matching = opts.iter().take_while(|t| t.dark == dark).count();
-            assert_eq!(
-                matching,
-                crate::theme::ALL.iter().filter(|t| t.dark == dark).count(),
-                "theme_options({dark}) must sort its own polarity first"
-            );
-        }
     }
 
     #[test]

@@ -723,7 +723,13 @@ fn render_debug(
             "settings file",
             settings::path().to_string_lossy().into_owned(),
         ),
-        ("theme", th.label.into()),
+        (
+            "chrome",
+            format!(
+                "{} · accent #{:02x}{:02x}{:02x}",
+                th.label, th.accent.0, th.accent.1, th.accent.2
+            ),
+        ),
         ("scale", format!("{:.2}", app.renderer.scale)),
         ("surface", format!("{}×{} px", sw, sh)),
         (
@@ -930,57 +936,6 @@ fn render_appearance(app: &App, theme: &Theme, entity: gpui::WeakEntity<App>) ->
             .into_any_element()
     };
 
-    // ── App theme selects ──────────────────────────────────────────────
-    let theme_select = |which: AppearanceDropdown| -> AnyElement {
-        let dark = which.dark();
-        let opts = pages::theme_options(dark);
-        let labels: Vec<String> = opts.iter().map(|t| t.label.to_string()).collect();
-        let selected_name = crate::theme::selected(dark).name;
-        let value = opts.iter().position(|t| t.name == selected_name);
-        let open = app.appearance_menu == Some(which);
-        let e_open = entity.clone();
-        let e_change = entity.clone();
-        let opts_for_change: Vec<&'static str> = opts.iter().map(|t| t.name).collect();
-        let id = match which {
-            AppearanceDropdown::ThemeLight => "appearance-theme-light",
-            AppearanceDropdown::ThemeDark => "appearance-theme-dark",
-            _ => "appearance-theme",
-        };
-        let label = if dark { "Dark theme" } else { "Light theme" };
-        settings_row()
-            .child(row_text(theme, label, None))
-            .child(
-                div().w(px(220.)).child(
-                    Select::new(id)
-                        .options(labels)
-                        .value(value)
-                        .open(open)
-                        .on_open_change(move |is_open: &bool, _win: &mut Window, gpui_app: &mut GpuiApp| {
-                            let open = *is_open;
-                            if let Some(e) = e_open.upgrade() {
-                                e.update(gpui_app, move |this, cx| {
-                                    this.appearance_menu = if open { Some(which) } else { None };
-                                    cx.notify();
-                                });
-                            }
-                        })
-                        .on_change(move |ix: &usize, _win: &mut Window, gpui_app: &mut GpuiApp| {
-                            let name = opts_for_change.get(*ix).copied().unwrap_or("");
-                            if name.is_empty() {
-                                return;
-                            }
-                            if let Some(e) = e_change.upgrade() {
-                                e.update(gpui_app, move |_this, cx| {
-                                    settings::set(crate::theme::setting_key(dark), name.into());
-                                    cx.notify();
-                                });
-                            }
-                        }),
-                ),
-            )
-            .into_any_element()
-    };
-
     // ── Terminal color selects ─────────────────────────────────────────
     let term_select = |which: AppearanceDropdown| -> AnyElement {
         let dark = which.dark();
@@ -1003,7 +958,6 @@ fn render_appearance(app: &App, theme: &Theme, entity: gpui::WeakEntity<App>) ->
         let id = match which {
             AppearanceDropdown::TermLight => "appearance-term-light",
             AppearanceDropdown::TermDark => "appearance-term-dark",
-            _ => "appearance-term",
         };
         let label = if dark { "Dark theme" } else { "Light theme" };
         settings_row()
@@ -1363,56 +1317,6 @@ fn render_appearance(app: &App, theme: &Theme, entity: gpui::WeakEntity<App>) ->
             .into_any_element()
     };
 
-    // ── Footer actions ─────────────────────────────────────────────────
-    let import_e = entity.clone();
-    let import_btn = Button::new("appearance-import")
-        .variant(ButtonVariant::Outline)
-        .size(ButtonSize::Sm)
-        .child("Import from clipboard")
-        .on_click(move |_ev: &ClickEvent, _win: &mut Window, gpui_app: &mut GpuiApp| {
-            gpui_app.stop_propagation();
-            if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                if let Some(tokens) = clipboard
-                    .get_text()
-                    .ok()
-                    .as_deref()
-                    .and_then(crate::theme::parse_tokens)
-                {
-                    let dark = crate::theme::is_dark_color(tokens[0]);
-                    if let Some(e) = import_e.upgrade() {
-                        e.update(gpui_app, move |_this, cx| {
-                            settings::set(
-                                crate::theme::custom_key(dark),
-                                crate::theme::serialize_tokens(&tokens).into(),
-                            );
-                            settings::set(
-                                crate::theme::setting_key(dark),
-                                crate::theme::custom_name(dark).into(),
-                            );
-                            cx.notify();
-                        });
-                    }
-                }
-            }
-        });
-
-    let copy_e = entity.clone();
-    let copy_btn = Button::new("appearance-copy")
-        .variant(ButtonVariant::Outline)
-        .size(ButtonSize::Sm)
-        .child("Copy theme tokens")
-        .on_click(move |_ev: &ClickEvent, _win: &mut Window, gpui_app: &mut GpuiApp| {
-            gpui_app.stop_propagation();
-            if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                let _ = clipboard.set_text(crate::theme::export_current());
-            }
-            if let Some(e) = copy_e.upgrade() {
-                e.update(gpui_app, |_this, cx| {
-                    cx.notify();
-                });
-            }
-        });
-
     div()
         .id("settings-rows")
         .flex()
@@ -1422,20 +1326,6 @@ fn render_appearance(app: &App, theme: &Theme, entity: gpui::WeakEntity<App>) ->
         .overflow_y_scroll()
         .gap_4()
         .child(settings_group(theme, vec![mode_seg, accent_row, preview_seg]))
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .gap_2()
-                .child(group_label(theme, "App theme"))
-                .child(settings_group(
-                    theme,
-                    vec![
-                        theme_select(AppearanceDropdown::ThemeLight),
-                        theme_select(AppearanceDropdown::ThemeDark),
-                    ],
-                )),
-        )
         .child(
             div()
                 .flex()
@@ -1457,14 +1347,6 @@ fn render_appearance(app: &App, theme: &Theme, entity: gpui::WeakEntity<App>) ->
                 .gap_4()
                 .child(div().flex_1().min_w(px(0.)).child(app_preview))
                 .child(div().flex_1().min_w(px(0.)).child(term_preview)),
-        )
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .gap_2()
-                .child(import_btn)
-                .child(copy_btn),
         )
         .into_any_element()
 }
