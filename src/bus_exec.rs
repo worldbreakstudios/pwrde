@@ -179,6 +179,18 @@ impl App {
                     Err(e) => Reply::err(e),
                 }
             }
+            Command::Key { keys } => {
+                let mut parsed = Vec::with_capacity(keys.len());
+                for chord in &keys {
+                    match bus_keystroke(chord) {
+                        Ok(ks) => parsed.push(ks),
+                        Err(e) => return Reply::err(e),
+                    }
+                }
+                let n = parsed.len();
+                self.pending_keys.extend(parsed);
+                Reply::success(json!({ "queued": n }))
+            }
         }
     }
 
@@ -782,5 +794,67 @@ mod tests {
         let p = default_screenshot_path();
         assert_eq!(p.extension().and_then(|e| e.to_str()), Some("png"));
         assert!(p.starts_with(std::env::temp_dir()));
+    }
+}
+
+/// Parse one bus `key` chord (gpui syntax: `cmd-p`, `escape`, `shift-h`) into
+/// the `Keystroke` a physical press would produce. Plain printable keys get
+/// `key_char` filled — macOS reports `space` with `" "` and letters with their
+/// (shifted) text — so `key_to_bytes` types them into the terminal; bindings
+/// match on modifiers + key regardless. Shifted symbols are not remapped
+/// (`shift-1` types `1`, not `!`): pass the symbol itself as the chord.
+pub(crate) fn bus_keystroke(chord: &str) -> Result<gpui::Keystroke, String> {
+    let mut ks = gpui::Keystroke::parse(chord)
+        .map_err(|e| format!("invalid key chord {chord:?}: {e}"))?;
+    let m = ks.modifiers;
+    if !m.platform && !m.control && !m.alt && !m.function {
+        if ks.key == "space" {
+            ks.key_char = Some(" ".into());
+        } else if ks.key.chars().count() == 1 {
+            ks.key_char = Some(if m.shift && ks.key.chars().all(char::is_alphabetic) {
+                ks.key.to_uppercase()
+            } else {
+                ks.key.clone()
+            });
+        }
+    }
+    Ok(ks)
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::bus_keystroke;
+
+    #[test]
+    fn chord_modifiers_and_key() {
+        let ks = bus_keystroke("cmd-shift-t").unwrap();
+        assert!(ks.modifiers.platform && ks.modifiers.shift);
+        assert_eq!(ks.key, "t");
+        assert_eq!(ks.key_char, None, "chords with cmd must not type text");
+    }
+
+    #[test]
+    fn printable_keys_get_key_char() {
+        assert_eq!(bus_keystroke("a").unwrap().key_char.as_deref(), Some("a"));
+        assert_eq!(bus_keystroke("shift-h").unwrap().key_char.as_deref(), Some("H"));
+        assert_eq!(bus_keystroke("shift-1").unwrap().key_char.as_deref(), Some("1"));
+        assert_eq!(bus_keystroke("space").unwrap().key_char.as_deref(), Some(" "));
+        assert_eq!(bus_keystroke("ctrl-c").unwrap().key_char, None);
+    }
+
+    #[test]
+    fn named_keys_have_no_key_char() {
+        for k in ["escape", "enter", "tab", "backspace", "up"] {
+            let ks = bus_keystroke(k).unwrap();
+            assert_eq!(ks.key, k);
+            assert_eq!(ks.key_char, None, "{k}");
+        }
+    }
+
+    #[test]
+    fn bad_chord_names_the_input() {
+        let err = bus_keystroke("cmd--x").unwrap_err();
+        assert!(err.contains("cmd--x"), "{err}");
+        assert!(bus_keystroke("cmd-shift-x-y").is_err());
     }
 }
