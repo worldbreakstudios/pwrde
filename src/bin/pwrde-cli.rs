@@ -270,6 +270,24 @@ fn parse_command(sub: &str, args: &[String]) -> Result<Command, CliError> {
             Ok(Command::Screenshot { path, clipboard })
         }
         "read" => parse_read(args),
+        "flow-send" => {
+            let text = if args.is_empty() {
+                return Err(CliError::Usage(
+                    "flow-send requires <text> (or - for stdin)".into(),
+                ));
+            } else if args.len() > 1 {
+                // Join words so `flow-send open the logs` reads naturally.
+                args.join(" ")
+            } else {
+                let t = &args[0];
+                if t == "-" {
+                    read_stdin()?
+                } else {
+                    t.clone()
+                }
+            };
+            Ok(Command::FlowSend { text })
+        }
         "state" => Ok(Command::State),
         "commands" => Ok(Command::ListCommands),
         "ping" => Ok(Command::Ping),
@@ -409,6 +427,7 @@ fn usage() -> String {
         ("action", "action"),
         ("new_session", "new-session"),
         ("send_text", "send-text"),
+        ("flow_send", "flow-send"),
         ("key", "key"),
         ("focus_group", "focus"),
         ("new_section", "new-section"),

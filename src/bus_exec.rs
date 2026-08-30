@@ -63,6 +63,8 @@ impl App {
                 Some(action) => {
                     if self.run_action(action) {
                         Reply::success(None)
+                    } else if action == Action::ToggleFlow && !crate::flow::enabled() {
+                        Reply::err(FLOW_DISABLED)
                     } else if self.page != Page::Sessions {
                         Reply::err(format!(
                             "{name:?} only applies on the Sessions page (currently {})",
@@ -77,6 +79,15 @@ impl App {
                 )),
             },
             Command::State => Reply::success(self.state_json()),
+            Command::FlowSend { text } => {
+                if !crate::flow::enabled() {
+                    return Reply::err(FLOW_DISABLED);
+                }
+                match self.flow_send(text) {
+                    Ok(()) => Reply::success(None),
+                    Err(e) => Reply::err(e),
+                }
+            }
             // A registered CLI tool's page answers to `tool:<index>` or to
             // the tool's name (case-insensitive), e.g. `cleanup`.
             Command::GoToPage { page } => match resolve_page(&page, &self.tools) {
@@ -403,6 +414,12 @@ impl App {
             "groups": groups,
             "sections": sections,
             "command_palette_open": self.command.is_some(),
+            "flow": {
+                "enabled": crate::flow::enabled(),
+                "open": self.flow.open,
+                "busy": self.flow.busy,
+                "messages": self.flow.messages.len(),
+            },
             "message": self.message.as_ref().map(|(m, _)| m.clone()),
         })
     }
@@ -550,6 +567,9 @@ pub(crate) fn pane_matches(
         .flatten()
         .any(|hay| hay.to_lowercase().contains(&q))
 }
+
+/// Refusal reason while the experimental flag is off.
+const FLOW_DISABLED: &str = "Flow is disabled — enable it under Settings > Feature Flags";
 
 pub(crate) fn page_from_name(name: &str) -> Option<Page> {
     match name.trim().to_ascii_lowercase().replace('-', "_").as_str() {

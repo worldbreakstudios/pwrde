@@ -84,6 +84,10 @@ pub enum TermEvent {
         cmd: crate::bus::Command,
         reply: std::sync::mpsc::Sender<crate::bus::Reply>,
     },
+    /// Flow agent progress (assistant text, tool cards, turn lifecycle) from
+    /// the embedded agent backend; see `flow.rs`. Arrives on the shared event
+    /// channel so the backend's reader thread never touches the foreground.
+    Flow(crate::flow::FlowEvent),
 }
 
 /// Forwards `Alert::ToastNotification` from wezterm-term to the UI event channel
