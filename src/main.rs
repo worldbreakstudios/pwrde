@@ -6535,7 +6535,11 @@ fn main() {
                 titlebar: Some(gpui::TitlebarOptions {
                     title: None,
                     appears_transparent: true,
-                    traffic_light_position: None,
+                    // Inside the sidebar panel, not on the window gutter.
+                    traffic_light_position: Some(gpui::point(
+                        px(workspace::TRAFFIC_LIGHT_ORIGIN),
+                        px(workspace::TRAFFIC_LIGHT_ORIGIN),
+                    )),
                 }),
                 is_resizable: true,
                 app_owns_titlebar_drag: true,

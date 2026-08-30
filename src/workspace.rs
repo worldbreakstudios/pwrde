@@ -457,10 +457,17 @@ pub fn titlebar(scale: f32, sidebar_w: f32) -> LayoutRect {
     LayoutRect { x: 0.0, y: 0.0, w: (sidebar_w * scale).round(), h: (TITLEBAR_H * scale).round() }
 }
 
+/// Where the native traffic lights sit (top-left of the close button, logical
+/// px): 12px inside the sidebar's 8px window gutter, which also centers the
+/// 12px buttons in the panel's header strip — Messages puts them there
+/// rather than at macOS's default (12, 12), which now lands on the gutter.
+pub const TRAFFIC_LIGHT_ORIGIN: f32 = 20.0;
+
 /// Logical width of the top-left corner the native traffic lights occupy.
-/// The buttons themselves end around x=59; the extra headroom keeps the
-/// first tab from crowding them.
-pub const TRAFFIC_LIGHT_SAFE_W: f32 = 78.0;
+/// The buttons themselves end around x=72 (three 12px lights, 8px apart,
+/// from [`TRAFFIC_LIGHT_ORIGIN`]); the extra headroom keeps the first tab
+/// from crowding them.
+pub const TRAFFIC_LIGHT_SAFE_W: f32 = 90.0;
 
 /// The window-drag corner while the sidebar is collapsed: the traffic-light
 /// span of the top-left tile's tab strip, plus the sliver of padding above.
