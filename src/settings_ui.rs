@@ -688,6 +688,16 @@ fn render_feature_flags(
         );
     }
 
+    if rows.is_empty() {
+        return div()
+            .px_3()
+            .py_2()
+            .text_size(px(13.))
+            .text_color(theme.muted_foreground)
+            .child("No experimental flags right now.")
+            .into_any_element();
+    }
+
     div()
         .flex()
         .flex_col()

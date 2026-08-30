@@ -574,9 +574,9 @@ impl Renderer {
 
         if matches!(
             chrome.page,
-            Page::Settings | Page::PullRequests | Page::Notes | Page::Tool(_)
+            Page::Settings | Page::PullRequests | Page::Tool(_)
         ) {
-            // Content is a gpui overlay (settings_ui / pr_ui / notes_ui) or,
+            // Content is a gpui overlay (settings_ui / pr_ui) or,
             // for a tool page, painted by `tool_page` — the canvas paints the
             // sidebar only here.
         } else {

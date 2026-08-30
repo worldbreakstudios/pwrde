@@ -36,7 +36,7 @@ Same shape as iTerm2: a PTY reader thread per session (`term.rs`) reads output i
 
 Painting happens inside a single custom gpui `Element`'s `paint()` in `main.rs`. `renderer.rs` is deliberately **stateless and GPU-free**: `build_frame` walks the workspace tree + terminal grids and produces a `Frame` of plain data (quads, text runs, labels) that the Element then paints via `window.paint_quad` / `shape_line`. Keep geometry/color logic in `renderer.rs` and actual painting in `main.rs`.
 
-**Exception: the Settings page** (and the Pull Requests / Notes pages) are real gpui element trees (`settings_ui.rs` etc., built from the vendored rcn components below) absolutely positioned over the canvas content area — not canvas-painted. Confirm dialogs and the Settings sidebar (search box + section tabs) stay on the canvas path. The Settings → Appearance section (segmented mode/preview controls, theme/terminal Selects, WYSIWYG preview mockups, token import/export) lives in the overlay too — its previews are element-tree divs painted with the exact theme colors.
+**Exception: the Settings page** (and the Pull Requests page) are real gpui element trees (`settings_ui.rs` etc., built from the vendored rcn components below) absolutely positioned over the canvas content area — not canvas-painted. Confirm dialogs and the Settings sidebar (search box + section tabs) stay on the canvas path. The Settings → Appearance section (segmented mode/preview controls, theme/terminal Selects, WYSIWYG preview mockups, token import/export) lives in the overlay too — its previews are element-tree divs painted with the exact theme colors.
 
 ### UI components (rcn, vendored in `src/ui/`)
 
@@ -54,7 +54,7 @@ Painting happens inside a single custom gpui `Element`'s `paint()` in `main.rs`.
 - `workspace.rs` — group/split-tree/tile/tab model plus pure layout math over the window size, so drawing and hit-testing/PTY-resize always agree.
 - `term.rs` — `Session`: PTY (portable-pty) + VT emulation (wezterm-term) + reader thread.
 - `renderer.rs` — stateless frame building (see above).
-- `pages.rs` — top-level pages (`Page`: Sessions, PullRequests, `Tool(i)` per registered CLI tool, Notes, Settings — `Page::all(n_tools)` gives the dot-strip order) and rebindable keyboard `Action`s; every ⌘ shortcut resolves through a bindings table from settings keys `keyboard.<action>`.
+- `pages.rs` — top-level pages (`Page`: Sessions, PullRequests, `Tool(i)` per registered CLI tool, Settings — `Page::all(n_tools)` gives the dot-strip order) and rebindable keyboard `Action`s; every ⌘ shortcut resolves through a bindings table from settings keys `keyboard.<action>`.
 - `command.rs` / `command_ui.rs` — the unified command palette (⌘P): a pure, unit-tested state machine (root commands grouped + fuzzy-filtered; `New session…` is the multi-step Repo › Base › Layout flow whose picks become token chips, ⌫ pops one) and its rcn element tree on a top-priority deferred layer. ⇧⌘T and the sidebar ＋ open the same palette with the command already committed; the flyover's first-open picker goes through it too. `palette.rs` keeps only `fuzzy_match`.
 - `picker.rs` — the palette's step data: the directory scan (`~`, `~/src`, subdirs; git detection; pins/recents in `groups.json`), fork-source choices, and workspace-profile choices.
 - `git.rs` — shells out to git for the fork-source picker (default branch, branch lists), mirroring what the `drop` worktree tool runs. Also `worktree_scope`, which settings/persist use to give each linked git worktree its own config/DB.

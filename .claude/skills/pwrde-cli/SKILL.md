@@ -50,7 +50,7 @@ pwrde-cli new-session ~/src/pwrde                # open a group at a dir; --layo
 pwrde-cli send-text 'cargo test' --enter         # raw keystrokes into the focused pane; --enter appends \r; --group <name|index>; text `-` reads stdin
 pwrde-cli send-text $'\x03'                      # control bytes pass through (^C, escape sequences)
 pwrde-cli action split_right                     # any Action by name (split_right, new_tab, close_tab, focus_left, toggle_sidebar, screenshot_to_file, …)
-pwrde-cli page settings                          # sessions | pull_requests | cleanup | notes | settings
+pwrde-cli page settings                          # sessions | pull_requests | settings | tool:<n>
 pwrde-cli focus pwrde                            # by group name, sidebar title, or 0-based index
 pwrde-cli new-section Work && pwrde-cli move pwrde Work
 pwrde-cli resize 1100 700                        # window content size in points

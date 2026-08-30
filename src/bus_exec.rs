@@ -85,7 +85,7 @@ impl App {
                     Reply::success(None)
                 }
                 None => Reply::err(format!(
-                    "unknown page {page:?}; expected one of sessions, pull_requests, notes, settings, tool:<n> or a registered tool's name"
+                    "unknown page {page:?}; expected one of sessions, pull_requests, settings, tool:<n> or a registered tool's name"
                 )),
             },
             Command::NewSession { cwd, base, layout } => self.bus_new_session(cwd, base, layout),
@@ -398,7 +398,6 @@ pub(crate) fn page_from_name(name: &str) -> Option<Page> {
     match name.trim().to_ascii_lowercase().replace('-', "_").as_str() {
         "sessions" => Some(Page::Sessions),
         "pull_requests" | "prs" | "pullrequests" => Some(Page::PullRequests),
-        "notes" => Some(Page::Notes),
         "settings" => Some(Page::Settings),
         s => s.strip_prefix("tool:").and_then(|n| n.parse().ok()).map(Page::Tool),
     }
@@ -424,7 +423,6 @@ pub(crate) fn page_name(page: Page) -> String {
         Page::Sessions => "sessions".into(),
         Page::PullRequests => "pull_requests".into(),
         Page::Tool(i) => format!("tool:{i}"),
-        Page::Notes => "notes".into(),
         Page::Settings => "settings".into(),
     }
 }

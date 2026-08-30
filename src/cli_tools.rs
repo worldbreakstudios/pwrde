@@ -3,8 +3,7 @@
 //! A *CLI tool* is a named shell command the user can launch in a terminal
 //! session (name, command string, working directory, icon glyph). The list is
 //! persisted in settings under `tools.cli` as a JSON array of [`CliTool`]
-//! objects serialized to a STRING value — the same pattern as `notes.vaults`
-//! in [`crate::notes`]. Nothing here touches gpui.
+//! objects serialized to a STRING value. Nothing here touches gpui.
 //!
 //! Semantics of the settings key:
 //! - **absent** → [`tools`] returns [`default_tools`] (the built-in Cleanup entry).

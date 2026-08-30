@@ -771,7 +771,7 @@ fn sidebar_row_rect_at(
     // Rows start below the titlebar and the header chip row — exactly where
     // `tab_rect`'s one-line rows start, so every page's ladder shares a top.
     // On the Sessions card ladder the pinned-bubble strip (if any) sits above
-    // the cards, so shift `top0` down by its height; Cleanup/Notes/Settings
+    // the cards, so shift `top0` down by its height; Cleanup/Settings
     // one-line rows keep the unshifted origin.
     let mut top0 = (TITLEBAR_H * scale).round() + 2.0 * gap;
     if card_rows {
