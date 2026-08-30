@@ -782,6 +782,41 @@ impl Session {
         title
     }
 
+    /// Read-only snapshot of the pane's text: every line of the whole buffer
+    /// (scrollback + visible screen) as right-trimmed strings, top to bottom.
+    /// With `tail = Some(n)` only the last n lines are kept. Never touches the
+    /// viewport scroll or the selection — this backs the bus `read_pane`
+    /// command and is safe to call while the UI is scrolled elsewhere.
+    pub fn read_lines(&self, tail: Option<usize>) -> Vec<String> {
+        let term = self.term.lock().unwrap();
+        let screen = term.screen();
+        let cols = screen.physical_cols;
+        let total = screen.scrollback_rows();
+        // Only materialize the rows asked for — the buffer can be thousands
+        // of lines deep and the default read is one screen's worth.
+        let first = tail.map_or(0, |n| total.saturating_sub(n));
+        screen
+            .lines_in_phys_range(first..total)
+            .iter()
+            .map(|l| l.columns_as_str(0..cols).trim_end().to_owned())
+            .collect()
+    }
+
+    /// Read-only pane metadata, in one lock: `(cols, rows, scrollback_rows,
+    /// (cursor col, cursor row), alt_screen)`. Never mutates state.
+    pub fn read_info(&self) -> (usize, usize, usize, (usize, usize), bool) {
+        let term = self.term.lock().unwrap();
+        let screen = term.screen();
+        let cursor = term.cursor_pos();
+        (
+            screen.physical_cols,
+            screen.physical_rows,
+            screen.scrollback_rows(),
+            (cursor.x, cursor.y as usize),
+            term.is_alt_screen_active(),
+        )
+    }
+
     /// Paste text, honoring bracketed-paste mode (the terminal wraps it in
     /// ESC[200~ / ESC[201~ when the app has requested that).
     pub fn paste(&self, text: &str) {
@@ -1378,6 +1413,36 @@ mod tests {
         assert_eq!(session.emulator_title(), "real");
         assert!(!session.needs_proc_title());
         assert_eq!(session.title(), "real");
+    }
+
+    /// The read-only pane snapshot: `None` returns the whole buffer
+    /// (scrollback + visible screen), `Some(n)` the last n lines — here the
+    /// final two, both non-empty — and the cursor/size info is read without
+    /// disturbing anything.
+    #[test]
+    fn read_lines_returns_full_buffer_and_tail() {
+        let session = Session::placeholder();
+        let mut feed = String::new();
+        for i in 1..24 {
+            feed.push_str(&format!("r{i}\r\n"));
+        }
+        feed.push_str("r24"); // no trailing newline: r24 must stay the last line
+        session.term.lock().unwrap().advance_bytes(feed.as_bytes());
+
+        let lines = session.read_lines(None);
+        let nonempty: Vec<&str> = lines.iter().map(String::as_str).filter(|l| !l.is_empty()).collect();
+        let expected: Vec<String> = (1..=24).map(|i| format!("r{i}")).collect();
+        assert_eq!(nonempty, expected.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(lines.last().map(String::as_str), Some("r24"));
+
+        let tail = session.read_lines(Some(2));
+        assert_eq!(tail, vec!["r23".to_owned(), "r24".to_owned()]);
+
+        let (cols, rows, scrollback, cursor, alt) = session.read_info();
+        assert_eq!((cols, rows), (80, 24));
+        assert!(scrollback >= rows);
+        assert_eq!(cursor, (3, 23));
+        assert!(!alt);
     }
 
     // ── foreground_command / deepest_descendant ──────────────────────────────
