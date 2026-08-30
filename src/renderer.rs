@@ -575,7 +575,6 @@ impl Renderer {
         if chrome.page == Page::Cleanup
             || chrome.page == Page::Settings
             || chrome.page == Page::PullRequests
-            || chrome.page == Page::Notes
         {
             // Content is a gpui overlay (cleanup_ui / settings_ui / pr_ui) —
             // the canvas paints the sidebar only.

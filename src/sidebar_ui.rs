@@ -62,13 +62,9 @@ const UNREAD_DOT: f32 = 7.0;
 const SECTION_TEXT: f32 = 10.5;
 
 /// Corner radius of a one-line row's pill. Mirrors `renderer.rs`'s
-/// `ROW_RADIUS`, so the Cleanup, Notes and Settings rows keep exactly the
+/// `ROW_RADIUS`, so the Cleanup and Settings rows keep exactly the
 /// silhouette the canvas gave them.
 const ROW_RADIUS: f32 = 14.0;
-
-/// How far a nested one-line row steps its label in — a Notes doc sitting
-/// under its vault. The canvas used the same 14px.
-const ROW_INDENT: f32 = 14.0;
 
 /// What the Settings search field shows while it is empty.
 pub(crate) const SEARCH_SETTINGS_PLACEHOLDER: &str = "Search settings";
@@ -414,11 +410,10 @@ impl App {
     /// it, so the affordance had gone invisible while staying clickable. The
     /// pixels moved here; the rects did not. Each slot is positioned at
     /// exactly [`crate::workspace::page_slot_rect`] — the same rect
-    /// `renderer.rs` registers as hot and `main.rs::page_slot_at` hit-tests —
-    /// and flag-gated pages (Notes, when the feature is off) drop out of the
-    /// strip entirely so the slot indices keep lining up. Each slot is a real
-    /// gpui click target that switches the page; the hover crossfade target
-    /// (`dot_hover`) is still tracked on the canvas mouse-move path.
+    /// `renderer.rs` registers as hot and `main.rs::page_slot_at` hit-tests.
+    /// Each slot is a real gpui click target that switches the page; the hover
+    /// crossfade target (`dot_hover`) is still tracked on the canvas mouse-move
+    /// path.
     fn page_dot_layer(&self, theme: &Theme, entity: gpui::WeakEntity<Self>) -> gpui::Div {
         let (_, surface_h) = self.renderer.surface_size();
         // `page_slot_rect` takes device pixels and a scale; gpui works in
@@ -426,7 +421,7 @@ impl App {
         // the rest of this file does.
         let height = (surface_h as f32 / self.scale()).round() as u32;
         let w = self.sidebar_w();
-        let pages = crate::Page::visible(crate::features::notes_enabled());
+        let pages = crate::Page::ALL;
         let n = pages.len();
 
         let mut layer = div().absolute().left(px(0.0)).top(px(0.0)).size_full();
@@ -559,9 +554,9 @@ impl App {
     /// Every page draws its rows into the same absolutely positioned layer
     /// over the panel, but they do not share a row *vocabulary*: Sessions and
     /// Pull Requests get card-height preview rows laid out by
-    /// [`crate::workspace::sidebar_row_rect`], while Cleanup, Notes and
-    /// Settings get one-line rows at [`crate::workspace::tab_rect`] — the very
-    /// rects `main.rs` already hit-tests for those pages. The split is
+    /// [`crate::workspace::sidebar_row_rect`], while Cleanup and Settings get
+    /// one-line rows at [`crate::workspace::tab_rect`] — the very rects
+    /// `main.rs` already hit-tests for those pages. The split is
     /// [`App::card_rows`], the same predicate the geometry helpers take.
     fn sidebar_row_layer(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
         let entity = cx.entity().downgrade();
@@ -570,7 +565,6 @@ impl App {
         }
         match self.page {
             crate::Page::Cleanup => self.cleanup_row_layer(theme, entity),
-            crate::Page::Notes => self.notes_row_layer(theme, entity),
             crate::Page::Settings => self.settings_row_layer(theme, cx),
             // Any page without rows of its own still gets the shell.
             _ => div().absolute().left(px(0.0)).top(px(0.0)).size_full(),
@@ -595,7 +589,7 @@ impl App {
             let section = *section;
             let entity = entity.clone();
             layer = layer.child(
-                self.simple_row(theme, &rect, section.label(), active, false, true)
+                self.simple_row(theme, &rect, section.label(), active, true)
                     .id(("settings-section", i))
                     .occlude()
                     .cursor_pointer()
@@ -670,46 +664,6 @@ impl App {
             .child(self.settings_search.clone())
     }
 
-    /// The Notes rows: one combined list stacking the registered vaults, then
-    /// the active vault's docs (indented), then the trailing add-vault row —
-    /// the same three ranges `main.rs`'s `Page::Notes` mouse branch walks.
-    /// [`notes_row`] owns the index → row mapping, so paint and hit-test read
-    /// one table rather than two hand-kept-in-sync loops.
-    fn notes_row_layer(&self, theme: &Theme, entity: gpui::WeakEntity<Self>) -> gpui::Div {
-        let w = self.sidebar_w();
-        let vaults = crate::notes::vaults();
-        let (n_vaults, n_docs) = (vaults.len(), self.notes_docs.len());
-
-        let mut layer = div().absolute().left(px(0.0)).top(px(0.0)).size_full();
-        for i in 0..(n_vaults + n_docs + 1) {
-            let Some(row) = notes_row(i, n_vaults, n_docs) else { break };
-            let rect = crate::workspace::tab_rect(i, 1.0, w);
-            let on_press = press(entity.clone(), move |this, _ev, cx| this.press_notes_row(i, cx));
-            layer = layer.child(match row {
-                // A vault row keeps full-strength ink even when inactive: the
-                // vault list is the page's primary navigation. Docs and the
-                // add-vault row are secondary, so they dim.
-                NotesRow::Vault(v) => self.simple_row(
-                    theme,
-                    &rect,
-                    vault_label(&vaults[v]),
-                    v == self.notes_active_vault,
-                    false,
-                    false,
-                ),
-                NotesRow::Doc(d) => {
-                    let doc = &self.notes_docs[d];
-                    let open = self.notes_selected.as_deref() == Some(doc.path.as_path());
-                    self.simple_row(theme, &rect, doc.rel.clone(), open, true, true)
-                },
-                NotesRow::AddVault => {
-                    self.simple_row(theme, &rect, ADD_VAULT_LABEL, false, false, true)
-                },
-            }.on_mouse_down(MouseButton::Left, on_press));
-        }
-        layer
-    }
-
     /// The Cleanup rows: an `All` row at slot 0 and one row per repo that has
     /// worktrees to drop, exactly the tabs `main.rs` hit-tests at
     /// [`crate::workspace::tab_rect`] — slot 0 clears the filter, slot `j + 1`
@@ -722,7 +676,7 @@ impl App {
         for (i, (label, active)) in cleanup_rows(&self.cleanup).into_iter().enumerate() {
             let rect = crate::workspace::tab_rect(i, 1.0, w);
             layer = layer.child(
-                self.simple_row(theme, &rect, label, active, false, true).on_mouse_down(
+                self.simple_row(theme, &rect, label, active, true).on_mouse_down(
                     MouseButton::Left,
                     press(entity.clone(), move |this, _ev, _cx| this.press_cleanup_row(i)),
                 ),
@@ -917,23 +871,22 @@ impl App {
     }
 
     /// One one-line row, for the pages with no git context worth previewing:
-    /// Cleanup's repo filters, Notes' vaults and docs, Settings' section tabs.
+    /// Cleanup's repo filters and Settings' section tabs.
     ///
     /// `rect` is whatever [`crate::workspace::tab_rect`] handed the mouse path
     /// for this row's index, so the pixels and the hit box cannot drift apart.
-    /// `indent` steps a nested row's label in, and `dim` marks a row whose
-    /// label is secondary — the canvas painted those in `ink_dim` unless they
-    /// were active. The fills mirror the canvas painter exactly: the active row
-    /// gets the card pill plus a soft shadow, a merely hovered row gets a
-    /// weaker muted fill, and every other row stays transparent. Hover comes
-    /// from [`App::sidebar_cursor`], so it is suppressed mid-drag here too.
+    /// `dim` marks a row whose label is secondary — the canvas painted those in
+    /// `ink_dim` unless they were active. The fills mirror the canvas painter
+    /// exactly: the active row gets the card pill plus a soft shadow, a merely
+    /// hovered row gets a weaker muted fill, and every other row stays
+    /// transparent. Hover comes from [`App::sidebar_cursor`], so it is
+    /// suppressed mid-drag here too.
     fn simple_row(
         &self,
         theme: &Theme,
         rect: &crate::workspace::LayoutRect,
         label: impl Into<SharedString>,
         active: bool,
-        indent: bool,
         dim: bool,
     ) -> gpui::Div {
         let hovered = self
@@ -977,7 +930,7 @@ impl App {
             })
             .flex()
             .items_center()
-            .pl(px(scaled(ROW_PAD + if indent { ROW_INDENT } else { 0.0 })))
+            .pl(px(scaled(ROW_PAD)))
             .pr(px(scaled(ROW_PAD)))
             .text_size(px(scaled(12.0)))
             .text_color(ink)
@@ -1734,44 +1687,6 @@ fn cleanup_rows(cleanup: &crate::cleanup::Cleanup) -> Vec<(String, bool)> {
     rows
 }
 
-/// The label of the Notes sidebar's trailing row. ASCII on purpose — it is what
-/// the canvas painted, and the row is decorative until `main.rs` toggles the
-/// add-vault prompt from the same slot.
-const ADD_VAULT_LABEL: &str = "+ Add vault";
-
-/// What a Notes sidebar slot addresses.
-///
-/// The rows are three stacked ranges — `[0, V)` vaults, `[V, V + D)` the active
-/// vault's docs, and `V + D` the add-vault row — so a bare index means nothing
-/// without the two counts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NotesRow {
-    /// The `i`th registered vault.
-    Vault(usize),
-    /// The `i`th doc of the *active* vault.
-    Doc(usize),
-    /// The trailing row that opens the add-vault prompt.
-    AddVault,
-}
-
-/// Map a Notes sidebar slot onto the thing it addresses, or `None` when the
-/// slot is past the end of the list.
-///
-/// This is the whole of the Notes row vocabulary, kept pure so it can be tested
-/// against the ranges `main.rs`'s `Page::Notes` mouse branch walks: paint and
-/// hit-test agree exactly when they agree here.
-fn notes_row(index: usize, n_vaults: usize, n_docs: usize) -> Option<NotesRow> {
-    if index < n_vaults {
-        Some(NotesRow::Vault(index))
-    } else if index < n_vaults + n_docs {
-        Some(NotesRow::Doc(index - n_vaults))
-    } else if index == n_vaults + n_docs {
-        Some(NotesRow::AddVault)
-    } else {
-        None
-    }
-}
-
 /// The logical-pixel cursor the panel hovers against, or `None` when nothing
 /// in the sidebar may look hot.
 ///
@@ -1792,15 +1707,6 @@ fn hover_cursor(
     let s = scale.max(0.01);
     Some((cursor.0 as f32 / s, cursor.1 as f32 / s))
 }
-
-/// A vault's row label: its directory name, falling back to the whole path when
-/// the vault sits at a filesystem root and has no final component.
-fn vault_label(path: &std::path::Path) -> String {
-    path.file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| path.to_string_lossy().to_string())
-}
-
 
 /// Nudge a token's lightness by `delta`, clamped. Used for the panel's
 /// vertical gradient so the material derives from the live theme instead of
@@ -1825,7 +1731,6 @@ mod tests {
     use gpui::AssetSource as _;
     use super::*;
     use crate::cleanup::{Cleanup, ScanState, WorktreeInfo};
-    use std::path::Path;
 
     #[test]
     fn a_cards_diffstat_carries_exactly_one_leading_sign() {
@@ -1975,35 +1880,6 @@ mod tests {
     }
 
     #[test]
-    fn notes_rows_stack_vaults_then_docs_then_add_vault() {
-        // Two vaults, three docs: [0,2) vaults, [2,5) docs, 5 add-vault — the
-        // ranges main.rs's Page::Notes mouse branch walks.
-        let rows: Vec<Option<NotesRow>> = (0..7).map(|i| notes_row(i, 2, 3)).collect();
-        assert_eq!(
-            rows,
-            vec![
-                Some(NotesRow::Vault(0)),
-                Some(NotesRow::Vault(1)),
-                Some(NotesRow::Doc(0)),
-                Some(NotesRow::Doc(1)),
-                Some(NotesRow::Doc(2)),
-                Some(NotesRow::AddVault),
-                None,
-            ]
-        );
-    }
-
-    #[test]
-    fn notes_rows_degenerate_to_just_add_vault() {
-        // No vaults registered yet: slot 0 is the add-vault row, nothing after.
-        assert_eq!(notes_row(0, 0, 0), Some(NotesRow::AddVault));
-        assert_eq!(notes_row(1, 0, 0), None);
-        // A vault with no docs keeps add-vault directly under the vault row.
-        assert_eq!(notes_row(0, 1, 0), Some(NotesRow::Vault(0)));
-        assert_eq!(notes_row(1, 1, 0), Some(NotesRow::AddVault));
-    }
-
-    #[test]
     fn hover_dies_under_a_drag_or_an_overlay() {
         // Idle and unobstructed: physical pixels come back as logical ones.
         assert_eq!(hover_cursor((40.0, 100.0), 2.0, true, false), Some((20.0, 50.0)));
@@ -2034,12 +1910,5 @@ mod tests {
         // and their contents scale apart — `font_scale` delegates for exactly
         // that reason, so this pins the delegation rather than a coincidence.
         assert_eq!(font_scale(), crate::workspace::row_font_scale());
-    }
-
-    #[test]
-    fn vault_labels_prefer_the_directory_name() {
-        assert_eq!(vault_label(Path::new("/src/notes/work")), "work");
-        // A path with no final component falls back to the whole path.
-        assert_eq!(vault_label(Path::new("/")), "/");
     }
 }

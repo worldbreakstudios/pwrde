@@ -35,8 +35,6 @@ mod local_diff_ui;
 mod markdown;
 mod mermaid;
 mod modal_ui;
-mod notes;
-mod notes_ui;
 mod pr_ui;
 mod settings_ui;
 mod links;
@@ -391,24 +389,6 @@ struct App {
     scroll_accum: f64,
     /// Cleanup page state (worktree listing, selection, filter).
     cleanup: cleanup::Cleanup,
-    /// Index of the active vault within `notes::vaults()` on the Notes page.
-    notes_active_vault: usize,
-    /// Markdown docs found in the active vault, refreshed by `notes_rescan`.
-    notes_docs: Vec<crate::notes::NoteDoc>,
-    /// Path of the note currently open in the Notes reader, if any.
-    notes_selected: Option<std::path::PathBuf>,
-    /// Whether the open note is being edited rather than rendered.
-    notes_edit_mode: bool,
-    /// Code-editor state backing the Notes editor while `notes_edit_mode` is on.
-    notes_editor: Option<gpui::Entity<gpui_component::input::EditorState>>,
-    /// Single-line input for registering a new vault directory (Notes page).
-    notes_add_input: gpui::Entity<crate::ui::Input>,
-    /// Whether the Notes content area is showing the "add vault" path field
-    /// (toggled by the sidebar's "＋ Add vault…" row). Always effectively on
-    /// when no vaults are registered yet.
-    notes_adding_vault: bool,
-    /// Transient Notes status line (e.g. "Saved") shown near the header.
-    notes_status: Option<String>,
     /// The active top-level page (Sessions / Settings).
     page: Page,
     /// The active section while the Settings page is up.
@@ -968,27 +948,6 @@ impl App {
         self.drag = Drag::TabPress { tile: id, tab: ti, start: self.cursor };
         self.sync_layout();
         self.mark_visible_read();
-        self.request_redraw();
-    }
-
-    /// A press on Notes sidebar row `i`: vault rows switch vaults, doc rows
-    /// select a doc (autosaving any in-flight edit first), the trailing row
-    /// toggles the add-vault field.
-    pub(crate) fn press_notes_row(&mut self, i: usize, cx: &mut Context<Self>) {
-        let n_vaults = crate::notes::vaults().len();
-        let n_docs = self.notes_docs.len();
-        if i < n_vaults {
-            self.notes_switch_vault(i);
-        } else if i < n_vaults + n_docs {
-            let doc = self.notes_docs[i - n_vaults].path.clone();
-            self.notes_autosave(cx);
-            self.notes_selected = Some(doc);
-            self.notes_edit_mode = false;
-            self.notes_editor = None;
-            self.notes_status = None;
-        } else {
-            self.notes_adding_vault = !self.notes_adding_vault;
-        }
         self.request_redraw();
     }
 
@@ -3263,11 +3222,11 @@ impl App {
                 self.blur_settings_search(window, cx);
                 return;
             }
-            // Every other sidebar row — Notes vaults/docs, Cleanup filters,
-            // the pinned bubbles, section headers (and their delete chip) and
-            // group cards — is an element click target now (`sidebar_ui`),
-            // which arms the same presses this branch used to; a press that
-            // reaches here landed between rows.
+            // Every other sidebar row — Cleanup filters, the pinned bubbles,
+            // section headers (and their delete chip) and group cards — is an
+            // element click target now (`sidebar_ui`), which arms the same
+            // presses this branch used to; a press that reaches here landed
+            // between rows.
             return;
         }
 
@@ -3281,10 +3240,6 @@ impl App {
         }
         // Pull Requests page: same — the gpui overlay owns the content area.
         if self.page == Page::PullRequests {
-            return;
-        }
-        // Notes page: same — the gpui overlay owns the content area.
-        if self.page == Page::Notes {
             return;
         }
         let area = self.area();
@@ -3703,21 +3658,6 @@ impl App {
         // The Cleanup page owns the keyboard too (no terminal underneath).
         if self.page == Page::Cleanup {
             self.handle_cleanup_key(ev);
-            return;
-        }
-        // The Notes page has no terminal underneath: a focused markdown editor
-        // or path input handles its own text via gpui's input dispatch, so we
-        // only route ⌘ shortcuts and let Escape leave edit mode. Other keys are
-        // swallowed here rather than written to a shell.
-        if self.page == Page::Notes {
-            if ev.keystroke.modifiers.platform {
-                self.handle_shortcut(ev);
-            } else if ev.keystroke.key == "escape" && self.notes_edit_mode {
-                self.notes_edit_mode = false;
-                self.notes_editor = None;
-                window.focus(&self.focus_handle, cx);
-            }
-            self.request_redraw();
             return;
         }
         // The Pull Requests page: ⌘ shortcuts still dispatch; Esc backs out of
@@ -4164,12 +4104,9 @@ impl App {
 
     /// ⌘⇧←/→: step through `Page::ALL`, wrapping at both ends.
     fn cycle_page(&mut self, delta: isize) {
-        // Cycle within the visible pages so a flag-gated page (Notes, when
-        // off) is skipped instead of landing on a dead slot.
-        let visible = Page::visible(crate::features::notes_enabled());
-        let cur = visible.iter().position(|p| *p == self.page).unwrap_or(0);
-        let i = pages::cycle(cur, visible.len(), delta);
-        self.set_page(visible[i]);
+        let cur = Page::ALL.iter().position(|p| *p == self.page).unwrap_or(0);
+        let i = pages::cycle(cur, Page::ALL.len(), delta);
+        self.set_page(Page::ALL[i]);
     }
 
     /// ⌘⇧↑/↓: step through the sidebar's tabs, wrapping at both ends —
@@ -4188,15 +4125,6 @@ impl App {
             },
             // The Pull Requests page has no sidebar tabs of its own.
             Page::PullRequests => {},
-            // ⌘⇧↑/↓ steps through the registered vaults.
-            Page::Notes => {
-                let n = crate::notes::vaults().len();
-                if n > 0 {
-                    let next = pages::cycle(self.notes_active_vault, n, delta);
-                    self.notes_switch_vault(next);
-                    self.request_redraw();
-                }
-            },
             Page::Cleanup => {
                 let repos = self.cleanup.repos();
                 // Tabs: 0 = All, 1..=n = per-repo
@@ -4217,11 +4145,6 @@ impl App {
     }
 
     fn set_page(&mut self, page: Page) {
-        // Notes is experimental: with the flag off it is not reachable at all.
-        if page == Page::Notes && !crate::features::notes_enabled() {
-            self.set_page(Page::Sessions);
-            return;
-        }
         if self.page != page {
             self.page = page;
             self.recording = None;
@@ -4251,73 +4174,8 @@ impl App {
             if page == Page::PullRequests {
                 self.reset_pr_surface();
             }
-            // Entering the Notes page scans the active vault's markdown docs.
-            if page == Page::Notes {
-                let n = crate::notes::vaults().len();
-                if self.notes_active_vault >= n {
-                    self.notes_active_vault = 0;
-                }
-                self.notes_rescan();
-            }
         }
         self.request_redraw();
-    }
-
-    /// The registered vault directory the Notes page is currently showing.
-    fn notes_active_vault_path(&self) -> Option<std::path::PathBuf> {
-        crate::notes::vaults().get(self.notes_active_vault).cloned()
-    }
-
-    /// Re-read the active vault's markdown docs; an unset or missing vault
-    /// simply yields an empty list.
-    fn notes_rescan(&mut self) {
-        self.notes_docs = self
-            .notes_active_vault_path()
-            .map(|p| crate::notes::scan_vault(&p))
-            .unwrap_or_default();
-    }
-
-    /// Clear the open-note/editor state. Used when the browsed vault changes,
-    /// so the reader never shows a doc that isn't in the vault on screen (and
-    /// Save can't write to a path from the previous vault).
-    fn notes_reset_selection(&mut self) {
-        self.notes_selected = None;
-        self.notes_edit_mode = false;
-        self.notes_editor = None;
-        self.notes_status = None;
-    }
-
-    /// If a note is open in edit mode, persist the editor's current text to its
-    /// file when it differs from disk. Called before leaving the editor (a doc
-    /// switch or flipping back to View) so edits aren't silently lost.
-    fn notes_autosave(&mut self, cx: &mut Context<Self>) {
-        if !self.notes_edit_mode {
-            return;
-        }
-        let (Some(path), Some(editor)) = (self.notes_selected.clone(), self.notes_editor.clone())
-        else {
-            return;
-        };
-        let content = editor.read(cx).value().to_string();
-        let differs = crate::notes::read_doc(&path).map(|d| d != content).unwrap_or(true);
-        if differs {
-            let _ = crate::notes::write_doc(&path, &content);
-        }
-    }
-
-    /// Switch the Notes page to vault `idx`: reset the open note and rescan.
-    /// `cx`-less callers (mouse/keyboard) can't autosave a dirty editor, so if
-    /// one was open we surface a non-silent warning rather than dropping the
-    /// edits quietly.
-    fn notes_switch_vault(&mut self, idx: usize) {
-        let was_editing = self.notes_edit_mode;
-        self.notes_active_vault = idx;
-        self.notes_reset_selection();
-        if was_editing {
-            self.notes_status =
-                Some("Switched vault — unsaved edits discarded (Save before switching).".into());
-        }
-        self.notes_rescan();
     }
 
     /// The page slot under a point in the sidebar's bottom strip, if any
@@ -4325,8 +4183,7 @@ impl App {
     fn page_slot_at(&self, px: f32, py: f32) -> Option<usize> {
         let (_, h) = self.renderer.surface_size();
         let scale = self.scale();
-        // Match the renderer: only visible pages get a slot.
-        let n = Page::visible(crate::features::notes_enabled()).len();
+        let n = Page::ALL.len();
         (0..n).find(|&i| {
             workspace::page_slot_rect(i, n, h, scale, self.sidebar_w())
                 .inflate((3.0 * scale).round())
@@ -5347,12 +5204,6 @@ impl Render for App {
             .when(self.page == Page::Cleanup, |el| el.child(self.render_cleanup(cx)))
             // Holistic Pull Requests page: full content-area element tree.
             .when(self.page == Page::PullRequests, |el| el.child(self.render_all_prs(cx)))
-            // Notes page overlay (experimental, flag-gated): markdown vault
-            // browser + viewer/editor as an element tree above the canvas.
-            .when(
-                self.page == Page::Notes && crate::features::notes_enabled(),
-                |el| el.child(self.render_notes(cx)),
-            )
             // Settings page overlay: same pattern as Cleanup. Sidebar search +
             // section tabs stay canvas-painted; the content card is elements.
             .when(self.page == Page::Settings, |el| el.child(self.render_settings(cx)))
@@ -6463,8 +6314,7 @@ fn main() {
         // never panics; Cleanup re-syncs it each frame from chrome tokens.
         cx.set_global(ui::theme::Theme::from_chrome(crate::theme::current()));
         crate::ui::Input::register_key_bindings(cx);
-        // Initialize gpui-component (theme + text/textarea key bindings) for the
-        // experimental Notes page's markdown viewer and editor.
+        // Initialize gpui-component (theme + text/textarea key bindings).
         gpui_component::init(cx);
         let bounds = Bounds::centered(None, gpui::size(px(1200.0), px(720.0)), cx);
 
@@ -6666,18 +6516,6 @@ fn main() {
                         dot_hover: None,
                         resize_hover: None,
                         cleanup: cleanup::Cleanup::default(),
-                        notes_active_vault: 0,
-                        notes_docs: Vec::new(),
-                        notes_selected: None,
-                        notes_edit_mode: false,
-                        notes_editor: None,
-                        notes_add_input: cx.new(|cx| {
-                            let mut input = crate::ui::Input::new(cx);
-                            input.placeholder("Path to a notes folder…");
-                            input
-                        }),
-                        notes_adding_vault: false,
-                        notes_status: None,
                         link_hover: None,
                         hot_rects: Vec::new(),
                         ui_hover: None,

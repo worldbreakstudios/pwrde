@@ -1,11 +1,11 @@
 //! Top-level page navigation + rebindable keyboard actions.
 //!
 //! pwrde has Arc-style *pages*: Sessions (the terminal workspace), Cleanup
-//! (worktree hygiene via the `drop` CLI), and Settings. The sidebar's bottom
-//! strip shows one slot per page — a subtle dot that crossfades into the
-//! page's glyph on hover, and stays a glyph on the active page. ⌘⇧←/→ cycle
-//! pages with wraparound; ⌘⇧↑/↓ cycle the sidebar's tabs (groups on Sessions,
-//! repos on Cleanup, sections on Settings) the same way.
+//! (worktree hygiene via the `drop` CLI), Pull Requests, and Settings. The
+//! sidebar's bottom strip shows one slot per page — a subtle dot that
+//! crossfades into the page's glyph on hover, and stays a glyph on the active
+//! page. ⌘⇧←/→ cycle pages with wraparound; ⌘⇧↑/↓ cycle the sidebar's tabs
+//! (groups on Sessions, repos on Cleanup, sections on Settings) the same way.
 //!
 //! Every ⌘ shortcut is an [`Action`] dispatched through a bindings table
 //! resolved from the settings store (`"keyboard.<action>"` keys, falling back
@@ -23,31 +23,20 @@ pub enum Page {
     /// Worktree hygiene page — lists all `drop`-managed worktrees and lets the
     /// user multi-select and delete stale ones.
     Cleanup,
-    /// Obsidian-style markdown vaults. Experimental — only reachable while the
-    /// `features.notes` flag is on (see [`crate::features`]).
-    Notes,
     Settings,
 }
 
 impl Page {
     /// Dot-strip order; `cycle` walks this.
-    pub const ALL: [Page; 5] = [
+    pub const ALL: [Page; 4] = [
         Page::Sessions,
         Page::PullRequests,
         Page::Cleanup,
-        Page::Notes,
         Page::Settings,
     ];
 
     pub fn index(self) -> usize {
         Self::ALL.iter().position(|p| *p == self).unwrap_or(0)
-    }
-
-    /// The pages the dot strip actually shows, in [`Self::ALL`] order.
-    /// Experimental pages drop out when their feature flag is off, so the
-    /// dot strip, hit-testing and page cycling all agree on slot indices.
-    pub fn visible(notes_enabled: bool) -> Vec<Page> {
-        Self::ALL.iter().copied().filter(|p| *p != Page::Notes || notes_enabled).collect()
     }
 
     /// Glyph shown in the page slot when active or hovered. The cog / broom /
@@ -59,8 +48,6 @@ impl Page {
             Page::PullRequests => "\u{f0629}",
             // U+F00D4 = nf-md-broom (Material Design Icons via Nerd Fonts)
             Page::Cleanup => "\u{f00d4}",
-            // U+F02D = nf-fa-book (Font Awesome via Nerd Fonts)
-            Page::Notes => "\u{f02d}",
             Page::Settings => "\u{f013}",
         }
     }
@@ -600,7 +587,13 @@ pub fn settings_index() -> Vec<SettingsEntry> {
         keywords: "frame stats fps debug performance",
     });
 
-    // Feature Flags — one entry per experimental flag.
+    // Feature Flags — the section itself, then one entry per experimental
+    // flag (so the section stays searchable even when no flags are defined).
+    out.push(SettingsEntry {
+        section: Section::FeatureFlags,
+        label: "Experimental features",
+        keywords: "feature flags experimental toggles beta",
+    });
     for flag in crate::features::ALL {
         out.push(SettingsEntry {
             section: Section::FeatureFlags,
@@ -633,19 +626,6 @@ pub fn search_settings(query: &str) -> Vec<SettingsEntry> {
 mod tests {
     use super::*;
     use gpui::Modifiers;
-
-    /// Notes is experimental: it only appears in the dot strip when its
-    /// feature flag is on, and hiding it never disturbs the other pages.
-    #[test]
-    fn visible_pages_gate_notes_only() {
-        let off = Page::visible(false);
-        assert!(!off.contains(&Page::Notes));
-        assert_eq!(off.len(), Page::ALL.len() - 1);
-        let on = Page::visible(true);
-        assert_eq!(on, Page::ALL.to_vec());
-        // Order is preserved in both cases.
-        assert_eq!(off, Page::ALL.iter().copied().filter(|p| *p != Page::Notes).collect::<Vec<_>>());
-    }
 
     #[test]
     fn appearance_dropdown_dark_polarity() {
