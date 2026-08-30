@@ -25,6 +25,8 @@ mod command_ui;
 mod diff;
 mod features;
 mod file_tree;
+mod flow;
+mod flow_ui;
 mod flyover_ui;
 mod gh;
 mod git;
@@ -490,6 +492,15 @@ struct App {
     /// Whether a group cwd sits inside a git checkout, memoized per path —
     /// ribbon registration probes this on every frame and hit-test.
     git_cwd_cache: std::cell::RefCell<std::collections::HashMap<std::path::PathBuf, bool>>,
+    // ── Flow agent (bottom pill + chat panel) ─────────────────────────────
+    /// Transcript/panel state; updated only via `FlowState::apply` from
+    /// `TermEvent::Flow` events on the main thread.
+    flow: crate::flow::FlowState,
+    /// The agent process, spawned lazily on first open/send so no `claude`
+    /// child exists until Flow is actually used.
+    flow_backend: Option<Box<dyn crate::flow::AgentBackend>>,
+    /// The pill bar's composer entity, created lazily on first render.
+    flow_composer: Option<flow_ui::FlowComposer>,
     // ── Git tools (PR + local diff), Sessions/git-group only ──────────────
     /// Pull Request tool state (list / detail / diff / write actions).
     pr: pr_ui::PrState,
@@ -3937,6 +3948,19 @@ impl App {
         // entity (and its own key bindings) handles editing, so keys don't
         // reach the shell or ⌘ shortcuts. Escape discards the composer and
         // hands focus back.
+        // A focused Flow composer likewise owns the keyboard: the Textarea
+        // edits itself and submits on ↩ (see `flow_ui`); ⎋ collapses the
+        // panel and hands focus back; ⌘ chords still resolve so ⌘J closes.
+        if self.flow_editor_focused(window, cx) {
+            if ev.keystroke.modifiers.platform {
+                self.handle_shortcut(ev);
+            } else if ev.keystroke.key == "escape" {
+                self.flow.open = false;
+                window.focus(&self.focus_handle, cx);
+            }
+            self.request_redraw();
+            return;
+        }
         if self.pr_editor_focused(window, cx) {
             if ev.keystroke.key == "escape" {
                 self.pr_close_composer();
@@ -4263,6 +4287,7 @@ impl App {
             Action::ScreenshotToClipboard => self.screenshot_action(true),
             Action::ScreenshotToFile => self.screenshot_action(false),
             Action::NewSection => self.new_section_action(),
+            Action::ToggleFlow => return self.toggle_flow(),
             _ => return false,
         }
         true
@@ -4347,7 +4372,8 @@ impl App {
             | Action::GoToTool
             | Action::ScreenshotToClipboard
             | Action::ScreenshotToFile
-            | Action::NewSection => {},
+            | Action::NewSection
+            | Action::ToggleFlow => {},
             Action::ToggleFlyover => self.toggle_flyover(),
             Action::FlyoverPopout => self.flyover_toggle_windowed(),
             // Closes whichever tool is open; opens the first registered tool
@@ -4788,6 +4814,10 @@ impl App {
                     redraw = true;
                 },
                 TermEvent::Redraw => {
+                    redraw = true;
+                },
+                TermEvent::Flow(ev) => {
+                    self.flow.apply(ev);
                     redraw = true;
                 },
             }
@@ -5379,6 +5409,12 @@ impl Render for App {
             .when(
                 self.visible_tool() == Some(pages::Tool::Launch) && !self.modal_overlay_open(),
                 |el| el.child(self.render_launch(cx)),
+            )
+            // Flow agent (experimental, `features.flow`): bottom-centered pill
+            // bar + chat panel over the tiles (`flow_ui`).
+            .when(
+                self.page == Page::Sessions && crate::flow::enabled() && !self.modal_overlay_open(),
+                |el| el.child(self.render_flow(window, cx)),
             )
             // Resize handles (sidebar edge, dividers, tool panel edge, flyover
             // top edge): elements own the cursor and the drag start; the
@@ -6767,6 +6803,9 @@ fn main() {
                         git_cwd_cache: Default::default(),
                         pr: pr_ui::PrState::default(),
                         local_diff: local_diff_ui::LocalDiffState::default(),
+                        flow: crate::flow::FlowState::default(),
+                        flow_backend: None,
+                        flow_composer: None,
                         _lfg_events_child: crate::lfg::spawn_event_stream(events_tx.clone()),
                     };
                     // With persistence on, reattach to the previous session's

@@ -14,7 +14,14 @@ pub struct FeatureFlag {
 }
 
 /// Every experimental flag, in display order.
-pub const ALL: &[FeatureFlag] = &[];
+pub const ALL: &[FeatureFlag] = &[FeatureFlag {
+    key: FLOW,
+    label: "Flow agent",
+    description: "Bottom command bar that drives this workspace through an embedded agent (see flow.rs)",
+}];
+
+/// Key of the Flow agent flag (`features.flow`).
+pub const FLOW: &str = "flow";
 
 /// True when the flag `key` is switched on (defaults to off).
 pub fn enabled(key: &str) -> bool {

@@ -61,6 +61,11 @@ pub enum Command {
     State,
     ListCommands,
     Ping,
+    /// Hand a user message to the embedded Flow agent (spawned lazily by the
+    /// app on first use; see `flow.rs` in the app crate).
+    FlowSend {
+        text: String,
+    },
 }
 
 /// Response written back on the same connection, one line per request.
@@ -376,6 +381,7 @@ fn command_tag(cmd: &Command) -> &'static str {
         Command::State => "state",
         Command::ListCommands => "list_commands",
         Command::Ping => "ping",
+        Command::FlowSend { .. } => "flow_send",
     }
 }
 

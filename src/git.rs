@@ -44,6 +44,7 @@ pub fn augmented_command(program: &str) -> Command {
     let mut paths: Vec<PathBuf> = Vec::new();
     if let Some(home) = dirs::home_dir() {
         paths.push(home.join(".bun/bin"));
+        paths.push(home.join(".local/bin"));
     }
     for p in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"] {
         paths.push(PathBuf::from(p));
