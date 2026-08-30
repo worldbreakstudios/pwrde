@@ -549,25 +549,39 @@ impl Renderer {
 
         // ── Tool ribbon + panel (right edge, when tools are registered) ──
         // Like the sidebar, the ribbon strip is transparent on the window
-        // gradient: only the slot pills and the panel card paint.
+        // gradient: only the slot circles and the panel card paint.
         for (i, tool) in chrome.ribbon_tools.iter().enumerate() {
             let slot = workspace::ribbon_slot_rect(i, width, self.scale);
             let active = open_tool == Some(*tool);
             let hov = hover(cur, &slot);
-            if active || hov {
-                let m = (4.0 * self.scale).round();
-                let pill = LayoutRect {
-                    x: slot.x + m,
-                    y: slot.y + m,
-                    w: (slot.w - 2.0 * m).max(0.0),
-                    h: (slot.h - 2.0 * m).max(0.0),
-                };
-                bg_quads.push(
-                    self.pill(&pill, th, if active { 0.85 } else { 0.40 }, row_r)
-                        .shadow(if active { Shadow::Soft } else { Shadow::None }),
-                );
+            // GANTRY mock: every tool sits in a circle — neutral glass while
+            // closed, solid accent while its panel is open.
+            let m = (4.0 * self.scale).round();
+            let circle = LayoutRect {
+                x: slot.x + m,
+                y: slot.y + m,
+                w: (slot.w - 2.0 * m).max(0.0),
+                h: (slot.h - 2.0 * m).max(0.0),
+            };
+            let r = circle.w / 2.0;
+            if active {
+                bg_quads.push(self.px_rect(&circle, th.accent, 1.0, r).shadow(Shadow::Soft));
+            } else {
+                // Ink mixed into the card so the circle reads as a muted gray
+                // on the near-white/near-black window gradient. Flat like the
+                // mock — no rim.
+                let fill = crate::theme::mix(th.card, th.ink, if hov { 0.16 } else { 0.08 });
+                bg_quads.push(self.px_rect(&circle, fill, 1.0, r));
             }
-            let ink = if active || hov { th.ink } else { th.ink_dim };
+            let ink = if active {
+                // Ink readable on the accent fill, same recipe as
+                // `ui::Theme::from_chrome`'s `primary_foreground`.
+                if crate::theme::is_dark_color(th.accent) { (255, 255, 255) } else { (23, 23, 23) }
+            } else if hov {
+                th.ink
+            } else {
+                th.ink_dim
+            };
             self.ribbon_icon(*tool, &slot, ink, &mut bg_quads, &mut carets);
             hot.push(slot);
         }
@@ -1347,37 +1361,6 @@ impl Renderer {
         }
     }
 
-    /// A glassy capsule, iTerm2-style: a flat translucent fill with the
-    /// radius clamped to a true capsule for the rect, plus a crisp hairline
-    /// rim. The glass read comes from the fill sitting *lighter* than its
-    /// ground — callers pick the fill accordingly.
-    fn glass(
-        &self,
-        r: &LayoutRect,
-        rgb: (u8, u8, u8),
-        alpha: f32,
-        radius: f32,
-        rim: Hsla,
-    ) -> Quad {
-        let rim_w = (0.5 * self.scale).round().max(1.0);
-        self.px_rect(r, rgb, alpha, radius.min(r.w / 2.0).min(r.h / 2.0))
-            .border(rim_w, rim)
-    }
-
-    /// [`Self::glass`] in sidebar colors, floating on the blurred vibrancy
-    /// ground. Dark chrome cards are darker than that ground, so the fill is
-    /// lifted toward white to read as light glass like iTerm2's tabs; light
-    /// themes' white cards already do.
-    fn pill(&self, r: &LayoutRect, th: &Theme, alpha: f32, radius: f32) -> Quad {
-        let fill = if th.dark {
-            let lift = |v: u8| (v as f32 + (255.0 - v as f32) * 0.30).round() as u8;
-            (lift(th.card.0), lift(th.card.1), lift(th.card.2))
-        } else {
-            th.card
-        };
-        self.glass(r, fill, alpha, radius, color(th.ink, 0.28))
-    }
-
     fn px_rect(&self, r: &LayoutRect, rgb: (u8, u8, u8), alpha: f32, radius: f32) -> Quad {
         Quad {
             x: r.x,
@@ -1487,6 +1470,22 @@ mod tests {
             frame.hot.iter().any(|r| r.x == slot.x && r.y == slot.y),
             "ribbon slot is a hover target"
         );
+        // Every slot carries its circular background even while closed — a
+        // flat, borderless circle spanning the slot minus the 4px margin.
+        let m = (4.0 * scale).round();
+        let cd = slot.w - 2.0 * m;
+        for i in 0..pages::Tool::ALL.len() {
+            let s = crate::workspace::ribbon_slot_rect(i, 1600, scale);
+            assert!(
+                frame
+                    .bg_quads
+                    .iter()
+                    .any(|q| q.w == cd && q.radius == cd / 2.0 && q.border == 0.0
+                        && q.shadow == Shadow::None
+                        && q.x == s.x + m && q.y == s.y + m),
+                "closed tool {i} draws its neutral background circle"
+            );
+        }
         // Local diff stacks in slot 1 (a hover target), Launch in slot 2 with
         // its prompt chevron.
         let slot1 = crate::workspace::ribbon_slot_rect(1, 1600, scale);
@@ -1519,6 +1518,17 @@ mod tests {
         assert!(
             !frame.bg_quads.iter().any(|q| q.x == panel.x && q.w == panel.w),
             "no canvas panel card: the element tree owns the panel"
+        );
+        // The open tool's circle is the solid accent fill — the soft shadow
+        // marks it apart from the flat neutral circles of the closed slots.
+        let launch_slot = crate::workspace::ribbon_slot_rect(2, 1600, scale);
+        assert!(
+            frame
+                .bg_quads
+                .iter()
+                .any(|q| q.w == cd && q.radius == cd / 2.0 && q.shadow == Shadow::Soft
+                    && q.x == launch_slot.x + m && q.y == launch_slot.y + m),
+            "open tool draws its solid accent circle"
         );
         let area = crate::workspace::terminal_area(
             1600,
