@@ -1,11 +1,11 @@
 //! Top-level page navigation + rebindable keyboard actions.
 //!
-//! pwrde has Arc-style *pages*: Sessions (the terminal workspace), Cleanup
-//! (worktree hygiene via the `drop` CLI), and Settings. The sidebar's bottom
-//! strip shows one slot per page — a subtle dot that crossfades into the
-//! page's glyph on hover, and stays a glyph on the active page. ⌘⇧←/→ cycle
-//! pages with wraparound; ⌘⇧↑/↓ cycle the sidebar's tabs (groups on Sessions,
-//! repos on Cleanup, sections on Settings) the same way.
+//! pwrde has Arc-style *pages*: Sessions (the terminal workspace), Pull
+//! Requests, one page per user-registered CLI tool (see [`crate::cli_tools`]),
+//! and Settings. The sidebar's bottom strip shows one slot per page — a subtle
+//! dot that crossfades into the page's glyph on hover, and stays a glyph on
+//! the active page. ⌘⇧←/→ cycle pages with wraparound; ⌘⇧↑/↓ cycle the
+//! sidebar's tabs (groups on Sessions, sections on Settings) the same way.
 //!
 //! Every ⌘ shortcut is an [`Action`] dispatched through a bindings table
 //! resolved from the settings store (`"keyboard.<action>"` keys, falling back
@@ -20,9 +20,10 @@ pub enum Page {
     /// openable into the shared detail view. (The Sessions PR tool is scoped to
     /// just the checked-out branch; this page is the wider view.)
     PullRequests,
-    /// Worktree hygiene page — lists all `drop`-managed worktrees and lets the
-    /// user multi-select and delete stale ones.
-    Cleanup,
+    /// A user-registered CLI tool (index into [`crate::cli_tools::tools`]):
+    /// a full-page, non-persisted terminal running that tool's command from
+    /// its configured directory.
+    Tool(usize),
     /// Obsidian-style markdown vaults. Experimental — only reachable while the
     /// `features.notes` flag is on (see [`crate::features`]).
     Notes,
@@ -30,38 +31,43 @@ pub enum Page {
 }
 
 impl Page {
-    /// Dot-strip order; `cycle` walks this.
-    pub const ALL: [Page; 5] = [
-        Page::Sessions,
-        Page::PullRequests,
-        Page::Cleanup,
-        Page::Notes,
-        Page::Settings,
-    ];
-
-    pub fn index(self) -> usize {
-        Self::ALL.iter().position(|p| *p == self).unwrap_or(0)
+    /// Dot-strip order for `n_tools` registered CLI tools; `cycle` walks
+    /// this. Tool pages sit between Pull Requests and Notes so the fixed
+    /// pages keep their ends of the strip.
+    pub fn all(n_tools: usize) -> Vec<Page> {
+        let mut v = vec![Page::Sessions, Page::PullRequests];
+        v.extend((0..n_tools).map(Page::Tool));
+        v.push(Page::Notes);
+        v.push(Page::Settings);
+        v
     }
 
-    /// The pages the dot strip actually shows, in [`Self::ALL`] order.
+    /// Stable index within [`Self::all`] — what the slot animation is keyed
+    /// by, so gating a page never shifts the others.
+    pub fn index(self, n_tools: usize) -> usize {
+        Self::all(n_tools).iter().position(|p| *p == self).unwrap_or(0)
+    }
+
+    /// The pages the dot strip actually shows, in [`Self::all`] order.
     /// Experimental pages drop out when their feature flag is off, so the
     /// dot strip, hit-testing and page cycling all agree on slot indices.
-    pub fn visible(notes_enabled: bool) -> Vec<Page> {
-        Self::ALL.iter().copied().filter(|p| *p != Page::Notes || notes_enabled).collect()
+    pub fn visible(notes_enabled: bool, n_tools: usize) -> Vec<Page> {
+        Self::all(n_tools).into_iter().filter(|p| *p != Page::Notes || notes_enabled).collect()
     }
 
-    /// Glyph shown in the page slot when active or hovered. The cog / broom /
+    /// Glyph shown in the page slot when active or hovered. The cog /
     /// brackets are Nerd Font codepoints — the UI font guarantees coverage.
-    pub fn glyph(self) -> &'static str {
+    /// A tool page's glyph is whatever the user registered for it (any
+    /// string; Nerd Font codepoints render like the built-ins).
+    pub fn glyph(self, tools: &[crate::cli_tools::CliTool]) -> String {
         match self {
-            Page::Sessions => "<>",
+            Page::Sessions => "<>".into(),
             // U+F0629 = nf-md-source_pull (Material Design Icons via Nerd Fonts)
-            Page::PullRequests => "\u{f0629}",
-            // U+F00D4 = nf-md-broom (Material Design Icons via Nerd Fonts)
-            Page::Cleanup => "\u{f00d4}",
+            Page::PullRequests => "\u{f0629}".into(),
+            Page::Tool(i) => tools.get(i).map(|t| t.icon.clone()).unwrap_or_else(|| "?".into()),
             // U+F02D = nf-fa-book (Font Awesome via Nerd Fonts)
-            Page::Notes => "\u{f02d}",
-            Page::Settings => "\u{f013}",
+            Page::Notes => "\u{f02d}".into(),
+            Page::Settings => "\u{f013}".into(),
         }
     }
 }
@@ -82,17 +88,20 @@ pub enum Section {
     Keyboard,
     Terminal,
     Appearance,
+    /// Registered CLI tool pages (see [`crate::cli_tools`]).
+    Tools,
     Accessibility,
     Debug,
     FeatureFlags,
 }
 
 impl Section {
-    pub const ALL: [Section; 7] = [
+    pub const ALL: [Section; 8] = [
         Section::Sessions,
         Section::Keyboard,
         Section::Terminal,
         Section::Appearance,
+        Section::Tools,
         Section::Accessibility,
         Section::Debug,
         Section::FeatureFlags,
@@ -104,6 +113,7 @@ impl Section {
             Section::Keyboard => "Keyboard",
             Section::Terminal => "Terminal",
             Section::Appearance => "Appearance",
+            Section::Tools => "Tools",
             Section::Accessibility => "Accessibility",
             Section::Debug => "Debug",
             Section::FeatureFlags => "Feature Flags",
@@ -229,7 +239,7 @@ pub enum Action {
     NewSection,
     GoToSessions,
     GoToPullRequests,
-    GoToCleanup,
+    GoToTool,
 }
 
 impl Action {
@@ -273,7 +283,7 @@ impl Action {
         Action::NewSection,
         Action::GoToSessions,
         Action::GoToPullRequests,
-        Action::GoToCleanup,
+        Action::GoToTool,
     ];
 
     /// Stable identifier used in the settings key (`keyboard.<name>`).
@@ -317,7 +327,7 @@ impl Action {
             Action::NewSection => "new_section",
             Action::GoToSessions => "go_to_sessions",
             Action::GoToPullRequests => "go_to_pull_requests",
-            Action::GoToCleanup => "go_to_cleanup",
+            Action::GoToTool => "go_to_tool",
         }
     }
 
@@ -361,7 +371,7 @@ impl Action {
             Action::NewSection => "New folder",
             Action::GoToSessions => "Go to Sessions",
             Action::GoToPullRequests => "Go to Pull Requests",
-            Action::GoToCleanup => "Go to Cleanup",
+            Action::GoToTool => "Go to first tool page",
         }
     }
 
@@ -413,7 +423,7 @@ impl Action {
             Action::NewSection => (false, true, true, "n"),
             Action::GoToSessions => (false, true, true, "1"),
             Action::GoToPullRequests => (false, true, true, "2"),
-            Action::GoToCleanup => (false, true, true, "3"),
+            Action::GoToTool => (false, true, true, "3"),
         };
         Binding { shift, alt, ctrl, key: key.into() }
     }
@@ -428,6 +438,15 @@ impl Action {
     pub fn binding(self) -> Binding {
         crate::settings::get_str(&self.setting_key())
             .and_then(|s| Binding::parse(&s))
+            // `go_to_tool` replaced `go_to_cleanup` when the Cleanup page
+            // became the first CLI tool page; honor the old key if it was
+            // customized so a rebinding survives the rename.
+            .or_else(|| {
+                (self == Action::GoToTool)
+                    .then(|| crate::settings::get_str("keyboard.go_to_cleanup"))
+                    .flatten()
+                    .and_then(|s| Binding::parse(&s))
+            })
             .unwrap_or_else(|| self.default_binding())
     }
 }
@@ -619,6 +638,13 @@ pub fn settings_index() -> Vec<SettingsEntry> {
         keywords: "export theme file save",
     });
 
+    // Tools
+    out.push(SettingsEntry {
+        section: Section::Tools,
+        label: "CLI tool pages",
+        keywords: "tool tools cli command page sidebar icon cwd drop cleanup register",
+    });
+
     // Accessibility
     out.push(SettingsEntry {
         section: Section::Accessibility,
@@ -676,13 +702,27 @@ mod tests {
     /// feature flag is on, and hiding it never disturbs the other pages.
     #[test]
     fn visible_pages_gate_notes_only() {
-        let off = Page::visible(false);
+        let off = Page::visible(false, 2);
         assert!(!off.contains(&Page::Notes));
-        assert_eq!(off.len(), Page::ALL.len() - 1);
-        let on = Page::visible(true);
-        assert_eq!(on, Page::ALL.to_vec());
+        assert_eq!(off.len(), Page::all(2).len() - 1);
+        let on = Page::visible(true, 2);
+        assert_eq!(on, Page::all(2));
         // Order is preserved in both cases.
-        assert_eq!(off, Page::ALL.iter().copied().filter(|p| *p != Page::Notes).collect::<Vec<_>>());
+        assert_eq!(off, Page::all(2).into_iter().filter(|p| *p != Page::Notes).collect::<Vec<_>>());
+    }
+
+    /// Tool pages slot between Pull Requests and Notes, one per registered
+    /// tool, and their stable index tracks the registered count.
+    #[test]
+    fn tool_pages_slot_between_prs_and_notes() {
+        assert_eq!(
+            Page::all(2),
+            vec![Page::Sessions, Page::PullRequests, Page::Tool(0), Page::Tool(1), Page::Notes, Page::Settings]
+        );
+        assert_eq!(Page::all(0), vec![Page::Sessions, Page::PullRequests, Page::Notes, Page::Settings]);
+        assert_eq!(Page::Tool(1).index(2), 3);
+        assert_eq!(Page::Settings.index(0), 3);
+        assert_eq!(Page::Settings.index(2), 5);
     }
 
     #[test]

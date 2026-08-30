@@ -19,8 +19,7 @@
 mod bus;
 mod bus_exec;
 mod claude_hooks;
-mod cleanup;
-mod cleanup_ui;
+mod cli_tools;
 mod command;
 mod command_ui;
 mod diff;
@@ -172,7 +171,6 @@ impl ConfirmClose {
     fn accept_label(&self) -> &'static str {
         match self.action {
             ConfirmAction::CloseGroup { .. } => "Close group",
-            ConfirmAction::CleanupDelete { .. } => "Delete",
         }
     }
 }
@@ -183,9 +181,28 @@ enum ConfirmAction {
     /// by primary tile id at confirm time so group reordering while the
     /// dialog is up can't misdirect the close.
     CloseGroup { primary_tile: u64 },
-    /// Delete the selected drop worktrees, grouped `(repo_root, ids)` the way
-    /// `drop rm` wants them.
-    CleanupDelete { targets: Vec<(String, Vec<String>)> },
+}
+
+/// A CLI tool page's terminal. `exited` keeps the last frame on screen after
+/// the command ends so its final output stays readable; ⏎ (or revisiting the
+/// page) relaunches it.
+struct ToolSession {
+    tab: workspace::Tab,
+    exited: bool,
+}
+
+/// The Settings → Tools add form: one rcn Input per field.
+struct ToolForm {
+    name: gpui::Entity<crate::ui::Input>,
+    command: gpui::Entity<crate::ui::Input>,
+    cwd: gpui::Entity<crate::ui::Input>,
+    icon: gpui::Entity<crate::ui::Input>,
+}
+
+impl ToolForm {
+    fn inputs(&self) -> [&gpui::Entity<crate::ui::Input>; 4] {
+        [&self.name, &self.command, &self.cwd, &self.icon]
+    }
 }
 
 /// A side effect [`App::popout_key`] needs applied to a window other than
@@ -229,6 +246,8 @@ enum Drag {
     Select { tile: u64 },
     /// A text selection is being dragged inside the flyover panel.
     FlyoverSelect,
+    /// A text selection is being dragged inside a tool page's terminal.
+    ToolSelect,
     /// The flyover panel's top edge is being dragged to resize it.
     FlyoverResize,
     /// The tool panel's left edge is being dragged to resize it.
@@ -250,6 +269,8 @@ enum Drag {
 enum MouseLoc {
     Tile(u64),
     Flyover,
+    /// The active tool page's terminal.
+    Tool,
 }
 
 /// An in-flight mouse-button grab by a tracking TUI: which pane got the
@@ -391,8 +412,15 @@ struct App {
     /// Sub-notch wheel travel carried between scroll events so tiny deltas
     /// accumulate into whole scroll steps instead of being lost.
     scroll_accum: f64,
-    /// Cleanup page state (worktree listing, selection, filter).
-    cleanup: cleanup::Cleanup,
+    /// Registered CLI tool pages (see [`cli_tools`]), mirrored from settings
+    /// on each change so the dot strip and page cycling read one snapshot.
+    tools: Vec<cli_tools::CliTool>,
+    /// One slot per registered tool: its terminal, spawned lazily on the
+    /// first visit. Held outside the workspace tree, so never persisted and
+    /// never reattached — quitting pwrde ends the tool.
+    tool_sessions: Vec<Option<ToolSession>>,
+    /// Settings → Tools add-form inputs.
+    tool_form: ToolForm,
     /// Index of the active vault within `notes::vaults()` on the Notes page.
     notes_active_vault: usize,
     /// Markdown docs found in the active vault, refreshed by `notes_rescan`.
@@ -639,6 +667,7 @@ impl App {
             ch,
             self.dpi(),
             cwd,
+            None,
             self.events_tx.clone(),
             shpool,
         )
@@ -762,6 +791,7 @@ impl App {
         workspace::normalize_section_anchors(&self.workspaces, &mut self.sections);
         self.sync_layout_impl(false);
         self.sync_flyover_layout(false);
+        self.sync_tool_layout(false);
     }
 
     /// `force` pushes a PTY resize even when cols/rows are unchanged — needed
@@ -829,6 +859,184 @@ impl App {
                 tab.session.resize(cols, rows, cw, ch, dpi);
             }
         }
+    }
+
+    // ── CLI tool pages ──────────────────────────────────────────────────
+
+    fn n_tools(&self) -> usize {
+        self.tools.len()
+    }
+
+    /// The tool page's terminal card: the whole content area (these pages
+    /// have no tool panel, so no right inset).
+    fn tool_area(&self) -> workspace::LayoutRect {
+        let (w, h) = self.renderer.surface_size();
+        workspace::terminal_area(w, h, self.scale(), self.sidebar_w(), 0.0)
+    }
+
+    fn active_tool_session(&self) -> Option<&ToolSession> {
+        match self.page {
+            Page::Tool(i) => self.tool_sessions.get(i).and_then(|s| s.as_ref()),
+            _ => None,
+        }
+    }
+
+    /// A tool page's terminal: the user's login shell running `command` from
+    /// `cwd`. Never persisted, never shpool-attached.
+    fn spawn_tool_session(&mut self, cwd: &std::path::Path, command: &str) -> Session {
+        let id = self.next_session_id;
+        self.next_session_id += 1;
+        let (cw, ch) = self.cell_px();
+        Session::new(
+            id,
+            80,
+            24,
+            cw,
+            ch,
+            self.dpi(),
+            Some(cwd),
+            Some(command),
+            self.events_tx.clone(),
+            None,
+        )
+    }
+
+    /// Launch tool `i`'s command unless it is already running (first visit,
+    /// or its last run exited).
+    fn ensure_tool_session(&mut self, i: usize) {
+        let Some(tool) = self.tools.get(i).cloned() else { return };
+        let live =
+            self.tool_sessions.get(i).and_then(|s| s.as_ref()).is_some_and(|s| !s.exited);
+        if live {
+            return;
+        }
+        let cwd = cli_tools::expand_cwd(&tool.cwd);
+        let session = self.spawn_tool_session(&cwd, &tool.command);
+        self.tool_sessions[i] =
+            Some(ToolSession { tab: workspace::Tab::new(session), exited: false });
+        self.sync_tool_layout(true);
+        self.request_redraw();
+    }
+
+    /// Resize the active tool page's PTY to the content area, the way
+    /// `sync_flyover_layout` does for the panel.
+    fn sync_tool_layout(&mut self, force: bool) {
+        let Page::Tool(i) = self.page else { return };
+        let content = workspace::tile_content(&self.tool_area(), self.scale());
+        let (cols, rows) = self.renderer.grid_size_for(&content);
+        let (cw, ch) = self.cell_px();
+        let dpi = self.dpi();
+        if let Some(Some(ts)) = self.tool_sessions.get_mut(i) {
+            let tab = &mut ts.tab;
+            if force || (cols, rows) != (tab.cols, tab.rows) {
+                tab.cols = cols;
+                tab.rows = rows;
+                tab.session.resize(cols, rows, cw, ch, dpi);
+            }
+        }
+    }
+
+    /// Write a plain (non-⌘) keystroke to the active tool page's terminal.
+    /// Once the command has exited only ⏎ does anything: it relaunches.
+    fn tool_write_key(&mut self, keystroke: &Keystroke) {
+        let Page::Tool(i) = self.page else { return };
+        let exited =
+            self.tool_sessions.get(i).and_then(|s| s.as_ref()).is_none_or(|s| s.exited);
+        if exited {
+            if keystroke.key == "enter" {
+                self.ensure_tool_session(i);
+            }
+            return;
+        }
+        if let Some(bytes) = key_to_bytes(keystroke)
+            && let Some(Some(ts)) = self.tool_sessions.get(i)
+        {
+            ts.tab.session.write(bytes);
+            ts.tab.session.scroll_to_bottom();
+            ts.tab.session.clear_selection();
+        }
+    }
+
+    /// ⌘C on a tool page: copy its terminal's selection.
+    fn tool_copy(&mut self) {
+        if let Some(ts) = self.active_tool_session()
+            && let Some(text) = ts.tab.session.selected_text()
+            && let Ok(mut clipboard) = arboard::Clipboard::new()
+        {
+            let _ = clipboard.set_text(text);
+        }
+    }
+
+    /// ⌘V on a tool page: paste into its terminal (mirrors `paste`). An
+    /// exited tool has no PTY to paste into — ⏎ relaunches it first.
+    fn tool_paste(&mut self) {
+        let Ok(mut clipboard) = arboard::Clipboard::new() else { return };
+        let Some(ts) = self.active_tool_session().filter(|ts| !ts.exited) else { return };
+        let session = &ts.tab.session;
+        match clipboard.get_text() {
+            Ok(text) if !text.is_empty() => session.paste(&text),
+            _ if clipboard.get_image().is_ok() => session.write([0x16u8]),
+            _ => return,
+        }
+        session.scroll_to_bottom();
+        session.clear_selection();
+        self.request_redraw();
+    }
+
+    /// Re-read the registered tools after a settings change, keeping the
+    /// session slots and the dot-strip animation aligned with the list.
+    fn reload_tools(&mut self) {
+        self.tools = cli_tools::tools();
+        let n = self.tools.len();
+        self.tool_sessions.resize_with(n, || None);
+        self.dot_anim.resize(Page::all(n).len(), 0.0);
+        if let Page::Tool(i) = self.page
+            && i >= n
+        {
+            self.set_page(Page::Settings);
+        }
+    }
+
+    /// Settings → Tools "Add": register the form's tool and clear the form.
+    /// Only the command is required; the rest default sensibly.
+    pub(crate) fn add_tool_from_form(&mut self, cx: &mut Context<Self>) {
+        let [name, command, cwd, icon] =
+            self.tool_form.inputs().map(|e| e.read(cx).text().trim().to_string());
+        if command.is_empty() {
+            return;
+        }
+        let tool = cli_tools::CliTool {
+            name: if name.is_empty() { command.clone() } else { name },
+            command,
+            cwd: if cwd.is_empty() { "~".into() } else { cwd },
+            icon: if icon.is_empty() { ">_".into() } else { icon },
+        };
+        cli_tools::add_tool(tool);
+        for e in self.tool_form.inputs() {
+            e.update(cx, |i, cx| i.set_text("", cx));
+        }
+        self.reload_tools();
+        self.request_redraw();
+    }
+
+    /// Settings → Tools "Remove": drop tool `i` along with its session.
+    /// Tool identity is positional (`tools`, `tool_sessions`, `Page::Tool`),
+    /// so a page at or past `i` shifts with the list — only reachable from
+    /// Settings today, but kept honest for any future caller.
+    pub(crate) fn remove_tool(&mut self, i: usize) {
+        if i < self.tool_sessions.len() {
+            self.tool_sessions.remove(i);
+        }
+        cli_tools::remove_tool(i);
+        if let Page::Tool(j) = self.page {
+            if j == i {
+                self.page = Page::Settings;
+            } else if j > i {
+                self.page = Page::Tool(j - 1);
+            }
+        }
+        self.reload_tools();
+        self.request_redraw();
     }
 
     fn split(&mut self, dir: Dir) {
@@ -991,16 +1199,6 @@ impl App {
         } else {
             self.notes_adding_vault = !self.notes_adding_vault;
         }
-        self.request_redraw();
-    }
-
-    /// A press on Cleanup sidebar row `i`: 0 = "All", then one per repo.
-    pub(crate) fn press_cleanup_row(&mut self, i: usize) {
-        self.cleanup.repo_filter = if i == 0 {
-            None
-        } else {
-            self.cleanup.repos().get(i - 1).map(|r| r.root.clone())
-        };
         self.request_redraw();
     }
 
@@ -1268,15 +1466,6 @@ impl App {
                     self.close_group(wi);
                 }
             },
-            ConfirmAction::CleanupDelete { targets } => {
-                let count: usize = targets.iter().map(|(_, ids)| ids.len()).sum();
-                self.message = Some((format!("Deleting {count} worktree(s)…"), false));
-                let tx = self.events_tx.clone();
-                std::thread::spawn(move || {
-                    let (removed, failed, error) = run_drop_rm(targets);
-                    let _ = tx.send(TermEvent::CleanupRemoved { removed, failed, error });
-                });
-            },
         }
         self.request_redraw();
     }
@@ -1326,8 +1515,35 @@ impl App {
                 return;
             }
         }
-        // Only the Sessions page has terminals to scroll; the Cleanup
-        // overlay's gpui scroll container handles its own wheel events.
+        // A tool page's terminal takes the wheel (a TUI usually claims it).
+        if let Page::Tool(i) = self.page {
+            if let Some(Some(ts)) = self.tool_sessions.get(i) {
+                let scale = self.scale();
+                let (px, py) = (self.cursor.0 as f32, self.cursor.1 as f32);
+                let notches = match delta {
+                    gpui::ScrollDelta::Lines(p) => p.y as f64,
+                    gpui::ScrollDelta::Pixels(p) => f32::from(p.y) as f64 / (cell_height as f64 * 3.0),
+                };
+                let steps = scroll_steps(&mut self.scroll_accum, notches);
+                if steps != 0 {
+                    let session = &ts.tab.session;
+                    let content = workspace::tile_content(&self.tool_area(), scale);
+                    let up = steps > 0;
+                    if session.app_consumes_wheel() {
+                        let (col, row) = self.renderer.cell_at(&content, px, py).unwrap_or((0, 0));
+                        for _ in 0..steps.unsigned_abs() {
+                            session.forward_wheel(up, col, row);
+                        }
+                    } else {
+                        session.scroll_by(steps * 3);
+                    }
+                    self.request_redraw();
+                }
+            }
+            return;
+        }
+        // Only the Sessions page has terminals to scroll; the other pages'
+        // gpui scroll containers handle their own wheel events.
         if self.page != Page::Sessions {
             return;
         }
@@ -1493,6 +1709,13 @@ impl App {
             .or_else(|| {
                 self.flyover_tabs.iter().find(|tab| tab.session.id == id).map(|tab| &tab.session)
             })
+            .or_else(|| {
+                self.tool_sessions
+                    .iter()
+                    .flatten()
+                    .find(|ts| ts.tab.session.id == id)
+                    .map(|ts| &ts.tab.session)
+            })
     }
 
     /// True when the session is the active tab of the flyover and the flyover
@@ -1516,6 +1739,7 @@ impl App {
             .iter()
             .any(|t| !t.collapsed && t.active_tab().is_some_and(|tab| tab.session.id == id))
             || self.flyover_visible(id)
+            || self.active_tool_session().is_some_and(|ts| ts.tab.session.id == id)
     }
 
     /// Record that the tab owning session `id` asked for attention, without
@@ -2965,6 +3189,7 @@ impl App {
     fn loc_session(&self, loc: MouseLoc) -> Option<&Session> {
         match loc {
             MouseLoc::Flyover => self.flyover_tabs.get(self.flyover_active).map(|t| &t.session),
+            MouseLoc::Tool => self.active_tool_session().map(|ts| &ts.tab.session),
             MouseLoc::Tile(id) => self.workspaces[self.active]
                 .root
                 .find_tile(id)
@@ -2988,6 +3213,7 @@ impl App {
         let scale = self.renderer.scale;
         let content = match loc {
             MouseLoc::Flyover => workspace::flyover_content(&self.flyover_rect_now(), scale),
+            MouseLoc::Tool => workspace::tile_content(&self.tool_area(), scale),
             MouseLoc::Tile(id) => match self.tile_rect(id) {
                 Some(rect) => workspace::tile_content(&rect, scale),
                 None => return,
@@ -3066,6 +3292,11 @@ impl App {
             && workspace::flyover_content(&self.flyover_rect_now(), scale).contains(px, py)
         {
             return Some(MouseLoc::Flyover);
+        }
+        if let Page::Tool(_) = self.page {
+            return workspace::tile_content(&self.tool_area(), scale)
+                .contains(px, py)
+                .then_some(MouseLoc::Tool);
         }
         if self.page != Page::Sessions {
             return None;
@@ -3265,7 +3496,7 @@ impl App {
                 self.blur_settings_search(window, cx);
                 return;
             }
-            // Every other sidebar row — Notes vaults/docs, Cleanup filters,
+            // Every other sidebar row — Notes vaults/docs,
             // the pinned bubbles, section headers (and their delete chip) and
             // group cards — is an element click target now (`sidebar_ui`),
             // which arms the same presses this branch used to; a press that
@@ -3277,8 +3508,25 @@ impl App {
         if self.page == Page::Settings {
             return;
         }
-        // Cleanup page: the gpui overlay owns all content-area clicks.
-        if self.page == Page::Cleanup {
+        // Tool page: the whole content area is one terminal — forward the
+        // click to a mouse-tracking TUI or start a text selection, exactly
+        // like a click in the flyover's content.
+        if let Page::Tool(_) = self.page {
+            let content = workspace::tile_content(&self.tool_area(), scale);
+            if !content.contains(px, py) {
+                return;
+            }
+            if self.try_forward_press(MouseLoc::Tool, MouseBtn::Left, px, py) {
+                self.request_redraw();
+                return;
+            }
+            if let Some((col, row)) = self.renderer.cell_at(&content, px, py)
+                && let Some(ts) = self.active_tool_session()
+            {
+                ts.tab.session.begin_selection(col, row);
+                self.drag = Drag::ToolSelect;
+            }
+            self.request_redraw();
             return;
         }
         // Pull Requests page: same — the gpui overlay owns the content area.
@@ -3451,6 +3699,17 @@ impl App {
                         tab.session.update_selection(col, row);
                         self.request_redraw();
                     }
+                }
+            },
+            Drag::ToolSelect => {
+                let scale = self.renderer.scale;
+                let (px, py) = (self.cursor.0 as f32, self.cursor.1 as f32);
+                let content = workspace::tile_content(&self.tool_area(), scale);
+                if let Some((col, row)) = self.renderer.cell_at(&content, px, py)
+                    && let Some(ts) = self.active_tool_session()
+                {
+                    ts.tab.session.update_selection(col, row);
+                    self.request_redraw();
                 }
             },
             Drag::Select { tile } => {
@@ -3702,9 +3961,14 @@ impl App {
             self.handle_settings_key(ev, window, cx);
             return;
         }
-        // The Cleanup page owns the keyboard too (no terminal underneath).
-        if self.page == Page::Cleanup {
-            self.handle_cleanup_key(ev);
+        // A tool page's terminal owns the keyboard; ⌘ shortcuts stay global.
+        if let Page::Tool(_) = self.page {
+            if ev.keystroke.modifiers.platform {
+                self.handle_shortcut(ev);
+            } else {
+                self.tool_write_key(&ev.keystroke);
+            }
+            self.request_redraw();
             return;
         }
         // The Notes page has no terminal underneath: a focused markdown editor
@@ -3989,6 +4253,20 @@ impl App {
             self.request_redraw();
             return;
         }
+        // Focused Tools add-form Input: enter adds, escape blurs; the Input
+        // itself owns character editing.
+        if self.tool_form.inputs().iter().any(|e| e.read(cx).focus_handle(cx).is_focused(window)) {
+            match ev.keystroke.key.as_str() {
+                "enter" => {
+                    self.add_tool_from_form(cx);
+                    window.focus(&self.focus_handle, cx);
+                },
+                "escape" => window.focus(&self.focus_handle, cx),
+                _ => {},
+            }
+            self.request_redraw();
+            return;
+        }
         if let Some(action) = self.recording {
             if ev.keystroke.key == "escape" {
                 self.recording = None;
@@ -4036,7 +4314,7 @@ impl App {
             Action::DecreaseFontSize => self.zoom_font(-renderer::FONT_SIZE_STEP),
             Action::GoToSessions => self.set_page(Page::Sessions),
             Action::GoToPullRequests => self.set_page(Page::PullRequests),
-            Action::GoToCleanup => self.set_page(Page::Cleanup),
+            Action::GoToTool => self.set_page(Page::Tool(0)),
             Action::ScreenshotToClipboard => self.screenshot_action(true),
             Action::ScreenshotToFile => self.screenshot_action(false),
             Action::NewSection => self.new_section_action(),
@@ -4051,6 +4329,20 @@ impl App {
     fn run_action(&mut self, action: Action) -> bool {
         if self.run_global_action(action) {
             return true;
+        }
+        // A tool page is one terminal: only the clipboard actions apply.
+        if let Page::Tool(_) = self.page {
+            return match action {
+                Action::Copy => {
+                    self.tool_copy();
+                    true
+                },
+                Action::Paste => {
+                    self.tool_paste();
+                    true
+                },
+                _ => false,
+            };
         }
         if self.page != Page::Sessions {
             return false;
@@ -4107,7 +4399,7 @@ impl App {
             | Action::DecreaseFontSize
             | Action::GoToSessions
             | Action::GoToPullRequests
-            | Action::GoToCleanup
+            | Action::GoToTool
             | Action::ScreenshotToClipboard
             | Action::ScreenshotToFile
             | Action::NewSection => {},
@@ -4184,11 +4476,11 @@ impl App {
         }
     }
 
-    /// ⌘⇧←/→: step through `Page::ALL`, wrapping at both ends.
+    /// ⌘⇧←/→: step through `Page::all`, wrapping at both ends.
     fn cycle_page(&mut self, delta: isize) {
         // Cycle within the visible pages so a flag-gated page (Notes, when
         // off) is skipped instead of landing on a dead slot.
-        let visible = Page::visible(crate::features::notes_enabled());
+        let visible = Page::visible(crate::features::notes_enabled(), self.n_tools());
         let cur = visible.iter().position(|p| *p == self.page).unwrap_or(0);
         let i = pages::cycle(cur, visible.len(), delta);
         self.set_page(visible[i]);
@@ -4219,28 +4511,21 @@ impl App {
                     self.request_redraw();
                 }
             },
-            Page::Cleanup => {
-                let repos = self.cleanup.repos();
-                // Tabs: 0 = All, 1..=n = per-repo
-                let n_tabs = repos.len() + 1;
-                let cur = match &self.cleanup.repo_filter {
-                    None => 0,
-                    Some(root) => repos.iter().position(|r| &r.root == root).map(|i| i + 1).unwrap_or(0),
-                };
-                let next = pages::cycle(cur, n_tabs, delta);
-                self.cleanup.repo_filter = if next == 0 {
-                    None
-                } else {
-                    repos.get(next - 1).map(|r| r.root.clone())
-                };
-                self.request_redraw();
-            },
+            // Tool pages have no sidebar tabs of their own.
+            Page::Tool(_) => {},
         }
     }
 
     fn set_page(&mut self, page: Page) {
         // Notes is experimental: with the flag off it is not reachable at all.
         if page == Page::Notes && !crate::features::notes_enabled() {
+            self.set_page(Page::Sessions);
+            return;
+        }
+        // A tool page whose tool was unregistered is gone too.
+        if let Page::Tool(i) = page
+            && i >= self.n_tools()
+        {
             self.set_page(Page::Sessions);
             return;
         }
@@ -4265,9 +4550,11 @@ impl App {
                     self.reset_pr_surface();
                 }
             }
-            // Entering the Cleanup page triggers a fresh scan.
-            if page == Page::Cleanup {
-                self.spawn_cleanup_scan();
+            // Entering a tool page launches its command (or relaunches one
+            // that has since exited) and fits its PTY to the content area.
+            if let Page::Tool(i) = page {
+                self.ensure_tool_session(i);
+                self.sync_tool_layout(true);
             }
             // Entering the Pull Requests page loads all open PRs fresh.
             if page == Page::PullRequests {
@@ -4348,7 +4635,7 @@ impl App {
         let (_, h) = self.renderer.surface_size();
         let scale = self.scale();
         // Match the renderer: only visible pages get a slot.
-        let n = Page::visible(crate::features::notes_enabled()).len();
+        let n = Page::visible(crate::features::notes_enabled(), self.n_tools()).len();
         (0..n).find(|&i| {
             workspace::page_slot_rect(i, n, h, scale, self.sidebar_w())
                 .inflate((3.0 * scale).round())
@@ -4415,21 +4702,6 @@ impl App {
         });
     }
 
-    /// Kick off a background `drop -d --json` sweep and show the scanning
-    /// state until its `TermEvent` lands.
-    fn spawn_cleanup_scan(&mut self) {
-        self.cleanup.set_scanning();
-        let tx = self.events_tx.clone();
-        std::thread::spawn(move || {
-            let event = match run_drop_status() {
-                Ok(worktrees) => TermEvent::CleanupScanned(worktrees),
-                Err(e) => TermEvent::CleanupScanFailed(e),
-            };
-            let _ = tx.send(event);
-        });
-        self.request_redraw();
-    }
-
     /// Re-name every pane that still has no emulator title from its foreground
     /// process, off-thread. Modelled on `spawn_git_context_refresh`: the slot
     /// is claimed in one atomic step so the guard doesn't rest on an unstated
@@ -4494,33 +4766,6 @@ impl App {
             let _ = tx.send(TermEvent::ProcTitlesReady { asked, titles });
         });
         true
-    }
-
-    /// Handle keyboard input on the Cleanup page (mirrors handle_settings_key).
-    fn handle_cleanup_key(&mut self, ev: &KeyDownEvent) {
-        if ev.keystroke.modifiers.platform {
-            self.handle_shortcut(ev);
-            return;
-        }
-        match ev.keystroke.key.as_str() {
-            "a" => {
-                self.cleanup.select_all_visible();
-                self.request_redraw();
-            },
-            "m" => {
-                self.cleanup.select_merged_visible();
-                self.request_redraw();
-            },
-            "r" => {
-                self.spawn_cleanup_scan();
-                self.request_redraw();
-            },
-            "escape" => {
-                self.cleanup.clear_selection();
-                self.request_redraw();
-            },
-            _ => {},
-        }
     }
 
     /// Drain PTY wakeups coalesced since the last frame; returns true if a
@@ -4622,28 +4867,6 @@ impl App {
                     }
                     redraw = true;
                 },
-                TermEvent::CleanupScanned(worktrees) => {
-                    self.cleanup.set_ready(worktrees);
-                    redraw = true;
-                },
-                TermEvent::CleanupScanFailed(msg) => {
-                    self.cleanup.set_failed(msg);
-                    redraw = true;
-                },
-                TermEvent::CleanupRemoved { removed, failed, error } => {
-                    // Replace the modal "Deleting…" message with the outcome
-                    // (dismissable), and refresh the table to match disk.
-                    let msg = if failed == 0 {
-                        format!("Removed {removed} worktree{}.", if removed == 1 { "" } else { "s" })
-                    } else {
-                        let reason =
-                            error.map(|e| format!(" — {e}")).unwrap_or_default();
-                        format!("Removed {removed}, failed {failed}{reason}")
-                    };
-                    self.message = Some((msg, true));
-                    self.spawn_cleanup_scan();
-                    redraw = true;
-                },
                 // A pane signaled for attention (OSC 9, emitted by the Claude
                 // Code hooks). On-screen tabs of the active group are being
                 // watched, so only hidden tabs gain the unread dot — but a
@@ -4708,7 +4931,7 @@ impl App {
         }
         // Advance the page-dot crossfades: hovered or active slots head to 1,
         // the rest back to 0. Redraw while any slot is mid-flight.
-        let active = self.page.index();
+        let active = self.page.index(self.tools.len());
         for (i, p) in self.dot_anim.iter_mut().enumerate() {
             let target = if i == active || Some(i) == self.dot_hover { 1.0 } else { 0.0 };
             let next =
@@ -4798,6 +5021,11 @@ impl App {
     }
 
     fn remove_session(&mut self, id: u64) {
+        // A tool page's command ended: keep its last frame up (⏎ relaunches).
+        if let Some(ts) = self.tool_sessions.iter_mut().flatten().find(|ts| ts.tab.session.id == id) {
+            ts.exited = true;
+            return;
+        }
         // Flyover shells live outside the workspace tree: drop the tab and
         // close the panel when the last one goes.
         if let Some(ti) = self.flyover_tabs.iter().position(|tab| tab.session.id == id) {
@@ -4872,6 +5100,11 @@ impl App {
         // Also call begin_frame on all flyover sessions every frame.
         for tab in &self.flyover_tabs {
             tab.session.begin_frame();
+        }
+        // And the tool pages' terminals — they coalesce wakeups the same
+        // way, so a skipped reset would freeze a tool after its first paint.
+        for ts in self.tool_sessions.iter().flatten() {
+            ts.tab.session.begin_frame();
         }
     }
 }
@@ -5014,116 +5247,6 @@ fn run_drop(repo: &std::path::Path, from: Option<&str>) -> Result<std::path::Pat
         return Err("drop produced no worktree path".into());
     }
     Ok(std::path::PathBuf::from(path))
-}
-
-/// Scan all drop-managed worktrees via `drop -d --json`. Run from the home
-/// directory (outside any repo) so drop sweeps favorites, recents, and its
-/// reposDir instead of just one repo. Runs synchronously — callers spawn it
-/// on a background thread.
-fn run_drop_status() -> Result<Vec<cleanup::WorktreeInfo>, String> {
-    let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"));
-    let mut cmd = git::augmented_command("drop");
-    cmd.args(["-d", "--json"]).current_dir(home);
-    let output = cmd.output().map_err(|e| format!("could not run drop: {e}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let reason =
-            stderr.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").trim().to_string();
-        return Err(if reason.is_empty() { "drop -d exited with an error".into() } else { reason });
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut worktrees = serde_json::from_str::<Vec<cleanup::WorktreeInfo>>(&stdout)
-        .map_err(|e| format!("could not parse drop output: {e}"))?;
-    // Enrich dirty worktrees with per-file +/- details for the hover popover.
-    // Best-effort: a git hiccup just leaves the list empty.
-    for w in worktrees.iter_mut().filter(|w| w.dirty_count > 0) {
-        w.dirty_files = dirty_file_details(std::path::Path::new(&w.path));
-    }
-    Ok(worktrees)
-}
-
-/// `git diff HEAD --numstat` + untracked listing for one worktree.
-fn dirty_file_details(worktree: &std::path::Path) -> Vec<cleanup::DirtyFile> {
-    let run = |args: &[&str]| -> String {
-        let mut cmd = git::augmented_command("git");
-        cmd.arg("-C").arg(worktree).args(args);
-        cmd.output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-            .unwrap_or_default()
-    };
-    let mut files = cleanup::parse_numstat(&run(&["diff", "HEAD", "--numstat"]));
-    // `--directory` collapses whole untracked directories to one `dir/` entry
-    // (like `git status` does) — an unignored build dir reads as one line, not
-    // thousands of files. Gitignored files are excluded outright.
-    for line in run(&[
-        "ls-files",
-        "--others",
-        "--exclude-standard",
-        "--directory",
-        "--no-empty-directory",
-    ])
-    .lines()
-    {
-        let path = line.trim();
-        if !path.is_empty() {
-            files.push(cleanup::DirtyFile {
-                path: path.to_string(),
-                added: None,
-                removed: None,
-                untracked: true,
-            });
-        }
-    }
-    files
-}
-
-/// Remove worktrees via `drop rm <ids...> --repo <root> --force --json`, once
-/// per repo — drop resolves ids only within a single repo. `--force` mirrors
-/// drop's own TUI: the user explicitly selected and confirmed these rows, so
-/// dirty worktrees are removed too (branch deletion stays safe-only either
-/// way — unmerged branches survive). Returns `(removed, failed)` totals plus
-/// the first failure's reason. Runs synchronously — callers spawn it on a
-/// background thread.
-fn run_drop_rm(targets: Vec<(String, Vec<String>)>) -> (usize, usize, Option<String>) {
-    #[derive(serde::Deserialize)]
-    struct RmResult {
-        removed: bool,
-        error: Option<String>,
-    }
-    let mut removed = 0;
-    let mut failed = 0;
-    let mut first_error: Option<String> = None;
-    for (repo, ids) in targets {
-        let count = ids.len();
-        let mut cmd = git::augmented_command("drop");
-        cmd.arg("rm").args(&ids).arg("--repo").arg(&repo).arg("--force").arg("--json");
-        let results: Vec<RmResult> = match cmd.output() {
-            Ok(o) => {
-                let parsed: Vec<RmResult> =
-                    serde_json::from_slice(&o.stdout).unwrap_or_default();
-                if parsed.is_empty() && first_error.is_none() {
-                    // drop itself failed to run — its last stderr line says why.
-                    let stderr = String::from_utf8_lossy(&o.stderr).into_owned();
-                    first_error =
-                        stderr.lines().rev().find(|l| !l.trim().is_empty()).map(str::to_string);
-                }
-                parsed
-            },
-            Err(e) => {
-                first_error.get_or_insert(format!("could not run drop: {e}"));
-                Vec::new()
-            },
-        };
-        let ok = results.iter().filter(|r| r.removed).count();
-        if first_error.is_none() {
-            first_error = results.iter().filter_map(|r| r.error.clone()).next();
-        }
-        removed += ok;
-        failed += count.saturating_sub(ok);
-    }
-    (removed, failed, first_error)
 }
 
 /// Convert accumulated fractional wheel travel into whole scroll steps,
@@ -5367,10 +5490,6 @@ impl Render for App {
             // Sessions empty state ("New group" pill + hint): element tree in
             // the terminal area; its click resolves on the element.
             .child(self.render_empty_state(cx))
-            // Cleanup page overlay: real gpui element tree above the canvas.
-            // The confirm dialog is an element modal above it now, so the
-            // page stays on screen (dimmed) while a delete is pending.
-            .when(self.page == Page::Cleanup, |el| el.child(self.render_cleanup(cx)))
             // Holistic Pull Requests page: full content-area element tree.
             .when(self.page == Page::PullRequests, |el| el.child(self.render_all_prs(cx)))
             // Notes page overlay (experimental, flag-gated): markdown vault
@@ -5379,7 +5498,7 @@ impl Render for App {
                 self.page == Page::Notes && crate::features::notes_enabled(),
                 |el| el.child(self.render_notes(cx)),
             )
-            // Settings page overlay: same pattern as Cleanup. Sidebar search +
+            // Settings page overlay: element tree over the canvas. Sidebar search +
             // section tabs stay canvas-painted; the content card is elements.
             .when(self.page == Page::Settings, |el| el.child(self.render_settings(cx)))
             // Right-edge git tool panels: real element trees over the canvas
@@ -5443,6 +5562,7 @@ impl App {
         self.sync_layout_impl(rescaled);
         if rescaled {
             self.sync_flyover_layout(true);
+            self.sync_tool_layout(true);
         }
         self.begin_frame();
 
@@ -5550,6 +5670,21 @@ impl App {
             link_hover_suppressed,
             &chrome,
         );
+        // A tool page's terminal lives outside the workspace tree too, so its
+        // card is built here from App state and slotted into the frame's
+        // ordinary layers (it *is* the page content, under the flyover).
+        if let Page::Tool(i) = self.page
+            && let Some(Some(ts)) = self.tool_sessions.get(i)
+        {
+            let area = self.tool_area();
+            let title = self.tools.get(i).map(|t| t.name.as_str()).unwrap_or("");
+            let (quads, pane, fg_quads, labels) =
+                self.renderer.tool_page(&ts.tab, &area, title, ts.exited, !overlay_open);
+            frame.bg_quads.extend(quads);
+            frame.panes.push(pane);
+            frame.fg_quads.extend(fg_quads);
+            frame.labels.extend(labels);
+        }
         // The flyover panel lives outside the workspace tree, so its layer is
         // built here from App state and slotted into the frame's flyover
         // fields (painted above tiles/labels, below the modal overlays).
@@ -6489,7 +6624,7 @@ fn main() {
 
     app.run(move |cx: &mut GpuiApp| {
         // Seed the rcn Theme global before any window opens so Theme::of
-        // never panics; Cleanup re-syncs it each frame from chrome tokens.
+        // never panics; the overlays re-sync it each frame from chrome tokens.
         cx.set_global(ui::theme::Theme::from_chrome(crate::theme::current()));
         crate::ui::Input::register_key_bindings(cx);
         // Initialize gpui-component (theme + text/textarea key bindings) for the
@@ -6538,6 +6673,7 @@ fn main() {
                 let renderer = Renderer::new(scale, cell_width, phys_w.max(1), phys_h.max(1));
 
                 let entity = cx.new(|cx| {
+                    let tools = cli_tools::tools();
                     let mut app = App {
                         events_rx,
                         events_tx: events_tx.clone(),
@@ -6688,13 +6824,20 @@ fn main() {
                         recording: None,
                         // The active page's slot starts fully glyphed.
                         dot_anim: {
-                            let mut v = vec![0.0; Page::ALL.len()];
-                            v[Page::Sessions.index()] = 1.0;
+                            let mut v = vec![0.0; Page::all(tools.len()).len()];
+                            v[Page::Sessions.index(tools.len())] = 1.0;
                             v
                         },
                         dot_hover: None,
                         resize_hover: None,
-                        cleanup: cleanup::Cleanup::default(),
+                        tool_sessions: (0..tools.len()).map(|_| None).collect(),
+                        tools,
+                        tool_form: ToolForm {
+                            name: cx.new(crate::ui::Input::new),
+                            command: cx.new(crate::ui::Input::new),
+                            cwd: cx.new(crate::ui::Input::new),
+                            icon: cx.new(crate::ui::Input::new),
+                        },
                         notes_active_vault: 0,
                         notes_docs: Vec::new(),
                         notes_selected: None,

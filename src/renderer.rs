@@ -572,13 +572,13 @@ impl Renderer {
         // nothing is painted for the panel body here — only the ribbon above
         // and the tile inset the docked panel reserves.
 
-        if chrome.page == Page::Cleanup
-            || chrome.page == Page::Settings
-            || chrome.page == Page::PullRequests
-            || chrome.page == Page::Notes
-        {
-            // Content is a gpui overlay (cleanup_ui / settings_ui / pr_ui) —
-            // the canvas paints the sidebar only.
+        if matches!(
+            chrome.page,
+            Page::Settings | Page::PullRequests | Page::Notes | Page::Tool(_)
+        ) {
+            // Content is a gpui overlay (settings_ui / pr_ui / notes_ui) or,
+            // for a tool page, painted by `tool_page` — the canvas paints the
+            // sidebar only here.
         } else {
             let hair = (1.0 * self.scale).round().max(1.0);
             // Messages-style blending: only the focused pane is a *card*. The
@@ -1020,6 +1020,72 @@ impl Renderer {
         (quads, panes, fg_quads, labels)
     }
 
+    /// Build a CLI tool page: one card filling `area`, styled like the
+    /// focused tile, with the tool's name in its strip and — once the command
+    /// has ended — a relaunch hint. Slots into the frame's ordinary layers.
+    pub fn tool_page(
+        &self,
+        tab: &crate::workspace::Tab,
+        area: &LayoutRect,
+        title: &str,
+        exited: bool,
+        draw_cursor: bool,
+    ) -> (Vec<Quad>, PaneText, Vec<Quad>, Vec<LabelSpec>) {
+        let th = self.theme();
+        let scale = self.scale;
+        let scheme = crate::term_theme::selected(crate::theme::dark_active());
+        let term_palette = crate::term_theme::build(scheme, th.term_bg);
+        let (pane_bg, pane_ink, pane_ink_dim) = match scheme {
+            Some(t) => (t.bg, (t.fg, 1.0), (t.fg, 0.55)),
+            None => (th.term_bg, (th.text_bright, 1.0), (th.text_dim, 1.0)),
+        };
+        let mut quads = Vec::new();
+        let mut fg_quads = Vec::new();
+        let mut labels = Vec::new();
+
+        let card_r = (CARD_RADIUS * scale).round();
+        quads.push(self.px_rect(area, pane_bg, 1.0, card_r).shadow(Shadow::Card));
+
+        // Strip: the tool's name, then the exit hint when there is one.
+        let bar = crate::workspace::tile_tab_bar(area, scale);
+        let text_pad = (12.0 * scale).round();
+        let top = (bar.y + (bar.h - self.chrome_cell_height) / 2.0).round();
+        labels.push(LabelSpec {
+            text: title.to_string(),
+            color: color(pane_ink.0, pane_ink.1),
+            left: bar.x + text_pad,
+            top,
+            clip: bar,
+            size: None,
+        });
+        if exited {
+            let hint = "exited — ⏎ to relaunch";
+            let w = hint.chars().count() as f32 * self.chrome_cell_width;
+            labels.push(LabelSpec {
+                text: hint.to_string(),
+                color: color(pane_ink_dim.0, pane_ink_dim.1),
+                left: (bar.x + bar.w - text_pad - w).max(bar.x),
+                top,
+                clip: bar,
+                size: None,
+            });
+        }
+
+        let content = crate::workspace::tile_content(area, scale);
+        let origin = self.content_origin(&content);
+        let rows = self.snapshot_pane(
+            &tab.session,
+            &term_palette,
+            origin,
+            draw_cursor && !exited,
+            None,
+            &mut quads,
+            &mut fg_quads,
+        );
+        self.selection_rects(&tab.session, origin, &mut fg_quads);
+        (quads, PaneText { origin, rows }, fg_quads, labels)
+    }
+
     /// Snapshot one pane's grid into per-row text spans + geometry quads,
     /// offset to `origin`. One `Vec<TextSpan>` per grid row (so the caller can
     /// shape each row independently). Holds the terminal lock only for the walk.
@@ -1362,9 +1428,9 @@ impl Renderer {
 mod tests {
     use super::*;
 
-    fn cleanup_chrome() -> ChromeState<'static> {
+    fn settings_chrome() -> ChromeState<'static> {
         ChromeState {
-            page: Page::Cleanup,
+            page: Page::Settings,
             ribbon_tools: &[],
             open_tool: None,
             tool_panel_w: 0.0,
@@ -1385,7 +1451,7 @@ mod tests {
         let wss = [crate::workspace::Workspace::new("g".into(), tile, None)];
 
         // Closed: the ribbon icon is there, the panel is not.
-        let mut chrome = cleanup_chrome();
+        let mut chrome = settings_chrome();
         chrome.page = Page::Sessions;
         chrome.ribbon_tools = &pages::Tool::ALL;
         let frame = renderer.build_frame(
@@ -1433,7 +1499,7 @@ mod tests {
         // Open: every tool panel is an element tree now, so the canvas paints
         // no card or label for it — but the tile card must still stop left of
         // the docked panel's reserved width.
-        let mut chrome = cleanup_chrome();
+        let mut chrome = settings_chrome();
         chrome.page = Page::Sessions;
         chrome.ribbon_tools = &pages::Tool::ALL;
         chrome.open_tool = Some(pages::Tool::Launch);
@@ -1465,7 +1531,7 @@ mod tests {
         // No tools registered (non-Sessions pages, or a group without the
         // tool's context): ribbon and panel hide — even with a stale
         // open_tool — and the tiles reclaim the full width.
-        let mut chrome = cleanup_chrome();
+        let mut chrome = settings_chrome();
         chrome.page = Page::Sessions;
         chrome.open_tool = Some(pages::Tool::Pr);
         chrome.tool_panel_w = crate::workspace::TOOL_PANEL_DEFAULT_W;
