@@ -1,13 +1,14 @@
 //! Pull Request tool: a gpui element tree over the canvas (same overlay
-//! pattern as `cleanup_ui`), positioned over the right-edge tool panel (the
-//! branch-scoped tool) or filling the content area (the Pull Requests page).
+//! pattern as `cleanup_ui`), positioned over the right-edge tool panel. The
+//! panel is width-responsive: past [`PR_WIDE_MIN_W`] it switches to the wide
+//! two-pane layout.
 //!
 //! The review is one continuous scroll — description → conversation → one
 //! collapsible card per changed file, unified or split, with review threads
 //! and comment composers anchored to diff lines — beside a "contact card"
-//! sidebar on the wide page surface (identity, Readiness: checks / review /
+//! sidebar when the panel is wide (identity, Readiness: checks / review /
 //! draft-or-conflicts, the file tree with viewed progress, and one contextual
-//! primary action). The narrow tool surface folds the identity into a compact
+//! primary action). The narrow layout folds the identity into a compact
 //! header and puts readiness + the primary action at the top of the stream.
 //!
 //! Inline comments can be posted one at a time or batched into a pending
@@ -53,26 +54,31 @@ pub(crate) fn tool_panel_overlay(
     header: gpui::AnyElement,
     body: gpui::AnyElement,
 ) -> gpui::AnyElement {
+    tool_panel_root(floating, panel_w)
+        .child(
+            Card::new()
+                .h_full()
+                .when(floating, |c| c.floating())
+                .child(CardHeader::new().child(header))
+                .child(CardContent::new().flex_1().child(body)),
+        )
+        .into_any_element()
+}
+
+/// The positioned, occluding root every tool-panel layout builds inside.
+fn tool_panel_root(floating: bool, panel_w: f32) -> gpui::Div {
     use crate::workspace::{AREA_PAD, RIBBON_W, TOOL_PANEL_FLOAT_INSET};
     // Occluding: the canvas no longer swallows clicks over the panel rect,
     // so the panel must own every click inside it — a floating panel sits
     // over live tiles.
-    let mut root = div().absolute().occlude().w(px(panel_w));
-    root = if floating {
+    let root = div().absolute().occlude().w(px(panel_w));
+    if floating {
         root.right(px(RIBBON_W + TOOL_PANEL_FLOAT_INSET))
             .top(px(AREA_PAD + TOOL_PANEL_FLOAT_INSET))
             .bottom(px(AREA_PAD + TOOL_PANEL_FLOAT_INSET))
     } else {
         root.right(px(RIBBON_W)).top(px(AREA_PAD)).bottom(px(AREA_PAD))
-    };
-    root.child(
-        Card::new()
-            .h_full()
-            .when(floating, |c| c.floating())
-            .child(CardHeader::new().child(header))
-            .child(CardContent::new().flex_1().child(body)),
-    )
-    .into_any_element()
+    }
 }
 
 /// A lazily-loaded value fetched off the UI thread.
@@ -92,8 +98,6 @@ pub enum PrSurface {
     None,
     /// The Sessions right-edge tool (branch-scoped).
     Tool,
-    /// The holistic Pull Requests page (all open PRs).
-    Page,
 }
 
 /// How diff bodies lay out: one column with both line numbers, or old/new
@@ -139,15 +143,10 @@ pub struct Composer {
     _sub: gpui::Subscription,
 }
 
-/// Pull-request state, shared by the branch-scoped Sessions tool and the
-/// holistic Pull Requests page. The two surfaces are never visible at once
-/// (the page is a top-level `Page`, the tool only shows on `Sessions`), so they
-/// share one review view; only the list differs.
+/// Pull-request state for the branch-scoped Sessions tool.
 pub struct PrState {
-    /// PR(s) for the checked-out branch — the Sessions tool's list.
+    /// PR(s) for the checked-out branch — the tool's list.
     pub branch_list: Load<Vec<PrSummary>>,
-    /// All open PRs for the repo — the Pull Requests page's list.
-    pub all_list: Load<Vec<PrSummary>>,
     /// Current branch name, for the tool's empty-state copy.
     pub branch: Option<String>,
     /// The PR open in the review view, or `None` while a list shows.
@@ -195,7 +194,6 @@ impl Default for PrState {
     fn default() -> Self {
         PrState {
             branch_list: Load::Idle,
-            all_list: Load::Idle,
             branch: None,
             open: None,
             detail: Load::Idle,
@@ -224,9 +222,7 @@ impl App {
 
     /// Which PR surface is on screen right now.
     pub fn pr_surface(&self) -> PrSurface {
-        if self.page == crate::pages::Page::PullRequests {
-            PrSurface::Page
-        } else if self.visible_tool() == Some(crate::pages::Tool::Pr) {
+        if self.visible_tool() == Some(crate::pages::Tool::Pr) {
             PrSurface::Tool
         } else {
             PrSurface::None
@@ -245,18 +241,7 @@ impl App {
                 Some(b) => gh::pr_list_for_branch(&dir, &b),
                 None => Ok(Vec::new()),
             };
-            let _ = tx.send(crate::term::TermEvent::PrListLoaded { all: false, result });
-        });
-        self.request_redraw();
-    }
-
-    /// (Re)load all open PRs for the repo — the Pull Requests page's list.
-    pub fn spawn_pr_all_list(&mut self) {
-        let Some(dir) = self.active_repo_dir() else { return };
-        self.pr.all_list = Load::Loading;
-        let tx = self.events_tx.clone();
-        std::thread::spawn(move || {
-            let _ = tx.send(crate::term::TermEvent::PrListLoaded { all: true, result: gh::pr_list(&dir) });
+            let _ = tx.send(crate::term::TermEvent::PrListLoaded { result });
         });
         self.request_redraw();
     }
@@ -271,10 +256,8 @@ impl App {
         self.pr.action_msg = None;
         self.pr.composer = None;
         self.pr.pending.clear();
-        match self.pr_surface() {
-            PrSurface::Page => self.spawn_pr_all_list(),
-            PrSurface::Tool => self.spawn_pr_branch_list(),
-            PrSurface::None => {}
+        if self.pr_surface() == PrSurface::Tool {
+            self.spawn_pr_branch_list();
         }
     }
 
@@ -541,17 +524,13 @@ impl App {
 
     // ── TermEvent handlers (called from drain_events) ─────────────────────
 
-    pub fn on_pr_list_loaded(&mut self, all: bool, result: Result<Vec<PrSummary>, String>) {
+    pub fn on_pr_list_loaded(&mut self, result: Result<Vec<PrSummary>, String>) {
         let load = match result {
             Ok(v) => Load::Ready(v),
             Err(e) => Load::Failed(e),
         };
-        if all {
-            self.pr.all_list = load;
-            return;
-        }
-        // Branch-scoped: if there's exactly one PR for the checked-out branch
-        // and nothing is open yet, jump straight into it — the common case.
+        // If there's exactly one PR for the checked-out branch and nothing is
+        // open yet, jump straight into it — the common case.
         if self.pr.open.is_none()
             && let Load::Ready(v) = &load
             && v.len() == 1
@@ -627,12 +606,10 @@ impl App {
         self.refresh_pr_list();
     }
 
-    /// Re-fetch the list backing the current surface (all vs branch).
+    /// Re-fetch the branch list backing the tool, if it's showing.
     fn refresh_pr_list(&mut self) {
-        match self.pr_surface() {
-            PrSurface::Page => self.spawn_pr_all_list(),
-            PrSurface::Tool => self.spawn_pr_branch_list(),
-            PrSurface::None => {}
+        if self.pr_surface() == PrSurface::Tool {
+            self.spawn_pr_branch_list();
         }
     }
 
@@ -661,12 +638,44 @@ impl App {
 
     // ── Surfaces ──────────────────────────────────────────────────────────
 
-    /// Build the Pull Request tool overlay (the narrow, branch-scoped
-    /// surface). Call only when the PR tool is the visible tool.
+    /// Build the Pull Request tool overlay. Width-responsive: an open review
+    /// in a panel at least [`PR_WIDE_MIN_W`] wide uses the two-pane layout —
+    /// the stream card beside the contact-card sidebar — while a narrower
+    /// panel folds identity into the card header instead. Call only when the
+    /// PR tool is the visible tool.
     pub fn render_pr(&self, cx: &mut Context<Self>) -> AnyElement {
         cx.set_global(Theme::from_chrome(crate::theme::current()));
         let theme = Theme::of(cx).clone();
         let entity = cx.entity().downgrade();
+
+        // Wide two-pane review: the stream card's header carries the back
+        // button + the stream strip; identity, Readiness, the file tree and
+        // the primary action live in the contact card (which also holds the
+        // GitHub / Refresh round actions).
+        if self.pr.open.is_some() && self.tool_panel_w >= PR_WIDE_MIN_W {
+            let header_row = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .w_full()
+                .gap_2()
+                .min_w(px(0.))
+                .child(back_button("pr-back", "\u{2039}", entity.clone()))
+                .child(self.stream_header(&theme, entity.clone()))
+                .child(float_toggle_button(self.tool_panel_floating, entity.clone()));
+            let stream = Card::new()
+                .h_full()
+                .when(self.tool_panel_floating, |c| c.floating())
+                .child(CardHeader::new().child(header_row))
+                .child(CardContent::new().flex_1().child(self.render_pr_review(true, &theme, entity.clone(), cx)));
+            return tool_panel_root(self.tool_panel_floating, self.tool_panel_w)
+                .flex()
+                .flex_row()
+                .gap_2()
+                .child(div().flex_1().min_w(px(0.)).h_full().child(stream))
+                .child(self.render_contact_card(&theme, entity.clone(), cx))
+                .into_any_element();
+        }
 
         let mut header_row = div().flex().flex_row().items_center().w_full().gap_2().min_w(px(0.));
         if self.pr.open.is_some() {
@@ -682,22 +691,8 @@ impl App {
         if let (Some(_), Load::Ready(d)) = (self.pr.open, &self.pr.detail) {
             actions = actions.child(github_button("pr-open-gh", &d.url));
         }
-        let float_entity = entity.clone();
-        actions = actions.child(
-            Button::new("pr-float-toggle")
-                .variant(ButtonVariant::Ghost)
-                .size(ButtonSize::Sm)
-                .child(if self.tool_panel_floating { "\u{25a3}" } else { "\u{29c9}" })
-                .on_click(move |_ev: &ClickEvent, _win: &mut Window, app: &mut GpuiApp| {
-                    if let Some(e) = float_entity.upgrade() {
-                        e.update(app, |this, cx| {
-                            this.toggle_tool_panel_floating();
-                            cx.notify();
-                        });
-                    }
-                }),
-        );
-        actions = actions.child(refresh_button("pr-refresh", false, entity.clone()));
+        actions = actions.child(float_toggle_button(self.tool_panel_floating, entity.clone()));
+        actions = actions.child(refresh_button("pr-refresh", entity.clone()));
         header_row = header_row.child(div().flex_1().min_w(px(0.))).child(actions);
 
         let body = match self.pr.open {
@@ -717,73 +712,6 @@ impl App {
             header_row.into_any_element(),
             body.into_any_element(),
         )
-    }
-
-    /// Build the holistic Pull Requests page overlay (all open PRs for the
-    /// repo). The list is a full content-area card like Cleanup/Settings;
-    /// opening a PR swaps in the two-pane review: the stream card beside the
-    /// PR's contact-card sidebar.
-    pub fn render_all_prs(&self, cx: &mut Context<Self>) -> AnyElement {
-        cx.set_global(Theme::from_chrome(crate::theme::current()));
-        let theme = Theme::of(cx).clone();
-        let entity = cx.entity().downgrade();
-
-        // Match cleanup_ui's content-area insets so the page tracks resizes.
-        let pad = crate::workspace::AREA_PAD;
-        let sidebar = self.sidebar_w();
-        let left = if sidebar == 0.0 { pad } else { sidebar };
-        let right = self.right_w() + pad;
-        let root = div().absolute().left(px(left)).top(px(pad)).right(px(right)).bottom(px(pad));
-
-        if self.pr.open.is_none() {
-            let header_row = div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .w_full()
-                .gap_2()
-                .child(CardTitle::new().child("Pull Requests"))
-                .child(div().flex_1())
-                .child(refresh_button("all-pr-refresh", true, entity.clone()));
-            let body = self.pr_list_body(
-                &self.pr.all_list,
-                "all-pr-row",
-                "No open pull requests.",
-                &theme,
-                entity.clone(),
-            );
-            return root
-                .child(
-                    Card::new()
-                        .h_full()
-                        .child(CardHeader::new().child(header_row))
-                        .child(CardContent::new().flex_1().child(body)),
-                )
-                .into_any_element();
-        }
-
-        // Two panes: the stream card and the contact card. The stream card's
-        // header carries the back button; identity lives in the sidebar.
-        let header_row = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .w_full()
-            .gap_2()
-            .min_w(px(0.))
-            .child(back_button("all-pr-back", "\u{2039} All PRs", entity.clone()))
-            .child(self.stream_header(&theme, entity.clone()));
-        let stream = Card::new()
-            .h_full()
-            .child(CardHeader::new().child(header_row))
-            .child(CardContent::new().flex_1().child(self.render_pr_review(true, &theme, entity.clone(), cx)));
-
-        root.flex()
-            .flex_row()
-            .gap_2()
-            .child(div().flex_1().min_w(px(0.)).h_full().child(stream))
-            .child(self.render_contact_card(&theme, entity.clone(), cx))
-            .into_any_element()
     }
 
     /// The narrow surface's identity: "#77 · title" plus the three readiness
@@ -829,9 +757,8 @@ impl App {
             .into_any_element()
     }
 
-    /// Render a PR list (branch-scoped or all), or its loading/empty/failed
-    /// state. `id` namespaces the scroller + row ids so the two surfaces never
-    /// collide. Shared by the Sessions tool and the Pull Requests page.
+    /// Render a PR list, or its loading/empty/failed state. `id` namespaces the
+    /// scroller + row ids.
     fn pr_list_body(
         &self,
         list: &Load<Vec<PrSummary>>,
@@ -965,9 +892,9 @@ impl App {
     }
 
     /// The continuous review: description → conversation → file cards, with
-    /// a sticky header for the topmost file. `wide` is the page surface (the
-    /// contact card carries readiness + actions); the narrow tool surface
-    /// puts them at the top of the stream instead.
+    /// a sticky header for the topmost file. `wide` is the two-pane layout (the
+    /// contact card carries readiness + actions); the narrow layout puts them
+    /// at the top of the stream instead.
     fn render_pr_review(
         &self,
         wide: bool,
@@ -1323,7 +1250,12 @@ impl App {
                 .flex_none()
                 .w(px(CONTACT_CARD_W))
                 .h_full()
-                .child(Card::new().h_full().child(CardContent::new().flex_1().child(skeleton_list())))
+                .child(
+                    Card::new()
+                        .h_full()
+                        .when(self.tool_panel_floating, |c| c.floating())
+                        .child(CardContent::new().flex_1().child(skeleton_list())),
+                )
                 .into_any_element();
         };
         let colors = DiffColors::new(theme);
@@ -1474,6 +1406,7 @@ impl App {
             .child(
                 Card::new()
                     .h_full()
+                    .when(self.tool_panel_floating, |c| c.floating())
                     .child(CardContent::new().flex_1().child(
                         div()
                             .flex()
@@ -1922,9 +1855,8 @@ impl App {
         })
     }
 
-    /// Jump to a Sessions group from the Pull Requests page.
+    /// Switch to the Sessions group checked out on this PR's branch.
     fn jump_to_group(&mut self, wi: usize) {
-        self.set_page(crate::pages::Page::Sessions);
         self.switch_workspace(wi);
     }
 
@@ -2699,8 +2631,13 @@ impl App {
     }
 }
 
-/// Width of the wide surface's contact card.
+/// Width of the wide layout's contact card.
 const CONTACT_CARD_W: f32 = 300.0;
+
+/// Tool-panel width at which an open review switches from the folded single
+/// card to the two-pane layout: the contact card plus enough stream for a
+/// readable diff.
+const PR_WIDE_MIN_W: f32 = 660.0;
 
 /// Which diff surface a view-state action targets.
 #[derive(Clone, Copy)]
@@ -4249,8 +4186,8 @@ fn github_button(id: &'static str, url: &str) -> AnyElement {
         .into_any_element()
 }
 
-/// Refresh: the open PR when one is showing, else the surface's list.
-fn refresh_button(id: &'static str, all: bool, entity: gpui::WeakEntity<App>) -> AnyElement {
+/// Refresh: the open PR when one is showing, else the branch list.
+fn refresh_button(id: &'static str, entity: gpui::WeakEntity<App>) -> AnyElement {
     Button::new(id)
         .variant(ButtonVariant::Outline)
         .size(ButtonSize::Sm)
@@ -4260,9 +4197,25 @@ fn refresh_button(id: &'static str, all: bool, entity: gpui::WeakEntity<App>) ->
                 e.update(app, |this, cx| {
                     match this.pr.open {
                         Some(n) => this.refresh_open_pr(n),
-                        None if all => this.spawn_pr_all_list(),
                         None => this.spawn_pr_branch_list(),
                     }
+                    cx.notify();
+                });
+            }
+        })
+        .into_any_element()
+}
+
+/// The tool panel's Float / Dock toggle.
+fn float_toggle_button(floating: bool, entity: gpui::WeakEntity<App>) -> AnyElement {
+    Button::new("pr-float-toggle")
+        .variant(ButtonVariant::Ghost)
+        .size(ButtonSize::Sm)
+        .child(if floating { "\u{25a3}" } else { "\u{29c9}" })
+        .on_click(move |_ev: &ClickEvent, _win: &mut Window, app: &mut GpuiApp| {
+            if let Some(e) = entity.upgrade() {
+                e.update(app, |this, cx| {
+                    this.toggle_tool_panel_floating();
                     cx.notify();
                 });
             }

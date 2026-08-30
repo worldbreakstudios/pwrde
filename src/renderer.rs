@@ -530,11 +530,9 @@ impl Renderer {
         // Traffic lights are the native macOS buttons now (transparent titlebar),
         // so we no longer draw our own here.
         match chrome.page {
-            // The Pull Requests page shares the Sessions sidebar (its list is
-            // scoped to the active group's repo, so group switching applies).
-            // The Sessions/PR empty state (centered "New group" pill + hint)
-            // is an element tree now — see `sidebar_ui::render_empty_state`.
-            Page::Sessions | Page::PullRequests => {}
+            // The Sessions empty state (centered "New group" pill + hint) is
+            // an element tree now — see `sidebar_ui::render_empty_state`.
+            Page::Sessions => {}
             // Every other page's sidebar rows live in the element tree now
             // (`sidebar_ui::render_sidebar`), so the canvas paints nothing
             // for them here — only the page-dot strip below.
@@ -592,7 +590,7 @@ impl Renderer {
 
         if matches!(
             chrome.page,
-            Page::Settings | Page::PullRequests | Page::Tool(_)
+            Page::Settings | Page::Tool(_)
         ) {
             // Content is a gpui overlay (settings_ui / pr_ui) or,
             // for a tool page, painted by `tool_page` — the canvas paints the

@@ -1,10 +1,10 @@
 //! Top-level page navigation + rebindable keyboard actions.
 //!
-//! pwrde has Arc-style *pages*: Sessions (the terminal workspace), Pull
-//! Requests, one page per user-registered CLI tool (see [`crate::cli_tools`]),
-//! and Settings. The sidebar's bottom strip shows one slot per page — a subtle
-//! dot that crossfades into the page's glyph on hover, and stays a glyph on
-//! the active page. ⌘⇧←/→ cycle pages with wraparound; ⌘⇧↑/↓ cycle the
+//! pwrde has Arc-style *pages*: Sessions (the terminal workspace), one page
+//! per user-registered CLI tool (see [`crate::cli_tools`]), and Settings. The
+//! sidebar's bottom strip shows one slot per page — a subtle dot that
+//! crossfades into the page's glyph on hover, and stays a glyph on the active
+//! page. ⌘⇧←/→ cycle pages with wraparound; ⌘⇧↑/↓ cycle the
 //! sidebar's tabs (groups on Sessions, sections on Settings) the same way.
 //!
 //! Every ⌘ shortcut is an [`Action`] dispatched through a bindings table
@@ -16,10 +16,6 @@ use gpui::Keystroke;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Page {
     Sessions,
-    /// Holistic pull-request list for the active group's repo — all open PRs,
-    /// openable into the shared detail view. (The Sessions PR tool is scoped to
-    /// just the checked-out branch; this page is the wider view.)
-    PullRequests,
     /// A user-registered CLI tool (index into [`crate::cli_tools::tools`]):
     /// a full-page, non-persisted terminal running that tool's command from
     /// its configured directory.
@@ -29,10 +25,10 @@ pub enum Page {
 
 impl Page {
     /// Dot-strip order for `n_tools` registered CLI tools; `cycle` walks
-    /// this. Tool pages sit between Pull Requests and Settings so the fixed
+    /// this. Tool pages sit between Sessions and Settings so the fixed
     /// pages keep their ends of the strip.
     pub fn all(n_tools: usize) -> Vec<Page> {
-        let mut v = vec![Page::Sessions, Page::PullRequests];
+        let mut v = vec![Page::Sessions];
         v.extend((0..n_tools).map(Page::Tool));
         v.push(Page::Settings);
         v
@@ -51,8 +47,6 @@ impl Page {
     pub fn glyph(self, tools: &[crate::cli_tools::CliTool]) -> String {
         match self {
             Page::Sessions => "<>".into(),
-            // U+F0629 = nf-md-source_pull (Material Design Icons via Nerd Fonts)
-            Page::PullRequests => "\u{f0629}".into(),
             Page::Tool(i) => tools.get(i).map(|t| t.icon.clone()).unwrap_or_else(|| "?".into()),
             Page::Settings => "\u{f013}".into(),
         }
@@ -208,13 +202,12 @@ pub enum Action {
     ScreenshotToFile,
     NewSection,
     GoToSessions,
-    GoToPullRequests,
     GoToTool,
 }
 
 impl Action {
     /// Keyboard-page row order.
-    pub const ALL: [Action; 40] = [
+    pub const ALL: [Action; 39] = [
         Action::SplitRight,
         Action::SplitDown,
         Action::NewTab,
@@ -253,7 +246,6 @@ impl Action {
         Action::ScreenshotToFile,
         Action::NewSection,
         Action::GoToSessions,
-        Action::GoToPullRequests,
         Action::GoToTool,
     ];
 
@@ -298,7 +290,6 @@ impl Action {
             Action::ScreenshotToFile => "screenshot_to_file",
             Action::NewSection => "new_section",
             Action::GoToSessions => "go_to_sessions",
-            Action::GoToPullRequests => "go_to_pull_requests",
             Action::GoToTool => "go_to_tool",
         }
     }
@@ -343,7 +334,6 @@ impl Action {
             Action::ScreenshotToFile => "Screenshot to file",
             Action::NewSection => "New folder",
             Action::GoToSessions => "Go to Sessions",
-            Action::GoToPullRequests => "Go to Pull Requests",
             Action::GoToTool => "Go to first tool page",
         }
     }
@@ -396,7 +386,6 @@ impl Action {
             Action::ScreenshotToFile => (false, true, true, "s"),
             Action::NewSection => (false, true, true, "n"),
             Action::GoToSessions => (false, true, true, "1"),
-            Action::GoToPullRequests => (false, true, true, "2"),
             Action::GoToTool => (false, true, true, "3"),
         };
         Binding { shift, alt, ctrl, key: key.into() }
@@ -671,15 +660,15 @@ mod tests {
 
     /// tool, and their stable index tracks the registered count.
     #[test]
-    fn tool_pages_slot_between_prs_and_settings() {
+    fn tool_pages_slot_between_sessions_and_settings() {
         assert_eq!(
             Page::all(2),
-            vec![Page::Sessions, Page::PullRequests, Page::Tool(0), Page::Tool(1), Page::Settings]
+            vec![Page::Sessions, Page::Tool(0), Page::Tool(1), Page::Settings]
         );
-        assert_eq!(Page::all(0), vec![Page::Sessions, Page::PullRequests, Page::Settings]);
-        assert_eq!(Page::Tool(1).index(2), 3);
-        assert_eq!(Page::Settings.index(0), 2);
-        assert_eq!(Page::Settings.index(2), 4);
+        assert_eq!(Page::all(0), vec![Page::Sessions, Page::Settings]);
+        assert_eq!(Page::Tool(1).index(2), 2);
+        assert_eq!(Page::Settings.index(0), 1);
+        assert_eq!(Page::Settings.index(2), 3);
     }
 
     #[test]
