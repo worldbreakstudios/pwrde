@@ -606,6 +606,11 @@ pub fn settings_index() -> Vec<SettingsEntry> {
     });
     out.push(SettingsEntry {
         section: Section::Appearance,
+        label: "Accent color",
+        keywords: "accent color colour tint highlight system blue purple pink red orange yellow green graphite",
+    });
+    out.push(SettingsEntry {
+        section: Section::Appearance,
         label: "Theme",
         keywords: "theme color scheme",
     });

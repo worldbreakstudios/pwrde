@@ -637,8 +637,12 @@ impl Theme {
         t.card_foreground = srgb(th.ink);
         t.popover = srgb(th.card);
         t.popover_foreground = srgb(th.ink);
-        t.primary = srgb(th.accent);
-        t.primary_foreground = if crate::theme::is_dark_color(th.accent) {
+        // `primary` is the user's accent (System → macOS's accent color), not
+        // the chrome theme's tint, so Approve / active segments match the
+        // sidebar's selected card.
+        let accent = crate::theme::accent_color();
+        t.primary = srgb(accent);
+        t.primary_foreground = if crate::theme::is_dark_color(accent) {
             srgb((0xff, 0xff, 0xff))
         } else {
             srgb((0x17, 0x17, 0x17))
@@ -694,13 +698,14 @@ mod pwrde_tests {
     fn from_chrome_maps_card_and_primary() {
         let midnight = Theme::from_chrome(&crate::theme::MIDNIGHT);
         assert_close(midnight.card, srgb(crate::theme::MIDNIGHT.card));
-        assert_close(midnight.primary, srgb(crate::theme::MIDNIGHT.accent));
+        // primary tracks the accent setting, not the chrome theme's tint.
+        assert_close(midnight.primary, srgb(crate::theme::accent_color()));
         assert_close(midnight.background, srgb(crate::theme::MIDNIGHT.gradient_to));
         assert_close(midnight.foreground, srgb(crate::theme::MIDNIGHT.ink));
 
         let arc = Theme::from_chrome(&crate::theme::ARC_LIGHT);
         assert_close(arc.card, srgb(crate::theme::ARC_LIGHT.card));
-        assert_close(arc.primary, srgb(crate::theme::ARC_LIGHT.accent));
+        assert_close(arc.primary, srgb(crate::theme::accent_color()));
         assert_close(arc.background, srgb(crate::theme::ARC_LIGHT.gradient_to));
         assert_close(arc.foreground, srgb(crate::theme::ARC_LIGHT.ink));
     }

@@ -774,9 +774,9 @@ impl App {
             .justify_center();
         let disc = match kind {
             CardAvatar::Draft => disc
-                .bg(gantry_accent(theme.dark))
+                .bg(accent())
                 .shadow(vec![BoxShadow {
-                    color: gantry_accent(theme.dark).opacity(0.35),
+                    color: accent().opacity(0.35),
                     offset: point(px(0.0), px(3.0)),
                     blur_radius: px(8.0),
                     spread_radius: px(0.0),
@@ -799,7 +799,7 @@ impl App {
             )),
         }
         // The active group's ring is the only chrome a bubble carries.
-        .when(active, |d| d.border_2().border_color(gantry_accent(theme.dark)))
+        .when(active, |d| d.border_2().border_color(accent()))
         .child(
             gpui::svg()
                 .path(avatar_icon(kind))
@@ -1152,7 +1152,7 @@ impl App {
             .w(px(rect.w))
             .h(px(rect.h))
             .rounded(px(10.0))
-            .when(selected, |d| d.bg(gantry_accent(theme.dark)))
+            .when(selected, |d| d.bg(accent()))
             .when(!selected && hovered, |d| {
                 d.bg(theme.muted.opacity(if theme.dark { 0.5 } else { 0.7 }))
             })
@@ -1311,7 +1311,7 @@ impl App {
 fn avatar(theme: &Theme, kind: CardAvatar, selected: bool) -> gpui::Div {
     let tint = match kind {
         CardAvatar::NoPr => pr_none_ink(theme.dark),
-        CardAvatar::Draft => gantry_accent(theme.dark),
+        CardAvatar::Draft => accent(),
         CardAvatar::Open => pr_open(theme.dark),
         CardAvatar::Merged => pr_merged(theme.dark),
     };
@@ -1377,15 +1377,12 @@ fn avatar_icon(kind: CardAvatar) -> &'static str {
 
 /// Git's PR green (`#1a7f37` in the mock), lightened for dark chrome the way
 /// GitHub's own dark palette does, so the stroke keeps its contrast.
-/// The GANTRY mock's own accent — vitrine's `--accent`, `oklch(0.60 0.19 258)`
-/// resolved to sRGB (and its dark-theme sibling).
-///
-/// The sidebar's selection fill is pinned to this rather than the chrome
-/// theme's accent: the panel is a port of a specific design, and the chrome
-/// accent (which the user retints freely) made the selected card read as a
-/// different, heavier blue than the mock's.
-fn gantry_accent(dark: bool) -> Hsla {
-    let (r, g, b) = crate::theme::gantry_accent(dark);
+/// The GANTRY mock's `--accent` as a gpui color — the user's accent setting
+/// (System follows macOS), resolved by `theme::accent_color`. Pinned to that
+/// rather than the chrome theme's own `accent`, which the user retints
+/// freely: the selected card has to agree with the focused pane's tab pill.
+fn accent() -> Hsla {
+    let (r, g, b) = crate::theme::accent_color();
     gpui::Rgba {
         r: r as f32 / 255.0,
         g: g as f32 / 255.0,

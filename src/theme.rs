@@ -8,6 +8,11 @@
 //! re-reads its `theme` reference each frame it paints. Terminal ANSI colors
 //! are themed separately in `term_theme`.
 //!
+//! The GANTRY accent (`"accent"` setting) is chosen the same way: System
+//! follows macOS's accent color (pushed in via [`set_system_accent`]), or a
+//! named preset overrides it — see the Accent section. It is independent of
+//! a chrome theme's own `accent` field.
+//!
 //! Beyond the built-in presets, a theme compresses to seven shareable tokens
 //! (comma-separated `#rrggbb` hex) that expand back into a full [`Theme`] —
 //! see the token section below. An imported token string lives under
@@ -144,17 +149,6 @@ fn find(name: &str) -> Option<&'static Theme> {
 
 /// The seven tokens in string order: gradient_from, gradient_to, card,
 /// term_bg, ink, text_bright, accent.
-/// The GANTRY mock's accent — vitrine's `--accent`, `oklch(0.60 0.19 258)`
-/// resolved to sRGB, and its dark-theme sibling.
-///
-/// Pinned rather than taken from the chrome theme's `accent`, which the user
-/// retints freely: the sidebar's selected card and the focused pane's tab are a
-/// port of a specific design, and they have to agree with each other. Shared
-/// from here so the sidebar and the renderer cannot drift apart.
-pub fn gantry_accent(dark: bool) -> (u8, u8, u8) {
-    if dark { (74, 145, 248) } else { (41, 124, 239) }
-}
-
 pub type Tokens = [(u8, u8, u8); 7];
 
 /// One `#rrggbb` (or bare `rrggbb`) hex color, case-insensitive.
@@ -269,6 +263,136 @@ pub fn custom(dark: bool) -> Option<&'static Theme> {
 /// The active theme as a shareable token string (Appearance-page export).
 pub fn export_current() -> String {
     serialize_tokens(&tokens_of(current()))
+}
+
+// ── Accent ─────────────────────────────────────────────────────────────
+//
+// The GANTRY mock's `--accent`: the sidebar's selected card and pinned
+// avatar, unread dots, the focused pane's tab pill, and rcn's `primary`
+// (Approve, the active segmented button). Distinct from a chrome theme's
+// own `accent` field, which stays a per-theme tint the renderer paints
+// canvas details with (link underlines, hint washes).
+//
+// Like appearance mode, it defaults to following macOS — System Settings →
+// Appearance → Accent color, read by main.rs from `NSColor.controlAccentColor`
+// into [`set_system_accent`] — and can be overridden with one of the mock's
+// eight named colors (the same set macOS offers).
+
+/// Accent choice (`"accent"` setting): follow the OS, or a fixed preset.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Accent {
+    System,
+    Blue,
+    Purple,
+    Pink,
+    Red,
+    Orange,
+    Yellow,
+    Green,
+    Graphite,
+}
+
+impl Accent {
+    /// Swatch order on the Appearance page: System first, then the mock's
+    /// palette in its own order.
+    pub const ALL: [Accent; 9] = [
+        Accent::System,
+        Accent::Blue,
+        Accent::Purple,
+        Accent::Pink,
+        Accent::Red,
+        Accent::Orange,
+        Accent::Yellow,
+        Accent::Green,
+        Accent::Graphite,
+    ];
+
+    /// Stable settings value (`"accent"`).
+    pub fn name(self) -> &'static str {
+        match self {
+            Accent::System => "system",
+            Accent::Blue => "blue",
+            Accent::Purple => "purple",
+            Accent::Pink => "pink",
+            Accent::Red => "red",
+            Accent::Orange => "orange",
+            Accent::Yellow => "yellow",
+            Accent::Green => "green",
+            Accent::Graphite => "graphite",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Accent::System => "System",
+            Accent::Blue => "Blue",
+            Accent::Purple => "Purple",
+            Accent::Pink => "Pink",
+            Accent::Red => "Red",
+            Accent::Orange => "Orange",
+            Accent::Yellow => "Yellow",
+            Accent::Green => "Green",
+            Accent::Graphite => "Graphite",
+        }
+    }
+
+    /// Unknown values fall back to System, like [`Mode::parse`].
+    pub fn parse(s: &str) -> Accent {
+        Accent::ALL
+            .into_iter()
+            .find(|a| a.name() == s)
+            .unwrap_or(Accent::System)
+    }
+
+    /// The preset's sRGB value — the mock's hex table verbatim. `None` for
+    /// System, which resolves from the OS at runtime.
+    pub fn rgb(self) -> Option<(u8, u8, u8)> {
+        Some(match self {
+            Accent::System => return None,
+            Accent::Blue => (0x0a, 0x84, 0xff),
+            Accent::Purple => (0xbf, 0x5a, 0xf2),
+            Accent::Pink => (0xff, 0x2d, 0x75),
+            Accent::Red => (0xff, 0x45, 0x3a),
+            Accent::Orange => (0xff, 0x9f, 0x0a),
+            Accent::Yellow => (0xff, 0xd6, 0x0a),
+            Accent::Green => (0x30, 0xd1, 0x58),
+            Accent::Graphite => (0x8e, 0x8e, 0x93),
+        })
+    }
+}
+
+/// The accent selected in settings (System when unset).
+pub fn accent_setting() -> Accent {
+    Accent::parse(&crate::settings::get_str("accent").unwrap_or_default())
+}
+
+/// The OS accent color, pushed in by main.rs (seeded at window open, refreshed
+/// when the window regains focus or its appearance changes — there is no
+/// AppKit observer wired for it). `None` until seeded, or off macOS.
+static SYSTEM_ACCENT: RwLock<Option<(u8, u8, u8)>> = RwLock::new(None);
+
+pub fn set_system_accent(rgb: Option<(u8, u8, u8)>) {
+    if let Ok(mut slot) = SYSTEM_ACCENT.write() {
+        *slot = rgb;
+    }
+}
+
+pub fn system_accent() -> Option<(u8, u8, u8)> {
+    SYSTEM_ACCENT.read().ok().and_then(|s| *s)
+}
+
+/// Pure accent resolution: a preset wins outright; System takes the OS color,
+/// falling back to the mock's default Blue when none has been read.
+pub fn resolve_accent(setting: Accent, system: Option<(u8, u8, u8)>) -> (u8, u8, u8) {
+    setting
+        .rgb()
+        .or(system)
+        .unwrap_or_else(|| Accent::Blue.rgb().expect("Blue is a preset"))
+}
+
+/// The accent in effect right now (setting + OS accent).
+pub fn accent_color() -> (u8, u8, u8) {
+    resolve_accent(accent_setting(), system_accent())
 }
 
 // ── Appearance mode ─────────────────────────────────────────────────────
@@ -414,6 +538,30 @@ mod tests {
         }
         assert_eq!(Mode::parse(""), Mode::System);
         assert_eq!(Mode::parse("purple"), Mode::System);
+    }
+
+    #[test]
+    fn accent_parse_round_trips_and_defaults_to_system() {
+        for a in Accent::ALL {
+            assert_eq!(Accent::parse(a.name()), a);
+        }
+        assert_eq!(Accent::parse(""), Accent::System);
+        assert_eq!(Accent::parse("magenta"), Accent::System);
+    }
+
+    #[test]
+    fn resolve_accent_prefers_preset_then_system_then_blue() {
+        let os = Some((1, 2, 3));
+        assert_eq!(resolve_accent(Accent::Purple, os), Accent::Purple.rgb().unwrap());
+        assert_eq!(resolve_accent(Accent::System, os), (1, 2, 3));
+        assert_eq!(resolve_accent(Accent::System, None), Accent::Blue.rgb().unwrap());
+    }
+
+    #[test]
+    fn every_preset_but_system_has_a_color() {
+        for a in Accent::ALL {
+            assert_eq!(a.rgb().is_none(), a == Accent::System, "{}", a.name());
+        }
     }
 
     #[test]

@@ -139,6 +139,10 @@ fn settings_group(theme: &Theme, rows: Vec<AnyElement>) -> gpui::Div {
     let mut boxed = div()
         .flex()
         .flex_col()
+        // Never shrink: `overflow_hidden` zeroes this box's automatic
+        // minimum size, so as a direct child of a scrolling column it would
+        // be squeezed to a sliver once the page overflows.
+        .flex_none()
         .rounded(theme.radius_lg())
         .bg(alpha(theme.foreground, 0.04))
         .border_1()
@@ -872,6 +876,60 @@ fn render_appearance(app: &App, theme: &Theme, entity: gpui::WeakEntity<App>) ->
             .into_any_element()
     };
 
+    // ── Accent swatches ────────────────────────────────────────────────
+    // macOS-style dot row: System (follows the OS accent) first, then the
+    // mock's eight presets. The selected dot wears an ink ring.
+    let accent_row = {
+        use crate::theme::Accent;
+        let current = crate::theme::accent_setting();
+        let system_rgb =
+            crate::theme::resolve_accent(Accent::System, crate::theme::system_accent());
+        let mut swatches = div().flex().flex_row().items_center().gap(px(6.));
+        for (ix, a) in Accent::ALL.into_iter().enumerate() {
+            let active = current == a;
+            let e = entity.clone();
+            let name = a.name();
+            let fill = color(a.rgb().unwrap_or(system_rgb), 1.0);
+            let ring = if active { theme.foreground } else { gpui::transparent_black() };
+            let mut dot = div().size_full().rounded_full().bg(fill);
+            if a == Accent::System {
+                // The follow-the-OS swatch: a hollow center so it reads as
+                // "auto" rather than as one more fixed color.
+                dot = dot.flex().items_center().justify_center().child(
+                    div().size(px(5.)).rounded_full().bg(gpui::white()),
+                );
+            }
+            swatches = swatches.child(
+                div()
+                    .id(("appearance-accent", ix))
+                    .size(px(22.))
+                    .p(px(2.))
+                    .rounded_full()
+                    .border_2()
+                    .border_color(ring)
+                    .cursor_pointer()
+                    .on_click(move |_ev: &ClickEvent, _win: &mut Window, gpui_app: &mut GpuiApp| {
+                        gpui_app.stop_propagation();
+                        if let Some(e) = e.upgrade() {
+                            e.update(gpui_app, move |_this, cx| {
+                                settings::set("accent", name.into());
+                                cx.notify();
+                            });
+                        }
+                    })
+                    .child(dot),
+            );
+        }
+        let desc: &'static str = match current {
+            Accent::System => "System — follows macOS",
+            other => other.label(),
+        };
+        settings_row()
+            .child(row_text(theme, "Accent", Some(desc)))
+            .child(swatches)
+            .into_any_element()
+    };
+
     // ── App theme selects ──────────────────────────────────────────────
     let theme_select = |which: AppearanceDropdown| -> AnyElement {
         let dark = which.dark();
@@ -1363,7 +1421,7 @@ fn render_appearance(app: &App, theme: &Theme, entity: gpui::WeakEntity<App>) ->
         .min_h(px(0.))
         .overflow_y_scroll()
         .gap_4()
-        .child(settings_group(theme, vec![mode_seg, preview_seg]))
+        .child(settings_group(theme, vec![mode_seg, accent_row, preview_seg]))
         .child(
             div()
                 .flex()

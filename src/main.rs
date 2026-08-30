@@ -6438,6 +6438,36 @@ fn parse_open_dir(url: &str) -> Option<std::path::PathBuf> {
     path.is_dir().then_some(path)
 }
 
+/// macOS's accent color (System Settings → Appearance → Accent color) as sRGB:
+/// `NSColor.controlAccentColor`, converted through the sRGB color space so the
+/// catalog color resolves under the current appearance. `None` if AppKit
+/// hands back nothing (or off macOS).
+#[cfg(target_os = "macos")]
+fn read_system_accent() -> Option<(u8, u8, u8)> {
+    use objc::runtime::Object;
+    use objc::{class, msg_send, sel, sel_impl};
+    unsafe {
+        let color: *mut Object = msg_send![class!(NSColor), controlAccentColor];
+        if color.is_null() {
+            return None;
+        }
+        let space: *mut Object = msg_send![class!(NSColorSpace), sRGBColorSpace];
+        let color: *mut Object = msg_send![color, colorUsingColorSpace: space];
+        if color.is_null() {
+            return None;
+        }
+        let (mut r, mut g, mut b, mut a): (f64, f64, f64, f64) = (0.0, 0.0, 0.0, 0.0);
+        let _: () = msg_send![color, getRed: &mut r as *mut f64 green: &mut g as *mut f64 blue: &mut b as *mut f64 alpha: &mut a as *mut f64];
+        let ch = |x: f64| (x.clamp(0.0, 1.0) * 255.0).round() as u8;
+        Some((ch(r), ch(g), ch(b)))
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn read_system_accent() -> Option<(u8, u8, u8)> {
+    None
+}
+
 fn main() {
     // Settings must be in memory before anything reads a binding or theme.
     settings::init();
@@ -6846,6 +6876,8 @@ fn main() {
                         let entity = entity.clone();
                         move |window, cx| {
                             theme::set_system_dark(is_dark(window.appearance()));
+                            // AppKit tunes the accent per polarity too.
+                            theme::set_system_accent(read_system_accent());
                             entity.update(cx, |app, cx| {
                                 app.request_redraw();
                                 cx.notify();
@@ -6853,6 +6885,21 @@ fn main() {
                         }
                     })
                     .detach();
+                // Follow the macOS accent color for the "System" accent
+                // setting: seed now, then re-read whenever the window regains
+                // focus — the user changed it in System Settings and came
+                // back. No AppKit notification is wired for it.
+                theme::set_system_accent(read_system_accent());
+                entity.update(cx, |_, cx| {
+                    cx.observe_window_activation(window, |app, window, cx| {
+                        if window.is_window_active() {
+                            theme::set_system_accent(read_system_accent());
+                            app.request_redraw();
+                            cx.notify();
+                        }
+                    })
+                    .detach();
+                });
 
                 // Establish keyboard focus so key events reach the terminal.
                 let handle = entity.read(cx).focus_handle.clone();
