@@ -58,7 +58,7 @@ pub fn is_dark_color((r, g, b): (u8, u8, u8)) -> bool {
 }
 
 /// Per-channel linear blend, `frac` of the way from `a` to `b`.
-fn mix(a: (u8, u8, u8), b: (u8, u8, u8), frac: f32) -> (u8, u8, u8) {
+pub(crate) fn mix(a: (u8, u8, u8), b: (u8, u8, u8), frac: f32) -> (u8, u8, u8) {
     let ch = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * frac).round() as u8;
     (ch(a.0, b.0), ch(a.1, b.1), ch(a.2, b.2))
 }
