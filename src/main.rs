@@ -334,6 +334,9 @@ struct App {
     /// Whether the sidebar is collapsed (⌘S toggle). Session-only, like the
     /// width; layout treats the effective width 0 as the collapsed state.
     sidebar_collapsed: bool,
+    /// The sidebar state the native traffic lights were last positioned for
+    /// (`workspace::traffic_light_origin`); `render` re-syncs on change.
+    traffic_lights_for_collapsed: Option<bool>,
     modifiers: Modifiers,
     title: String,
     cursor: (f64, f64),
@@ -5206,6 +5209,13 @@ fn key_to_bytes(ks: &Keystroke) -> Option<Vec<u8>> {
 
 impl Render for App {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Native traffic lights follow the sidebar: inside the panel while it
+        // is open, back over the first tile's tab strip when it collapses.
+        if self.traffic_lights_for_collapsed != Some(self.sidebar_collapsed) {
+            let (x, y) = workspace::traffic_light_origin(self.sidebar_collapsed);
+            window.set_traffic_light_position(gpui::point(px(x), px(y)));
+            self.traffic_lights_for_collapsed = Some(self.sidebar_collapsed);
+        }
         // Settings search field: focus lives in the window, so reflect it
         // into the flag the sidebar styles from, and drop it (and any stale
         // query) the moment the field is off screen — leaving Settings must
@@ -6535,7 +6545,8 @@ fn main() {
                 titlebar: Some(gpui::TitlebarOptions {
                     title: None,
                     appears_transparent: true,
-                    // Inside the sidebar panel, not on the window gutter.
+                    // Inside the sidebar panel, not on the window gutter;
+                    // `App::render` moves them when the sidebar collapses.
                     traffic_light_position: Some(gpui::point(
                         px(workspace::TRAFFIC_LIGHT_ORIGIN),
                         px(workspace::TRAFFIC_LIGHT_ORIGIN),
@@ -6596,6 +6607,7 @@ fn main() {
                         next_tile_id: 0,
                         sidebar_expanded_w: workspace::SIDEBAR_DEFAULT_W,
                         sidebar_collapsed: false,
+                        traffic_lights_for_collapsed: None,
                         modifiers: Modifiers::default(),
                         mouse_report: None,
                         title: String::new(),
