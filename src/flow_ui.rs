@@ -368,8 +368,11 @@ impl App {
                 .flex()
                 .flex_col()
                 .gap(sp(8.0))
+                // The scroll container clips to its bounds, so the padding
+                // has to be wider than the card shadows (blur 28, y 8) or
+                // they end in a hard edge at the top and bottom.
                 .px(sp(40.0))
-                .py(sp(6.0));
+                .py(sp(26.0));
             for i in order {
                 let chat = &self.flow.chats[i];
                 let id = chat.id;
