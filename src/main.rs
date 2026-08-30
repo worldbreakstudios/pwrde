@@ -769,10 +769,24 @@ impl App {
         Tile::new(id, session)
     }
 
+    /// Bottom safe area (logical px) reserved for the Flow pill bar so
+    /// terminal rows reflow above it instead of hiding beneath it. Zero
+    /// while the `features.flow` flag is off; tracks the app font scale.
+    fn flow_inset(&self) -> f32 {
+        if crate::flow::enabled() { flow_ui::safe_area_h() } else { 0.0 }
+    }
+
     /// Physical-pixel terminal area (excludes the sidebar).
     fn area(&self) -> workspace::LayoutRect {
         let (w, h) = self.renderer.surface_size();
-        workspace::terminal_area(w, h, self.scale(), self.sidebar_w(), self.right_w())
+        workspace::terminal_area(
+            w,
+            h,
+            self.scale(),
+            self.sidebar_w(),
+            self.right_w(),
+            self.flow_inset(),
+        )
     }
 
     /// The screen-space rect of a tile in the active workspace, if present.
@@ -808,6 +822,7 @@ impl App {
             scale,
             self.sidebar_w(),
             self.right_w_for(Page::Sessions),
+            self.flow_inset(),
         );
         let ws = &mut self.workspaces[self.active];
         let (tiles, _) = workspace::layout_tiles(&ws.root, area, scale);
@@ -868,7 +883,7 @@ impl App {
     /// have no tool panel, so no right inset).
     fn tool_area(&self) -> workspace::LayoutRect {
         let (w, h) = self.renderer.surface_size();
-        workspace::terminal_area(w, h, self.scale(), self.sidebar_w(), 0.0)
+        workspace::terminal_area(w, h, self.scale(), self.sidebar_w(), 0.0, self.flow_inset())
     }
 
     fn active_tool_session(&self) -> Option<&ToolSession> {
@@ -5528,6 +5543,7 @@ impl App {
             open_tool: self.open_tool,
             tool_panel_w: self.tool_panel_w,
             tool_panel_floating: self.tool_panel_floating,
+            flow_inset: self.flow_inset(),
             // Overlay scoping happens in the renderer (only overlay elements
             // hover while one is up). Here we suppress hover mid-drag, and
             // for the chrome under an open flyover panel — clicks inside the

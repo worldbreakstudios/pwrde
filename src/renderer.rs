@@ -175,6 +175,9 @@ pub struct ChromeState<'a> {
     pub tool_panel_w: f32,
     /// Whether the tool panel floats over the tiles (vs. docking the edge).
     pub tool_panel_floating: bool,
+    /// Bottom safe area (logical px) reserved for the Flow pill bar; 0 while
+    /// the `features.flow` flag is off. See `flow_ui::safe_area_h`.
+    pub flow_inset: f32,
     /// Physical-pixel cursor position for hover painting. `None` while any
     /// drag is active so hover highlights are suppressed mid-drag.
     pub cursor: Option<(f32, f32)>,
@@ -492,7 +495,8 @@ impl Renderer {
         } else {
             workspace::RIBBON_W + panel_w
         };
-        let area = workspace::terminal_area(width, height, self.scale, sidebar_w, right_w);
+        let area =
+            workspace::terminal_area(width, height, self.scale, sidebar_w, right_w, chrome.flow_inset);
         let empty = workspaces.len() == 1 && workspaces[0].is_empty();
         // Dividers aren't painted (the gap between cards shows the gradient);
         // they remain drag handles for hit-testing in `main.rs`. The empty
@@ -1435,6 +1439,7 @@ mod tests {
             open_tool: None,
             tool_panel_w: 0.0,
         tool_panel_floating: false,
+            flow_inset: 0.0,
             cursor: None,
             element_modal: false,
         }
@@ -1521,6 +1526,7 @@ mod tests {
             scale,
             240.0,
             crate::workspace::RIBBON_W + crate::workspace::TOOL_PANEL_DEFAULT_W,
+            0.0,
         );
         assert!(
             frame.bg_quads.iter().any(|q| q.x == area.x && q.w == area.w),
@@ -1544,7 +1550,7 @@ mod tests {
             !frame.bg_quads.iter().any(|q| q.w == d && q.radius == d / 2.0 && q.border > 0.0),
             "no ribbon icons without registered tools"
         );
-        let full = crate::workspace::terminal_area(1600, 1000, scale, 240.0, 0.0);
+        let full = crate::workspace::terminal_area(1600, 1000, scale, 240.0, 0.0, 0.0);
         assert!(
             frame.bg_quads.iter().any(|q| q.x == full.x && q.w == full.w),
             "tile card reclaims the ribbon's width"
