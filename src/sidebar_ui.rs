@@ -152,8 +152,8 @@ impl App {
     /// Rendered as a sibling of the terminal canvas, so it paints above it
     /// while the canvas keeps owning input. The shell is *universal* — every
     /// page gets the same inlaid panel and header, and only the row
-    /// layer differs (preview cards on Sessions and Pull Requests, one-line
-    /// rows everywhere else). Returns an empty element only when the sidebar
+    /// layer differs (preview cards on Sessions, one-line rows everywhere
+    /// else). Returns an empty element only when the sidebar
     /// is collapsed to zero width.
     pub fn render_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
         cx.set_global(Theme::from_chrome(crate::theme::current()));
@@ -264,13 +264,9 @@ impl App {
     /// here, not on the canvas mouse path), positioned at
     /// [`crate::workspace::empty_state_cta`] / [`empty_state_hint`] so it
     /// lands exactly where the canvas used to paint it. Returns an empty
-    /// element off the Sessions / Pull Requests pages, or once the workspace
-    /// has a tile.
+    /// element off the Sessions page, or once the workspace has a tile.
     pub fn render_empty_state(&self, cx: &mut Context<Self>) -> AnyElement {
-        // Sessions and Pull Requests share the card sidebar, so both pages
-        // carried the canvas CTA (on Pull Requests it sits under that page's
-        // own content card, exactly as before).
-        if !matches!(self.page, crate::Page::Sessions | crate::Page::PullRequests)
+        if self.page != crate::Page::Sessions
             || !self.is_empty_state()
         {
             return div().into_any_element();
@@ -588,8 +584,8 @@ impl App {
     /// The row layer for whichever page is showing.
     ///
     /// Every page draws its rows into the same absolutely positioned layer
-    /// over the panel, but they do not share a row *vocabulary*: Sessions and
-    /// Pull Requests get card-height preview rows laid out by
+    /// over the panel, but they do not share a row *vocabulary*: Sessions
+    /// gets card-height preview rows laid out by
     /// [`crate::workspace::sidebar_row_rect`], while Settings
     /// gets one-line rows at [`crate::workspace::tab_rect`] — the very
     /// rects `main.rs` already hit-tests for those pages. The split is
@@ -700,7 +696,7 @@ impl App {
     }
 
 
-    /// The Sessions and Pull Requests rows: section headers and preview cards.
+    /// The Sessions rows: section headers and preview cards.
     /// Every row is absolutely positioned at exactly the rect
     /// [`crate::workspace::sidebar_row_rect`] hands the mouse path, so a click
     /// that looks like it landed on a row *is* that row as far as hit-testing

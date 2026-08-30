@@ -166,7 +166,7 @@ pub fn command_specs() -> Vec<CommandSpec> {
         CommandSpec {
             name: "go_to_page",
             args: "<page>",
-            help: "Navigate to a page (sessions, pull_requests, settings, tool:<n> or a tool's name)",
+            help: "Navigate to a page (sessions, settings, tool:<n> or a tool's name)",
             read_only: false,
         },
         CommandSpec {

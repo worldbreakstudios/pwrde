@@ -559,13 +559,6 @@ fn fetch_list(dir: &Path, args: &[&str]) -> Result<Vec<PrSummary>, String> {
     parse_summaries(&run_within(cmd, crate::git::TIMEOUT_LIST)?)
 }
 
-/// List all open PRs for the repo containing `dir` (repo resolved from the git
-/// remote by the CLI). Newest first, capped so the list stays snappy. Used by
-/// the holistic Pull Requests page.
-pub fn pr_list(dir: &Path) -> Result<Vec<PrSummary>, String> {
-    fetch_list(dir, &["pr", "list", "--state", "open", "--limit", "50", "--json", LIST_FIELDS])
-}
-
 /// List the PR(s) whose head is `branch` (any state), for the branch-scoped PR
 /// tool. Usually one; capped small.
 pub fn pr_list_for_branch(dir: &Path, branch: &str) -> Result<Vec<PrSummary>, String> {

@@ -46,10 +46,9 @@ pub enum TermEvent {
     OpenDir { cwd: std::path::PathBuf },
     /// `drop` failed; show `message` in the picker overlay.
     GroupFailed { message: String },
-    /// A PR list finished loading (or failed). `all` distinguishes the
-    /// holistic Pull Requests page (all open PRs) from the branch-scoped PR
-    /// tool (`--head <current branch>`).
-    PrListLoaded { all: bool, result: Result<Vec<crate::gh::PrSummary>, String> },
+    /// The branch-scoped PR list (`--head <current branch>`) finished loading
+    /// (or failed).
+    PrListLoaded { result: Result<Vec<crate::gh::PrSummary>, String> },
     /// A PR's detail finished loading, tagged with the PR number so a stale
     /// result for a PR the user already navigated away from can be dropped.
     PrDetailLoaded { number: u32, result: Result<crate::gh::PrDetail, String> },
