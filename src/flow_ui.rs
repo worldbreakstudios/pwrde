@@ -1,6 +1,6 @@
 //! Flow agent surface: the bottom-centered pill bar and the chat panel that
-//! expands above it, as a gpui element tree over the Sessions tiles (same
-//! overlay pattern as `local_diff_ui`). This module owns only presentation
+//! expands above it, as a gpui element tree mounted on every page — Flow
+//! follows the user around the app (same overlay pattern as `local_diff_ui`). This module owns only presentation
 //! and the app-side glue (`toggle_flow`, `flow_send`, composer lifecycle);
 //! the transcript it renders is `flow::FlowState`, reduced from backend
 //! events on the main thread, and the agent itself sits behind
@@ -19,7 +19,7 @@ use gpui::{
 use gpui_component::input::{InputEvent, Textarea, TextareaState};
 
 use crate::flow::{ActionStatus, FlowMsg};
-use crate::pages::{Action, Page};
+use crate::pages::Action;
 use crate::ui::theme::Theme;
 use crate::App;
 
@@ -51,11 +51,11 @@ impl App {
             .is_some_and(|c| c.editor.read(cx).focus_handle(cx).is_focused(window))
     }
 
-    /// `Action::ToggleFlow`: expand/collapse the panel. Returns whether it
-    /// applied — false when the flag is off or off the Sessions page, so the
-    /// bus reports a no-op rather than a silent success.
+    /// `Action::ToggleFlow`: expand/collapse the panel (any page). Returns
+    /// whether it applied — false when the flag is off, so the bus reports a
+    /// no-op rather than a silent success.
     pub(crate) fn toggle_flow(&mut self) -> bool {
-        if !crate::flow::enabled() || self.page != Page::Sessions {
+        if !crate::flow::enabled() {
             return false;
         }
         self.flow.open = !self.flow.open;
@@ -176,8 +176,8 @@ impl App {
         cx.notify();
     }
 
-    /// The pill bar (always, while the flag is on and Sessions is showing)
-    /// plus the chat panel above it while `flow.open`.
+    /// The pill bar (always, while the flag is on, on every page) plus the
+    /// chat panel above it while `flow.open`.
     pub fn render_flow(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         self.ensure_flow_composer(window, cx);
         cx.set_global(Theme::from_chrome(crate::theme::current()));

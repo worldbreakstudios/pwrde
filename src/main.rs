@@ -3922,6 +3922,20 @@ impl App {
             return;
         }
 
+        // A focused Flow composer owns the keyboard on every page (ahead of the
+        // Settings/tool-page handlers, since Flow follows the user): the Textarea
+        // edits itself and submits on ↩ (see `flow_ui`); ⎋ collapses the
+        // panel and hands focus back; ⌘ chords still resolve so ⌘J closes.
+        if self.flow_editor_focused(window, cx) {
+            if ev.keystroke.modifiers.platform {
+                self.handle_shortcut(ev);
+            } else if ev.keystroke.key == "escape" {
+                self.flow.open = false;
+                window.focus(&self.focus_handle, cx);
+            }
+            self.request_redraw();
+            return;
+        }
         // Sidebar section rename captures typing; shortcuts stay muted.
         if self.editing_section.is_some() {
             self.handle_section_key(ev);
@@ -3948,19 +3962,6 @@ impl App {
         // entity (and its own key bindings) handles editing, so keys don't
         // reach the shell or ⌘ shortcuts. Escape discards the composer and
         // hands focus back.
-        // A focused Flow composer likewise owns the keyboard: the Textarea
-        // edits itself and submits on ↩ (see `flow_ui`); ⎋ collapses the
-        // panel and hands focus back; ⌘ chords still resolve so ⌘J closes.
-        if self.flow_editor_focused(window, cx) {
-            if ev.keystroke.modifiers.platform {
-                self.handle_shortcut(ev);
-            } else if ev.keystroke.key == "escape" {
-                self.flow.open = false;
-                window.focus(&self.focus_handle, cx);
-            }
-            self.request_redraw();
-            return;
-        }
         if self.pr_editor_focused(window, cx) {
             if ev.keystroke.key == "escape" {
                 self.pr_close_composer();
@@ -5411,9 +5412,9 @@ impl Render for App {
                 |el| el.child(self.render_launch(cx)),
             )
             // Flow agent (experimental, `features.flow`): bottom-centered pill
-            // bar + chat panel over the tiles (`flow_ui`).
+            // bar + chat panel, on every page so it follows the user (`flow_ui`).
             .when(
-                self.page == Page::Sessions && crate::flow::enabled() && !self.modal_overlay_open(),
+                crate::flow::enabled() && !self.modal_overlay_open(),
                 |el| el.child(self.render_flow(window, cx)),
             )
             // Resize handles (sidebar edge, dividers, tool panel edge, flyover
