@@ -58,6 +58,17 @@ pub enum Command {
         #[serde(default)]
         clipboard: bool,
     },
+    ReadPane {
+        session: u64,
+        #[serde(default)]
+        lines: Option<usize>,
+        #[serde(default)]
+        all: bool,
+    },
+    ReadPanes {
+        #[serde(default)]
+        query: Option<String>,
+    },
     State,
     ListCommands,
     Ping,
@@ -102,6 +113,9 @@ pub struct CommandSpec {
     pub name: &'static str,
     pub args: &'static str,
     pub help: &'static str,
+    /// True when the command only reads state and never moves focus, the
+    /// page, or a pane's scroll position (safe for agents to call freely).
+    pub read_only: bool,
 }
 
 /// Specs for every [`Command`] variant, in a stable display order.
@@ -111,66 +125,91 @@ pub fn command_specs() -> Vec<CommandSpec> {
             name: "action",
             args: "<name>",
             help: "Invoke a named pages::Action (e.g. split_right)",
+            read_only: false,
         },
         CommandSpec {
             name: "new_session",
             args: "<cwd> [--base <ref>] [--layout <name>]",
             help: "Open a new session at the given working directory",
+            read_only: false,
         },
         CommandSpec {
             name: "send_text",
             args: "<text> [--group <name>]",
             help: "Send raw keystrokes to the focused (or named) group's pane (--enter appends \\r)",
+            read_only: false,
         },
         CommandSpec {
             name: "key",
             args: "<chord>...",
             help: "Press keystrokes through the app's key handler (gpui chord syntax: cmd-p, escape, cmd-shift-t, ctrl-c)",
+            read_only: false,
         },
         CommandSpec {
             name: "focus_group",
             args: "<group>",
             help: "Focus a session group by name",
+            read_only: false,
         },
         CommandSpec {
             name: "new_section",
             args: "<name>",
             help: "Create a new sidebar section/folder",
+            read_only: false,
         },
         CommandSpec {
             name: "move_group_to_section",
             args: "<group> <section>",
             help: "Move a group into a section",
+            read_only: false,
         },
         CommandSpec {
             name: "go_to_page",
             args: "<page>",
             help: "Navigate to a page (sessions, pull_requests, settings, tool:<n> or a tool's name)",
+            read_only: false,
         },
         CommandSpec {
             name: "resize_window",
             args: "<width> <height>",
             help: "Resize the pwrde window",
+            read_only: false,
         },
         CommandSpec {
             name: "screenshot",
             args: "[path] [--clipboard]",
             help: "Capture the window to a PNG file (default: a temp path) or, with --clipboard, the pasteboard",
+            read_only: false,
+        },
+        CommandSpec {
+            name: "read_pane",
+            args: "<session> [--lines N|--all]",
+            help: "Read a pane's text and metadata by session id (read-only; never changes focus or scroll)",
+            read_only: true,
+        },
+        CommandSpec {
+            name: "read_panes",
+            args: "[query]",
+            help: "List every pane (session id, group, title, foreground) across all groups, optionally filtered by a substring (read-only)",
+            read_only: true,
         },
         CommandSpec {
             name: "state",
             args: "",
             help: "Dump current app state as JSON",
+            read_only: true,
         },
         CommandSpec {
             name: "list_commands",
             args: "",
             help: "List available bus commands",
+            read_only: true,
         },
         CommandSpec {
             name: "ping",
             args: "",
             help: "Liveness check",
+            read_only: true,
         },
     ]
 }
@@ -378,6 +417,8 @@ fn command_tag(cmd: &Command) -> &'static str {
         Command::GoToPage { .. } => "go_to_page",
         Command::ResizeWindow { .. } => "resize_window",
         Command::Screenshot { .. } => "screenshot",
+        Command::ReadPane { .. } => "read_pane",
+        Command::ReadPanes { .. } => "read_panes",
         Command::State => "state",
         Command::ListCommands => "list_commands",
         Command::Ping => "ping",
@@ -442,6 +483,20 @@ mod tests {
                 path: None,
                 clipboard: false,
             },
+            Command::ReadPane {
+                session: 7,
+                lines: Some(2),
+                all: false,
+            },
+            Command::ReadPane {
+                session: 9,
+                lines: None,
+                all: true,
+            },
+            Command::ReadPanes { query: None },
+            Command::ReadPanes {
+                query: Some("zsh".into()),
+            },
             Command::State,
             Command::ListCommands,
             Command::Ping,
@@ -480,6 +535,34 @@ mod tests {
                 base: None,
                 layout: None,
             }
+        );
+    }
+
+    #[test]
+    fn read_pane_omitted_optionals_default() {
+        let cmd = decode_command(r#"{"cmd":"read_pane","session":42}"#).unwrap();
+        assert_eq!(
+            cmd,
+            Command::ReadPane {
+                session: 42,
+                lines: None,
+                all: false,
+            }
+        );
+    }
+
+    /// Only inspection commands are marked read-only; everything that could
+    /// move focus, send keys, or resize the window must stay `false`.
+    #[test]
+    fn read_only_flag_marks_only_inspection_commands() {
+        let read_only: Vec<&str> = command_specs()
+            .into_iter()
+            .filter(|s| s.read_only)
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(
+            read_only,
+            vec!["read_pane", "read_panes", "state", "list_commands", "ping"]
         );
     }
 
@@ -530,6 +613,12 @@ mod tests {
                 path: None,
                 clipboard: false,
             },
+            Command::ReadPane {
+                session: 1,
+                lines: None,
+                all: false,
+            },
+            Command::ReadPanes { query: None },
             Command::State,
             Command::ListCommands,
             Command::Ping,

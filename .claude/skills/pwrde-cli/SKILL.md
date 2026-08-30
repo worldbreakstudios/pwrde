@@ -45,6 +45,8 @@ When finished: `pkill -f target/debug/pwrde`.
 
 ```sh
 pwrde-cli state                                  # JSON: page, groups → tiles → tabs (title/active/unread/cols/rows), sections, palette open, status message
+pwrde-cli read panes [query]                     # read-only: one line per pane in every group (session id, group, title, foreground; focused *), filtered by substring; --json for rows
+pwrde-cli read pane <id> [--lines N|--all] [--json]   # read-only: a pane's text (screen, or scrollback tail/all) by session id; --json adds title/size/cursor/group/foreground. Never moves focus/scroll
 pwrde-cli commands                               # every bus command + every rebindable Action with its current key binding
 pwrde-cli new-session ~/src/pwrde                # open a group at a dir; --layout <profile> applies a .pwrspace profile; --base <ref|default> forks a worktree via drop
 pwrde-cli send-text 'cargo test' --enter         # raw keystrokes into the focused pane; --enter appends \r; --group <name|index>; text `-` reads stdin

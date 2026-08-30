@@ -45,7 +45,7 @@ impl App {
             Command::ListCommands => {
                 let specs: Vec<Value> = bus::command_specs()
                     .iter()
-                    .map(|s| json!({ "name": s.name, "args": s.args, "help": s.help }))
+                    .map(|s| json!({ "name": s.name, "args": s.args, "help": s.help, "read_only": s.read_only }))
                     .collect();
                 let actions: Vec<Value> = Action::ALL
                     .iter()
@@ -190,6 +190,8 @@ impl App {
                     Err(e) => Reply::err(e),
                 }
             }
+            Command::ReadPane { session, lines, all } => self.bus_read_pane(session, lines, all),
+            Command::ReadPanes { query } => Reply::success(self.bus_read_panes(query.as_deref())),
             Command::Key { keys } => {
                 let mut parsed = Vec::with_capacity(keys.len());
                 for chord in &keys {
@@ -421,6 +423,149 @@ impl App {
             "message": self.message.as_ref().map(|(m, _)| m.clone()),
         })
     }
+
+    /// Where a session lives in the workspace tree: `(group index, tile id,
+    /// is the active tab of its tile)`. Flyover and CLI-tool sessions are not
+    /// part of any group and return `None`. Read-only; backs the `read_pane`
+    /// reply and never touches focus or scroll.
+    fn locate_session(&self, id: u64) -> Option<(usize, u64, bool)> {
+        self.workspaces.iter().enumerate().find_map(|(i, w)| {
+            w.root
+                .tiles()
+                .into_iter()
+                .find_map(|t| {
+                    let idx = t.tabs.iter().position(|tab| tab.session.id == id)?;
+                    Some((i, t.id, idx == t.active))
+                })
+        })
+    }
+
+    /// Read-only pane discovery for `read_panes`: one flat row per tab in
+    /// every group (the `state` tree flattened), so an agent can find the
+    /// session id to hand to `read_pane`. `query` keeps only panes whose
+    /// title, group name, cwd, or foreground command contains it
+    /// (case-insensitive). Never touches focus or scroll.
+    fn bus_read_panes(&self, query: Option<&str>) -> Value {
+        let mut rows = Vec::new();
+        if self.is_empty_state() {
+            return json!(rows);
+        }
+        // One `ps` sweep for every pane (a pair per pane would be slow with
+        // many tabs), exactly like the title poll.
+        let specs: Vec<(u64, Option<String>, Option<u32>)> = self
+            .workspaces
+            .iter()
+            .flat_map(|w| w.root.tiles())
+            .flat_map(|t| t.tabs.iter())
+            .map(|tab| foreground_spec(&tab.session))
+            .collect();
+        let foregrounds: std::collections::HashMap<u64, String> =
+            crate::term::foreground_titles(&specs).into_iter().collect();
+        for (gi, w) in self.workspaces.iter().enumerate() {
+            let cwd = w.cwd.as_ref().map(|p| p.to_string_lossy().into_owned());
+            for t in w.root.tiles() {
+                for (ti, tab) in t.tabs.iter().enumerate() {
+                    let title = tab.session.title();
+                    let foreground = foregrounds.get(&tab.session.id).map(String::as_str);
+                    if !pane_matches(query, &title, &w.name, cwd.as_deref(), foreground) {
+                        continue;
+                    }
+                    let active = ti == t.active;
+                    rows.push(json!({
+                        "session": tab.session.id,
+                        "title": title,
+                        "group": { "index": gi, "name": w.name, "cwd": cwd },
+                        "tile": t.id,
+                        "active": active,
+                        "focused": gi == self.active && w.focused_tile == t.id && active,
+                        "unread": tab.unread,
+                        "cols": tab.cols,
+                        "rows": tab.rows,
+                        "foreground": foreground,
+                    }));
+                }
+            }
+        }
+        json!(rows)
+    }
+
+    /// Read-only pane inspection for `read_pane`: dump a session's text and
+    /// metadata without touching focus, the active page, or its scroll
+    /// position. `all` reads the whole scrollback; `lines` keeps the last n;
+    /// otherwise only the visible screen height is returned.
+    fn bus_read_pane(&self, id: u64, lines: Option<usize>, all: bool) -> Reply {
+        let Some(session) = self.find_session(id) else {
+            return Reply::err(format!("no session with id {id}"));
+        };
+        let (cols, rows, scrollback_rows, (cur_col, cur_row), alt_screen) = session.read_info();
+        let tail = if all {
+            None
+        } else {
+            Some(lines.unwrap_or(rows))
+        };
+        let foreground = crate::term::foreground_titles(&[foreground_spec(session)])
+            .pop()
+            .map(|(_, name)| name);
+        let location = self.locate_session(id);
+        let (group, tile, focused) = match &location {
+            Some((gi, tile_id, active_tab)) => {
+                let w = &self.workspaces[*gi];
+                let tile_json = json!({
+                    "index": gi,
+                    "name": w.name,
+                    "cwd": w.cwd.as_ref().map(|p| p.to_string_lossy().into_owned()),
+                });
+                (
+                    Some(tile_json),
+                    Some(*tile_id),
+                    *active_tab && w.focused_tile == *tile_id && *gi == self.active,
+                )
+            }
+            None => (None, None, false),
+        };
+        Reply::success(json!({
+            "session": id,
+            "title": session.title(),
+            "cols": cols,
+            "rows": rows,
+            "cursor": { "col": cur_col, "row": cur_row },
+            "alt_screen": alt_screen,
+            "scrollback_rows": scrollback_rows,
+            "group": group,
+            "tile": tile,
+            "active": location.as_ref().is_some_and(|(_, _, active)| *active),
+            "focused": focused,
+            "foreground": foreground,
+            "lines": session.read_lines(tail),
+        }))
+    }
+}
+
+/// A session's row for [`crate::term::foreground_titles`], the same resolver
+/// the tab-title poll uses, so `read pane`/`read panes` name a pane's
+/// foreground process exactly as the sidebar would.
+fn foreground_spec(session: &crate::term::Session) -> (u64, Option<String>, Option<u32>) {
+    (session.id, session.shpool_session.clone(), session.child_pid)
+}
+
+/// Whether a pane matches a `read_panes` query: no query keeps everything;
+/// otherwise the query must appear (case-insensitively) in the title, the
+/// group name, the group cwd, or the foreground command.
+pub(crate) fn pane_matches(
+    query: Option<&str>,
+    title: &str,
+    group_name: &str,
+    cwd: Option<&str>,
+    foreground: Option<&str>,
+) -> bool {
+    let Some(q) = query.map(str::trim).filter(|q| !q.is_empty()) else {
+        return true;
+    };
+    let q = q.to_lowercase();
+    [Some(title), Some(group_name), cwd, foreground]
+        .into_iter()
+        .flatten()
+        .any(|hay| hay.to_lowercase().contains(&q))
 }
 
 /// Refusal reason while the experimental flag is off.
@@ -807,6 +952,20 @@ mod tests {
         assert_eq!(resolve_page("nope", &tools), None);
         assert_eq!(page_from_name("Pull-Requests"), Some(Page::PullRequests));
         assert_eq!(page_from_name("nope"), None);
+    }
+
+    #[test]
+    fn pane_query_matches_any_field_case_insensitively() {
+        let m = |q: Option<&str>| pane_matches(q, "vim main.rs", "pwrde", Some("/Users/me/src/pwrde"), Some("nvim"));
+        assert!(m(None));
+        assert!(m(Some("")));
+        assert!(m(Some("  ")));
+        assert!(m(Some("MAIN.RS")));
+        assert!(m(Some("PWRDE")));
+        assert!(m(Some("/src/")));
+        assert!(m(Some("nvim")));
+        assert!(!m(Some("zsh")));
+        assert!(!pane_matches(Some("src"), "sh", "g", None, None));
     }
 
     #[test]

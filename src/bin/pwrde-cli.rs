@@ -7,6 +7,7 @@
 mod bus;
 
 use bus::{Command, Reply};
+use serde_json::Value;
 use std::env;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -86,12 +87,21 @@ fn run(args: &[String]) -> Result<(), CliError> {
 
     let sub = rest[0].as_str();
     let sub_args = &rest[1..];
-    let cmd = parse_command(sub, sub_args)?;
+    if sub == "read" && sub_args.is_empty() {
+        print!("{}", read_usage());
+        return Ok(());
+    }
+    // `--json` on a read-only command asks for the full reply object instead
+    // of the plain-text rendering agents pipe by default.
+    let json = sub == "read" && sub_args.iter().any(|a| a == "--json");
+    let sub_args: Vec<String> =
+        sub_args.iter().filter(|a| !(json && *a == "--json")).cloned().collect();
+    let cmd = parse_command(sub, &sub_args)?;
 
     let path = socket.unwrap_or_else(bus::default_socket_path);
     let timeout = Duration::from_secs(timeout_secs);
     let reply = bus::request(&path, &cmd, timeout).map_err(CliError::Connect)?;
-    emit_reply(&cmd, &reply)
+    emit_reply(&cmd, &reply, json)
 }
 
 fn parse_command(sub: &str, args: &[String]) -> Result<Command, CliError> {
@@ -259,6 +269,7 @@ fn parse_command(sub: &str, args: &[String]) -> Result<Command, CliError> {
             }
             Ok(Command::Screenshot { path, clipboard })
         }
+        "read" => parse_read(args),
         "flow-send" => {
             let text = if args.is_empty() {
                 return Err(CliError::Usage(
@@ -290,7 +301,78 @@ fn parse_command(sub: &str, args: &[String]) -> Result<Command, CliError> {
     }
 }
 
-fn emit_reply(cmd: &Command, reply: &Reply) -> Result<(), CliError> {
+/// The read-only `read <what>` namespace: `pane <session> [--lines N|--all]`
+/// and `panes [query]`. Nothing here can change focus, page, or scroll.
+fn parse_read(args: &[String]) -> Result<Command, CliError> {
+    let Some(what) = args.first() else {
+        return Err(CliError::Usage("read requires a subcommand: pane | panes".into()));
+    };
+    let args = &args[1..];
+    match what.as_str() {
+        "pane" => {
+            let mut session: Option<u64> = None;
+            let mut lines: Option<usize> = None;
+            let mut all = false;
+            let mut i = 0;
+            while i < args.len() {
+                let a = &args[i];
+                if a == "--all" {
+                    all = true;
+                } else if a == "--lines" {
+                    i += 1;
+                    let n = args
+                        .get(i)
+                        .ok_or_else(|| CliError::Usage("--lines requires a count".into()))?;
+                    lines = Some(parse_lines(n)?);
+                } else if let Some(n) = a.strip_prefix("--lines=") {
+                    lines = Some(parse_lines(n)?);
+                } else if a.starts_with('-') {
+                    return Err(CliError::Usage(format!("unknown flag: {a}")));
+                } else if session.is_none() {
+                    session = Some(
+                        a.parse()
+                            .map_err(|_| CliError::Usage(format!("invalid session id: {a}")))?,
+                    );
+                } else {
+                    return Err(CliError::Usage(format!("unexpected argument: {a}")));
+                }
+                i += 1;
+            }
+            let session = session
+                .ok_or_else(|| CliError::Usage("read pane requires <session-id>".into()))?;
+            if all && lines.is_some() {
+                return Err(CliError::Usage("read pane: give --lines or --all, not both".into()));
+            }
+            Ok(Command::ReadPane { session, lines, all })
+        }
+        "panes" => {
+            if let Some(flag) = args.iter().find(|a| a.starts_with('-')) {
+                return Err(CliError::Usage(format!("unknown flag: {flag}")));
+            }
+            let query = (!args.is_empty()).then(|| args.join(" "));
+            Ok(Command::ReadPanes { query })
+        }
+        other => Err(CliError::Usage(format!("unknown read subcommand: {other}"))),
+    }
+}
+
+fn parse_lines(n: &str) -> Result<usize, CliError> {
+    n.parse()
+        .ok()
+        .filter(|n| *n > 0)
+        .ok_or_else(|| CliError::Usage(format!("invalid --lines count: {n}")))
+}
+
+fn read_usage() -> String {
+    let mut out = String::new();
+    out.push_str("Usage: pwrde-cli read <what> [args] [--json]\n\n");
+    out.push_str("Read-only inspection (never changes focus, page, or scroll):\n");
+    out.push_str("  pane <session-id> [--lines N|--all]   A pane's text (visible screen by default, --lines N / --all for scrollback); --json adds title, size, cursor, group, foreground\n");
+    out.push_str("  panes [query]                          One line per pane across every group: <session>\\t<group>\\t<title>\\t<foreground>, focused marked *; --json for the full rows\n");
+    out
+}
+
+fn emit_reply(cmd: &Command, reply: &Reply, json: bool) -> Result<(), CliError> {
     if !reply.ok {
         let msg = reply
             .error
@@ -300,6 +382,18 @@ fn emit_reply(cmd: &Command, reply: &Reply) -> Result<(), CliError> {
     }
     match &reply.data {
         None => Ok(()),
+        Some(data) if !json && matches!(cmd, Command::ReadPane { .. }) => {
+            for line in data.get("lines").and_then(Value::as_array).into_iter().flatten() {
+                println!("{}", line.as_str().unwrap_or_default());
+            }
+            Ok(())
+        }
+        Some(data) if !json && matches!(cmd, Command::ReadPanes { .. }) => {
+            for row in data.as_array().into_iter().flatten() {
+                println!("{}", pane_row(row));
+            }
+            Ok(())
+        }
         Some(data) => {
             // screenshot and ping: print a JSON string value plainly
             let plain = matches!(cmd, Command::Screenshot { .. } | Command::Ping);
@@ -341,12 +435,14 @@ fn usage() -> String {
         ("go_to_page", "page"),
         ("resize_window", "resize"),
         ("screenshot", "screenshot"),
+        ("read_pane", "read pane"),
+        ("read_panes", "read panes"),
         ("state", "state"),
         ("list_commands", "commands"),
         ("ping", "ping"),
     ];
     let specs = bus::command_specs();
-    for spec in &specs {
+    let row = |out: &mut String, spec: &bus::CommandSpec| {
         let cli = cli_names
             .iter()
             .find(|(tag, _)| *tag == spec.name)
@@ -358,8 +454,21 @@ fn usage() -> String {
             let head = format!("{cli} {}", spec.args);
             out.push_str(&format!("  {head:<28}  {}\n", spec.help));
         }
+    };
+    for spec in &specs {
+        if spec.read_only {
+            continue;
+        }
+        row(&mut out, spec);
     }
     out.push_str("  raw '<json line>'             Send a raw NDJSON command line\n");
+    out.push_str("\nRead-only commands (never change focus, page, or scroll):\n");
+    for spec in &specs {
+        if !spec.read_only {
+            continue;
+        }
+        row(&mut out, spec);
+    }
     out.push_str("\nSend-text extras: --enter appends CR; <text> of - reads stdin.\n");
     out.push_str("Key chords use gpui syntax (cmd-p, escape, cmd-shift-t, ctrl-c, enter).\n");
     out
@@ -378,6 +487,29 @@ fn absolute_path(path: &Path) -> PathBuf {
             .unwrap_or_else(|_| PathBuf::from("."))
             .join(path)
     }
+}
+
+/// One `read panes` line: `<session>\t<group-index>:<group-name>\t<title>\t<foreground or ->`,
+/// with a trailing `*` on the focused pane.
+fn pane_row(row: &Value) -> String {
+    fn s(v: Option<&Value>) -> &str {
+        v.and_then(Value::as_str).unwrap_or("-")
+    }
+    let group = row.get("group");
+    let index = group
+        .and_then(|g| g.get("index"))
+        .and_then(Value::as_u64)
+        .map(|i| i.to_string())
+        .unwrap_or_else(|| "-".into());
+    let focused = row.get("focused").and_then(Value::as_bool).unwrap_or(false);
+    format!(
+        "{}\t{index}:{}\t{}\t{}{}",
+        row.get("session").and_then(Value::as_u64).map(|i| i.to_string()).unwrap_or_else(|| "-".into()),
+        s(group.and_then(|g| g.get("name"))),
+        s(row.get("title")),
+        s(row.get("foreground")),
+        if focused { "*" } else { "" },
+    )
 }
 
 fn read_stdin() -> Result<String, CliError> {
