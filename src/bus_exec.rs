@@ -417,8 +417,24 @@ impl App {
             "flow": {
                 "enabled": crate::flow::enabled(),
                 "open": self.flow.open,
-                "busy": self.flow.busy,
-                "messages": self.flow.messages.len(),
+                "view": match self.flow.view {
+                    crate::flow::FlowView::List => "list",
+                    crate::flow::FlowView::Chat => "chat",
+                },
+                "active": self.flow.active_chat().map(|c| json!(c.id)),
+                "busy": self.flow.chats.iter().any(|c| c.busy),
+                "chats": self
+                    .flow
+                    .chats
+                    .iter()
+                    .map(|c| json!({
+                        "id": c.id,
+                        "title": c.title,
+                        "busy": c.busy,
+                        "unseen": c.unseen,
+                        "messages": c.messages.len(),
+                    }))
+                    .collect::<Vec<_>>(),
             },
             "message": self.message.as_ref().map(|(m, _)| m.clone()),
         })

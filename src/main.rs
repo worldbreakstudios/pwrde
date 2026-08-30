@@ -502,7 +502,7 @@ struct App {
     flow: crate::flow::FlowState,
     /// The agent process, spawned lazily on first open/send so no `claude`
     /// child exists until Flow is actually used.
-    flow_backend: Option<Box<dyn crate::flow::AgentBackend>>,
+    flow_backends: std::collections::HashMap<u64, Box<dyn crate::flow::AgentBackend>>,
     /// The pill bar's composer entity, created lazily on first render.
     flow_composer: Option<flow_ui::FlowComposer>,
     // ── Git tools (PR + local diff), Sessions/git-group only ──────────────
@@ -4322,7 +4322,14 @@ impl App {
             Action::NextSidebarTab => self.cycle_sidebar_tab(1),
             Action::ToggleSidebar => self.toggle_sidebar(),
             Action::OpenSettings => self.set_page(Page::Settings),
-            Action::Quit => std::process::exit(0),
+            Action::Quit => {
+                // Take the agent children down before the abrupt exit below;
+                // each backend kills its CLI and unblocks its reader thread.
+                for (_, mut backend) in self.flow_backends.drain() {
+                    backend.shutdown();
+                }
+                std::process::exit(0);
+            }
             Action::CommandPalette => self.toggle_command_root(),
             Action::IncreaseFontSize => self.zoom_font(renderer::FONT_SIZE_STEP),
             Action::DecreaseFontSize => self.zoom_font(-renderer::FONT_SIZE_STEP),
@@ -4854,8 +4861,8 @@ impl App {
                 TermEvent::Redraw => {
                     redraw = true;
                 },
-                TermEvent::Flow(ev) => {
-                    self.flow.apply(ev);
+                TermEvent::Flow { chat, ev } => {
+                    self.flow.apply(chat, ev, crate::flow::now_epoch());
                     redraw = true;
                 },
             }
@@ -6842,7 +6849,7 @@ fn main() {
                         pr: pr_ui::PrState::default(),
                         local_diff: local_diff_ui::LocalDiffState::default(),
                         flow: crate::flow::FlowState::default(),
-                        flow_backend: None,
+                        flow_backends: std::collections::HashMap::new(),
                         flow_composer: None,
                         _lfg_events_child: crate::lfg::spawn_event_stream(events_tx.clone()),
                     };
