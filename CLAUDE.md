@@ -11,7 +11,7 @@ The top-level pages (see `pages.rs`) are **Sessions** (the terminal workspace), 
 ## Commands
 
 - `cargo run --release` — build and run the app. Debug builds also work (deps are compiled at `-O2` even in dev, so it stays usable).
-- `cargo run --bin pwrde-cli -- <subcommand>` — drive a running app over the command bus (`pwrde-cli --help`; e.g. `pwrde-cli new-session ~/src/pwrde`, `pwrde-cli send-text 'ls' --enter`, `pwrde-cli screenshot /tmp/app.png`, `pwrde-cli state`).
+- `pwrde-cli <subcommand>` — drive a running app over the command bus (`pwrde-cli --help`). **Use the `/pwrde-cli` project skill (`.claude/skills/pwrde-cli/SKILL.md`) to verify changes against the real app** — dev-build launch, socket resolution, the command cheat-sheet, and the screenshot + `state` verification loop.
 - `cargo test` — run all tests. Tests are inline `#[cfg(test)]` modules in `src/*.rs`; there is no `tests/` directory.
 - `cargo test <name>` — run a single test or filter by substring.
 - `scripts/make-app.sh` — assemble `target/release/Pwrde.app` (requires `cargo build --release` first).
