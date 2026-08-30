@@ -219,16 +219,38 @@ pub fn shpool_binary() -> Option<std::path::PathBuf> {
     candidates.into_iter().map(|d| d.join("shpool")).find(|p| p.exists())
 }
 
-/// Config file to pass to `shpool attach` so the daemon it auto-starts skips
-/// the `shpool:$SHPOOL_SESSION_NAME` prompt prefix, which otherwise stamps an
-/// extra line above every prompt in persisted panes.
+/// Contents of the pwrde-managed shpool config (see [`shpool_quiet_config`]).
+///
+/// `prompt_prefix = ""` silences the `shpool:$SHPOOL_SESSION_NAME` line the
+/// daemon otherwise stamps above every prompt. `forward_env` matters because
+/// the daemon spawns the session's shell with a scrubbed environment (only
+/// `TERM`, `DISPLAY`, `LANG`, `SSH_AUTH_SOCK` and the `forward_env` list cross
+/// over from the attach client) — without it the `COLORTERM`/`PWRDE`/
+/// `PWRDE_SOCKET` vars set on `shpool attach` in [`Session::new`] never reach
+/// the persisted shell, so apps inside it fall back to 256 colors and
+/// `pwrde-cli` can't find the bus socket. The list is read by the attach
+/// *client* on every attach, so it takes effect for newly created sessions
+/// without a daemon restart (reattached sessions keep the env they started
+/// with).
+const SHPOOL_CONFIG: &str =
+    "prompt_prefix = \"\"\nforward_env = [\"COLORTERM\", \"PWRDE\", \"PWRDE_SOCKET\"]\n";
+
+/// Exact contents pwrde wrote to `shpool.toml` in earlier versions. A file
+/// matching one of these was written by pwrde, not hand-edited, and is safe to
+/// upgrade in place to [`SHPOOL_CONFIG`].
+const SHPOOL_CONFIG_STALE: &[&str] = &["prompt_prefix = \"\"\n"];
+
+/// Config file to pass to `shpool attach` so the prompt prefix is silenced and
+/// the truecolor/bus env vars are forwarded into the session shell (see
+/// [`SHPOOL_CONFIG`]).
 ///
 /// Defers to the user: if they keep their own shpool config (either the
 /// macOS `~/Library/Application Support/shpool/config.toml` or the XDG
 /// `~/.config/shpool/config.toml`), returns None so shpool loads it normally.
-/// Otherwise lazily writes `~/.pwrde/shpool.toml` with `prompt_prefix = ""`
-/// and returns its path. Any failure returns None — persistence must keep
-/// working even if the prefix can't be silenced.
+/// Otherwise lazily writes `~/.pwrde/shpool.toml` and returns its path,
+/// upgrading a file left by an older pwrde but never touching a hand-edited
+/// one. Any failure returns None — persistence must keep working even if the
+/// config can't be written.
 pub fn shpool_quiet_config() -> Option<std::path::PathBuf> {
     let home = dirs::home_dir()?;
     let user_configs = [
@@ -248,9 +270,15 @@ pub fn shpool_quiet_config_in(
         return None;
     }
     let path = pwrde_dir.join("shpool.toml");
-    if !path.exists() {
-        std::fs::create_dir_all(pwrde_dir).ok()?;
-        std::fs::write(&path, "prompt_prefix = \"\"\n").ok()?;
+    match std::fs::read_to_string(&path) {
+        Err(_) => {
+            std::fs::create_dir_all(pwrde_dir).ok()?;
+            std::fs::write(&path, SHPOOL_CONFIG).ok()?;
+        }
+        Ok(current) if SHPOOL_CONFIG_STALE.contains(&current.as_str()) => {
+            std::fs::write(&path, SHPOOL_CONFIG).ok()?;
+        }
+        Ok(_) => {} // hand-edited: leave it alone
     }
     Some(path)
 }
@@ -529,9 +557,10 @@ impl Session {
             if let Some(shpool_path) = shpool_binary() {
                 let mut cmd = CommandBuilder::new(shpool_path);
                 // Global flag, so it must precede the subcommand (after
-                // `attach`, `-c` means `--cmd`). Only matters when this attach
-                // auto-starts the daemon; an already-running daemon keeps the
-                // config it was launched with.
+                // `attach`, `-c` means `--cmd`). The attach client reads
+                // `forward_env` from it on every attach; `prompt_prefix` only
+                // matters when this attach auto-starts the daemon — an
+                // already-running daemon keeps the config it was launched with.
                 if let Some(cfg) = shpool_quiet_config() {
                     cmd.arg("--config-file");
                     cmd.arg(cfg);
@@ -551,6 +580,9 @@ impl Session {
                 cmd.env("TERM", "xterm-256color");
                 // Advertise 24-bit color: wezterm-term parses truecolor SGR and
                 // the renderer paints full RGB per cell, so apps should emit it.
+                // These land on the attach *client*; they only reach the
+                // daemon-spawned session shell because the pwrde shpool config
+                // lists them in `forward_env` (see SHPOOL_CONFIG).
                 cmd.env("COLORTERM", "truecolor");
                 cmd.env("PWRDE", "1");
                 if let Ok(sock) = std::env::var("PWRDE_SOCKET") {
@@ -1222,10 +1254,20 @@ mod tests {
         let missing = [dir.join("nope/config.toml")];
         let path = shpool_quiet_config_in(&missing, &dir.join("pwrde"))
             .expect("should produce a config path");
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            "prompt_prefix = \"\"\n"
-        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), SHPOOL_CONFIG);
+    }
+
+    /// A config written by an older pwrde (no `forward_env`) is upgraded in
+    /// place so persisted sessions get COLORTERM and the bus vars forwarded.
+    #[test]
+    fn quiet_config_upgrades_stale_pwrde_default() {
+        let dir = temp_dir("quiet-upgrade");
+        let pwrde = dir.join("pwrde");
+        std::fs::create_dir_all(&pwrde).unwrap();
+        std::fs::write(pwrde.join("shpool.toml"), "prompt_prefix = \"\"\n").unwrap();
+        let missing = [dir.join("nope/config.toml")];
+        let path = shpool_quiet_config_in(&missing, &pwrde).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), SHPOOL_CONFIG);
     }
 
     /// A user-managed shpool config wins: no pwrde config is offered or written.
