@@ -356,6 +356,10 @@ struct App {
     /// Profile chosen for a group whose `drop` worktree is still provisioning;
     /// applied on `GroupReady`, dropped on `GroupFailed`.
     pending_group_profile: Option<pwrspace::WorkspaceProfile>,
+    /// Sidebar section chosen for that same provisioning group; the section
+    /// already exists (a "New folder…" pick creates it at launch), only the
+    /// membership waits for `GroupReady`.
+    pending_group_section: Option<u64>,
     /// The open save-as-workspace modal, or `None`.
     save_ws: Option<SaveWorkspaceModal>,
     /// The save modal's Name / Description fields: rcn text inputs whose
@@ -2035,6 +2039,22 @@ impl App {
                     self.claim_command_search();
                 }
             },
+            Outcome::LayoutChosen => {
+                let folders: Vec<picker::FolderSource> = self
+                    .sections
+                    .iter()
+                    .map(|s| picker::FolderSource {
+                        id: s.id,
+                        name: s.name.clone(),
+                        emoji: s.emoji.clone(),
+                        groups: self.workspaces.iter().filter(|w| w.section == Some(s.id)).count(),
+                    })
+                    .collect();
+                if let Some(pal) = self.command.as_mut() {
+                    pal.provide_folder(picker::FolderPicker::new(folders));
+                }
+                self.claim_command_search();
+            },
             Outcome::Launch(session) => {
                 self.command = None;
                 self.launch_new_session(session);
@@ -2063,18 +2083,29 @@ impl App {
 
     /// Create the group (or flyover tab) the New-session flow described.
     fn launch_new_session(&mut self, session: command::NewSession) {
-        let command::NewSession { name, repo, base, layout, for_flyover } = session;
+        let command::NewSession { name, repo, base, layout, folder, for_flyover } = session;
         if for_flyover {
             let cwd = base.and_then(|b| b.path).or(Some(repo.path));
             self.spawn_flyover_tab(cwd);
             return;
         }
+        // Resolve the folder pick to a section id up front — a "New folder…"
+        // pick creates its (empty) section right away — so both the in-place
+        // and the async fork paths can file the group once it exists.
+        let section = folder.and_then(|f| match f.kind {
+            picker::FolderKind::TopLevel => None,
+            picker::FolderKind::Existing { id } => Some(id),
+            picker::FolderKind::New { name } => Some(self.new_section(name)),
+        });
         let profile = layout.and_then(|l| l.profile);
         match base {
             // A plain directory: open it, with the chosen layout.
-            None => match profile {
-                Some(profile) => self.add_group_with_profile(name, Some(repo.path), &profile),
-                None => self.add_group(name, Some(repo.path)),
+            None => {
+                match profile {
+                    Some(profile) => self.add_group_with_profile(name, Some(repo.path), &profile),
+                    None => self.add_group(name, Some(repo.path)),
+                }
+                self.file_active_group(section);
             },
             // The repo root or an existing worktree: open in place.
             Some(b)
@@ -2085,14 +2116,28 @@ impl App {
                     (Some(p), None) => self.add_group(name, Some(p)),
                     (None, _) => self.add_group(name, None),
                 }
+                self.file_active_group(section);
             },
             // A fresh worktree off a branch: provision through `drop`, and
-            // apply the layout once the worktree exists.
+            // apply the layout and folder once the worktree exists.
             Some(b) => {
                 self.pending_group_profile = profile;
+                self.pending_group_section = section;
                 self.start_fork(repo.path, name, b.from);
             },
         }
+    }
+
+    /// File the just-created active group under `section`, keeping the
+    /// section's member block contiguous and its header expanded.
+    fn file_active_group(&mut self, section: Option<u64>) {
+        let Some(section_id) = section else { return };
+        self.active = workspace::append_to_section(&mut self.workspaces, self.active, section_id);
+        workspace::normalize_section_anchors(&self.workspaces, &mut self.sections);
+        workspace::ensure_active_section_expanded(&self.workspaces, &mut self.sections, self.active);
+        self.sync_layout();
+        self.request_redraw();
+        self.persist_snapshot();
     }
 
     fn open_picker(&mut self) {
@@ -4737,6 +4782,8 @@ impl App {
                         Some(profile) => self.add_group_with_profile(name, Some(cwd), &profile),
                         None => self.add_group(name, Some(cwd)),
                     }
+                    let section = self.pending_group_section.take();
+                    self.file_active_group(section);
                     redraw = true;
                 },
                 TermEvent::Bus { cmd, reply } => {
@@ -4745,6 +4792,7 @@ impl App {
                 },
                 TermEvent::GroupFailed { message } => {
                     self.pending_group_profile = None;
+                    self.pending_group_section = None;
                     self.message = Some((format!("drop failed: {message}"), true));
                     redraw = true;
                 },
@@ -6668,6 +6716,7 @@ fn main() {
                         drag: Drag::None,
                         just_expanded: None,
                         pending_group_profile: None,
+                        pending_group_section: None,
                         save_ws: None,
                         message: None,
                         confirm: None,

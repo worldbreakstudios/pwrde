@@ -2,7 +2,7 @@
 //!
 //! One surface for everything: opened at the root it lists every `Action`
 //! grouped and fuzzy-filterable; `New session…` is the multi-step command
-//! whose picks (repository › base › layout) collapse into token chips in the
+//! whose picks (repository › base › layout › folder) collapse into token chips in the
 //! field, with a step rail as the receipt. The sidebar ＋ and ⇧⌘T open the
 //! same surface with the command token already committed. The state machine
 //! is [`crate::command::CommandPalette`] — pure, unit-tested — and this
@@ -27,7 +27,7 @@ use gpui::{
 
 use crate::App;
 use crate::command::{RootRow, Stage, StepState, Token};
-use crate::picker::{ForkScope, PickerRow};
+use crate::picker::{FolderKind, ForkScope, PickerRow};
 use crate::pwrspace::ProfileNode;
 use crate::ui::theme::Theme;
 use crate::ui::{Badge, Button, ButtonSize, ButtonVariant, Kbd};
@@ -342,7 +342,7 @@ impl App {
                                         .child(action.label()),
                                 )
                                 .when(multi, |d| {
-                                    d.child(Badge::new().variant(crate::ui::BadgeVariant::Secondary).child("3 steps ›"))
+                                    d.child(Badge::new().variant(crate::ui::BadgeVariant::Secondary).child("4 steps ›"))
                                 })
                                 .child(div().flex_1())
                                 .child(
@@ -547,6 +547,50 @@ impl App {
                         grid = grid.child(row.child(div().flex_1()));
                     }
                     list = list.child(grid);
+                }
+            }
+            Stage::Folder => {
+                if let Some(folder) = pal.folder.as_ref() {
+                    let mut last_group: Option<&'static str> = None;
+                    for (i, entry) in folder.rows.iter().enumerate() {
+                        let (group, glyph, tinted) = match &entry.kind {
+                            FolderKind::TopLevel => ("Session folder", "—".to_string(), false),
+                            FolderKind::Existing { .. } => (
+                                "Existing folders",
+                                if entry.emoji.is_empty() { "▸".to_string() } else { entry.emoji.clone() },
+                                true,
+                            ),
+                            FolderKind::New { .. } => ("Existing folders", "＋".to_string(), false),
+                        };
+                        if last_group != Some(group) {
+                            list = list.child(caption(&theme, group));
+                            last_group = Some(group);
+                        }
+                        let (tile_bg, tile_fg) = if tinted {
+                            (theme.primary.opacity(0.13), theme.primary)
+                        } else {
+                            (chip_bg, theme.muted_foreground)
+                        };
+                        list = list.child(
+                            row_shell(&theme, i, i == selected, on_pick.clone())
+                                .child(glyph_tile(&theme, 26.0, 7.0, tile_bg, tile_fg, glyph))
+                                .child(
+                                    div()
+                                        .text_size(px(12.0))
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .text_color(theme.foreground)
+                                        .child(entry.label.clone()),
+                                )
+                                .child(div().flex_1())
+                                .child(
+                                    div()
+                                        .font_family(crate::renderer::FONT_FAMILY)
+                                        .text_size(px(11.0))
+                                        .text_color(theme.muted_foreground)
+                                        .child(entry.meta.clone()),
+                                ),
+                        );
+                    }
                 }
             }
             Stage::Done => {

@@ -6,10 +6,11 @@
 //! `~/src` (the usual home for checkouts), flagging the ones that are git
 //! repos so the UI can mark them.
 //!
-//! It also holds the two follow-up picker models: the fork-source picker
-//! ([`ForkPicker`], step 2 for git repos) and the workspace-profile picker
+//! It also holds the follow-up picker models: the fork-source picker
+//! ([`ForkPicker`], step 2 for git repos), the workspace-profile picker
 //! ([`ProfilePicker`], shown when `.pwrspace.json` profiles exist for the
-//! chosen directory).
+//! chosen directory), and the sidebar-folder picker ([`FolderPicker`], the
+//! last step — which section the new group files under, if any).
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -345,6 +346,149 @@ impl ProfilePicker {
                 .cloned()
                 .collect()
         };
+        if self.selected >= self.rows.len() {
+            self.selected = self.rows.len().saturating_sub(1);
+        }
+    }
+}
+
+/// An existing sidebar section offered by the folder picker. The app builds
+/// these from its live `Section` list (the model never sees gpui or App).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FolderSource {
+    /// The section's id ([`crate::workspace::Section::id`]).
+    pub id: u64,
+    pub name: String,
+    /// The section's emoji, `""` when it has none.
+    pub emoji: String,
+    /// How many groups currently file under the section.
+    pub groups: usize,
+}
+
+/// What a folder-step row resolves to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FolderKind {
+    /// "No folder" — the group stays at the sidebar's top level.
+    TopLevel,
+    /// An existing sidebar section.
+    Existing { id: u64 },
+    /// "New folder…" — create a section named `name` (filled from the query
+    /// when the pick is confirmed; empty falls back to the default name).
+    New { name: String },
+}
+
+/// One row of the folder picker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FolderEntry {
+    /// Display label: the section name, "No folder", or "New folder…".
+    pub label: String,
+    /// The section's emoji for the glyph tile, `""` for a generic glyph.
+    pub emoji: String,
+    /// Dim right-aligned annotation: "top level", "n groups", or the
+    /// pending create hint on the New row.
+    pub meta: String,
+    pub kind: FolderKind,
+}
+
+/// The sidebar-folder picker: the last step of group creation. "No folder"
+/// sits first so Enter with no filter keeps today's behavior one keystroke
+/// away; existing sections follow, then "New folder…" (which names the new
+/// section from whatever is typed in the query).
+pub struct FolderPicker {
+    /// Every choice: No folder, each section, New folder….
+    pub entries: Vec<FolderEntry>,
+    pub query: String,
+    pub selected: usize,
+    /// The filtered view currently on screen.
+    pub rows: Vec<FolderEntry>,
+}
+
+impl FolderPicker {
+    /// Build the picker over the app's sidebar sections, in sidebar order.
+    pub fn new(folders: Vec<FolderSource>) -> Self {
+        let mut entries = vec![FolderEntry {
+            label: "No folder".into(),
+            emoji: String::new(),
+            meta: "top level".into(),
+            kind: FolderKind::TopLevel,
+        }];
+        entries.extend(folders.into_iter().map(|f| FolderEntry {
+            label: f.name,
+            emoji: f.emoji,
+            meta: match f.groups {
+                0 => "empty".into(),
+                1 => "1 group".into(),
+                n => format!("{n} groups"),
+            },
+            kind: FolderKind::Existing { id: f.id },
+        }));
+        entries.push(FolderEntry {
+            label: "New folder…".into(),
+            emoji: String::new(),
+            meta: String::new(),
+            kind: FolderKind::New { name: String::new() },
+        });
+        let mut picker = Self { entries, query: String::new(), selected: 0, rows: Vec::new() };
+        picker.rebuild();
+        picker
+    }
+
+    /// Replaces the whole query (the search field owns editing) and
+    /// refilters from the top of the list.
+    pub fn set_query(&mut self, query: &str) {
+        if self.query == query {
+            return;
+        }
+        self.query = query.to_string();
+        self.selected = 0;
+        self.rebuild();
+    }
+
+    /// Moves the highlight by `delta` rows, clamped to the list.
+    pub fn move_selection(&mut self, delta: isize) {
+        if self.rows.is_empty() {
+            self.selected = 0;
+            return;
+        }
+        let max = self.rows.len() as isize - 1;
+        self.selected = (self.selected as isize + delta).clamp(0, max) as usize;
+    }
+
+    /// Selects the row at `index` when it is in range.
+    pub fn select(&mut self, index: usize) {
+        if index < self.rows.len() {
+            self.selected = index;
+        }
+    }
+
+    /// The highlighted row, if the list is not empty.
+    pub fn selected_entry(&self) -> Option<&FolderEntry> {
+        self.rows.get(self.selected)
+    }
+
+    /// Recomputes [`FolderPicker::rows`] from the query (case-insensitive
+    /// substring match on the label). "New folder…" always stays listed —
+    /// a query that matches nothing is the name the new folder would get,
+    /// and the row's meta previews the create.
+    fn rebuild(&mut self) {
+        let query = self.query.trim().to_lowercase();
+        self.rows = self
+            .entries
+            .iter()
+            .filter(|e| {
+                matches!(e.kind, FolderKind::New { .. })
+                    || query.is_empty()
+                    || e.label.to_lowercase().contains(&query)
+            })
+            .cloned()
+            .collect();
+        let trimmed = self.query.trim();
+        if let Some(new_row) =
+            self.rows.iter_mut().find(|e| matches!(e.kind, FolderKind::New { .. }))
+        {
+            new_row.meta =
+                if trimmed.is_empty() { String::new() } else { format!("create \"{trimmed}\"") };
+        }
         if self.selected >= self.rows.len() {
             self.selected = self.rows.len().saturating_sub(1);
         }
@@ -748,5 +892,46 @@ mod tests {
         picker.move_selection(100);
         assert_eq!(picker.selected, picker.rows.len() - 1);
         assert_eq!(picker.selected_entry().unwrap().label, "review");
+    }
+
+    // ── FolderPicker ──────────────────────────────────────────────────────
+
+    fn sample_folder_picker() -> FolderPicker {
+        FolderPicker::new(vec![
+            FolderSource { id: 1, name: "PWRDE".into(), emoji: "🚀".into(), groups: 3 },
+            FolderSource { id: 2, name: "RCN".into(), emoji: String::new(), groups: 1 },
+            FolderSource { id: 3, name: "Experiments".into(), emoji: String::new(), groups: 0 },
+        ])
+    }
+
+    #[test]
+    fn folder_picker_lists_no_folder_first_and_new_folder_last() {
+        let picker = sample_folder_picker();
+        assert_eq!(picker.rows.len(), 5);
+        assert_eq!(picker.rows[0].kind, FolderKind::TopLevel);
+        assert_eq!(picker.rows[0].meta, "top level");
+        assert_eq!(picker.rows[1].kind, FolderKind::Existing { id: 1 });
+        assert_eq!(picker.rows[1].meta, "3 groups");
+        assert_eq!(picker.rows[2].meta, "1 group");
+        assert_eq!(picker.rows[3].meta, "empty");
+        assert!(matches!(picker.rows[4].kind, FolderKind::New { .. }));
+        // Enter with no filter keeps today's behavior: "No folder" is seated.
+        assert_eq!(picker.selected_entry().unwrap().kind, FolderKind::TopLevel);
+    }
+
+    #[test]
+    fn folder_picker_filters_but_keeps_the_new_row() {
+        let mut picker = sample_folder_picker();
+        picker.set_query("pw");
+        let labels: Vec<&str> = picker.rows.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(labels, ["PWRDE", "New folder…"]);
+        // A query matching nothing still offers the create, previewing the name.
+        picker.set_query("infra");
+        assert_eq!(picker.rows.len(), 1);
+        assert!(matches!(picker.rows[0].kind, FolderKind::New { .. }));
+        assert_eq!(picker.rows[0].meta, "create \"infra\"");
+        picker.set_query("");
+        assert_eq!(picker.rows.len(), 5);
+        assert_eq!(picker.rows[4].meta, "");
     }
 }
