@@ -424,8 +424,10 @@ fn section_header_h(font_scale: f32) -> f32 {
 const MEMBER_INDENT: f32 = 12.0;
 /// Vertical gap between the sidebar's rounded group rows.
 const TAB_GAP: f32 = 3.0;
-/// Horizontal inset of the sidebar's rows from the sidebar edges.
-const SIDEBAR_PAD: f32 = 10.0;
+/// Horizontal inset of the sidebar's rows from the sidebar (window) edges:
+/// `sidebar_ui::GUTTER` (8px, the panel's inset) plus the mock's 8px list
+/// padding inside the panel, so the rows stay clear of the panel edge.
+const SIDEBAR_PAD: f32 = 16.0;
 /// Side of the square header chips ("⇤" collapse, "＋" new group). Both sit
 /// right-aligned inside [`TITLEBAR_H`], opposite the native traffic lights, so
 /// the chrome costs one strip instead of two.
@@ -2635,15 +2637,15 @@ mod tests {
     }
 
     /// The pinned strip collapses to nothing when empty and matches the
-    /// pad + rows×83 + gaps formula otherwise — including the wrap at a
-    /// 300px sidebar where four pins become two rows (3 + 1).
+    /// pad + rows×83 + gaps formula otherwise — including the wrap at the
+    /// default sidebar width where four pins become two rows (3 + 1).
     #[test]
     fn pinned_strip_h_zero_one_and_wrap() {
-        let sw = 300.0;
+        let sw = SIDEBAR_DEFAULT_W;
         assert_eq!(pinned_strip_h(0, 1.0, sw), 0.0);
         // One row: 6 + 83 + 12 = 101.
         assert_eq!(pinned_strip_h(1, 1.0, sw), 101.0);
-        // 300 inner = 280; per_row = floor((280+14)/(84+14)) = 3, so 4 pins
+        // 360 inner = 328; per_row = floor((328+14)/(84+14)) = 3, so 4 pins
         // wrap to 2 rows: 6 + 2*83 + 8 + 12 = 192.
         assert_eq!(pinned_per_row(sw), 3);
         assert_eq!(pinned_strip_h(4, 1.0, sw), 192.0);
@@ -2655,7 +2657,7 @@ mod tests {
     /// row is centered in the sidebar (first.x + last.x + col_w ≈ sidebar_w).
     #[test]
     fn pinned_bubble_rects_centered_non_overlapping() {
-        let sw = 300.0;
+        let sw = SIDEBAR_DEFAULT_W;
         let scale = 1.0;
         let n = 3;
         let rects: Vec<_> = (0..n)

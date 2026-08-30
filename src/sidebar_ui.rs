@@ -43,8 +43,15 @@ use crate::ui::theme::Theme;
 use crate::workspace::{TITLEBAR_H, TRAFFIC_LIGHT_SAFE_W};
 
 /// Gap between the window edge and the inlaid panel (the spec's window
-/// gutter). The panel floats inside it, Apple Messages style.
-const GUTTER: f32 = 3.0;
+/// gutter). The panel floats inside it, Apple Messages style — Messages insets
+/// its panel about this far, well past the mock's 3px. `workspace::SIDEBAR_PAD`
+/// adds the rows' own margin on top of this, so the two move together.
+const GUTTER: f32 = 8.0;
+
+/// How far past the sidebar's width the panel's drop shadow may paint. The
+/// clipped root stops at the sidebar width, which cut the shadow to a hard
+/// line; the shadow lives in its own wider, non-interactive layer instead.
+const SHADOW_SPILL: f32 = 16.0;
 
 /// Panel corner radius (`--radius-l` in the spec's token set).
 const PANEL_RADIUS: f32 = 18.0;
@@ -169,31 +176,55 @@ impl App {
             return div().into_any_element();
         }
 
+        let clip_height = |d: gpui::Div| match ceiling {
+            Some(limit) => d.h(px(limit)),
+            None => d.h_full(),
+        };
+
+        // Two sibling layers under an unclipped anchor (no overflow rule, no
+        // listeners — transparent to the mouse): the panel's drop shadow in a
+        // box wider than the sidebar so it can fade out past the edge, then
+        // the interactive sidebar clipped to exactly the sidebar width.
         div()
             .absolute()
             .left(px(0.0))
             .top(px(0.0))
-            .w(px(w))
-            // Clipped, not just shortened: the row, dot and grip layers are
-            // absolutely positioned against the whole window, so the height has
-            // to actually cut them off.
-            .overflow_hidden()
-            .map(|d| match ceiling {
-                Some(limit) => d.h(px(limit)),
-                None => d.h_full(),
-            })
+            .w(px(w + SHADOW_SPILL))
+            .map(clip_height)
             .child(
-                panel(&theme, panel_w)
-                    .child(header())
-                    // The rows live in their own absolutely positioned layer,
-                    // so the panel only needs to hold the scroll region open
-                    // and let the row layer own everything below it.
-                    .child(div().flex_1()),
+                div()
+                    .absolute()
+                    .left(px(0.0))
+                    .top(px(0.0))
+                    .size_full()
+                    .overflow_hidden()
+                    .child(panel_shadow(&theme, panel_w)),
             )
-            .child(self.clipped_row_layer(&theme, cx))
-            .child(self.drop_feedback_layer(&theme))
-            .child(self.header_chips(&theme, cx.entity().downgrade()))
-            .child(self.page_dot_layer(&theme, cx.entity().downgrade()))
+            .child(
+                div()
+                    .absolute()
+                    .left(px(0.0))
+                    .top(px(0.0))
+                    .w(px(w))
+                    // Clipped, not just shortened: the row, dot and grip
+                    // layers are absolutely positioned against the whole
+                    // window, so the height has to actually cut them off.
+                    .overflow_hidden()
+                    .map(clip_height)
+                    .child(
+                        panel(&theme, panel_w)
+                            .child(header())
+                            // The rows live in their own absolutely
+                            // positioned layer, so the panel only needs to
+                            // hold the scroll region open and let the row
+                            // layer own everything below it.
+                            .child(div().flex_1()),
+                    )
+                    .child(self.clipped_row_layer(&theme, cx))
+                    .child(self.drop_feedback_layer(&theme))
+                    .child(self.header_chips(&theme, cx.entity().downgrade()))
+                    .child(self.page_dot_layer(&theme, cx.entity().downgrade())),
+            )
             .into_any_element()
     }
 
@@ -1500,16 +1531,9 @@ fn panel(theme: &Theme, w: f32) -> gpui::Div {
             linear_color_stop(bottom, 0.30),
         ))
         .shadow(vec![
-            // Drop shadow (`--shadow-2`).
-            BoxShadow {
-                color: gpui::black().opacity(if theme.dark { 0.45 } else { 0.14 }),
-                offset: point(px(0.0), px(2.0)),
-                blur_radius: px(10.0),
-                spread_radius: px(0.0),
-                inset: false,
-            },
             // Top rim highlight (`--highlight-top`), the one-pixel lit edge
-            // that sells the inlaid material.
+            // that sells the inlaid material. The drop shadow is painted by
+            // `panel_shadow`, outside the sidebar's clip.
             BoxShadow {
                 color: gpui::white().opacity(if theme.dark { 0.10 } else { 0.70 }),
                 offset: point(px(0.0), px(1.0)),
@@ -1518,6 +1542,26 @@ fn panel(theme: &Theme, w: f32) -> gpui::Div {
                 inset: true,
             },
         ])
+}
+
+/// The panel's drop shadow (`--shadow-2`) on an otherwise invisible box with
+/// the panel's exact geometry. Kept apart from [`panel`] so it can sit in a
+/// layer wider than the sidebar and fade out instead of being cut off.
+fn panel_shadow(theme: &Theme, w: f32) -> gpui::Div {
+    div()
+        .absolute()
+        .left(px(GUTTER))
+        .top(px(GUTTER))
+        .w(px(w))
+        .bottom(px(GUTTER))
+        .rounded(px(PANEL_RADIUS))
+        .shadow(vec![BoxShadow {
+            color: gpui::black().opacity(if theme.dark { 0.45 } else { 0.14 }),
+            offset: point(px(0.0), px(2.0)),
+            blur_radius: px(10.0),
+            spread_radius: px(0.0),
+            inset: false,
+        }])
 }
 
 /// Header block: the titlebar-height strip plus the toggle / new-session
