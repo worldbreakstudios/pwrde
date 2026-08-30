@@ -2,9 +2,9 @@
 //!
 //! The palette opens at the ROOT, listing every [`Action`] grouped by
 //! [`action_group`]. [`Action::NewGroup`] is the one multi-step command:
-//! entering it walks steps Repo → Base → Layout → Done, each pick collapsing
-//! into a token chip; ⌫ on an empty query pops the last token and returns to
-//! that step. The same flow can be opened directly at the Repo step
+//! entering it walks steps Repo → Base → Layout → Folder → Done, each pick
+//! collapsing into a token chip; ⌫ on an empty query pops the last token and
+//! returns to that step. The same flow can be opened directly at the Repo step
 //! (⇧⌘T / the sidebar ＋ button), optionally for the flyover terminal
 //! (which skips Layout and launches right after Base, or right after Repo
 //! for a non-git directory).
@@ -13,9 +13,12 @@ use std::path::Path;
 
 use crate::pages::Action;
 use crate::palette::fuzzy_match;
-use crate::picker::{ForkEntry, ForkPicker, Picker, PickerEntry, ProfileEntry, ProfilePicker};
+use crate::picker::{
+    FolderEntry, FolderKind, FolderPicker, ForkEntry, ForkPicker, Picker, PickerEntry,
+    ProfileEntry, ProfilePicker,
+};
 
-/// Which step the palette is on: the command root or one of the three
+/// Which step the palette is on: the command root or one of the four
 /// "New session" picks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stage {
@@ -27,6 +30,8 @@ pub enum Stage {
     Base,
     /// Step 3: which saved workspace profile the group opens with.
     Layout,
+    /// Step 4: which sidebar folder (section) the group files under.
+    Folder,
     /// The flow is complete: the summary card is showing.
     Done,
 }
@@ -40,7 +45,7 @@ pub enum Token {
     Arg { kind: &'static str, label: String },
 }
 
-/// Rail state for one of the three "New session" steps.
+/// Rail state for one of the four "New session" steps.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StepState {
     /// Not reached yet.
@@ -71,6 +76,9 @@ pub struct NewSession {
     pub base: Option<ForkEntry>,
     /// The workspace profile, or `None` for the default (single pane).
     pub layout: Option<ProfileEntry>,
+    /// The sidebar folder pick, or `None` when the step was skipped
+    /// (the flyover path never reaches it).
+    pub folder: Option<FolderEntry>,
     /// Whether the group opens in the flyover terminal.
     pub for_flyover: bool,
 }
@@ -89,6 +97,9 @@ pub enum Outcome {
     /// The fork-source pick completed (the caller supplies a
     /// [`ProfilePicker`] via [`CommandPalette::provide_layout`]).
     BaseChosen(ForkEntry),
+    /// The layout pick completed (the caller supplies a [`FolderPicker`]
+    /// via [`CommandPalette::provide_folder`]).
+    LayoutChosen,
     /// The flow completed: launch the session.
     Launch(NewSession),
     /// The palette closed (pop at the Repo step of a flow opened directly).
@@ -116,6 +127,8 @@ pub struct CommandPalette {
     pub base: Option<ForkPicker>,
     /// Step 3's model, once the fork source (or repo, non-git) is chosen.
     pub layout: Option<ProfilePicker>,
+    /// Step 4's model, once the layout is chosen.
+    pub folder: Option<FolderPicker>,
     /// The group name (derived from the repo path).
     pub name: String,
     /// The picked repo, once chosen.
@@ -124,6 +137,8 @@ pub struct CommandPalette {
     pub base_choice: Option<ForkEntry>,
     /// The picked workspace profile, once chosen.
     pub layout_choice: Option<ProfileEntry>,
+    /// The picked sidebar folder, once chosen.
+    pub folder_choice: Option<FolderEntry>,
 }
 
 impl CommandPalette {
@@ -140,10 +155,12 @@ impl CommandPalette {
             repo: None,
             base: None,
             layout: None,
+            folder: None,
             name: String::new(),
             repo_choice: None,
             base_choice: None,
             layout_choice: None,
+            folder_choice: None,
         };
         palette.rebuild_root("");
         palette
@@ -163,10 +180,12 @@ impl CommandPalette {
             repo: None,
             base: None,
             layout: None,
+            folder: None,
             name: String::new(),
             repo_choice: None,
             base_choice: None,
             layout_choice: None,
+            folder_choice: None,
         };
         palette.rebuild_root("");
         palette
@@ -203,10 +222,12 @@ impl CommandPalette {
         self.repo = None;
         self.base = None;
         self.layout = None;
+        self.folder = None;
         self.name = String::new();
         self.repo_choice = None;
         self.base_choice = None;
         self.layout_choice = None;
+        self.folder_choice = None;
     }
 
     /// Rebuilds `root_rows` from `root_query`: with an empty query, every
@@ -254,6 +275,7 @@ impl CommandPalette {
             Stage::Repo => self.repo.as_ref().map(|p| p.query.as_str()).unwrap_or(""),
             Stage::Base => self.base.as_ref().map(|p| p.query.as_str()).unwrap_or(""),
             Stage::Layout => self.layout.as_ref().map(|p| p.query.as_str()).unwrap_or(""),
+            Stage::Folder => self.folder.as_ref().map(|p| p.query.as_str()).unwrap_or(""),
             Stage::Done => "",
         }
     }
@@ -277,6 +299,11 @@ impl CommandPalette {
                     picker.set_query(q);
                 }
             }
+            Stage::Folder => {
+                if let Some(picker) = self.folder.as_mut() {
+                    picker.set_query(q);
+                }
+            }
             Stage::Done => {},
         }
     }
@@ -288,6 +315,7 @@ impl CommandPalette {
             Stage::Repo => self.repo.as_ref().map(|p| p.selected).unwrap_or(0),
             Stage::Base => self.base.as_ref().map(|p| p.selected).unwrap_or(0),
             Stage::Layout => self.layout.as_ref().map(|p| p.selected).unwrap_or(0),
+            Stage::Folder => self.folder.as_ref().map(|p| p.selected).unwrap_or(0),
             Stage::Done => 0,
         }
     }
@@ -337,6 +365,11 @@ impl CommandPalette {
                     picker.move_selection(delta);
                 }
             }
+            Stage::Folder => {
+                if let Some(picker) = self.folder.as_mut() {
+                    picker.move_selection(delta);
+                }
+            }
             Stage::Done => {},
         }
     }
@@ -368,6 +401,11 @@ impl CommandPalette {
                     picker.select(index);
                 }
             }
+            Stage::Folder => {
+                if let Some(picker) = self.folder.as_mut() {
+                    picker.select(index);
+                }
+            }
             Stage::Done => {},
         }
     }
@@ -388,12 +426,15 @@ impl CommandPalette {
         if let Some(layout) = &self.layout_choice {
             tokens.push(Token::Arg { kind: "layout", label: layout.label.clone() });
         }
+        if let Some(folder) = &self.folder_choice {
+            tokens.push(Token::Arg { kind: "folder", label: folder.label.clone() });
+        }
         tokens
     }
 
-    /// The step rail: `("Repository", ..)`, `("Base", ..)`, `("Layout", ..)`
-    /// with each step's state.
-    pub fn steps(&self) -> [(&'static str, StepState); 3] {
+    /// The step rail: `("Repository", ..)`, `("Base", ..)`, `("Layout", ..)`,
+    /// `("Folder", ..)` with each step's state.
+    pub fn steps(&self) -> [(&'static str, StepState); 4] {
         // A step is Done once it holds a pick, Active while it is the stage,
         // and Pending otherwise — so a skipped Base (non-git repo) never
         // shows a ✓ it did not earn.
@@ -414,12 +455,13 @@ impl CommandPalette {
             ("Repository", state(Stage::Repo, self.repo_choice.is_some())),
             ("Base", state(Stage::Base, self.base_choice.is_some())),
             ("Layout", state(Stage::Layout, self.layout_choice.is_some())),
+            ("Folder", state(Stage::Folder, self.folder_choice.is_some())),
         ]
     }
 
     /// Whether the flow (and so the step rail) is showing.
     pub fn in_flow(&self) -> bool {
-        matches!(self.stage, Stage::Repo | Stage::Base | Stage::Layout)
+        matches!(self.stage, Stage::Repo | Stage::Base | Stage::Layout | Stage::Folder)
     }
 
     /// The search field's placeholder for the current stage.
@@ -429,6 +471,7 @@ impl CommandPalette {
             Stage::Repo => "Search repos…",
             Stage::Base => "Filter branches & worktrees…",
             Stage::Layout => "Pick a layout…",
+            Stage::Folder => "Choose a folder…",
             Stage::Done => "",
         }
     }
@@ -440,9 +483,10 @@ impl CommandPalette {
                 let commands = self.root_rows.iter().filter(|r| matches!(r, RootRow::Action(_))).count();
                 format!("root · {commands} commands")
             }
-            Stage::Repo => "New session · step 1 of 3".into(),
-            Stage::Base => "New session · step 2 of 3".into(),
-            Stage::Layout => "New session · step 3 of 3".into(),
+            Stage::Repo => "New session · step 1 of 4".into(),
+            Stage::Base => "New session · step 2 of 4".into(),
+            Stage::Layout => "New session · step 3 of 4".into(),
+            Stage::Folder => "New session · step 4 of 4".into(),
             Stage::Done => "ready".into(),
         }
     }
@@ -461,6 +505,13 @@ impl CommandPalette {
         self.stage = Stage::Layout;
     }
 
+    /// Supplies the folder picker after [`Outcome::LayoutChosen`]: stage
+    /// moves to Folder.
+    pub fn provide_folder(&mut self, folder: FolderPicker) {
+        self.folder = Some(folder);
+        self.stage = Stage::Folder;
+    }
+
     /// ⌫ on an empty query: pop the last token and go back one step.
     /// Never pops when the query is non-empty.
     pub fn pop(&mut self) -> Outcome {
@@ -469,8 +520,14 @@ impl CommandPalette {
         }
         match self.stage {
             Stage::Done => {
+                self.stage = Stage::Folder;
+                self.folder_choice = None;
+                Outcome::Nothing
+            }
+            Stage::Folder => {
                 self.stage = Stage::Layout;
                 self.layout_choice = None;
+                self.folder = None;
                 Outcome::Nothing
             }
             Stage::Layout => {
@@ -547,6 +604,25 @@ impl CommandPalette {
                     return Outcome::Nothing;
                 };
                 self.layout_choice = Some(choice);
+                Outcome::LayoutChosen
+            }
+            Stage::Folder => {
+                let choice = self.folder.as_ref().and_then(FolderPicker::selected_entry).cloned();
+                let Some(mut choice) = choice else {
+                    return Outcome::Nothing;
+                };
+                if let FolderKind::New { name } = &mut choice.kind {
+                    // The query is the new folder's name; empty falls back
+                    // to the default the sidebar rename flow also uses.
+                    let typed = self
+                        .folder
+                        .as_ref()
+                        .map(|p| p.query.trim().to_string())
+                        .unwrap_or_default();
+                    *name = if typed.is_empty() { "folder".into() } else { typed };
+                    choice.label = name.clone();
+                }
+                self.folder_choice = Some(choice);
                 self.stage = Stage::Done;
                 Outcome::Nothing
             }
@@ -564,6 +640,7 @@ impl CommandPalette {
                 .expect("launch without a repo pick"),
             base: self.base_choice.clone(),
             layout: self.layout_choice.clone(),
+            folder: self.folder_choice.clone(),
             for_flyover: self.for_flyover,
         }
     }
@@ -595,6 +672,12 @@ impl CommandPalette {
             }
         } else {
             "New worktree will be created · processes start on launch".into()
+        };
+        let status = match &self.folder_choice {
+            Some(folder) if !matches!(folder.kind, FolderKind::TopLevel) => {
+                format!("In folder {} · {}", folder.label, status)
+            }
+            _ => status,
         };
         (headline, status)
     }
@@ -800,7 +883,7 @@ mod tests {
         assert!(palette.needs_repo(), "the app provides the directory scan");
         assert_eq!(palette.tokens(), vec![Token::Command("New session")]);
         assert!(palette.in_flow());
-        assert_eq!(palette.footer(), "New session · step 1 of 3");
+        assert_eq!(palette.footer(), "New session · step 1 of 4");
         assert_eq!(palette.placeholder(), "Search repos…");
     }
 
@@ -839,18 +922,28 @@ mod tests {
         ProfilePicker::new(Vec::new())
     }
 
+    fn folder_picker() -> FolderPicker {
+        FolderPicker::new(vec![crate::picker::FolderSource {
+            id: 7,
+            name: "PWRDE".into(),
+            emoji: String::new(),
+            groups: 3,
+        }])
+    }
+
     #[test]
-    fn repo_to_base_to_layout_to_done_walk() {
+    fn repo_to_base_to_layout_to_folder_to_done_walk() {
         let mut palette = CommandPalette::new_session(false);
         assert_eq!(palette.stage, Stage::Repo);
         assert_eq!(palette.placeholder(), "Search repos…");
-        assert_eq!(palette.footer(), "New session · step 1 of 3");
+        assert_eq!(palette.footer(), "New session · step 1 of 4");
         assert_eq!(
             palette.steps(),
             [
                 ("Repository", StepState::Active),
                 ("Base", StepState::Pending),
                 ("Layout", StepState::Pending),
+                ("Folder", StepState::Pending),
             ]
         );
         assert_eq!(palette.tokens(), vec![Token::Command("New session")]);
@@ -882,16 +975,23 @@ mod tests {
 
         palette.provide_layout(profile_picker());
         assert_eq!(palette.stage, Stage::Layout);
-        assert_eq!(palette.footer(), "New session · step 3 of 3");
+        assert_eq!(palette.footer(), "New session · step 3 of 4");
         assert_eq!(
             palette.steps(),
             [
                 ("Repository", StepState::Done),
                 ("Base", StepState::Pending),
                 ("Layout", StepState::Active),
+                ("Folder", StepState::Pending),
             ]
         );
         palette.select(0); // the Default row
+        assert_eq!(palette.enter(), Outcome::LayoutChosen);
+        palette.provide_folder(folder_picker());
+        assert_eq!(palette.stage, Stage::Folder);
+        assert_eq!(palette.footer(), "New session · step 4 of 4");
+        assert_eq!(palette.placeholder(), "Choose a folder…");
+        palette.select(0); // the "No folder" row
         assert_eq!(palette.enter(), Outcome::Nothing);
         assert_eq!(palette.stage, Stage::Done);
         assert_eq!(palette.footer(), "ready");
@@ -903,6 +1003,7 @@ mod tests {
                 ("Repository", StepState::Done),
                 ("Base", StepState::Done),
                 ("Layout", StepState::Done),
+                ("Folder", StepState::Done),
             ]
         );
 
@@ -914,6 +1015,10 @@ mod tests {
         assert_eq!(launched.repo.path, PathBuf::from("/tmp/notes"));
         assert!(launched.base.is_none());
         assert!(launched.layout.is_some());
+        assert_eq!(
+            launched.folder.as_ref().map(|f| &f.kind),
+            Some(&crate::picker::FolderKind::TopLevel)
+        );
         assert!(!launched.for_flyover);
 
         // Git-repo variant: provide_base walks through Base too.
@@ -925,13 +1030,14 @@ mod tests {
         }
         palette.provide_base(fork_picker());
         assert_eq!(palette.stage, Stage::Base);
-        assert_eq!(palette.footer(), "New session · step 2 of 3");
+        assert_eq!(palette.footer(), "New session · step 2 of 4");
         assert_eq!(
             palette.steps(),
             [
                 ("Repository", StepState::Done),
                 ("Base", StepState::Active),
                 ("Layout", StepState::Pending),
+                ("Folder", StepState::Pending),
             ]
         );
         palette.select(1); // the RepoRoot row
@@ -940,6 +1046,9 @@ mod tests {
             other => panic!("expected BaseChosen, got {other:?}"),
         }
         palette.provide_layout(profile_picker());
+        palette.select(0);
+        assert_eq!(palette.enter(), Outcome::LayoutChosen);
+        palette.provide_folder(folder_picker());
         palette.select(0);
         palette.enter();
         assert_eq!(palette.stage, Stage::Done);
@@ -959,7 +1068,15 @@ mod tests {
         palette.provide_layout(profile_picker());
         palette.select(0);
         palette.enter();
+        palette.provide_folder(folder_picker());
+        palette.select(0);
+        palette.enter();
         assert_eq!(palette.stage, Stage::Done);
+
+        assert_eq!(palette.pop(), Outcome::Nothing);
+        assert_eq!(palette.stage, Stage::Folder);
+        assert!(palette.folder.is_some(), "the folder picker is kept");
+        assert!(palette.folder_choice.is_none(), "the folder choice is cleared");
 
         assert_eq!(palette.pop(), Outcome::Nothing);
         assert_eq!(palette.stage, Stage::Layout);
@@ -1034,6 +1151,55 @@ mod tests {
         assert_eq!(palette.stage, Stage::Layout);
         assert_eq!(palette.name, "notes");
         assert!(matches!(palette.tokens().as_slice(), [Token::Command(_), Token::Arg { kind: "repo", .. }]));
+    }
+
+    /// The folder step: an existing section resolves to its id, and the
+    /// "New folder…" row takes its name from the query.
+    #[test]
+    fn folder_step_picks_existing_and_names_new_folders() {
+        let entry = PickerEntry { path: PathBuf::from("/tmp/notes"), label: "notes".into(), is_git: false };
+        let mut palette = CommandPalette::for_directory(entry.clone(), profile_picker());
+        palette.select(0);
+        assert_eq!(palette.enter(), Outcome::LayoutChosen);
+        palette.provide_folder(folder_picker());
+        assert_eq!(palette.stage, Stage::Folder);
+
+        // Row 1 is the PWRDE section (row 0 is "No folder").
+        palette.select(1);
+        assert_eq!(palette.enter(), Outcome::Nothing);
+        assert_eq!(palette.stage, Stage::Done);
+        assert_eq!(
+            palette.folder_choice.as_ref().map(|f| f.kind.clone()),
+            Some(crate::picker::FolderKind::Existing { id: 7 })
+        );
+        assert!(palette.tokens().iter().any(
+            |t| matches!(t, Token::Arg { kind: "folder", label } if label == "PWRDE")
+        ));
+        let (_, status) = palette.summary();
+        assert!(status.starts_with("In folder PWRDE · "), "{status}");
+
+        // Pop back and take "New folder…" with a typed name instead.
+        assert_eq!(palette.pop(), Outcome::Nothing);
+        assert_eq!(palette.stage, Stage::Folder);
+        palette.set_query("infra");
+        let new_row = palette
+            .folder
+            .as_ref()
+            .unwrap()
+            .rows
+            .iter()
+            .position(|r| matches!(r.kind, crate::picker::FolderKind::New { .. }))
+            .expect("the New folder row survives any query");
+        palette.select(new_row);
+        assert_eq!(palette.enter(), Outcome::Nothing);
+        let launched = match palette.enter() {
+            Outcome::Launch(session) => session,
+            other => panic!("expected Launch, got {other:?}"),
+        };
+        assert_eq!(
+            launched.folder.map(|f| f.kind),
+            Some(crate::picker::FolderKind::New { name: "infra".into() })
+        );
     }
 }
 
