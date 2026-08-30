@@ -49,6 +49,7 @@ pwrde-cli commands                               # every bus command + every reb
 pwrde-cli new-session ~/src/pwrde                # open a group at a dir; --layout <profile> applies a .pwrspace profile; --base <ref|default> forks a worktree via drop
 pwrde-cli send-text 'cargo test' --enter         # raw keystrokes into the focused pane; --enter appends \r; --group <name|index>; text `-` reads stdin
 pwrde-cli send-text $'\x03'                      # control bytes pass through (^C, escape sequences)
+pwrde-cli key cmd-p escape                       # press chords through the app's key handler (tests bindings/overlays; gpui syntax: cmd-shift-t, ctrl-c, enter)
 pwrde-cli action split_right                     # any Action by name (split_right, new_tab, close_tab, focus_left, toggle_sidebar, screenshot_to_file, …)
 pwrde-cli page settings                          # sessions | pull_requests | settings | tool:<n>
 pwrde-cli focus pwrde                            # by group name, sidebar title, or 0-based index
@@ -58,6 +59,9 @@ pwrde-cli screenshot /tmp/app.png                # PNG of the app window (no Scr
 pwrde-cli raw '{"cmd":"send_text","text":"ls\r","group":"pwrde"}'   # anything the protocol accepts
 ```
 
+`key` enters at the app's key handler (bindings, palette/overlay and flyover
+routing, PTY typing), not gpui's focus tree — a focused child view such as a
+Settings Input or the PR composer won't receive it; use `send-text` for text.
 `send-text` is raw input, not a bracketed paste: multi-line text runs line by
 line in a shell. Actions that don't apply (e.g. `split_right` on the Settings
 page, or with no session open) return exit `1` with a reason rather than a

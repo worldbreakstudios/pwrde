@@ -182,6 +182,16 @@ fn parse_command(sub: &str, args: &[String]) -> Result<Command, CliError> {
             }
             Ok(Command::SendText { text, group })
         }
+        "key" => {
+            if args.is_empty() {
+                return Err(CliError::Usage(
+                    "key requires at least one <chord>".into(),
+                ));
+            }
+            Ok(Command::Key {
+                keys: args.to_vec(),
+            })
+        }
         "focus" => {
             let group = args
                 .first()
@@ -305,6 +315,7 @@ fn usage() -> String {
         ("action", "action"),
         ("new_session", "new-session"),
         ("send_text", "send-text"),
+        ("key", "key"),
         ("focus_group", "focus"),
         ("new_section", "new-section"),
         ("move_group_to_section", "move"),
@@ -331,6 +342,7 @@ fn usage() -> String {
     }
     out.push_str("  raw '<json line>'             Send a raw NDJSON command line\n");
     out.push_str("\nSend-text extras: --enter appends CR; <text> of - reads stdin.\n");
+    out.push_str("Key chords use gpui syntax (cmd-p, escape, cmd-shift-t, ctrl-c, enter).\n");
     out
 }
 

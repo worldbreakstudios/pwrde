@@ -467,6 +467,9 @@ struct App {
     /// The main window, so popout-initiated flows (new-tab picker, docking)
     /// can bring it forward.
     main_window: Option<gpui::AnyWindowHandle>,
+    /// Keystrokes queued by the bus `key` command, drained through the real
+    /// gpui key-down handler so bindings and overlay routing are exercised.
+    pending_keys: Vec<gpui::Keystroke>,
     /// Polarity shown in the Appearance preview cards (independent of the
     /// system/user mode setting); seeded from the active polarity at launch.
     preview_dark: bool,
@@ -6704,6 +6707,7 @@ fn main() {
                         flyover_window_visible: false,
                         flyover_window: None,
                         main_window: None,
+                        pending_keys: Vec::new(),
                         preview_dark: theme::dark_active(),
                         appearance_menu: None,
                         open_tool: settings::get_str("toolpanel.tool").and_then(|s| {
@@ -6744,7 +6748,7 @@ fn main() {
                                 .timer(Duration::from_millis(16))
                                 .await;
                             let Some(app) = handle.upgrade() else { break };
-                            let (redraw, want_popout, popout) =
+                            let (redraw, want_popout, popout, (pending_keys, main)) =
                                 app.update(cx, |app: &mut App, cx| {
                                     let redraw = app.drain_events();
                                     if redraw {
@@ -6754,8 +6758,46 @@ fn main() {
                                         redraw,
                                         app.flyover_windowed && app.flyover_window_visible,
                                         app.flyover_window,
+                                        // Only dequeue once the main window
+                                        // exists: keys pressed over the bus
+                                        // during startup wait rather than
+                                        // vanishing after their `queued` ack.
+                                        match app.main_window.and_then(|w| w.downcast::<App>()) {
+                                            Some(main) => (std::mem::take(&mut app.pending_keys), Some(main)),
+                                            None => (Vec::new(), None),
+                                        },
                                     )
                                 });
+                            // Keystrokes queued by the bus `key` command go
+                            // through the main window's `on_key_down` (which
+                            // needs a Window the entity update above lacks),
+                            // so app-level bindings and overlay/flyover routing
+                            // are exercised. This enters at the App handler,
+                            // not gpui's focus tree: a focused child view
+                            // (Settings Input, PR composer) is not reached.
+                            if let (false, Some(main)) = (pending_keys.is_empty(), main) {
+                                let n = pending_keys.len();
+                                if main
+                                    .update(cx, |app, window, cx| {
+                                        for keystroke in pending_keys {
+                                            let ev = KeyDownEvent {
+                                                keystroke,
+                                                is_held: false,
+                                                prefer_character_input: false,
+                                            };
+                                            app.on_key_down(&ev, window, cx);
+                                        }
+                                        // No key-up follows a synthetic press:
+                                        // clear the latched modifiers so the
+                                        // next real click isn't read as ⌘-click.
+                                        app.modifiers = Modifiers::default();
+                                        cx.notify();
+                                    })
+                                    .is_err()
+                                {
+                                    eprintln!("bus key: main window gone, dropped {n} keystroke(s)");
+                                }
+                            }
                             // Reconcile the popout window with the desired
                             // state — window lifecycle stays here, on the
                             // foreground executor, so entity code never has

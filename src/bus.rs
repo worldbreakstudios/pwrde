@@ -32,6 +32,9 @@ pub enum Command {
         #[serde(default)]
         group: Option<String>,
     },
+    Key {
+        keys: Vec<String>,
+    },
     FocusGroup {
         group: String,
     },
@@ -113,6 +116,11 @@ pub fn command_specs() -> Vec<CommandSpec> {
             name: "send_text",
             args: "<text> [--group <name>]",
             help: "Send raw keystrokes to the focused (or named) group's pane (--enter appends \\r)",
+        },
+        CommandSpec {
+            name: "key",
+            args: "<chord>...",
+            help: "Press keystrokes through the app's key handler (gpui chord syntax: cmd-p, escape, cmd-shift-t, ctrl-c)",
         },
         CommandSpec {
             name: "focus_group",
@@ -358,6 +366,7 @@ fn command_tag(cmd: &Command) -> &'static str {
         Command::Action { .. } => "action",
         Command::NewSession { .. } => "new_session",
         Command::SendText { .. } => "send_text",
+        Command::Key { .. } => "key",
         Command::FocusGroup { .. } => "focus_group",
         Command::NewSection { .. } => "new_section",
         Command::MoveGroupToSection { .. } => "move_group_to_section",
@@ -400,6 +409,10 @@ mod tests {
                 text: "hello".into(),
                 group: None,
             },
+            Command::Key {
+                keys: vec!["cmd-p".into(), "escape".into()],
+            },
+            Command::Key { keys: vec!["enter".into()] },
             Command::FocusGroup { group: "g1".into() },
             Command::NewSection {
                 name: "Work".into(),
@@ -489,6 +502,7 @@ mod tests {
                 text: String::new(),
                 group: None,
             },
+            Command::Key { keys: vec![] },
             Command::FocusGroup {
                 group: String::new(),
             },
