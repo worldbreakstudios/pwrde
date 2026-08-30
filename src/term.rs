@@ -85,6 +85,12 @@ pub enum TermEvent {
     /// from a shared cache rather than carried in the event (e.g. a finished
     /// mermaid render). Carries no state — just marks the frame dirty.
     Redraw,
+    /// A request arrived on the command bus socket; the drain loop executes it on
+    /// the main thread and sends exactly one Reply back.
+    Bus {
+        cmd: crate::bus::Command,
+        reply: std::sync::mpsc::Sender<crate::bus::Reply>,
+    },
 }
 
 /// Forwards `Alert::ToastNotification` from wezterm-term to the UI event channel
@@ -539,6 +545,9 @@ impl Session {
                 // the renderer paints full RGB per cell, so apps should emit it.
                 cmd.env("COLORTERM", "truecolor");
                 cmd.env("PWRDE", "1");
+                if let Ok(sock) = std::env::var("PWRDE_SOCKET") {
+                    cmd.env("PWRDE_SOCKET", sock);
+                }
                 (Some(cmd), None)
             } else {
                 // Fail the pane loudly rather than silently losing persistence.
@@ -549,6 +558,9 @@ impl Session {
             cmd.env("TERM", "xterm-256color");
             cmd.env("COLORTERM", "truecolor");
             cmd.env("PWRDE", "1");
+            if let Ok(sock) = std::env::var("PWRDE_SOCKET") {
+                cmd.env("PWRDE_SOCKET", sock);
+            }
             // Only honor a cwd that still exists — a pinned/recent dir may have
             // been deleted since it was saved, and spawning a shell in a missing
             // directory would fail. Fall back to inheriting our own cwd.

@@ -224,11 +224,17 @@ pub enum Action {
     ToggleToolPanel,
     IncreaseFontSize,
     DecreaseFontSize,
+    ScreenshotToClipboard,
+    ScreenshotToFile,
+    NewSection,
+    GoToSessions,
+    GoToPullRequests,
+    GoToCleanup,
 }
 
 impl Action {
     /// Keyboard-page row order.
-    pub const ALL: [Action; 33] = [
+    pub const ALL: [Action; 39] = [
         Action::SplitRight,
         Action::SplitDown,
         Action::NewTab,
@@ -262,6 +268,12 @@ impl Action {
         Action::ToggleToolPanel,
         Action::IncreaseFontSize,
         Action::DecreaseFontSize,
+        Action::ScreenshotToClipboard,
+        Action::ScreenshotToFile,
+        Action::NewSection,
+        Action::GoToSessions,
+        Action::GoToPullRequests,
+        Action::GoToCleanup,
     ];
 
     /// Stable identifier used in the settings key (`keyboard.<name>`).
@@ -300,6 +312,12 @@ impl Action {
             Action::ToggleToolPanel => "toggle_tool_panel",
             Action::IncreaseFontSize => "increase_font_size",
             Action::DecreaseFontSize => "decrease_font_size",
+            Action::ScreenshotToClipboard => "screenshot_to_clipboard",
+            Action::ScreenshotToFile => "screenshot_to_file",
+            Action::NewSection => "new_section",
+            Action::GoToSessions => "go_to_sessions",
+            Action::GoToPullRequests => "go_to_pull_requests",
+            Action::GoToCleanup => "go_to_cleanup",
         }
     }
 
@@ -338,6 +356,12 @@ impl Action {
             Action::ToggleToolPanel => "Toggle tool panel",
             Action::IncreaseFontSize => "Increase font size",
             Action::DecreaseFontSize => "Decrease font size",
+            Action::ScreenshotToClipboard => "Screenshot to clipboard",
+            Action::ScreenshotToFile => "Screenshot to file",
+            Action::NewSection => "New folder",
+            Action::GoToSessions => "Go to Sessions",
+            Action::GoToPullRequests => "Go to Pull Requests",
+            Action::GoToCleanup => "Go to Cleanup",
         }
     }
 
@@ -346,43 +370,57 @@ impl Action {
     }
 
     pub fn default_binding(self) -> Binding {
-        let (shift, key) = match self {
-            Action::SplitRight => (false, "d"),
-            Action::SplitDown => (true, "d"),
-            Action::NewTab => (false, "t"),
-            Action::NewGroup => (true, "t"),
-            Action::Copy => (false, "c"),
-            Action::Paste => (false, "v"),
-            Action::CloseTab => (false, "w"),
-            Action::CloseGroup => (true, "w"),
-            Action::TogglePin => (true, "p"),
-            Action::Quit => (false, "q"),
-            Action::PrevTile => (false, "["),
-            Action::NextTile => (false, "]"),
-            Action::PrevTab => (true, "["),
-            Action::NextTab => (true, "]"),
-            Action::FocusLeft => (true, "h"),
-            Action::FocusDown => (true, "j"),
-            Action::FocusUp => (true, "k"),
-            Action::FocusRight => (true, "l"),
-            Action::ToggleCollapse => (true, "m"),
-            Action::ToggleFocusOthers => (true, "f"),
-            Action::PrevSidebarTab => (true, "up"),
-            Action::NextSidebarTab => (true, "down"),
-            Action::ToggleSidebar => (false, "s"),
-            Action::PrevPage => (true, "left"),
-            Action::NextPage => (true, "right"),
-            Action::OpenSettings => (false, ","),
-            Action::CommandPalette => (false, "p"),
-            Action::ToggleFlyover => (false, "`"),
-            Action::FlyoverPopout => (true, "`"),
-            Action::SaveWorkspace => (true, "s"),
-            Action::ToggleToolPanel => (true, "g"),
-            Action::IncreaseFontSize => (false, "="),
+        // (shift, alt, ctrl, key) — most app chords are cmd+key; alt/ctrl let a
+        // few actions avoid macOS system shortcuts and existing defaults.
+        let (shift, alt, ctrl, key) = match self {
+            Action::SplitRight => (false, false, false, "d"),
+            Action::SplitDown => (true, false, false, "d"),
+            Action::NewTab => (false, false, false, "t"),
+            Action::NewGroup => (true, false, false, "t"),
+            Action::Copy => (false, false, false, "c"),
+            Action::Paste => (false, false, false, "v"),
+            Action::CloseTab => (false, false, false, "w"),
+            Action::CloseGroup => (true, false, false, "w"),
+            Action::TogglePin => (true, false, false, "p"),
+            Action::Quit => (false, false, false, "q"),
+            Action::PrevTile => (false, false, false, "["),
+            Action::NextTile => (false, false, false, "]"),
+            Action::PrevTab => (true, false, false, "["),
+            Action::NextTab => (true, false, false, "]"),
+            Action::FocusLeft => (true, false, false, "h"),
+            Action::FocusDown => (true, false, false, "j"),
+            Action::FocusUp => (true, false, false, "k"),
+            Action::FocusRight => (true, false, false, "l"),
+            Action::ToggleCollapse => (true, false, false, "m"),
+            Action::ToggleFocusOthers => (true, false, false, "f"),
+            Action::PrevSidebarTab => (true, false, false, "up"),
+            Action::NextSidebarTab => (true, false, false, "down"),
+            Action::ToggleSidebar => (false, false, false, "s"),
+            Action::PrevPage => (true, false, false, "left"),
+            Action::NextPage => (true, false, false, "right"),
+            Action::OpenSettings => (false, false, false, ","),
+            Action::CommandPalette => (false, false, false, "p"),
+            Action::ToggleFlyover => (false, false, false, "`"),
+            Action::FlyoverPopout => (true, false, false, "`"),
+            Action::SaveWorkspace => (true, false, false, "s"),
+            Action::ToggleToolPanel => (true, false, false, "g"),
+            Action::IncreaseFontSize => (false, false, false, "="),
             // "minus" (not "-") because "-" is the binding token separator.
-            Action::DecreaseFontSize => (false, "minus"),
+            Action::DecreaseFontSize => (false, false, false, "minus"),
+            // ctrl+alt chords: avoid macOS system screenshot and existing defaults.
+            Action::ScreenshotToClipboard => (false, true, true, "c"),
+            Action::ScreenshotToFile => (false, true, true, "s"),
+            Action::NewSection => (false, true, true, "n"),
+            Action::GoToSessions => (false, true, true, "1"),
+            Action::GoToPullRequests => (false, true, true, "2"),
+            Action::GoToCleanup => (false, true, true, "3"),
         };
-        Binding { shift, alt: false, ctrl: false, key: key.into() }
+        Binding { shift, alt, ctrl, key: key.into() }
+    }
+
+    /// Look up an action by its stable `name()` string (e.g. `"split_right"`).
+    pub fn from_name(name: &str) -> Option<Action> {
+        Action::ALL.iter().copied().find(|a| a.name() == name)
     }
 
     /// The user's binding from settings, or the default. Resolved per lookup —
@@ -907,6 +945,14 @@ mod tests {
                 action,
             );
         }
+    }
+
+    #[test]
+    fn from_name_roundtrips_all_and_rejects_unknown() {
+        for action in Action::ALL {
+            assert_eq!(Action::from_name(action.name()), Some(action));
+        }
+        assert_eq!(Action::from_name("nope"), None);
     }
 
     #[test]

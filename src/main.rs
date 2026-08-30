@@ -16,6 +16,8 @@
 //! `Application`, a window, and a terminal `Element`. Terminal wakeups arrive
 //! over an `mpsc` channel drained on gpui's foreground executor.
 
+mod bus;
+mod bus_exec;
 mod claude_hooks;
 mod cleanup;
 mod cleanup_ui;
@@ -4019,35 +4021,48 @@ impl App {
         self.request_redraw();
     }
 
-    /// Run a rebindable action. Page navigation and quit work everywhere;
-    /// terminal-layout actions only make sense on the Sessions page.
-    fn run_action(&mut self, action: Action) {
+    /// Actions that work on every page. Returns whether `action` was one.
+    fn run_global_action(&mut self, action: Action) -> bool {
         match action {
-            Action::PrevPage => return self.cycle_page(-1),
-            Action::NextPage => return self.cycle_page(1),
-            Action::PrevSidebarTab => return self.cycle_sidebar_tab(-1),
-            Action::NextSidebarTab => return self.cycle_sidebar_tab(1),
-            Action::ToggleSidebar => return self.toggle_sidebar(),
-            Action::OpenSettings => return self.set_page(Page::Settings),
+            Action::PrevPage => self.cycle_page(-1),
+            Action::NextPage => self.cycle_page(1),
+            Action::PrevSidebarTab => self.cycle_sidebar_tab(-1),
+            Action::NextSidebarTab => self.cycle_sidebar_tab(1),
+            Action::ToggleSidebar => self.toggle_sidebar(),
+            Action::OpenSettings => self.set_page(Page::Settings),
             Action::Quit => std::process::exit(0),
-            Action::CommandPalette => {
-                self.toggle_command_root();
-                return;
-            },
-            Action::IncreaseFontSize => return self.zoom_font(renderer::FONT_SIZE_STEP),
-            Action::DecreaseFontSize => return self.zoom_font(-renderer::FONT_SIZE_STEP),
-            _ => {},
+            Action::CommandPalette => self.toggle_command_root(),
+            Action::IncreaseFontSize => self.zoom_font(renderer::FONT_SIZE_STEP),
+            Action::DecreaseFontSize => self.zoom_font(-renderer::FONT_SIZE_STEP),
+            Action::GoToSessions => self.set_page(Page::Sessions),
+            Action::GoToPullRequests => self.set_page(Page::PullRequests),
+            Action::GoToCleanup => self.set_page(Page::Cleanup),
+            Action::ScreenshotToClipboard => self.screenshot_action(true),
+            Action::ScreenshotToFile => self.screenshot_action(false),
+            Action::NewSection => self.new_section_action(),
+            _ => return false,
+        }
+        true
+    }
+
+    /// Run a rebindable action. Page navigation and quit work everywhere;
+    /// terminal-layout actions only make sense on the Sessions page. Returns
+    /// whether the action applied (false: wrong page or no open session).
+    fn run_action(&mut self, action: Action) -> bool {
+        if self.run_global_action(action) {
+            return true;
         }
         if self.page != Page::Sessions {
-            return;
+            return false;
         }
         // Empty state: there is no pane to act on. New tab / new group start
         // a group via the picker; everything else is a no-op.
         if self.is_empty_state() {
             if matches!(action, Action::NewTab | Action::NewGroup) {
                 self.open_picker();
+                return true;
             }
-            return;
+            return false;
         }
         match action {
             Action::SplitRight => self.split(Dir::Row),
@@ -4089,7 +4104,13 @@ impl App {
             | Action::Quit
             | Action::CommandPalette
             | Action::IncreaseFontSize
-            | Action::DecreaseFontSize => {},
+            | Action::DecreaseFontSize
+            | Action::GoToSessions
+            | Action::GoToPullRequests
+            | Action::GoToCleanup
+            | Action::ScreenshotToClipboard
+            | Action::ScreenshotToFile
+            | Action::NewSection => {},
             Action::ToggleFlyover => self.toggle_flyover(),
             Action::FlyoverPopout => self.flyover_toggle_windowed(),
             // Closes whichever tool is open; opens the first registered tool
@@ -4102,6 +4123,7 @@ impl App {
                 }
             },
         }
+        true
     }
 
     /// ⌘= / ⌘-: grow or shrink a font size. Context-aware — the terminal
@@ -4565,6 +4587,10 @@ impl App {
                         Some(profile) => self.add_group_with_profile(name, Some(cwd), &profile),
                         None => self.add_group(name, Some(cwd)),
                     }
+                    redraw = true;
+                },
+                TermEvent::Bus { cmd, reply } => {
+                    self.execute_bus(cmd, reply);
                     redraw = true;
                 },
                 TermEvent::GroupFailed { message } => {
@@ -6439,6 +6465,9 @@ fn main() {
         .with_quit_mode(QuitMode::LastWindowClosed);
 
     let (events_tx, events_rx) = mpsc::channel::<TermEvent>();
+    // Command bus: listen before any session spawns so child shells inherit
+    // `PWRDE_SOCKET` and `pwrde-cli` inside a tab targets this instance.
+    bus_exec::start(events_tx.clone());
     // Let finished off-thread mermaid renders nudge a repaint.
     crate::mermaid::init(events_tx.clone());
     // React to a directory arriving from outside the app. Registered on the
