@@ -479,8 +479,6 @@ struct App {
     pr: pr_ui::PrState,
     /// Local diff tool state (mode + gathered diff).
     local_diff: local_diff_ui::LocalDiffState,
-    /// Shared comment/request-changes text box for the PR tool.
-    pr_comment_input: gpui::Entity<crate::ui::Input>,
     /// The `lfg events` SSE tail process, kept alive while the app runs (its
     /// reader thread forwards cache-updated events). `None` when the async path
     /// is off or `lfg` couldn't launch.
@@ -3724,23 +3722,23 @@ impl App {
         }
         // The Pull Requests page: ⌘ shortcuts still dispatch; Esc backs out of
         // a PR detail to the list; other typing is swallowed (no terminal).
+        // A focused PR composer owns the keyboard: the multi-line editor
+        // entity (and its own key bindings) handles editing, so keys don't
+        // reach the shell or ⌘ shortcuts. Escape discards the composer and
+        // hands focus back.
+        if self.pr_editor_focused(window, cx) {
+            if ev.keystroke.key == "escape" {
+                self.pr_close_composer();
+                window.focus(&self.focus_handle, cx);
+            }
+            self.request_redraw();
+            return;
+        }
         if self.page == Page::PullRequests {
             if ev.keystroke.modifiers.platform {
                 self.handle_shortcut(ev);
             } else if ev.keystroke.key == "escape" && self.pr.open.is_some() {
                 self.close_pr_detail();
-            }
-            self.request_redraw();
-            return;
-        }
-        // A focused PR-comment box owns the keyboard: let the rcn Input entity
-        // (and its own key bindings) handle editing, so keys don't reach the
-        // shell or ⌘ shortcuts. Escape blurs back to the terminal.
-        if self.visible_tool() == Some(pages::Tool::Pr)
-            && self.pr_comment_input.read(cx).focus_handle(cx).is_focused(window)
-        {
-            if ev.keystroke.key == "escape" {
-                window.focus(&self.focus_handle, cx);
             }
             self.request_redraw();
             return;
@@ -6709,11 +6707,6 @@ fn main() {
                         git_cwd_cache: Default::default(),
                         pr: pr_ui::PrState::default(),
                         local_diff: local_diff_ui::LocalDiffState::default(),
-                        pr_comment_input: cx.new(|cx| {
-                            let mut input = crate::ui::Input::new(cx);
-                            input.placeholder("Leave a comment…");
-                            input
-                        }),
                         _lfg_events_child: crate::lfg::spawn_event_stream(events_tx.clone()),
                     };
                     // With persistence on, reattach to the previous session's

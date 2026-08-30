@@ -9,11 +9,15 @@
 //! (only meaningful for `lfg`; plain `gh` blocks synchronously).
 //!
 //! Reads return normalized, gpui-free structs so the UI layer and the tests
-//! don't care which CLI produced them. Writes (approve/comment/merge/ready) go
-//! through the same CLI's `pr` subcommands.
+//! don't care which CLI produced them. Writes go through the same CLI:
+//! approve/comment/ready/merge/close via its `pr` subcommands, thread
+//! resolution via `api graphql`, and inline line comments / thread replies /
+//! batched review submission via `api` REST with a JSON body on stdin
+//! (`--input -`), so they work identically under `gh` and `lfg`.
 
+use std::io::Write;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use serde::Deserialize;
 
@@ -84,6 +88,21 @@ fn finish(out: std::process::Output) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Like [`run`], but feeds `body` on stdin (for `gh api … --input -`).
+fn run_with_stdin(mut cmd: Command, body: &str) -> Result<String, String> {
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| format!("{}: {e}", cli()))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(body.as_bytes())
+            .map_err(|e| format!("write stdin: {e}"))?;
+    }
+    let out = child.wait_with_output().map_err(|e| format!("{}: {e}", cli()))?;
+    finish(out)
+}
+
 /// Whether a CLI failure message is an authentication problem rather than a
 /// timeout, a missing binary, or a missing remote.
 ///
@@ -128,6 +147,8 @@ pub struct PrDetail {
     pub author: String,
     pub head: String,
     pub base: String,
+    /// Head commit oid (`headRefOid` from `pr view --json`).
+    pub head_sha: String,
     pub additions: u32,
     pub deletions: u32,
     pub changed_files: u32,
@@ -192,6 +213,8 @@ pub struct ReviewThreadComment {
     pub author: String,
     pub body: String,
     pub created_at: String,
+    /// REST database id — used as the parent for thread replies.
+    pub database_id: Option<u64>,
 }
 
 /// A threaded set of inline review comments on a file/line, with its resolution.
@@ -408,6 +431,8 @@ struct RawDetail {
     #[serde(default)]
     base_ref_name: String,
     #[serde(default)]
+    head_ref_oid: String,
+    #[serde(default)]
     additions: u32,
     #[serde(default)]
     deletions: u32,
@@ -486,7 +511,7 @@ pub fn aggregate_check_status(checks: &[Check]) -> Option<CheckStatus> {
 // ── Reads ───────────────────────────────────────────────────────────────
 
 const DETAIL_FIELDS: &str = "number,title,body,state,isDraft,author,createdAt,headRefName,\
-baseRefName,additions,deletions,changedFiles,reviewDecision,mergeable,url,labels,comments,\
+baseRefName,headRefOid,additions,deletions,changedFiles,reviewDecision,mergeable,url,labels,comments,\
 reviews,statusCheckRollup";
 
 const LIST_FIELDS: &str =
@@ -574,6 +599,28 @@ pub fn pr_detail(dir: &Path, number: u32) -> Result<PrDetail, String> {
     let raw: RawDetail =
         serde_json::from_str(trimmed).map_err(|e| format!("parse pr view: {e}"))?;
 
+    // Threads + timeline come from `api graphql` passthrough, which needs the
+    // owner/repo (resolved from the git remote). Best-effort: a failure here
+    // leaves the timeline empty rather than dropping the whole detail.
+    let (threads, events) = match origin_nwo(dir) {
+        Some((owner, repo)) => (
+            pr_review_threads(dir, &owner, &repo, number).unwrap_or_default(),
+            pr_timeline(dir, &owner, &repo, number).unwrap_or_default(),
+        ),
+        None => (Vec::new(), Vec::new()),
+    };
+
+    Ok(detail_from_raw(raw, threads, events))
+}
+
+/// Map a deserialized `pr view --json` payload (+ optional GraphQL extras) into
+/// the public [`PrDetail`]. Pure so unit tests can cover field mapping without
+/// shelling out to the CLI.
+fn detail_from_raw(
+    raw: RawDetail,
+    threads: Vec<ReviewThread>,
+    events: Vec<TimelineEvent>,
+) -> PrDetail {
     // Merge issue comments and reviews into one time-ordered conversation.
     let mut comments: Vec<Comment> = raw
         .comments
@@ -597,18 +644,7 @@ pub fn pr_detail(dir: &Path, number: u32) -> Result<PrDetail, String> {
     }));
     comments.sort_by(|a, b| a.created_at.cmp(&b.created_at));
 
-    // Threads + timeline come from `api graphql` passthrough, which needs the
-    // owner/repo (resolved from the git remote). Best-effort: a failure here
-    // leaves the timeline empty rather than dropping the whole detail.
-    let (threads, events) = match origin_nwo(dir) {
-        Some((owner, repo)) => (
-            pr_review_threads(dir, &owner, &repo, number).unwrap_or_default(),
-            pr_timeline(dir, &owner, &repo, number).unwrap_or_default(),
-        ),
-        None => (Vec::new(), Vec::new()),
-    };
-
-    Ok(PrDetail {
+    PrDetail {
         number: raw.number,
         title: raw.title,
         body: raw.body,
@@ -617,6 +653,7 @@ pub fn pr_detail(dir: &Path, number: u32) -> Result<PrDetail, String> {
         author: raw.author.login,
         head: raw.head_ref_name,
         base: raw.base_ref_name,
+        head_sha: raw.head_ref_oid,
         additions: raw.additions,
         deletions: raw.deletions,
         changed_files: raw.changed_files,
@@ -629,7 +666,7 @@ pub fn pr_detail(dir: &Path, number: u32) -> Result<PrDetail, String> {
         checks: raw.status_check_rollup.into_iter().map(normalize_check).collect(),
         threads,
         events,
-    })
+    }
 }
 
 // ── GraphQL passthrough (timeline + review threads) ─────────────────────────
@@ -686,7 +723,7 @@ query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
         nodes {
           id isResolved isOutdated path line
           comments(first: 100) {
-            nodes { id author { login } body createdAt diffHunk }
+            nodes { id databaseId author { login } body createdAt diffHunk }
           }
         }
       }
@@ -891,6 +928,7 @@ fn parse_thread_node(node: &serde_json::Value) -> Option<ReviewThread> {
             author: c.get("author").and_then(|a| str_field(a, "login")).unwrap_or_default(),
             body: str_field(c, "body").unwrap_or_default(),
             created_at: str_field(c, "createdAt").unwrap_or_default(),
+            database_id: c.get("databaseId").and_then(|v| v.as_u64()),
         })
         .collect();
     Some(ReviewThread {
@@ -947,11 +985,26 @@ pub fn pr_diff(dir: &Path, number: u32) -> Result<Vec<DiffFile>, String> {
 
 // ── Writes ────────────────────────────────────────────────────────────────
 
+/// One not-yet-submitted inline comment, batched into a pending review.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingComment {
+    pub path: String,
+    pub line: u32,
+    pub body: String,
+}
+
+/// How a batched review is submitted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewEvent {
+    Approve,
+    RequestChanges,
+    Comment,
+}
+
 /// A write action the panel can invoke.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
     Approve,
-    RequestChanges(String),
     Comment(String),
     /// Mark a draft PR ready for review.
     Ready,
@@ -961,6 +1014,22 @@ pub enum Action {
     Close,
     /// Resolve (`true`) or unresolve (`false`) a review thread by node id.
     ResolveThread { id: String, resolved: bool },
+    /// Post one inline review comment on the RIGHT (new) side of `path:line` at `commit_id`.
+    LineComment {
+        path: String,
+        line: u32,
+        body: String,
+        commit_id: String,
+    },
+    /// Reply to an existing review thread comment (REST `pulls/{n}/comments/{id}/replies`).
+    ReplyThread { comment_id: u64, body: String },
+    /// Submit a batched review with zero or more inline comments in one call.
+    SubmitReview {
+        event: ReviewEvent,
+        body: String,
+        comments: Vec<PendingComment>,
+        commit_id: String,
+    },
 }
 
 impl Action {
@@ -968,13 +1037,26 @@ impl Action {
     pub fn describe(&self) -> &'static str {
         match self {
             Action::Approve => "Approved",
-            Action::RequestChanges(_) => "Requested changes",
             Action::Comment(_) => "Commented",
             Action::Ready => "Marked ready for review",
             Action::Merge => "Merged (squash)",
             Action::Close => "Closed",
             Action::ResolveThread { resolved: true, .. } => "Resolved thread",
             Action::ResolveThread { resolved: false, .. } => "Unresolved thread",
+            Action::LineComment { .. } => "Commented on line",
+            Action::ReplyThread { .. } => "Replied",
+            Action::SubmitReview {
+                event: ReviewEvent::Approve,
+                ..
+            } => "Approved",
+            Action::SubmitReview {
+                event: ReviewEvent::RequestChanges,
+                ..
+            } => "Requested changes",
+            Action::SubmitReview {
+                event: ReviewEvent::Comment,
+                ..
+            } => "Submitted review",
         }
     }
 }
@@ -983,6 +1065,57 @@ const RESOLVE_THREAD_MUTATION: &str =
     "mutation($threadId: ID!) { resolveReviewThread(input: { threadId: $threadId }) { thread { id } } }";
 const UNRESOLVE_THREAD_MUTATION: &str =
     "mutation($threadId: ID!) { unresolveReviewThread(input: { threadId: $threadId }) { thread { id } } }";
+
+/// JSON body for a single inline review comment on the RIGHT side.
+fn line_comment_body(path: &str, line: u32, body: &str, commit_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "body": body,
+        "commit_id": commit_id,
+        "path": path,
+        "line": line,
+        "side": "RIGHT",
+    })
+}
+
+/// JSON body for a reply to an existing review thread comment.
+fn reply_body(body: &str) -> serde_json::Value {
+    serde_json::json!({ "body": body })
+}
+
+/// JSON body for a batched pull-request review submission.
+fn review_body(
+    event: ReviewEvent,
+    body: &str,
+    comments: &[PendingComment],
+    commit_id: &str,
+) -> serde_json::Value {
+    let event_str = match event {
+        ReviewEvent::Approve => "APPROVE",
+        ReviewEvent::RequestChanges => "REQUEST_CHANGES",
+        ReviewEvent::Comment => "COMMENT",
+    };
+    let mut obj = serde_json::Map::new();
+    obj.insert("commit_id".into(), serde_json::Value::String(commit_id.into()));
+    obj.insert("event".into(), serde_json::Value::String(event_str.into()));
+    if !body.is_empty() {
+        obj.insert("body".into(), serde_json::Value::String(body.into()));
+    }
+    if !comments.is_empty() {
+        let comments_json: Vec<serde_json::Value> = comments
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "path": c.path,
+                    "line": c.line,
+                    "side": "RIGHT",
+                    "body": c.body,
+                })
+            })
+            .collect();
+        obj.insert("comments".into(), serde_json::Value::Array(comments_json));
+    }
+    serde_json::Value::Object(obj)
+}
 
 /// Run a write action against a PR. Writes never use the async placeholder
 /// path — they must block on the real mutation — so this shells the CLI
@@ -994,9 +1127,6 @@ pub fn run_action(dir: &Path, number: u32, action: &Action) -> Result<String, St
     match action {
         Action::Approve => {
             cmd.args(["pr", "review", &n, "--approve"]);
-        }
-        Action::RequestChanges(body) => {
-            cmd.args(["pr", "review", &n, "--request-changes", "--body", body]);
         }
         Action::Comment(body) => {
             cmd.args(["pr", "comment", &n, "--body", body]);
@@ -1018,6 +1148,40 @@ pub fn run_action(dir: &Path, number: u32, action: &Action) -> Result<String, St
             cmd.arg("api").arg("graphql");
             cmd.arg("-f").arg(format!("threadId={id}"));
             cmd.arg("-f").arg(format!("query={mutation}"));
+        }
+        Action::LineComment {
+            path,
+            line,
+            body,
+            commit_id,
+        } => {
+            let (owner, repo) = origin_nwo(dir).ok_or_else(|| "no GitHub remote for this repo".to_string())?;
+            let api_path = format!("repos/{owner}/{repo}/pulls/{n}/comments");
+            cmd.args(["api", &api_path, "--method", "POST", "--input", "-"]);
+            let payload = line_comment_body(path, *line, body, commit_id);
+            run_with_stdin(cmd, &payload.to_string())?;
+            return Ok(action.describe().to_string());
+        }
+        Action::ReplyThread { comment_id, body } => {
+            let (owner, repo) = origin_nwo(dir).ok_or_else(|| "no GitHub remote for this repo".to_string())?;
+            let api_path = format!("repos/{owner}/{repo}/pulls/{n}/comments/{comment_id}/replies");
+            cmd.args(["api", &api_path, "--method", "POST", "--input", "-"]);
+            let payload = reply_body(body);
+            run_with_stdin(cmd, &payload.to_string())?;
+            return Ok(action.describe().to_string());
+        }
+        Action::SubmitReview {
+            event,
+            body,
+            comments,
+            commit_id,
+        } => {
+            let (owner, repo) = origin_nwo(dir).ok_or_else(|| "no GitHub remote for this repo".to_string())?;
+            let api_path = format!("repos/{owner}/{repo}/pulls/{n}/reviews");
+            cmd.args(["api", &api_path, "--method", "POST", "--input", "-"]);
+            let payload = review_body(*event, body, comments, commit_id);
+            run_with_stdin(cmd, &payload.to_string())?;
+            return Ok(action.describe().to_string());
         }
     }
     run(cmd)?;
@@ -1258,6 +1422,115 @@ mod tests {
         assert_eq!(Action::Close.describe(), "Closed");
         assert_eq!(Action::ResolveThread { id: "x".into(), resolved: true }.describe(), "Resolved thread");
         assert_eq!(Action::ResolveThread { id: "x".into(), resolved: false }.describe(), "Unresolved thread");
+        assert_eq!(
+            Action::LineComment {
+                path: "a.rs".into(),
+                line: 1,
+                body: "x".into(),
+                commit_id: "abc".into(),
+            }
+            .describe(),
+            "Commented on line"
+        );
+        assert_eq!(
+            Action::ReplyThread {
+                comment_id: 1,
+                body: "y".into(),
+            }
+            .describe(),
+            "Replied"
+        );
+        assert_eq!(
+            Action::SubmitReview {
+                event: ReviewEvent::Approve,
+                body: String::new(),
+                comments: vec![],
+                commit_id: "abc".into(),
+            }
+            .describe(),
+            "Approved"
+        );
+        assert_eq!(
+            Action::SubmitReview {
+                event: ReviewEvent::RequestChanges,
+                body: "fix".into(),
+                comments: vec![],
+                commit_id: "abc".into(),
+            }
+            .describe(),
+            "Requested changes"
+        );
+        assert_eq!(
+            Action::SubmitReview {
+                event: ReviewEvent::Comment,
+                body: "note".into(),
+                comments: vec![],
+                commit_id: "abc".into(),
+            }
+            .describe(),
+            "Submitted review"
+        );
+    }
+
+    #[test]
+    fn line_comment_body_sets_right_side() {
+        let v = line_comment_body("src/a.rs", 12, "nit", "deadbeef");
+        assert_eq!(v["path"], "src/a.rs");
+        assert_eq!(v["line"], 12);
+        assert_eq!(v["body"], "nit");
+        assert_eq!(v["commit_id"], "deadbeef");
+        assert_eq!(v["side"], "RIGHT");
+    }
+
+    #[test]
+    fn reply_body_wraps_text() {
+        let v = reply_body("thanks");
+        assert_eq!(v["body"], "thanks");
+        assert!(v.as_object().unwrap().len() == 1);
+    }
+
+    #[test]
+    fn review_body_maps_events_and_omits_empty() {
+        let approve = review_body(ReviewEvent::Approve, "", &[], "sha1");
+        assert_eq!(approve["event"], "APPROVE");
+        assert_eq!(approve["commit_id"], "sha1");
+        assert!(approve.get("body").is_none());
+        assert!(approve.get("comments").is_none());
+
+        let changes = review_body(ReviewEvent::RequestChanges, "please fix", &[], "sha2");
+        assert_eq!(changes["event"], "REQUEST_CHANGES");
+        assert_eq!(changes["body"], "please fix");
+        assert!(changes.get("comments").is_none());
+
+        let comments = vec![PendingComment {
+            path: "f.rs".into(),
+            line: 3,
+            body: "here".into(),
+        }];
+        let comment = review_body(ReviewEvent::Comment, "ok", &comments, "sha3");
+        assert_eq!(comment["event"], "COMMENT");
+        assert_eq!(comment["body"], "ok");
+        let arr = comment["comments"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["path"], "f.rs");
+        assert_eq!(arr[0]["line"], 3);
+        assert_eq!(arr[0]["body"], "here");
+        assert_eq!(arr[0]["side"], "RIGHT");
+    }
+
+    #[test]
+    fn detail_from_raw_maps_head_sha() {
+        let raw: RawDetail = serde_json::from_str(
+            r#"{"number":1,"title":"t","state":"OPEN","isDraft":false,
+            "author":{"login":"me"},"headRefName":"feat","baseRefName":"main",
+            "headRefOid":"abc123def","url":"u","createdAt":"t"}"#,
+        )
+        .unwrap();
+        assert_eq!(raw.head_ref_oid, "abc123def");
+        let d = detail_from_raw(raw, vec![], vec![]);
+        assert_eq!(d.head_sha, "abc123def");
+        assert_eq!(d.number, 1);
+        assert_eq!(d.head, "feat");
     }
 
     #[test]
@@ -1377,7 +1650,7 @@ mod tests {
             "path": "src/x.rs",
             "line": 42,
             "comments": { "nodes": [
-                { "id": "C1", "author": { "login": "me" }, "body": "nit", "createdAt": "t", "diffHunk": "@@ -1 +1 @@" }
+                { "id": "C1", "databaseId": 99, "author": { "login": "me" }, "body": "nit", "createdAt": "t", "diffHunk": "@@ -1 +1 @@" }
             ] }
         });
         let t = parse_thread_node(&node).unwrap();
@@ -1388,6 +1661,20 @@ mod tests {
         assert_eq!(t.diff_hunk, "@@ -1 +1 @@");
         assert_eq!(t.comments.len(), 1);
         assert_eq!(t.comments[0].author, "me");
+        assert_eq!(t.comments[0].database_id, Some(99));
+        // Absent databaseId → None.
+        let no_db = serde_json::json!({
+            "id": "THREAD2",
+            "isResolved": false,
+            "isOutdated": false,
+            "path": "y.rs",
+            "line": 1,
+            "comments": { "nodes": [
+                { "id": "C2", "author": { "login": "x" }, "body": "hi", "createdAt": "t", "diffHunk": "" }
+            ] }
+        });
+        let t2 = parse_thread_node(&no_db).unwrap();
+        assert_eq!(t2.comments[0].database_id, None);
         // A thread with no comments is dropped.
         assert!(parse_thread_node(&serde_json::json!({ "id": "T", "comments": { "nodes": [] } })).is_none());
     }

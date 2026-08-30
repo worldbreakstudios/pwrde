@@ -16,7 +16,7 @@ use gpui::{
 use std::sync::Arc;
 
 use crate::git::DiffMode;
-use crate::pr_ui::{build_diff_render, DiffSurface, DiffViewState, Load, LocalDiffRender};
+use crate::pr_ui::{build_diff_render, DiffSurface, DiffView, DiffViewState, Load, LocalDiffRender};
 use crate::ui::theme::Theme;
 use crate::ui::{Button, ButtonSize, ButtonVariant, CardTitle};
 use crate::App;
@@ -27,6 +27,8 @@ pub struct LocalDiffState {
     pub data: Load<LocalDiffRender>,
     /// Collapse/viewed state for the local diff files list.
     pub files_view: DiffViewState,
+    /// Unified or split diff bodies.
+    pub diff_view: DiffView,
 }
 
 impl Default for LocalDiffState {
@@ -35,6 +37,7 @@ impl Default for LocalDiffState {
             mode: DiffMode::Branch,
             data: Load::Idle,
             files_view: DiffViewState::default(),
+            diff_view: DiffView::Unified,
         }
     }
 }
@@ -178,7 +181,7 @@ impl App {
                 theme.muted_foreground,
             ),
             Load::Ready(d) => {
-                self.render_diff_files(&d.render, DiffSurface::LocalDiff, &[], &theme, entity.clone())
+                self.render_diff_files(&d.render, DiffSurface::LocalDiff, &[], &theme, entity.clone(), cx)
             }
         };
 
