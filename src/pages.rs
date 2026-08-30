@@ -201,6 +201,7 @@ pub enum Action {
     FlyoverPopout,
     SaveWorkspace,
     ToggleToolPanel,
+    ToggleFlow,
     IncreaseFontSize,
     DecreaseFontSize,
     ScreenshotToClipboard,
@@ -213,7 +214,7 @@ pub enum Action {
 
 impl Action {
     /// Keyboard-page row order.
-    pub const ALL: [Action; 39] = [
+    pub const ALL: [Action; 40] = [
         Action::SplitRight,
         Action::SplitDown,
         Action::NewTab,
@@ -245,6 +246,7 @@ impl Action {
         Action::FlyoverPopout,
         Action::SaveWorkspace,
         Action::ToggleToolPanel,
+        Action::ToggleFlow,
         Action::IncreaseFontSize,
         Action::DecreaseFontSize,
         Action::ScreenshotToClipboard,
@@ -289,6 +291,7 @@ impl Action {
             Action::FlyoverPopout => "flyover_popout",
             Action::SaveWorkspace => "save_workspace",
             Action::ToggleToolPanel => "toggle_tool_panel",
+            Action::ToggleFlow => "toggle_flow",
             Action::IncreaseFontSize => "increase_font_size",
             Action::DecreaseFontSize => "decrease_font_size",
             Action::ScreenshotToClipboard => "screenshot_to_clipboard",
@@ -333,6 +336,7 @@ impl Action {
             Action::FlyoverPopout => "Flyover: panel ↔ window",
             Action::SaveWorkspace => "Save as workspace",
             Action::ToggleToolPanel => "Toggle tool panel",
+            Action::ToggleFlow => "Toggle Flow agent",
             Action::IncreaseFontSize => "Increase font size",
             Action::DecreaseFontSize => "Decrease font size",
             Action::ScreenshotToClipboard => "Screenshot to clipboard",
@@ -383,6 +387,7 @@ impl Action {
             Action::FlyoverPopout => (true, false, false, "`"),
             Action::SaveWorkspace => (true, false, false, "s"),
             Action::ToggleToolPanel => (true, false, false, "g"),
+            Action::ToggleFlow => (false, false, false, "j"),
             Action::IncreaseFontSize => (false, false, false, "="),
             // "minus" (not "-") because "-" is the binding token separator.
             Action::DecreaseFontSize => (false, false, false, "minus"),

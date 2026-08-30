@@ -631,6 +631,7 @@ pub fn action_group(action: Action) -> &'static str {
         | Action::ToggleFlyover
         | Action::FlyoverPopout
         | Action::ToggleToolPanel
+        | Action::ToggleFlow
         | Action::IncreaseFontSize
         | Action::DecreaseFontSize
         | Action::OpenSettings => "View",
@@ -673,6 +674,7 @@ pub fn action_glyph(action: Action) -> &'static str {
         Action::ToggleFlyover => "⤓",
         Action::FlyoverPopout => "⇱",
         Action::ToggleToolPanel => "⌗",
+        Action::ToggleFlow => "✳",
         Action::IncreaseFontSize => "␣",
         Action::DecreaseFontSize => "␡",
         Action::OpenSettings => "⚙",
