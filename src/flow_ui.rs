@@ -23,12 +23,25 @@ use crate::pages::Action;
 use crate::ui::theme::Theme;
 use crate::App;
 
-/// Pill bar / panel width (shrinks on narrow windows).
+/// Pill bar / panel width at the default app font size (shrinks on narrow
+/// windows, grows with `appearance.font_size`).
 const BAR_W: f32 = 480.0;
+/// Pill bar height at the default app font size.
+const BAR_H: f32 = 46.0;
+/// Breathing room between the reserved safe area and the tile above it.
+const SAFE_GAP: f32 = 8.0;
 /// Gap between the bar and the window's bottom edge.
 const BOTTOM_INSET: f32 = 14.0;
 /// The expanded panel never exceeds this fraction of the window height.
 const PANEL_MAX_FRAC: f32 = 0.52;
+
+/// Logical height of the bottom safe area the Sessions/tool-page layouts
+/// reserve while the flag is on (`App::flow_inset`): inset + pill bar + gap,
+/// tracking the app font scale so a larger accessibility font still clears
+/// the bar.
+pub fn safe_area_h() -> f32 {
+    BOTTOM_INSET + BAR_H * crate::renderer::chrome_font_scale() + SAFE_GAP
+}
 
 /// The pill bar's composer: a `gpui_component` textarea plus the transcript
 /// scroll handle, created lazily on the first render after the flag is on.
@@ -184,6 +197,10 @@ impl App {
         let theme = Theme::of(cx).clone();
         let chrome = crate::theme::current();
         let entity = cx.entity().downgrade();
+        // Track the app text size (Settings → Accessibility): every size in
+        // the bar and panel scales with `appearance.font_size`.
+        let fs = crate::renderer::chrome_font_scale();
+        let sp = move |v: f32| px(v * fs);
 
         let editor = self.flow_composer.as_ref().expect("ensured").editor.clone();
         if self.flow.wants_focus {
@@ -197,7 +214,7 @@ impl App {
         let (win_w, win_h) = (surface_w as f32 / scale, surface_h as f32 / scale);
         let left_edge = self.sidebar_w();
         let right_edge = win_w - crate::workspace::RIBBON_W;
-        let bar_w = BAR_W.min(right_edge - left_edge - 24.0).max(240.0);
+        let bar_w = (BAR_W * fs).min(right_edge - left_edge - 24.0).max(240.0);
         let left = left_edge + ((right_edge - left_edge) - bar_w) / 2.0;
 
         let shadow = |blur: f32, y: f32, alpha: f32| {
@@ -217,7 +234,7 @@ impl App {
         let send_entity = entity.clone();
         let send = div()
             .id("flow-send")
-            .size(px(28.0))
+            .size(sp(28.0))
             .flex_none()
             .rounded_full()
             .flex()
@@ -225,7 +242,7 @@ impl App {
             .justify_center()
             .bg(theme.primary.opacity(if busy { 0.45 } else { 1.0 }))
             .text_color(theme.primary_foreground)
-            .text_size(px(13.0))
+            .text_size(sp(13.0))
             .cursor_pointer()
             .on_click(move |_ev: &ClickEvent, window: &mut Window, app: &mut GpuiApp| {
                 if let Some(e) = send_entity.upgrade() {
@@ -240,11 +257,11 @@ impl App {
             .w_full()
             .flex()
             .items_center()
-            .gap(px(10.0))
-            .pl(px(16.0))
-            .pr(px(9.0))
-            .py(px(7.0))
-            .rounded(px(999.0))
+            .gap(sp(10.0))
+            .pl(sp(16.0))
+            .pr(sp(9.0))
+            .py(sp(7.0))
+            .rounded(sp(999.0))
             .bg(theme.popover.opacity(0.94))
             .border_1()
             .border_color(theme.border)
@@ -253,25 +270,25 @@ impl App {
             .on_click(move |_ev: &ClickEvent, window: &mut Window, app: &mut GpuiApp| {
                 focus_editor.update(app, |s, cx| s.focus(window, cx));
             })
-            .child(div().flex_none().text_size(px(14.0)).text_color(theme.primary).child("✳"))
+            .child(div().flex_none().text_size(sp(14.0)).text_color(theme.primary).child("✳"))
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
-                    .text_size(px(13.0))
+                    .text_size(sp(13.0))
                     .text_color(theme.foreground)
                     .child(Textarea::new(&editor).appearance(false).bordered(false)),
             )
             .child(
                 div()
                     .flex_none()
-                    .text_size(px(10.5))
+                    .text_size(sp(10.5))
                     .text_color(theme.muted_foreground)
                     .border_1()
                     .border_color(theme.border)
-                    .rounded(px(6.0))
-                    .px(px(6.0))
-                    .py(px(2.0))
+                    .rounded(sp(6.0))
+                    .px(sp(6.0))
+                    .py(sp(2.0))
                     .child(Action::ToggleFlow.binding().display()),
             )
             .child(send);
@@ -283,33 +300,33 @@ impl App {
                 .flex()
                 .flex_none()
                 .items_center()
-                .gap(px(8.0))
-                .px(px(16.0))
-                .py(px(12.0))
+                .gap(sp(8.0))
+                .px(sp(16.0))
+                .py(sp(12.0))
                 .border_b_1()
                 .border_color(theme.border)
                 .child(
                     div()
-                        .size(px(22.0))
+                        .size(sp(22.0))
                         .rounded_full()
                         .bg(theme.primary)
                         .flex()
                         .items_center()
                         .justify_center()
                         .text_color(theme.primary_foreground)
-                        .text_size(px(12.0))
+                        .text_size(sp(12.0))
                         .child("✳"),
                 )
                 .child(
                     div()
-                        .text_size(px(13.0))
+                        .text_size(sp(13.0))
                         .font_weight(gpui::FontWeight::BOLD)
                         .text_color(theme.foreground)
                         .child("Flow"),
                 )
                 .child(
                     div()
-                        .text_size(px(11.0))
+                        .text_size(sp(11.0))
                         .text_color(theme.muted_foreground)
                         .child("can drive the whole workspace"),
                 )
@@ -317,9 +334,9 @@ impl App {
                 .child(
                     div()
                         .id("flow-collapse")
-                        .px(px(6.0))
-                        .py(px(2.0))
-                        .text_size(px(12.0))
+                        .px(sp(6.0))
+                        .py(sp(2.0))
+                        .text_size(sp(12.0))
                         .text_color(theme.muted_foreground)
                         .cursor_pointer()
                         .on_click(move |_ev: &ClickEvent, _win: &mut Window, app: &mut GpuiApp| {
@@ -342,15 +359,15 @@ impl App {
                 .track_scroll(&self.flow_composer.as_ref().expect("ensured").scroll)
                 .flex()
                 .flex_col()
-                .gap(px(12.0))
-                .px(px(16.0))
-                .py(px(14.0))
-                .text_size(px(12.5))
-                .line_height(px(18.0));
+                .gap(sp(12.0))
+                .px(sp(16.0))
+                .py(sp(14.0))
+                .text_size(sp(12.5))
+                .line_height(sp(18.0));
             if self.flow.messages.is_empty() {
                 body = body.child(
                     div()
-                        .text_size(px(12.0))
+                        .text_size(sp(12.0))
                         .text_color(theme.muted_foreground)
                         .child("Ask for anything the workspace can do — open a session, run a command, review a PR."),
                 );
@@ -360,12 +377,12 @@ impl App {
                     FlowMsg::User(text) => div()
                         .self_end()
                         .max_w(px(bar_w * 0.82))
-                        .px(px(13.0))
-                        .py(px(8.0))
-                        .rounded_tl(px(16.0))
-                        .rounded_tr(px(16.0))
-                        .rounded_bl(px(16.0))
-                        .rounded_br(px(4.0))
+                        .px(sp(13.0))
+                        .py(sp(8.0))
+                        .rounded_tl(sp(16.0))
+                        .rounded_tr(sp(16.0))
+                        .rounded_bl(sp(16.0))
+                        .rounded_br(sp(4.0))
                         .bg(theme.primary)
                         .text_color(theme.primary_foreground)
                         .child(text.clone())
@@ -373,12 +390,12 @@ impl App {
                     FlowMsg::Assistant(text) => div()
                         .self_start()
                         .max_w(px(bar_w * 0.88))
-                        .px(px(13.0))
-                        .py(px(8.0))
-                        .rounded_tl(px(16.0))
-                        .rounded_tr(px(16.0))
-                        .rounded_br(px(16.0))
-                        .rounded_bl(px(4.0))
+                        .px(sp(13.0))
+                        .py(sp(8.0))
+                        .rounded_tl(sp(16.0))
+                        .rounded_tr(sp(16.0))
+                        .rounded_br(sp(16.0))
+                        .rounded_bl(sp(4.0))
                         .bg(theme.muted)
                         .text_color(theme.foreground)
                         .child(text.clone())
@@ -386,18 +403,18 @@ impl App {
                     FlowMsg::Action { title, detail, status, .. } => {
                         let glyph = match status {
                             ActionStatus::Running => div()
-                                .size(px(7.0))
-                                .mx(px(3.0))
+                                .size(sp(7.0))
+                                .mx(sp(3.0))
                                 .rounded_full()
                                 .bg(theme.primary)
                                 .into_any_element(),
                             ActionStatus::Done => div()
-                                .text_size(px(13.0))
+                                .text_size(sp(13.0))
                                 .text_color(ok_color)
                                 .child("✓")
                                 .into_any_element(),
                             ActionStatus::Failed => div()
-                                .text_size(px(13.0))
+                                .text_size(sp(13.0))
                                 .text_color(theme.destructive)
                                 .child("✗")
                                 .into_any_element(),
@@ -406,13 +423,13 @@ impl App {
                             .w_full()
                             .flex()
                             .items_center()
-                            .gap(px(10.0))
-                            .px(px(12.0))
-                            .py(px(9.0))
-                            .rounded(px(12.0))
+                            .gap(sp(10.0))
+                            .px(sp(12.0))
+                            .py(sp(9.0))
+                            .rounded(sp(12.0))
                             .border_1()
                             .border_color(theme.border)
-                            .child(div().flex_none().flex().items_center().justify_center().w(px(14.0)).child(glyph))
+                            .child(div().flex_none().flex().items_center().justify_center().w(sp(14.0)).child(glyph))
                             .child(
                                 div()
                                     .flex_1()
@@ -421,7 +438,7 @@ impl App {
                                     .flex_col()
                                     .child(
                                         div()
-                                            .text_size(px(12.0))
+                                            .text_size(sp(12.0))
                                             .font_weight(gpui::FontWeight::SEMIBOLD)
                                             .text_color(theme.foreground)
                                             .whitespace_nowrap()
@@ -431,7 +448,7 @@ impl App {
                                     )
                                     .child(
                                         div()
-                                            .text_size(px(11.0))
+                                            .text_size(sp(11.0))
                                             .text_color(theme.muted_foreground)
                                             .whitespace_nowrap()
                                             .overflow_hidden()
@@ -446,12 +463,12 @@ impl App {
             let last_is_action = matches!(self.flow.messages.last(), Some(FlowMsg::Action { .. }));
             if busy && !last_is_action {
                 body = body.child(
-                    div().text_size(px(11.0)).text_color(theme.muted_foreground).child("Working…"),
+                    div().text_size(sp(11.0)).text_color(theme.muted_foreground).child("Working…"),
                 );
             }
             if let Some(err) = &self.flow.draft_error {
                 body = body.child(
-                    div().text_size(px(11.0)).text_color(theme.destructive).child(err.clone()),
+                    div().text_size(sp(11.0)).text_color(theme.destructive).child(err.clone()),
                 );
             }
 
@@ -462,7 +479,7 @@ impl App {
                 .max_h(px(win_h * PANEL_MAX_FRAC))
                 .flex()
                 .flex_col()
-                .rounded(px(18.0))
+                .rounded(sp(18.0))
                 .overflow_hidden()
                 .bg(theme.popover)
                 .border_1()
@@ -488,7 +505,7 @@ impl App {
             .flex()
             .flex_col()
             .items_center()
-            .gap(px(10.0))
+            .gap(sp(10.0))
             .when_some(panel, |el, panel| el.child(panel))
             .child(bar)
             .into_any_element()
