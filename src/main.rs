@@ -502,7 +502,7 @@ struct App {
     flow: crate::flow::FlowState,
     /// The agent process, spawned lazily on first open/send so no `claude`
     /// child exists until Flow is actually used.
-    flow_backend: Option<Box<dyn crate::flow::AgentBackend>>,
+    flow_backends: std::collections::HashMap<u64, Box<dyn crate::flow::AgentBackend>>,
     /// The pill bar's composer entity, created lazily on first render.
     flow_composer: Option<flow_ui::FlowComposer>,
     // ── Git tools (PR + local diff), Sessions/git-group only ──────────────
@@ -528,11 +528,10 @@ impl App {
     }
 
     /// Whether the current page paints the Messages-style preview cards, which
-    /// are taller than the one-line rows every other page uses. Sessions and
-    /// Pull Requests share one sidebar, so both must answer the same way or
-    /// hit-testing would drift from what is painted.
+    /// are taller than the one-line rows every other page uses. Drawing and
+    /// hit-testing both go through this so they can't drift apart.
     fn card_rows(&self) -> bool {
-        matches!(self.page, Page::Sessions | Page::PullRequests)
+        self.page == Page::Sessions
     }
 
     /// Tools registered for `page`, resolved against the active group.
@@ -3564,10 +3563,6 @@ impl App {
             self.request_redraw();
             return;
         }
-        // Pull Requests page: same — the gpui overlay owns the content area.
-        if self.page == Page::PullRequests {
-            return;
-        }
         let area = self.area();
         let ws = &self.workspaces[self.active];
         let (tiles, _) = workspace::layout_tiles(&ws.root, area, scale);
@@ -4016,8 +4011,6 @@ impl App {
             self.request_redraw();
             return;
         }
-        // The Pull Requests page: ⌘ shortcuts still dispatch; Esc backs out of
-        // a PR detail to the list; other typing is swallowed (no terminal).
         // A focused PR composer owns the keyboard: the multi-line editor
         // entity (and its own key bindings) handles editing, so keys don't
         // reach the shell or ⌘ shortcuts. Escape discards the composer and
@@ -4026,15 +4019,6 @@ impl App {
             if ev.keystroke.key == "escape" {
                 self.pr_close_composer();
                 window.focus(&self.focus_handle, cx);
-            }
-            self.request_redraw();
-            return;
-        }
-        if self.page == Page::PullRequests {
-            if ev.keystroke.modifiers.platform {
-                self.handle_shortcut(ev);
-            } else if ev.keystroke.key == "escape" && self.pr.open.is_some() {
-                self.close_pr_detail();
             }
             self.request_redraw();
             return;
@@ -4338,12 +4322,18 @@ impl App {
             Action::NextSidebarTab => self.cycle_sidebar_tab(1),
             Action::ToggleSidebar => self.toggle_sidebar(),
             Action::OpenSettings => self.set_page(Page::Settings),
-            Action::Quit => std::process::exit(0),
+            Action::Quit => {
+                // Take the agent children down before the abrupt exit below;
+                // each backend kills its CLI and unblocks its reader thread.
+                for (_, mut backend) in self.flow_backends.drain() {
+                    backend.shutdown();
+                }
+                std::process::exit(0);
+            }
             Action::CommandPalette => self.toggle_command_root(),
             Action::IncreaseFontSize => self.zoom_font(renderer::FONT_SIZE_STEP),
             Action::DecreaseFontSize => self.zoom_font(-renderer::FONT_SIZE_STEP),
             Action::GoToSessions => self.set_page(Page::Sessions),
-            Action::GoToPullRequests => self.set_page(Page::PullRequests),
             Action::GoToTool => self.set_page(Page::Tool(0)),
             Action::ScreenshotToClipboard => self.screenshot_action(true),
             Action::ScreenshotToFile => self.screenshot_action(false),
@@ -4429,7 +4419,6 @@ impl App {
             | Action::IncreaseFontSize
             | Action::DecreaseFontSize
             | Action::GoToSessions
-            | Action::GoToPullRequests
             | Action::GoToTool
             | Action::ScreenshotToClipboard
             | Action::ScreenshotToFile
@@ -4530,8 +4519,6 @@ impl App {
                 self.section = Section::ALL[i];
                 self.request_redraw();
             },
-            // The Pull Requests page has no sidebar tabs of its own.
-            Page::PullRequests => {},
             // Tool pages have no sidebar tabs of their own.
             Page::Tool(_) => {},
         }
@@ -4551,9 +4538,7 @@ impl App {
             self.settings_query.clear();
             self.settings_search_focus = false;
             // The sidebar cards are on screen again; top up whatever went
-            // stale while another page was up. Sessions and Pull Requests
-            // share one card sidebar (`card_rows`), so both must refresh or
-            // the Pull Requests page would quote a frozen snapshot forever.
+            // stale while another page was up.
             if self.card_rows() {
                 self.spawn_git_context_refresh();
             }
@@ -4571,10 +4556,6 @@ impl App {
             if let Page::Tool(i) = page {
                 self.ensure_tool_session(i);
                 self.sync_tool_layout(true);
-            }
-            // Entering the Pull Requests page loads all open PRs fresh.
-            if page == Page::PullRequests {
-                self.reset_pr_surface();
             }
         }
         self.request_redraw();
@@ -4837,8 +4818,8 @@ impl App {
                         redraw = true;
                     }
                 },
-                TermEvent::PrListLoaded { all, result } => {
-                    self.on_pr_list_loaded(all, result);
+                TermEvent::PrListLoaded { result } => {
+                    self.on_pr_list_loaded(result);
                     redraw = true;
                 },
                 TermEvent::PrDetailLoaded { number, result } => {
@@ -4880,8 +4861,8 @@ impl App {
                 TermEvent::Redraw => {
                     redraw = true;
                 },
-                TermEvent::Flow(ev) => {
-                    self.flow.apply(ev);
+                TermEvent::Flow { chat, ev } => {
+                    self.flow.apply(chat, ev, crate::flow::now_epoch());
                     redraw = true;
                 },
             }
@@ -5454,8 +5435,6 @@ impl Render for App {
             // Sessions empty state ("New group" pill + hint): element tree in
             // the terminal area; its click resolves on the element.
             .child(self.render_empty_state(cx))
-            // Holistic Pull Requests page: full content-area element tree.
-            .when(self.page == Page::PullRequests, |el| el.child(self.render_all_prs(cx)))
             // Settings page overlay: element tree over the canvas. Sidebar search +
             // section tabs stay canvas-painted; the content card is elements.
             .when(self.page == Page::Settings, |el| el.child(self.render_settings(cx)))
@@ -6870,7 +6849,7 @@ fn main() {
                         pr: pr_ui::PrState::default(),
                         local_diff: local_diff_ui::LocalDiffState::default(),
                         flow: crate::flow::FlowState::default(),
-                        flow_backend: None,
+                        flow_backends: std::collections::HashMap::new(),
                         flow_composer: None,
                         _lfg_events_child: crate::lfg::spawn_event_stream(events_tx.clone()),
                     };

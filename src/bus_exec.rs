@@ -96,7 +96,7 @@ impl App {
                     Reply::success(None)
                 }
                 None => Reply::err(format!(
-                    "unknown page {page:?}; expected one of sessions, pull_requests, settings, tool:<n> or a registered tool's name"
+                    "unknown page {page:?}; expected one of sessions, settings, tool:<n> or a registered tool's name"
                 )),
             },
             Command::NewSession { cwd, base, layout } => self.bus_new_session(cwd, base, layout),
@@ -417,8 +417,24 @@ impl App {
             "flow": {
                 "enabled": crate::flow::enabled(),
                 "open": self.flow.open,
-                "busy": self.flow.busy,
-                "messages": self.flow.messages.len(),
+                "view": match self.flow.view {
+                    crate::flow::FlowView::List => "list",
+                    crate::flow::FlowView::Chat => "chat",
+                },
+                "active": self.flow.active_chat().map(|c| json!(c.id)),
+                "busy": self.flow.chats.iter().any(|c| c.busy),
+                "chats": self
+                    .flow
+                    .chats
+                    .iter()
+                    .map(|c| json!({
+                        "id": c.id,
+                        "title": c.title,
+                        "busy": c.busy,
+                        "unseen": c.unseen,
+                        "messages": c.messages.len(),
+                    }))
+                    .collect::<Vec<_>>(),
             },
             "message": self.message.as_ref().map(|(m, _)| m.clone()),
         })
@@ -574,7 +590,6 @@ const FLOW_DISABLED: &str = "Flow is disabled — enable it under Settings > Fea
 pub(crate) fn page_from_name(name: &str) -> Option<Page> {
     match name.trim().to_ascii_lowercase().replace('-', "_").as_str() {
         "sessions" => Some(Page::Sessions),
-        "pull_requests" | "prs" | "pullrequests" => Some(Page::PullRequests),
         "settings" => Some(Page::Settings),
         s => s.strip_prefix("tool:").and_then(|n| n.parse().ok()).map(Page::Tool),
     }
@@ -598,7 +613,6 @@ pub(crate) fn resolve_page(name: &str, tools: &[crate::cli_tools::CliTool]) -> O
 pub(crate) fn page_name(page: Page) -> String {
     match page {
         Page::Sessions => "sessions".into(),
-        Page::PullRequests => "pull_requests".into(),
         Page::Tool(i) => format!("tool:{i}"),
         Page::Settings => "settings".into(),
     }
@@ -950,7 +964,6 @@ mod tests {
         assert_eq!(resolve_page("tool:1", &tools), None);
         assert_eq!(resolve_page("settings", &tools), Some(Page::Settings));
         assert_eq!(resolve_page("nope", &tools), None);
-        assert_eq!(page_from_name("Pull-Requests"), Some(Page::PullRequests));
         assert_eq!(page_from_name("nope"), None);
     }
 

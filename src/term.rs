@@ -46,10 +46,9 @@ pub enum TermEvent {
     OpenDir { cwd: std::path::PathBuf },
     /// `drop` failed; show `message` in the picker overlay.
     GroupFailed { message: String },
-    /// A PR list finished loading (or failed). `all` distinguishes the
-    /// holistic Pull Requests page (all open PRs) from the branch-scoped PR
-    /// tool (`--head <current branch>`).
-    PrListLoaded { all: bool, result: Result<Vec<crate::gh::PrSummary>, String> },
+    /// The branch-scoped PR list (`--head <current branch>`) finished loading
+    /// (or failed).
+    PrListLoaded { result: Result<Vec<crate::gh::PrSummary>, String> },
     /// A PR's detail finished loading, tagged with the PR number so a stale
     /// result for a PR the user already navigated away from can be dropped.
     PrDetailLoaded { number: u32, result: Result<crate::gh::PrDetail, String> },
@@ -85,9 +84,9 @@ pub enum TermEvent {
         reply: std::sync::mpsc::Sender<crate::bus::Reply>,
     },
     /// Flow agent progress (assistant text, tool cards, turn lifecycle) from
-    /// the embedded agent backend; see `flow.rs`. Arrives on the shared event
+    /// one of the per-chat agent backends; see `flow.rs`. Arrives on the shared event
     /// channel so the backend's reader thread never touches the foreground.
-    Flow(crate::flow::FlowEvent),
+    Flow { chat: u64, ev: crate::flow::FlowEvent },
 }
 
 /// Forwards `Alert::ToastNotification` from wezterm-term to the UI event channel

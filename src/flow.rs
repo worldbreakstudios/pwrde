@@ -16,8 +16,12 @@
 //! gpui foreground is never blocked and all UI updates arrive through the
 //! regular event drain.
 //!
-//! [`FlowState::apply`] is the single reducer turning events into transcript
-//! entries; `flow_ui.rs` renders that transcript.
+//! Flow holds several conversations at once: each [`FlowChat`] has its own
+//! transcript and its own backend (one agent process per chat, keyed by chat
+//! id in `App::flow_backends`), and every event carries the id of the chat
+//! it belongs to. [`FlowState::apply`] is the single reducer routing events
+//! into the right chat's transcript; `flow_ui.rs` renders the chat list and
+//! the open conversation.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -79,10 +83,11 @@ pub struct ClaudeCliBackend {
 }
 
 impl ClaudeCliBackend {
-    /// Spawn the CLI in `cwd` and start its stdout reader thread. The prompt
-    /// file is (re)written first so an updated skill doc is picked up on the
-    /// next session.
-    pub(crate) fn new(cwd: &Path, tx: Sender<TermEvent>) -> std::io::Result<Self> {
+    /// Spawn the CLI in `cwd` and start its stdout reader thread, tagging
+    /// every event with `chat` so the reducer routes it to the right
+    /// transcript. The prompt file is (re)written first so an updated skill
+    /// doc is picked up on the next session.
+    pub(crate) fn new(cwd: &Path, tx: Sender<TermEvent>, chat: u64) -> std::io::Result<Self> {
         let prompt = write_prompt_file()?;
         let mut cmd = crate::git::augmented_command("claude");
         cmd.arg("-p")
@@ -119,13 +124,14 @@ impl ClaudeCliBackend {
             for line in reader.lines() {
                 let Ok(line) = line else { break };
                 for ev in parse_stream_line(&line) {
-                    if tx.send(TermEvent::Flow(ev)).is_err() {
+                    if tx.send(TermEvent::Flow { chat, ev }).is_err() {
                         return; // app gone
                     }
                 }
             }
             if !flag.load(Ordering::Relaxed) {
-                let _ = tx.send(TermEvent::Flow(FlowEvent::Error("agent exited".into())));
+                let _ = tx
+                    .send(TermEvent::Flow { chat, ev: FlowEvent::Error("agent exited".into()) });
             }
         });
         Ok(Self { child, stdin, shutting_down })
@@ -156,8 +162,12 @@ impl AgentBackend for ClaudeCliBackend {
 /// The single construction site for the concrete backend. `main.rs` calls
 /// this and holds only the trait object; if the backend is swapped later,
 /// this is the only function that changes.
-pub fn spawn_flow_backend(cwd: &Path, tx: Sender<TermEvent>) -> Option<Box<dyn AgentBackend>> {
-    match ClaudeCliBackend::new(cwd, tx) {
+pub fn spawn_flow_backend(
+    cwd: &Path,
+    tx: Sender<TermEvent>,
+    chat: u64,
+) -> Option<Box<dyn AgentBackend>> {
+    match ClaudeCliBackend::new(cwd, tx, chat) {
         Ok(backend) => Some(Box::new(backend)),
         Err(e) => {
             eprintln!("pwrde: flow backend failed to spawn: {e}");
@@ -333,43 +343,133 @@ pub enum ActionStatus {
     Failed,
 }
 
-/// The whole Flow UI state: panel visibility, transcript, and the composer
-/// invariants (`busy`, `ready`, `draft_error`). Updated only via
-/// [`FlowState::apply`] / [`FlowState::push_user`].
+/// Which surface the panel shows: the chat list, or one open conversation.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum FlowView {
+    #[default]
+    List,
+    Chat,
+}
+
+/// One conversation: its transcript plus the per-chat invariants (`busy`,
+/// `ready`, `draft_error`) and the list-card fields (`title`, `unseen`,
+/// `last_activity`). `title` is derived from the first user message;
+/// `last_activity` is epoch seconds the caller feeds in — this module never
+/// reads the clock, so reducers stay pure and tests stay deterministic.
+#[derive(Debug, Default, Clone)]
+pub struct FlowChat {
+    pub id: u64,
+    pub title: Option<String>,
+    pub messages: Vec<FlowMsg>,
+    pub busy: bool,
+    pub ready: bool,
+    pub draft_error: Option<String>,
+    pub last_activity: i64,
+    pub unseen: bool,
+}
+
+/// The whole Flow UI state: panel visibility, which surface is shown, the
+/// chat list and the active one. Updated only via the methods below.
 #[derive(Debug, Default, Clone)]
 pub struct FlowState {
     pub open: bool,
-    pub busy: bool,
-    pub ready: bool,
-    pub messages: Vec<FlowMsg>,
-    pub draft_error: Option<String>,
+    pub view: FlowView,
+    pub chats: Vec<FlowChat>,
+    pub active: usize,
     /// Set when the panel opens so the next render focuses the composer
     /// (focusing needs the window, which only render has).
     pub wants_focus: bool,
 }
 
+/// Wall-clock epoch seconds for the reducer's `now` argument. The reducer
+/// itself never reads the clock (tests feed times in); call sites use this.
+pub fn now_epoch() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Age of a chat for the list card: "now" (< 60s), then floored "Nm" /
+/// "Nh" / "Nd" — deliberately terser than `pr_ui.rs`'s `format_ago` (no
+/// rounding, no " ago") because it sits in a narrow card corner; no chrono,
+/// just epoch seconds in.
+pub fn format_age(now: i64, then: i64) -> String {
+    let s = (now - then).max(0);
+    if s < 60 {
+        "now".to_string()
+    } else if s < 3600 {
+        format!("{}m", s / 60)
+    } else if s < 86400 {
+        format!("{}h", s / 3600)
+    } else {
+        format!("{}d", s / 86400)
+    }
+}
+
 impl FlowState {
-    /// Reduce one backend event into transcript state. Text chunks arriving
-    /// mid-turn append to the open Assistant bubble; a new turn starts a new
-    /// one.
-    pub fn apply(&mut self, ev: FlowEvent) {
+    /// Start a fresh chat, make it the active one and switch to it. Ids are
+    /// one past the highest seen so they stay stable across view switches.
+    pub fn new_chat(&mut self, now: i64) -> u64 {
+        let id = self.chats.iter().map(|c| c.id).max().unwrap_or(0) + 1;
+        self.chats
+            .push(FlowChat { id, last_activity: now, ..FlowChat::default() });
+        self.active = self.chats.len() - 1;
+        self.view = FlowView::Chat;
+        id
+    }
+
+    /// Switch to a chat by id and clear its unread marker (it is on screen).
+    pub fn open_chat(&mut self, id: u64) {
+        if let Some(i) = self.chats.iter().position(|c| c.id == id) {
+            self.active = i;
+            self.chats[i].unseen = false;
+            self.view = FlowView::Chat;
+        }
+    }
+
+    pub fn active_chat(&self) -> Option<&FlowChat> {
+        self.chats.get(self.active)
+    }
+
+    pub fn active_chat_mut(&mut self) -> Option<&mut FlowChat> {
+        self.chats.get_mut(self.active)
+    }
+
+    /// The chat an event is about — events are routed by id, not by which
+    /// chat is on screen, so background chats keep receiving their turns.
+    fn chat_mut(&mut self, id: u64) -> Option<&mut FlowChat> {
+        self.chats.iter_mut().find(|c| c.id == id)
+    }
+
+    /// Reduce one backend event into the transcript of chat `id` (unknown
+    /// ids are ignored). Text chunks arriving mid-turn append to the open
+    /// Assistant bubble; a new turn starts a new one. A turn finishing in a
+    /// chat that is not currently visible marks it unseen for the list
+    /// badge.
+    pub fn apply(&mut self, id: u64, ev: FlowEvent, now: i64) {
+        let visible = self.open
+            && self.view == FlowView::Chat
+            && self.active_chat().is_some_and(|c| c.id == id);
+        let Some(chat) = self.chat_mut(id) else { return };
         match ev {
-            FlowEvent::Ready => self.ready = true,
+            FlowEvent::Ready => chat.ready = true,
             FlowEvent::Text(text) => {
-                if self.busy {
-                    if let Some(FlowMsg::Assistant(last)) = self.messages.last_mut() {
+                let merged = chat.busy && matches!(chat.messages.last(), Some(FlowMsg::Assistant(_)));
+                if merged {
+                    if let Some(FlowMsg::Assistant(last)) = chat.messages.last_mut() {
                         last.push_str(&text);
-                        return;
                     }
+                } else {
+                    chat.messages.push(FlowMsg::Assistant(text));
                 }
-                self.messages.push(FlowMsg::Assistant(text));
             }
             FlowEvent::ToolStarted { id, title, detail } => {
-                self.messages
+                chat.messages
                     .push(FlowMsg::Action { id, title, detail, status: ActionStatus::Running });
             }
             FlowEvent::ToolFinished { id, ok, detail } => {
-                if let Some(FlowMsg::Action { status, detail: d, .. }) = self
+                if let Some(FlowMsg::Action { status, detail: d, .. }) = chat
                     .messages
                     .iter_mut()
                     .rev()
@@ -379,19 +479,37 @@ impl FlowState {
                     *d = detail;
                 }
             }
-            FlowEvent::TurnDone => self.busy = false,
+            FlowEvent::TurnDone => {
+                chat.busy = false;
+                if !visible {
+                    chat.unseen = true;
+                }
+            }
             FlowEvent::Error(e) => {
-                self.busy = false;
-                self.draft_error = Some(e);
+                chat.busy = false;
+                chat.draft_error = Some(e);
+                // A background failure deserves the badge at least as much
+                // as a background success — a died agent must not look idle.
+                if !visible {
+                    chat.unseen = true;
+                }
             }
         }
+        chat.last_activity = now;
     }
 
-    /// Record the user's request and mark the turn in flight.
-    pub fn push_user(&mut self, text: String) {
-        self.messages.push(FlowMsg::User(text));
-        self.busy = true;
-        self.draft_error = None;
+    /// Record the user's request in chat `id` and mark the turn in flight.
+    /// The first user message also names the chat (the list-card title).
+    pub fn push_user(&mut self, id: u64, text: String, now: i64) {
+        let Some(chat) = self.chat_mut(id) else { return };
+        let first = text.lines().next().unwrap_or("").trim();
+        if chat.title.is_none() && !first.is_empty() {
+            chat.title = Some(truncate_chars(first, 40));
+        }
+        chat.messages.push(FlowMsg::User(text));
+        chat.busy = true;
+        chat.draft_error = None;
+        chat.last_activity = now;
     }
 }
 
@@ -525,12 +643,14 @@ mod tests {
     #[test]
     fn apply_pairs_tool_start_and_finish() {
         let mut st = FlowState::default();
-        st.push_user("spawn a shell".into());
-        assert!(st.busy);
-        st.apply(FlowEvent::ToolStarted { id: "t1".into(), title: "pwrde-cli state".into(), detail: "Bash".into() });
-        st.apply(FlowEvent::ToolFinished { id: "t1".into(), ok: true, detail: "ok".into() });
-        assert_eq!(st.messages.len(), 2);
-        match &st.messages[1] {
+        st.new_chat(0);
+        st.push_user(1, "spawn a shell".into(), 0);
+        assert!(st.active_chat().unwrap().busy);
+        st.apply(1, FlowEvent::ToolStarted { id: "t1".into(), title: "pwrde-cli state".into(), detail: "Bash".into() }, 1);
+        st.apply(1, FlowEvent::ToolFinished { id: "t1".into(), ok: true, detail: "ok".into() }, 2);
+        let chat = st.active_chat().unwrap();
+        assert_eq!(chat.messages.len(), 2);
+        match &chat.messages[1] {
             FlowMsg::Action { id, status, detail, .. } => {
                 assert_eq!(id, "t1");
                 assert_eq!(*status, ActionStatus::Done);
@@ -543,10 +663,11 @@ mod tests {
     #[test]
     fn apply_marks_unmatched_tool_finish_failed_and_ignores_unknown_ids() {
         let mut st = FlowState::default();
-        st.apply(FlowEvent::ToolStarted { id: "t1".into(), title: "a".into(), detail: "Bash".into() });
-        st.apply(FlowEvent::ToolFinished { id: "nope".into(), ok: true, detail: "x".into() });
-        st.apply(FlowEvent::ToolFinished { id: "t1".into(), ok: false, detail: "bad".into() });
-        match &st.messages[0] {
+        st.new_chat(0);
+        st.apply(1, FlowEvent::ToolStarted { id: "t1".into(), title: "a".into(), detail: "Bash".into() }, 0);
+        st.apply(1, FlowEvent::ToolFinished { id: "nope".into(), ok: true, detail: "x".into() }, 0);
+        st.apply(1, FlowEvent::ToolFinished { id: "t1".into(), ok: false, detail: "bad".into() }, 0);
+        match &st.active_chat().unwrap().messages[0] {
             FlowMsg::Action { status, detail, .. } => {
                 assert_eq!(*status, ActionStatus::Failed);
                 assert_eq!(detail, "bad");
@@ -558,37 +679,42 @@ mod tests {
     #[test]
     fn apply_turn_done_clears_busy_and_error_sets_draft_error() {
         let mut st = FlowState::default();
-        st.push_user("hi".into());
-        st.apply(FlowEvent::TurnDone);
-        assert!(!st.busy);
-        st.push_user("again".into());
-        st.apply(FlowEvent::Error("agent exited".into()));
-        assert!(!st.busy);
-        assert_eq!(st.draft_error.as_deref(), Some("agent exited"));
-        st.apply(FlowEvent::Ready);
-        assert!(st.ready);
+        st.new_chat(0);
+        st.push_user(1, "hi".into(), 0);
+        st.apply(1, FlowEvent::TurnDone, 1);
+        assert!(!st.active_chat().unwrap().busy);
+        st.push_user(1, "again".into(), 2);
+        st.apply(1, FlowEvent::Error("agent exited".into()), 3);
+        let chat = st.active_chat().unwrap();
+        assert!(!chat.busy);
+        assert_eq!(chat.draft_error.as_deref(), Some("agent exited"));
+        st.apply(1, FlowEvent::Ready, 4);
+        assert!(st.active_chat().unwrap().ready);
     }
 
     #[test]
     fn text_chunks_merge_into_one_bubble_within_a_turn() {
         let mut st = FlowState::default();
-        st.push_user("go".into());
-        st.apply(FlowEvent::Text("a".into()));
-        st.apply(FlowEvent::Text("b".into()));
-        assert_eq!(st.messages.len(), 2); // User + one merged Assistant
-        assert_eq!(st.messages[1], FlowMsg::Assistant("ab".into()));
+        st.new_chat(0);
+        st.push_user(1, "go".into(), 0);
+        st.apply(1, FlowEvent::Text("a".into()), 1);
+        st.apply(1, FlowEvent::Text("b".into()), 1);
+        let chat = st.active_chat().unwrap();
+        assert_eq!(chat.messages.len(), 2); // User + one merged Assistant
+        assert_eq!(chat.messages[1], FlowMsg::Assistant("ab".into()));
     }
 
     #[test]
     fn a_new_turn_starts_a_fresh_assistant_bubble() {
         let mut st = FlowState::default();
-        st.push_user("one".into());
-        st.apply(FlowEvent::Text("a".into()));
-        st.apply(FlowEvent::TurnDone);
-        st.push_user("two".into());
-        st.apply(FlowEvent::Text("b".into()));
+        st.new_chat(0);
+        st.push_user(1, "one".into(), 0);
+        st.apply(1, FlowEvent::Text("a".into()), 1);
+        st.apply(1, FlowEvent::TurnDone, 2);
+        st.push_user(1, "two".into(), 3);
+        st.apply(1, FlowEvent::Text("b".into()), 4);
         assert_eq!(
-            st.messages,
+            st.active_chat().unwrap().messages,
             vec![
                 FlowMsg::User("one".into()),
                 FlowMsg::Assistant("a".into()),
@@ -596,5 +722,120 @@ mod tests {
                 FlowMsg::Assistant("b".into()),
             ]
         );
+    }
+
+    #[test]
+    fn events_route_by_chat_id() {
+        let mut st = FlowState::default();
+        st.new_chat(0); // chat 1, active
+        st.new_chat(1); // chat 2, active now
+        st.push_user(1, "for A".into(), 2);
+        st.push_user(2, "for B".into(), 2);
+        // Chat 1's turn streams while chat 2 is on screen: A must not leak
+        // into B, and events for an unknown id are dropped entirely.
+        st.apply(1, FlowEvent::Text("A reply".into()), 3);
+        st.apply(1, FlowEvent::ToolStarted { id: "t1".into(), title: "ls".into(), detail: "Bash".into() }, 4);
+        st.apply(99, FlowEvent::Text("ghost".into()), 5);
+        assert_eq!(
+            st.chats[0].messages,
+            vec![
+                FlowMsg::User("for A".into()),
+                FlowMsg::Assistant("A reply".into()),
+                FlowMsg::Action { id: "t1".into(), title: "ls".into(), detail: "Bash".into(), status: ActionStatus::Running },
+            ]
+        );
+        assert_eq!(st.chats[1].messages, vec![FlowMsg::User("for B".into())]);
+        assert!(st
+            .chats
+            .iter()
+            .all(|c| !c.messages.iter().any(|m| matches!(m, FlowMsg::Assistant(t) if t == "ghost"))));
+    }
+
+    #[test]
+    fn busy_is_per_chat() {
+        let mut st = FlowState::default();
+        st.new_chat(0);
+        st.new_chat(1);
+        st.push_user(1, "A's turn".into(), 1); // A turns busy even though B is active
+        assert!(st.chats[0].busy);
+        assert!(!st.chats[1].busy);
+        // B still accepts a send while A is mid-turn.
+        st.push_user(2, "B's turn".into(), 1);
+        assert!(st.chats[1].busy);
+        st.apply(1, FlowEvent::TurnDone, 2);
+        assert!(!st.chats[0].busy);
+        assert!(st.chats[1].busy);
+    }
+
+    #[test]
+    fn background_turn_done_marks_unseen_and_open_chat_clears_it() {
+        let mut st = FlowState::default();
+        st.new_chat(0);
+        st.new_chat(1);
+        st.open = true; // panel open, chat 2 on screen
+        st.push_user(1, "A's turn".into(), 1);
+        st.apply(1, FlowEvent::TurnDone, 2); // finished in the background
+        assert!(st.chats[0].unseen);
+        st.apply(2, FlowEvent::TurnDone, 2); // the visible chat is never unseen
+        assert!(!st.chats[1].unseen);
+        st.open_chat(1); // switching to it clears the marker
+        assert!(!st.chats[0].unseen);
+        assert_eq!(st.active, 0);
+        assert_eq!(st.view, FlowView::Chat);
+        // A closed panel means even the active chat's turn is unseen.
+        let mut closed = FlowState::default();
+        closed.new_chat(0);
+        closed.push_user(1, "hi".into(), 1);
+        closed.apply(1, FlowEvent::TurnDone, 2);
+        assert!(closed.chats[0].unseen);
+    }
+
+    #[test]
+    fn background_error_marks_unseen_too() {
+        // A background agent failure must badge the chat — a died agent
+        // should be at least as visible in the list as a finished turn.
+        let mut st = FlowState::default();
+        st.new_chat(0);
+        st.new_chat(1);
+        st.open = true; // chat 2 on screen; chat 1 fails in the background
+        st.push_user(1, "go".into(), 1);
+        st.apply(1, FlowEvent::Error("agent exited".into()), 2);
+        assert!(st.chats[0].unseen);
+        assert!(!st.chats[0].busy);
+        assert_eq!(st.chats[0].draft_error.as_deref(), Some("agent exited"));
+        // The visible chat's failure is on screen already — no badge.
+        st.apply(2, FlowEvent::Error("boom".into()), 3);
+        assert!(!st.chats[1].unseen);
+    }
+
+    #[test]
+    fn title_comes_from_first_user_message_and_truncates() {
+        let mut st = FlowState::default();
+        st.new_chat(0);
+        st.push_user(1, "  Review the open PR\nsecond line ignored".into(), 1);
+        assert_eq!(st.active_chat().unwrap().title.as_deref(), Some("Review the open PR"));
+        // Only the first user message names the chat.
+        st.push_user(1, "and now this".into(), 2);
+        assert_eq!(st.active_chat().unwrap().title.as_deref(), Some("Review the open PR"));
+        // Long first lines truncate to 40 chars on char boundaries.
+        let mut st2 = FlowState::default();
+        st2.new_chat(0);
+        st2.push_user(1, format!("🦀{}", "x".repeat(60)).into(), 1);
+        let title = st2.active_chat().unwrap().title.clone().unwrap();
+        assert_eq!(title.chars().count(), 40);
+        assert!(title.is_char_boundary(title.len()));
+    }
+
+    #[test]
+    fn format_age_buckets() {
+        let t = 1_700_000_000;
+        assert_eq!(format_age(t, t), "now");
+        assert_eq!(format_age(t, t - 59), "now");
+        assert_eq!(format_age(t, t - 60), "1m");
+        assert_eq!(format_age(t, t - 3_599), "59m");
+        assert_eq!(format_age(t, t - 3_600), "1h");
+        assert_eq!(format_age(t, t - 86_399), "23h");
+        assert_eq!(format_age(t, t - 86_400), "1d");
+        assert_eq!(format_age(t, t - 7 * 86_400), "7d");
     }
 }
