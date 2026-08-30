@@ -43,8 +43,15 @@ use crate::ui::theme::Theme;
 use crate::workspace::{TITLEBAR_H, TRAFFIC_LIGHT_SAFE_W};
 
 /// Gap between the window edge and the inlaid panel (the spec's window
-/// gutter). The panel floats inside it, Apple Messages style.
-const GUTTER: f32 = 3.0;
+/// gutter). The panel floats inside it, Apple Messages style — Messages insets
+/// its panel about this far, well past the mock's 3px. `workspace::SIDEBAR_PAD`
+/// adds the rows' own margin on top of this, so the two move together.
+const GUTTER: f32 = 8.0;
+
+/// How far past the sidebar's width the panel's drop shadow may paint. The
+/// clipped root stops at the sidebar width, which cut the shadow to a hard
+/// line; the shadow lives in its own wider, non-interactive layer instead.
+const SHADOW_SPILL: f32 = 16.0;
 
 /// Panel corner radius (`--radius-l` in the spec's token set).
 const PANEL_RADIUS: f32 = 18.0;
@@ -169,31 +176,55 @@ impl App {
             return div().into_any_element();
         }
 
+        let clip_height = |d: gpui::Div| match ceiling {
+            Some(limit) => d.h(px(limit)),
+            None => d.h_full(),
+        };
+
+        // Two sibling layers under an unclipped anchor (no overflow rule, no
+        // listeners — transparent to the mouse): the panel's drop shadow in a
+        // box wider than the sidebar so it can fade out past the edge, then
+        // the interactive sidebar clipped to exactly the sidebar width.
         div()
             .absolute()
             .left(px(0.0))
             .top(px(0.0))
-            .w(px(w))
-            // Clipped, not just shortened: the row, dot and grip layers are
-            // absolutely positioned against the whole window, so the height has
-            // to actually cut them off.
-            .overflow_hidden()
-            .map(|d| match ceiling {
-                Some(limit) => d.h(px(limit)),
-                None => d.h_full(),
-            })
+            .w(px(w + SHADOW_SPILL))
+            .map(clip_height)
             .child(
-                panel(&theme, panel_w)
-                    .child(header())
-                    // The rows live in their own absolutely positioned layer,
-                    // so the panel only needs to hold the scroll region open
-                    // and let the row layer own everything below it.
-                    .child(div().flex_1()),
+                div()
+                    .absolute()
+                    .left(px(0.0))
+                    .top(px(0.0))
+                    .size_full()
+                    .overflow_hidden()
+                    .child(panel_shadow(&theme, panel_w)),
             )
-            .child(self.clipped_row_layer(&theme, cx))
-            .child(self.drop_feedback_layer(&theme))
-            .child(self.header_chips(&theme, cx.entity().downgrade()))
-            .child(self.page_dot_layer(&theme, cx.entity().downgrade()))
+            .child(
+                div()
+                    .absolute()
+                    .left(px(0.0))
+                    .top(px(0.0))
+                    .w(px(w))
+                    // Clipped, not just shortened: the row, dot and grip
+                    // layers are absolutely positioned against the whole
+                    // window, so the height has to actually cut them off.
+                    .overflow_hidden()
+                    .map(clip_height)
+                    .child(
+                        panel(&theme, panel_w)
+                            .child(header())
+                            // The rows live in their own absolutely
+                            // positioned layer, so the panel only needs to
+                            // hold the scroll region open and let the row
+                            // layer own everything below it.
+                            .child(div().flex_1()),
+                    )
+                    .child(self.clipped_row_layer(&theme, cx))
+                    .child(self.drop_feedback_layer(&theme))
+                    .child(self.header_chips(&theme, cx.entity().downgrade()))
+                    .child(self.page_dot_layer(&theme, cx.entity().downgrade())),
+            )
             .into_any_element()
     }
 
@@ -774,9 +805,9 @@ impl App {
             .justify_center();
         let disc = match kind {
             CardAvatar::Draft => disc
-                .bg(gantry_accent(theme.dark))
+                .bg(accent())
                 .shadow(vec![BoxShadow {
-                    color: gantry_accent(theme.dark).opacity(0.35),
+                    color: accent().opacity(0.35),
                     offset: point(px(0.0), px(3.0)),
                     blur_radius: px(8.0),
                     spread_radius: px(0.0),
@@ -799,7 +830,7 @@ impl App {
             )),
         }
         // The active group's ring is the only chrome a bubble carries.
-        .when(active, |d| d.border_2().border_color(gantry_accent(theme.dark)))
+        .when(active, |d| d.border_2().border_color(accent()))
         .child(
             gpui::svg()
                 .path(avatar_icon(kind))
@@ -1152,7 +1183,7 @@ impl App {
             .w(px(rect.w))
             .h(px(rect.h))
             .rounded(px(10.0))
-            .when(selected, |d| d.bg(gantry_accent(theme.dark)))
+            .when(selected, |d| d.bg(accent()))
             .when(!selected && hovered, |d| {
                 d.bg(theme.muted.opacity(if theme.dark { 0.5 } else { 0.7 }))
             })
@@ -1311,7 +1342,7 @@ impl App {
 fn avatar(theme: &Theme, kind: CardAvatar, selected: bool) -> gpui::Div {
     let tint = match kind {
         CardAvatar::NoPr => pr_none_ink(theme.dark),
-        CardAvatar::Draft => gantry_accent(theme.dark),
+        CardAvatar::Draft => accent(),
         CardAvatar::Open => pr_open(theme.dark),
         CardAvatar::Merged => pr_merged(theme.dark),
     };
@@ -1377,15 +1408,12 @@ fn avatar_icon(kind: CardAvatar) -> &'static str {
 
 /// Git's PR green (`#1a7f37` in the mock), lightened for dark chrome the way
 /// GitHub's own dark palette does, so the stroke keeps its contrast.
-/// The GANTRY mock's own accent — vitrine's `--accent`, `oklch(0.60 0.19 258)`
-/// resolved to sRGB (and its dark-theme sibling).
-///
-/// The sidebar's selection fill is pinned to this rather than the chrome
-/// theme's accent: the panel is a port of a specific design, and the chrome
-/// accent (which the user retints freely) made the selected card read as a
-/// different, heavier blue than the mock's.
-fn gantry_accent(dark: bool) -> Hsla {
-    let (r, g, b) = crate::theme::gantry_accent(dark);
+/// The GANTRY mock's `--accent` as a gpui color — the user's accent setting
+/// (System follows macOS), resolved by `theme::accent_color`. Pinned to that
+/// rather than the chrome theme's own `accent`, which the user retints
+/// freely: the selected card has to agree with the focused pane's tab pill.
+fn accent() -> Hsla {
+    let (r, g, b) = crate::theme::accent_color();
     gpui::Rgba {
         r: r as f32 / 255.0,
         g: g as f32 / 255.0,
@@ -1470,22 +1498,17 @@ fn diff_removed(dark: bool) -> Hsla {
 /// drop shadow with the spec's inset top rim highlight, and the vertical
 /// material gradient.
 fn panel(theme: &Theme, w: f32) -> gpui::Div {
-    // The mock's panel is not a flat card — it is cool, blue-tinted glass that
-    // fades over its top 30% and then holds: `#eaf4fb -> #f4f8fb 30%`. Deriving
-    // the fill from `theme.card` alone (near-white in light chrome) is what made
-    // it read as flat white, so the chrome material is blended *toward* the
-    // mock's glass instead. The blend keeps a retinted chrome visible while the
-    // cast stays GANTRY's.
-    let (top, bottom) = if theme.dark {
-        // Dark glass is the same idea inverted: vitrine's dark material is a
-        // cool near-black, so lift the top slightly rather than tinting it.
-        (shade(theme.card, 0.04), shade(theme.card, -0.015))
-    } else {
-        (
-            mix_hsla(theme.card, gpui::rgb(0xeaf4fb).into(), GLASS_BLEND),
-            mix_hsla(theme.card, gpui::rgb(0xf4f8fb).into(), GLASS_BLEND),
-        )
-    };
+    // The mock's panel is accent-tinted glass that fades over its top 30% and
+    // then holds: `--sb1 -> --sb2 30%`, where the stops are the accent mixed
+    // into a near-white ground at 13% and 5%. `theme::from_accent` computes
+    // exactly those as the chrome's `gradient_from` / `gradient_to` (and the
+    // dark-ground equivalents), so the panel paints them directly — blending
+    // toward a fixed tint here is what made it read as flat blue-white.
+    let chrome = crate::theme::current();
+    let (top, bottom) = (
+        crate::renderer::color(chrome.gradient_from, 1.0),
+        crate::renderer::color(chrome.gradient_to, 1.0),
+    );
 
     div()
         .absolute()
@@ -1508,16 +1531,9 @@ fn panel(theme: &Theme, w: f32) -> gpui::Div {
             linear_color_stop(bottom, 0.30),
         ))
         .shadow(vec![
-            // Drop shadow (`--shadow-2`).
-            BoxShadow {
-                color: gpui::black().opacity(if theme.dark { 0.45 } else { 0.14 }),
-                offset: point(px(0.0), px(2.0)),
-                blur_radius: px(10.0),
-                spread_radius: px(0.0),
-                inset: false,
-            },
             // Top rim highlight (`--highlight-top`), the one-pixel lit edge
-            // that sells the inlaid material.
+            // that sells the inlaid material. The drop shadow is painted by
+            // `panel_shadow`, outside the sidebar's clip.
             BoxShadow {
                 color: gpui::white().opacity(if theme.dark { 0.10 } else { 0.70 }),
                 offset: point(px(0.0), px(1.0)),
@@ -1528,27 +1544,24 @@ fn panel(theme: &Theme, w: f32) -> gpui::Div {
         ])
 }
 
-/// How far the panel's fill is pulled toward the mock's glass tint. High enough
-/// that the cast reads as GANTRY's, low enough that a retinted chrome theme
-/// still tells.
-const GLASS_BLEND: f32 = 0.72;
-
-/// Blend two colours in sRGB, `t` of the way from `a` to `b`.
-///
-/// Via `Rgba` rather than interpolating `Hsla` directly: hue interpolation
-/// between a near-grey and a tinted colour swings through whatever hue the grey
-/// nominally has, which is not a blend anyone asked for.
-fn mix_hsla(a: Hsla, b: Hsla, t: f32) -> Hsla {
-    let (a, b) = (gpui::Rgba::from(a), gpui::Rgba::from(b));
-    let t = t.clamp(0.0, 1.0);
-    let lerp = |x: f32, y: f32| x + (y - x) * t;
-    gpui::Rgba {
-        r: lerp(a.r, b.r),
-        g: lerp(a.g, b.g),
-        b: lerp(a.b, b.b),
-        a: lerp(a.a, b.a),
-    }
-    .into()
+/// The panel's drop shadow (`--shadow-2`) on an otherwise invisible box with
+/// the panel's exact geometry. Kept apart from [`panel`] so it can sit in a
+/// layer wider than the sidebar and fade out instead of being cut off.
+fn panel_shadow(theme: &Theme, w: f32) -> gpui::Div {
+    div()
+        .absolute()
+        .left(px(GUTTER))
+        .top(px(GUTTER))
+        .w(px(w))
+        .bottom(px(GUTTER))
+        .rounded(px(PANEL_RADIUS))
+        .shadow(vec![BoxShadow {
+            color: gpui::black().opacity(if theme.dark { 0.45 } else { 0.14 }),
+            offset: point(px(0.0), px(2.0)),
+            blur_radius: px(10.0),
+            spread_radius: px(0.0),
+            inset: false,
+        }])
 }
 
 /// Header block: the titlebar-height strip plus the toggle / new-session

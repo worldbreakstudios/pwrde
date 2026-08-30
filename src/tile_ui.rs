@@ -278,7 +278,7 @@ impl App {
             workspace::tile_collapse_axis(&ws.root).into_iter().collect();
 
         let base = StripStyle::from_scheme(th, 0.13);
-        let accent = color(crate::theme::gantry_accent(th.dark), 1.0);
+        let accent = color(crate::theme::accent_color(), 1.0);
 
         // Hover in physical px, like the canvas: none while dragging or
         // under a modal.

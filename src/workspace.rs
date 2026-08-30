@@ -424,8 +424,10 @@ fn section_header_h(font_scale: f32) -> f32 {
 const MEMBER_INDENT: f32 = 12.0;
 /// Vertical gap between the sidebar's rounded group rows.
 const TAB_GAP: f32 = 3.0;
-/// Horizontal inset of the sidebar's rows from the sidebar edges.
-const SIDEBAR_PAD: f32 = 10.0;
+/// Horizontal inset of the sidebar's rows from the sidebar (window) edges:
+/// `sidebar_ui::GUTTER` (8px, the panel's inset) plus the mock's 8px list
+/// padding inside the panel, so the rows stay clear of the panel edge.
+const SIDEBAR_PAD: f32 = 16.0;
 /// Side of the square header chips ("⇤" collapse, "＋" new group). Both sit
 /// right-aligned inside [`TITLEBAR_H`], opposite the native traffic lights, so
 /// the chrome costs one strip instead of two.
@@ -455,10 +457,30 @@ pub fn titlebar(scale: f32, sidebar_w: f32) -> LayoutRect {
     LayoutRect { x: 0.0, y: 0.0, w: (sidebar_w * scale).round(), h: (TITLEBAR_H * scale).round() }
 }
 
+/// Where the native traffic lights sit (top-left of the close button, logical
+/// px) while the sidebar is open: 12px inside the sidebar's 8px window
+/// gutter, which also centers the 12px buttons in the panel's header strip —
+/// Messages puts them there rather than at macOS's default (12, 12), which
+/// now lands on the gutter.
+pub const TRAFFIC_LIGHT_ORIGIN: f32 = 20.0;
+
+/// The traffic lights' origin for the current sidebar state. Collapsed, the
+/// first tile's tab strip takes over the top-left corner, so the lights move
+/// back to sit centered on that 28px strip at the tile gap — essentially
+/// macOS's default spot.
+pub fn traffic_light_origin(sidebar_collapsed: bool) -> (f32, f32) {
+    if sidebar_collapsed {
+        (AREA_PAD + 9.0, AREA_PAD + (TILE_TAB_H - 12.0) / 2.0)
+    } else {
+        (TRAFFIC_LIGHT_ORIGIN, TRAFFIC_LIGHT_ORIGIN)
+    }
+}
+
 /// Logical width of the top-left corner the native traffic lights occupy.
-/// The buttons themselves end around x=59; the extra headroom keeps the
-/// first tab from crowding them.
-pub const TRAFFIC_LIGHT_SAFE_W: f32 = 78.0;
+/// The buttons themselves end around x=72 (three 12px lights, 8px apart,
+/// from [`TRAFFIC_LIGHT_ORIGIN`]); the extra headroom keeps the first tab
+/// from crowding them.
+pub const TRAFFIC_LIGHT_SAFE_W: f32 = 90.0;
 
 /// The window-drag corner while the sidebar is collapsed: the traffic-light
 /// span of the top-left tile's tab strip, plus the sliver of padding above.
@@ -2635,15 +2657,15 @@ mod tests {
     }
 
     /// The pinned strip collapses to nothing when empty and matches the
-    /// pad + rows×83 + gaps formula otherwise — including the wrap at a
-    /// 300px sidebar where four pins become two rows (3 + 1).
+    /// pad + rows×83 + gaps formula otherwise — including the wrap at the
+    /// default sidebar width where four pins become two rows (3 + 1).
     #[test]
     fn pinned_strip_h_zero_one_and_wrap() {
-        let sw = 300.0;
+        let sw = SIDEBAR_DEFAULT_W;
         assert_eq!(pinned_strip_h(0, 1.0, sw), 0.0);
         // One row: 6 + 83 + 12 = 101.
         assert_eq!(pinned_strip_h(1, 1.0, sw), 101.0);
-        // 300 inner = 280; per_row = floor((280+14)/(84+14)) = 3, so 4 pins
+        // 360 inner = 328; per_row = floor((328+14)/(84+14)) = 3, so 4 pins
         // wrap to 2 rows: 6 + 2*83 + 8 + 12 = 192.
         assert_eq!(pinned_per_row(sw), 3);
         assert_eq!(pinned_strip_h(4, 1.0, sw), 192.0);
@@ -2655,7 +2677,7 @@ mod tests {
     /// row is centered in the sidebar (first.x + last.x + col_w ≈ sidebar_w).
     #[test]
     fn pinned_bubble_rects_centered_non_overlapping() {
-        let sw = 300.0;
+        let sw = SIDEBAR_DEFAULT_W;
         let scale = 1.0;
         let n = 3;
         let rects: Vec<_> = (0..n)

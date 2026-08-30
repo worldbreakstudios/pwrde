@@ -4565,7 +4565,7 @@ mod tests {
 
     #[test]
     fn readiness_rows_summarize_checks_review_and_state() {
-        let theme = Theme::from_chrome(&crate::theme::ARC_LIGHT);
+        let theme = Theme::from_chrome(&crate::theme::from_accent((0x0a, 0x84, 0xff), false));
         let mut d = detail_with(None, Some("APPROVED"), vec![CheckStatus::Success, CheckStatus::Failure, CheckStatus::Pending]);
         d.checks[1].name = "wasm-build".into();
         d.checks[2].name = "clippy".into();

@@ -637,6 +637,8 @@ impl Theme {
         t.card_foreground = srgb(th.ink);
         t.popover = srgb(th.card);
         t.popover_foreground = srgb(th.ink);
+        // `primary` is the accent the chrome was derived from, so Approve /
+        // active segments match the sidebar's selected card.
         t.primary = srgb(th.accent);
         t.primary_foreground = if crate::theme::is_dark_color(th.accent) {
             srgb((0xff, 0xff, 0xff))
@@ -684,24 +686,24 @@ mod pwrde_tests {
 
     #[test]
     fn from_chrome_polarity_follows_dark() {
-        let light = Theme::from_chrome(&crate::theme::ARC_LIGHT);
-        let dark = Theme::from_chrome(&crate::theme::MIDNIGHT);
+        let pink = (0xff, 0x2d, 0x75);
+        let light = Theme::from_chrome(&crate::theme::from_accent(pink, false));
+        let dark = Theme::from_chrome(&crate::theme::from_accent(pink, true));
         assert!(!light.dark);
         assert!(dark.dark);
     }
 
     #[test]
     fn from_chrome_maps_card_and_primary() {
-        let midnight = Theme::from_chrome(&crate::theme::MIDNIGHT);
-        assert_close(midnight.card, srgb(crate::theme::MIDNIGHT.card));
-        assert_close(midnight.primary, srgb(crate::theme::MIDNIGHT.accent));
-        assert_close(midnight.background, srgb(crate::theme::MIDNIGHT.gradient_to));
-        assert_close(midnight.foreground, srgb(crate::theme::MIDNIGHT.ink));
-
-        let arc = Theme::from_chrome(&crate::theme::ARC_LIGHT);
-        assert_close(arc.card, srgb(crate::theme::ARC_LIGHT.card));
-        assert_close(arc.primary, srgb(crate::theme::ARC_LIGHT.accent));
-        assert_close(arc.background, srgb(crate::theme::ARC_LIGHT.gradient_to));
-        assert_close(arc.foreground, srgb(crate::theme::ARC_LIGHT.ink));
+        let purple = (0xbf, 0x5a, 0xf2);
+        for dark in [false, true] {
+            let chrome = crate::theme::from_accent(purple, dark);
+            let t = Theme::from_chrome(&chrome);
+            assert_close(t.card, srgb(chrome.card));
+            // primary is the accent the chrome was derived from.
+            assert_close(t.primary, srgb(purple));
+            assert_close(t.background, srgb(chrome.gradient_to));
+            assert_close(t.foreground, srgb(chrome.ink));
+        }
     }
 }

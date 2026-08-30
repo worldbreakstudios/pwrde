@@ -334,6 +334,9 @@ struct App {
     /// Whether the sidebar is collapsed (⌘S toggle). Session-only, like the
     /// width; layout treats the effective width 0 as the collapsed state.
     sidebar_collapsed: bool,
+    /// The sidebar state the native traffic lights were last positioned for
+    /// (`workspace::traffic_light_origin`); `render` re-syncs on change.
+    traffic_lights_for_collapsed: Option<bool>,
     modifiers: Modifiers,
     title: String,
     cursor: (f64, f64),
@@ -5206,6 +5209,13 @@ fn key_to_bytes(ks: &Keystroke) -> Option<Vec<u8>> {
 
 impl Render for App {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Native traffic lights follow the sidebar: inside the panel while it
+        // is open, back over the first tile's tab strip when it collapses.
+        if self.traffic_lights_for_collapsed != Some(self.sidebar_collapsed) {
+            let (x, y) = workspace::traffic_light_origin(self.sidebar_collapsed);
+            window.set_traffic_light_position(gpui::point(px(x), px(y)));
+            self.traffic_lights_for_collapsed = Some(self.sidebar_collapsed);
+        }
         // Settings search field: focus lives in the window, so reflect it
         // into the flag the sidebar styles from, and drop it (and any stale
         // query) the moment the field is off screen — leaving Settings must
@@ -6438,6 +6448,36 @@ fn parse_open_dir(url: &str) -> Option<std::path::PathBuf> {
     path.is_dir().then_some(path)
 }
 
+/// macOS's accent color (System Settings → Appearance → Accent color) as sRGB:
+/// `NSColor.controlAccentColor`, converted through the sRGB color space so the
+/// catalog color resolves under the current appearance. `None` if AppKit
+/// hands back nothing (or off macOS).
+#[cfg(target_os = "macos")]
+fn read_system_accent() -> Option<(u8, u8, u8)> {
+    use objc::runtime::Object;
+    use objc::{class, msg_send, sel, sel_impl};
+    unsafe {
+        let color: *mut Object = msg_send![class!(NSColor), controlAccentColor];
+        if color.is_null() {
+            return None;
+        }
+        let space: *mut Object = msg_send![class!(NSColorSpace), sRGBColorSpace];
+        let color: *mut Object = msg_send![color, colorUsingColorSpace: space];
+        if color.is_null() {
+            return None;
+        }
+        let (mut r, mut g, mut b, mut a): (f64, f64, f64, f64) = (0.0, 0.0, 0.0, 0.0);
+        let _: () = msg_send![color, getRed: &mut r as *mut f64 green: &mut g as *mut f64 blue: &mut b as *mut f64 alpha: &mut a as *mut f64];
+        let ch = |x: f64| (x.clamp(0.0, 1.0) * 255.0).round() as u8;
+        Some((ch(r), ch(g), ch(b)))
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn read_system_accent() -> Option<(u8, u8, u8)> {
+    None
+}
+
 fn main() {
     // Settings must be in memory before anything reads a binding or theme.
     settings::init();
@@ -6505,7 +6545,12 @@ fn main() {
                 titlebar: Some(gpui::TitlebarOptions {
                     title: None,
                     appears_transparent: true,
-                    traffic_light_position: None,
+                    // Inside the sidebar panel, not on the window gutter;
+                    // `App::render` moves them when the sidebar collapses.
+                    traffic_light_position: Some(gpui::point(
+                        px(workspace::TRAFFIC_LIGHT_ORIGIN),
+                        px(workspace::TRAFFIC_LIGHT_ORIGIN),
+                    )),
                 }),
                 is_resizable: true,
                 app_owns_titlebar_drag: true,
@@ -6562,6 +6607,7 @@ fn main() {
                         next_tile_id: 0,
                         sidebar_expanded_w: workspace::SIDEBAR_DEFAULT_W,
                         sidebar_collapsed: false,
+                        traffic_lights_for_collapsed: None,
                         modifiers: Modifiers::default(),
                         mouse_report: None,
                         title: String::new(),
@@ -6846,6 +6892,8 @@ fn main() {
                         let entity = entity.clone();
                         move |window, cx| {
                             theme::set_system_dark(is_dark(window.appearance()));
+                            // AppKit tunes the accent per polarity too.
+                            theme::set_system_accent(read_system_accent());
                             entity.update(cx, |app, cx| {
                                 app.request_redraw();
                                 cx.notify();
@@ -6853,6 +6901,21 @@ fn main() {
                         }
                     })
                     .detach();
+                // Follow the macOS accent color for the "System" accent
+                // setting: seed now, then re-read whenever the window regains
+                // focus — the user changed it in System Settings and came
+                // back. No AppKit notification is wired for it.
+                theme::set_system_accent(read_system_accent());
+                entity.update(cx, |_, cx| {
+                    cx.observe_window_activation(window, |app, window, cx| {
+                        if window.is_window_active() {
+                            theme::set_system_accent(read_system_accent());
+                            app.request_redraw();
+                            cx.notify();
+                        }
+                    })
+                    .detach();
+                });
 
                 // Establish keyboard focus so key events reach the terminal.
                 let handle = entity.read(cx).focus_handle.clone();

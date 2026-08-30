@@ -139,6 +139,10 @@ fn settings_group(theme: &Theme, rows: Vec<AnyElement>) -> gpui::Div {
     let mut boxed = div()
         .flex()
         .flex_col()
+        // Never shrink: `overflow_hidden` zeroes this box's automatic
+        // minimum size, so as a direct child of a scrolling column it would
+        // be squeezed to a sliver once the page overflows.
+        .flex_none()
         .rounded(theme.radius_lg())
         .bg(alpha(theme.foreground, 0.04))
         .border_1()
@@ -719,7 +723,13 @@ fn render_debug(
             "settings file",
             settings::path().to_string_lossy().into_owned(),
         ),
-        ("theme", th.label.into()),
+        (
+            "chrome",
+            format!(
+                "{} · accent #{:02x}{:02x}{:02x}",
+                th.label, th.accent.0, th.accent.1, th.accent.2
+            ),
+        ),
         ("scale", format!("{:.2}", app.renderer.scale)),
         ("surface", format!("{}×{} px", sw, sh)),
         (
@@ -872,54 +882,57 @@ fn render_appearance(app: &App, theme: &Theme, entity: gpui::WeakEntity<App>) ->
             .into_any_element()
     };
 
-    // ── App theme selects ──────────────────────────────────────────────
-    let theme_select = |which: AppearanceDropdown| -> AnyElement {
-        let dark = which.dark();
-        let opts = pages::theme_options(dark);
-        let labels: Vec<String> = opts.iter().map(|t| t.label.to_string()).collect();
-        let selected_name = crate::theme::selected(dark).name;
-        let value = opts.iter().position(|t| t.name == selected_name);
-        let open = app.appearance_menu == Some(which);
-        let e_open = entity.clone();
-        let e_change = entity.clone();
-        let opts_for_change: Vec<&'static str> = opts.iter().map(|t| t.name).collect();
-        let id = match which {
-            AppearanceDropdown::ThemeLight => "appearance-theme-light",
-            AppearanceDropdown::ThemeDark => "appearance-theme-dark",
-            _ => "appearance-theme",
+    // ── Accent swatches ────────────────────────────────────────────────
+    // macOS-style dot row: System (follows the OS accent) first, then the
+    // mock's eight presets. The selected dot wears an ink ring.
+    let accent_row = {
+        use crate::theme::Accent;
+        let current = crate::theme::accent_setting();
+        let system_rgb =
+            crate::theme::resolve_accent(Accent::System, crate::theme::system_accent());
+        let mut swatches = div().flex().flex_row().items_center().gap(px(6.));
+        for (ix, a) in Accent::ALL.into_iter().enumerate() {
+            let active = current == a;
+            let e = entity.clone();
+            let name = a.name();
+            let fill = color(a.rgb().unwrap_or(system_rgb), 1.0);
+            let ring = if active { theme.foreground } else { gpui::transparent_black() };
+            let mut dot = div().size_full().rounded_full().bg(fill);
+            if a == Accent::System {
+                // The follow-the-OS swatch: a hollow center so it reads as
+                // "auto" rather than as one more fixed color.
+                dot = dot.flex().items_center().justify_center().child(
+                    div().size(px(5.)).rounded_full().bg(gpui::white()),
+                );
+            }
+            swatches = swatches.child(
+                div()
+                    .id(("appearance-accent", ix))
+                    .size(px(22.))
+                    .p(px(2.))
+                    .rounded_full()
+                    .border_2()
+                    .border_color(ring)
+                    .cursor_pointer()
+                    .on_click(move |_ev: &ClickEvent, _win: &mut Window, gpui_app: &mut GpuiApp| {
+                        gpui_app.stop_propagation();
+                        if let Some(e) = e.upgrade() {
+                            e.update(gpui_app, move |_this, cx| {
+                                settings::set("accent", name.into());
+                                cx.notify();
+                            });
+                        }
+                    })
+                    .child(dot),
+            );
+        }
+        let desc: &'static str = match current {
+            Accent::System => "System — follows macOS",
+            other => other.label(),
         };
-        let label = if dark { "Dark theme" } else { "Light theme" };
         settings_row()
-            .child(row_text(theme, label, None))
-            .child(
-                div().w(px(220.)).child(
-                    Select::new(id)
-                        .options(labels)
-                        .value(value)
-                        .open(open)
-                        .on_open_change(move |is_open: &bool, _win: &mut Window, gpui_app: &mut GpuiApp| {
-                            let open = *is_open;
-                            if let Some(e) = e_open.upgrade() {
-                                e.update(gpui_app, move |this, cx| {
-                                    this.appearance_menu = if open { Some(which) } else { None };
-                                    cx.notify();
-                                });
-                            }
-                        })
-                        .on_change(move |ix: &usize, _win: &mut Window, gpui_app: &mut GpuiApp| {
-                            let name = opts_for_change.get(*ix).copied().unwrap_or("");
-                            if name.is_empty() {
-                                return;
-                            }
-                            if let Some(e) = e_change.upgrade() {
-                                e.update(gpui_app, move |_this, cx| {
-                                    settings::set(crate::theme::setting_key(dark), name.into());
-                                    cx.notify();
-                                });
-                            }
-                        }),
-                ),
-            )
+            .child(row_text(theme, "Accent", Some(desc)))
+            .child(swatches)
             .into_any_element()
     };
 
@@ -945,7 +958,6 @@ fn render_appearance(app: &App, theme: &Theme, entity: gpui::WeakEntity<App>) ->
         let id = match which {
             AppearanceDropdown::TermLight => "appearance-term-light",
             AppearanceDropdown::TermDark => "appearance-term-dark",
-            _ => "appearance-term",
         };
         let label = if dark { "Dark theme" } else { "Light theme" };
         settings_row()
@@ -1305,56 +1317,6 @@ fn render_appearance(app: &App, theme: &Theme, entity: gpui::WeakEntity<App>) ->
             .into_any_element()
     };
 
-    // ── Footer actions ─────────────────────────────────────────────────
-    let import_e = entity.clone();
-    let import_btn = Button::new("appearance-import")
-        .variant(ButtonVariant::Outline)
-        .size(ButtonSize::Sm)
-        .child("Import from clipboard")
-        .on_click(move |_ev: &ClickEvent, _win: &mut Window, gpui_app: &mut GpuiApp| {
-            gpui_app.stop_propagation();
-            if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                if let Some(tokens) = clipboard
-                    .get_text()
-                    .ok()
-                    .as_deref()
-                    .and_then(crate::theme::parse_tokens)
-                {
-                    let dark = crate::theme::is_dark_color(tokens[0]);
-                    if let Some(e) = import_e.upgrade() {
-                        e.update(gpui_app, move |_this, cx| {
-                            settings::set(
-                                crate::theme::custom_key(dark),
-                                crate::theme::serialize_tokens(&tokens).into(),
-                            );
-                            settings::set(
-                                crate::theme::setting_key(dark),
-                                crate::theme::custom_name(dark).into(),
-                            );
-                            cx.notify();
-                        });
-                    }
-                }
-            }
-        });
-
-    let copy_e = entity.clone();
-    let copy_btn = Button::new("appearance-copy")
-        .variant(ButtonVariant::Outline)
-        .size(ButtonSize::Sm)
-        .child("Copy theme tokens")
-        .on_click(move |_ev: &ClickEvent, _win: &mut Window, gpui_app: &mut GpuiApp| {
-            gpui_app.stop_propagation();
-            if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                let _ = clipboard.set_text(crate::theme::export_current());
-            }
-            if let Some(e) = copy_e.upgrade() {
-                e.update(gpui_app, |_this, cx| {
-                    cx.notify();
-                });
-            }
-        });
-
     div()
         .id("settings-rows")
         .flex()
@@ -1363,21 +1325,7 @@ fn render_appearance(app: &App, theme: &Theme, entity: gpui::WeakEntity<App>) ->
         .min_h(px(0.))
         .overflow_y_scroll()
         .gap_4()
-        .child(settings_group(theme, vec![mode_seg, preview_seg]))
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .gap_2()
-                .child(group_label(theme, "App theme"))
-                .child(settings_group(
-                    theme,
-                    vec![
-                        theme_select(AppearanceDropdown::ThemeLight),
-                        theme_select(AppearanceDropdown::ThemeDark),
-                    ],
-                )),
-        )
+        .child(settings_group(theme, vec![mode_seg, accent_row, preview_seg]))
         .child(
             div()
                 .flex()
@@ -1399,14 +1347,6 @@ fn render_appearance(app: &App, theme: &Theme, entity: gpui::WeakEntity<App>) ->
                 .gap_4()
                 .child(div().flex_1().min_w(px(0.)).child(app_preview))
                 .child(div().flex_1().min_w(px(0.)).child(term_preview)),
-        )
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .gap_2()
-                .child(import_btn)
-                .child(copy_btn),
         )
         .into_any_element()
 }
