@@ -30,12 +30,15 @@ pub use alert_dialog::{AlertDialog, AlertDialogFooter};
 #[allow(unused_imports)] // vendored rcn surface: kept exported while no caller uses it
 pub use alert_dialog::{AlertDialogDescription, AlertDialogHeader, AlertDialogTitle};
 pub use button::{Button, ButtonSize, ButtonVariant};
+#[allow(unused_imports)] // vendored rcn surface: kept exported while no caller uses it
 pub use card::{
     Card, CardAction, CardContent, CardDescription, CardFooter, CardHeader, CardSize, CardTitle,
 };
+#[allow(unused_imports)] // vendored rcn surface: kept exported while no caller uses it
 pub use checkbox::Checkbox;
 #[allow(unused_imports)] // vendored rcn surface: kept exported while no caller uses it
 pub use dialog::{Dialog, DialogDescription, DialogFooter, DialogHeader, DialogTitle};
+#[allow(unused_imports)] // vendored rcn surface: kept exported while no caller uses it
 pub use hover_card::HoverCard;
 pub use input::Input;
 pub use kbd::Kbd;

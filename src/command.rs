@@ -603,7 +603,11 @@ impl CommandPalette {
 /// The group an [`Action`] belongs to (drives root-list headers).
 pub fn action_group(action: Action) -> &'static str {
     match action {
-        Action::NewGroup | Action::CloseGroup | Action::TogglePin | Action::SaveWorkspace => "Session",
+        Action::NewGroup
+        | Action::CloseGroup
+        | Action::TogglePin
+        | Action::SaveWorkspace
+        | Action::NewSection => "Session",
         Action::SplitRight
         | Action::SplitDown
         | Action::NewTab
@@ -630,7 +634,13 @@ pub fn action_group(action: Action) -> &'static str {
         | Action::IncreaseFontSize
         | Action::DecreaseFontSize
         | Action::OpenSettings => "View",
-        Action::Quit | Action::CommandPalette => "App",
+        Action::Quit
+        | Action::CommandPalette
+        | Action::ScreenshotToClipboard
+        | Action::ScreenshotToFile
+        | Action::GoToSessions
+        | Action::GoToPullRequests
+        | Action::GoToTool => "App",
     }
 }
 
@@ -670,6 +680,12 @@ pub fn action_glyph(action: Action) -> &'static str {
         Action::Paste => "⎘",
         Action::Quit => "⏻",
         Action::CommandPalette => "⌘",
+        Action::ScreenshotToClipboard => "◫",
+        Action::ScreenshotToFile => "⎙",
+        Action::NewSection => "▤",
+        Action::GoToSessions => "▣",
+        Action::GoToPullRequests => "⇅",
+        Action::GoToTool => ">_",
     }
 }
 

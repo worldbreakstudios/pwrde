@@ -2,6 +2,7 @@
 name = "pwrde"
 version = "0.1.0"
 edition = "2024"
+default-run = "pwrde"
 
 [dependencies]
 glyphon = "0.12.0"
@@ -78,3 +79,11 @@ opt-level = 3
 # even in debug so the terminal is snappy during development.
 [profile.dev.package."*"]
 opt-level = 2
+
+[[bin]]
+name = "pwrde"
+path = "src/main.rs"
+
+[[bin]]
+name = "pwrde-cli"
+path = "src/bin/pwrde-cli.rs"

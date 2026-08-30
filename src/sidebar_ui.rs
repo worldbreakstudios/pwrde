@@ -62,9 +62,13 @@ const UNREAD_DOT: f32 = 7.0;
 const SECTION_TEXT: f32 = 10.5;
 
 /// Corner radius of a one-line row's pill. Mirrors `renderer.rs`'s
-/// `ROW_RADIUS`, so the Cleanup and Settings rows keep exactly the
+/// `ROW_RADIUS`, so the Settings rows keep exactly the
 /// silhouette the canvas gave them.
 const ROW_RADIUS: f32 = 14.0;
+
+/// How far a nested one-line row steps its label in. The canvas used the
+/// same 14px.
+const ROW_INDENT: f32 = 14.0;
 
 /// What the Settings search field shows while it is empty.
 pub(crate) const SEARCH_SETTINGS_PLACEHOLDER: &str = "Search settings";
@@ -411,9 +415,9 @@ impl App {
     /// pixels moved here; the rects did not. Each slot is positioned at
     /// exactly [`crate::workspace::page_slot_rect`] — the same rect
     /// `renderer.rs` registers as hot and `main.rs::page_slot_at` hit-tests.
-    /// Each slot is a real gpui click target that switches the page; the hover
-    /// crossfade target (`dot_hover`) is still tracked on the canvas mouse-move
-    /// path.
+    /// Each slot is a real
+    /// gpui click target that switches the page; the hover crossfade target
+    /// (`dot_hover`) is still tracked on the canvas mouse-move path.
     fn page_dot_layer(&self, theme: &Theme, entity: gpui::WeakEntity<Self>) -> gpui::Div {
         let (_, surface_h) = self.renderer.surface_size();
         // `page_slot_rect` takes device pixels and a scale; gpui works in
@@ -421,7 +425,8 @@ impl App {
         // the rest of this file does.
         let height = (surface_h as f32 / self.scale()).round() as u32;
         let w = self.sidebar_w();
-        let pages = crate::Page::ALL;
+        let n_tools = self.tools.len();
+        let pages = crate::Page::all(n_tools);
         let n = pages.len();
 
         let mut layer = div().absolute().left(px(0.0)).top(px(0.0)).size_full();
@@ -431,7 +436,7 @@ impl App {
             // index, not its slot, so gating a page never shifts the others.
             let p = self
                 .dot_anim
-                .get(page.index())
+                .get(page.index(n_tools))
                 .copied()
                 .unwrap_or(0.0)
                 .clamp(0.0, 1.0);
@@ -442,7 +447,7 @@ impl App {
             // still the canvas's to own until the modals themselves move.
             let modal = self.modal_overlay_open();
             layer = layer.child(
-                page_slot(theme, &slot, page.glyph(), p)
+                page_slot(theme, &slot, page.glyph(&self.tools), p)
                     .id(("page-slot", i))
                     .occlude()
                     .when(!modal, |slot| {
@@ -554,9 +559,9 @@ impl App {
     /// Every page draws its rows into the same absolutely positioned layer
     /// over the panel, but they do not share a row *vocabulary*: Sessions and
     /// Pull Requests get card-height preview rows laid out by
-    /// [`crate::workspace::sidebar_row_rect`], while Cleanup and Settings get
-    /// one-line rows at [`crate::workspace::tab_rect`] — the very rects
-    /// `main.rs` already hit-tests for those pages. The split is
+    /// [`crate::workspace::sidebar_row_rect`], while Settings
+    /// gets one-line rows at [`crate::workspace::tab_rect`] — the very
+    /// rects `main.rs` already hit-tests for those pages. The split is
     /// [`App::card_rows`], the same predicate the geometry helpers take.
     fn sidebar_row_layer(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
         let entity = cx.entity().downgrade();
@@ -564,7 +569,6 @@ impl App {
             return self.card_row_layer(theme, entity);
         }
         match self.page {
-            crate::Page::Cleanup => self.cleanup_row_layer(theme, entity),
             crate::Page::Settings => self.settings_row_layer(theme, cx),
             // Any page without rows of its own still gets the shell.
             _ => div().absolute().left(px(0.0)).top(px(0.0)).size_full(),
@@ -589,7 +593,7 @@ impl App {
             let section = *section;
             let entity = entity.clone();
             layer = layer.child(
-                self.simple_row(theme, &rect, section.label(), active, true)
+                self.simple_row(theme, &rect, section.label(), active, false, true)
                     .id(("settings-section", i))
                     .occlude()
                     .cursor_pointer()
@@ -664,26 +668,6 @@ impl App {
             .child(self.settings_search.clone())
     }
 
-    /// The Cleanup rows: an `All` row at slot 0 and one row per repo that has
-    /// worktrees to drop, exactly the tabs `main.rs` hit-tests at
-    /// [`crate::workspace::tab_rect`] — slot 0 clears the filter, slot `j + 1`
-    /// filters to the `j`th repo. The labels and the active row both come from
-    /// [`cleanup_rows`], so the painted order cannot drift from the order the
-    /// mouse path walks.
-    fn cleanup_row_layer(&self, theme: &Theme, entity: gpui::WeakEntity<Self>) -> gpui::Div {
-        let w = self.sidebar_w();
-        let mut layer = div().absolute().left(px(0.0)).top(px(0.0)).size_full();
-        for (i, (label, active)) in cleanup_rows(&self.cleanup).into_iter().enumerate() {
-            let rect = crate::workspace::tab_rect(i, 1.0, w);
-            layer = layer.child(
-                self.simple_row(theme, &rect, label, active, true).on_mouse_down(
-                    MouseButton::Left,
-                    press(entity.clone(), move |this, _ev, _cx| this.press_cleanup_row(i)),
-                ),
-            );
-        }
-        layer
-    }
 
     /// The Sessions and Pull Requests rows: section headers and preview cards.
     /// Every row is absolutely positioned at exactly the rect
@@ -871,22 +855,23 @@ impl App {
     }
 
     /// One one-line row, for the pages with no git context worth previewing:
-    /// Cleanup's repo filters and Settings' section tabs.
+    /// Settings' section tabs.
     ///
     /// `rect` is whatever [`crate::workspace::tab_rect`] handed the mouse path
     /// for this row's index, so the pixels and the hit box cannot drift apart.
-    /// `dim` marks a row whose label is secondary — the canvas painted those in
-    /// `ink_dim` unless they were active. The fills mirror the canvas painter
-    /// exactly: the active row gets the card pill plus a soft shadow, a merely
-    /// hovered row gets a weaker muted fill, and every other row stays
-    /// transparent. Hover comes from [`App::sidebar_cursor`], so it is
-    /// suppressed mid-drag here too.
+    /// `indent` steps a nested row's label in, and `dim` marks a row whose
+    /// label is secondary — the canvas painted those in `ink_dim` unless they
+    /// were active. The fills mirror the canvas painter exactly: the active row
+    /// gets the card pill plus a soft shadow, a merely hovered row gets a
+    /// weaker muted fill, and every other row stays transparent. Hover comes
+    /// from [`App::sidebar_cursor`], so it is suppressed mid-drag here too.
     fn simple_row(
         &self,
         theme: &Theme,
         rect: &crate::workspace::LayoutRect,
         label: impl Into<SharedString>,
         active: bool,
+        indent: bool,
         dim: bool,
     ) -> gpui::Div {
         let hovered = self
@@ -930,7 +915,7 @@ impl App {
             })
             .flex()
             .items_center()
-            .pl(px(scaled(ROW_PAD)))
+            .pl(px(scaled(ROW_PAD + if indent { ROW_INDENT } else { 0.0 })))
             .pr(px(scaled(ROW_PAD)))
             .text_size(px(scaled(12.0)))
             .text_color(ink)
@@ -1631,7 +1616,7 @@ fn chip(
 fn page_slot(
     theme: &Theme,
     rect: &crate::workspace::LayoutRect,
-    glyph: &'static str,
+    glyph: String,
     progress: f32,
 ) -> gpui::Div {
     let p = progress.clamp(0.0, 1.0);
@@ -1668,24 +1653,6 @@ fn page_slot(
         })
 }
 
-/// The Cleanup sidebar's rows, in slot order: `("All", no filter)` first, then
-/// one `("{repo} · {count}", is the filter)` row per repo the scan found.
-///
-/// Pure so the row *order* — which is what `main.rs` turns a click's slot index
-/// back into a repo filter with — can be tested without a renderer. An
-/// unscanned or failed scan yields just the `All` row, because
-/// [`crate::cleanup::Cleanup::repos`] is empty until the scan is `Ready`.
-fn cleanup_rows(cleanup: &crate::cleanup::Cleanup) -> Vec<(String, bool)> {
-    let filter = cleanup.repo_filter.as_deref();
-    let mut rows = vec![("All".to_string(), filter.is_none())];
-    for repo in &cleanup.repos() {
-        rows.push((
-            format!("{} · {}", repo.display, repo.count),
-            filter == Some(repo.root.as_str()),
-        ));
-    }
-    rows
-}
 
 /// The logical-pixel cursor the panel hovers against, or `None` when nothing
 /// in the sidebar may look hot.
@@ -1707,6 +1674,7 @@ fn hover_cursor(
     let s = scale.max(0.01);
     Some((cursor.0 as f32 / s, cursor.1 as f32 / s))
 }
+
 
 /// Nudge a token's lightness by `delta`, clamped. Used for the panel's
 /// vertical gradient so the material derives from the live theme instead of
@@ -1730,7 +1698,6 @@ mod tests {
     }
     use gpui::AssetSource as _;
     use super::*;
-    use crate::cleanup::{Cleanup, ScanState, WorktreeInfo};
 
     #[test]
     fn a_cards_diffstat_carries_exactly_one_leading_sign() {
@@ -1801,82 +1768,6 @@ mod tests {
         // Green and purple must never collapse onto one another.
         assert_ne!(pr_open(true), pr_merged(true));
         assert_ne!(pr_open(false), pr_merged(false));
-    }
-
-    /// A worktree in `repo_root` — only the fields the row list reads matter.
-    fn wt(repo_root: &str, id: &str) -> WorktreeInfo {
-        WorktreeInfo {
-            repo_root: repo_root.to_string(),
-            path: format!("{repo_root}/.worktrees/{id}"),
-            id: id.to_string(),
-            branch: Some(format!("feat/{id}")),
-            head: "abc1234".to_string(),
-            dirty_count: 0,
-            merged: false,
-            ahead: 0,
-            behind: 0,
-            last_activity_ms: 0.0,
-            is_current: false,
-            pr: None,
-            dirty_files: Vec::new(),
-        }
-    }
-
-    fn ready(worktrees: Vec<WorktreeInfo>, filter: Option<&str>) -> Cleanup {
-        let mut state = Cleanup::default();
-        state.scan = Some(ScanState::Ready(worktrees));
-        state.repo_filter = filter.map(str::to_string);
-        state
-    }
-
-    #[test]
-    fn cleanup_rows_lead_with_all_then_one_row_per_repo() {
-        let state = ready(
-            vec![
-                wt("/src/alpha", "wt-1"),
-                wt("/src/alpha", "wt-2"),
-                wt("/src/beta", "wt-3"),
-            ],
-            None,
-        );
-        let rows = cleanup_rows(&state);
-        assert_eq!(
-            rows,
-            vec![
-                ("All".to_string(), true),
-                ("alpha · 2".to_string(), false),
-                ("beta · 1".to_string(), false),
-            ]
-        );
-    }
-
-    #[test]
-    fn cleanup_rows_move_the_active_flag_onto_the_filtered_repo() {
-        let state = ready(
-            vec![wt("/src/alpha", "wt-1"), wt("/src/beta", "wt-2")],
-            Some("/src/beta"),
-        );
-        let rows = cleanup_rows(&state);
-        // Slot 0 is "All" and stops being active; slot 2 is the second repo,
-        // the same slot main.rs maps back onto `repos()[1]`.
-        assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0], ("All".to_string(), false));
-        assert_eq!(rows[1].1, false);
-        assert_eq!(rows[2], ("beta · 1".to_string(), true));
-    }
-
-    #[test]
-    fn cleanup_rows_are_just_all_before_a_scan_lands() {
-        assert_eq!(
-            cleanup_rows(&Cleanup::default()),
-            vec![("All".to_string(), true)]
-        );
-        let failed = {
-            let mut state = Cleanup::default();
-            state.set_failed("boom".to_string());
-            state
-        };
-        assert_eq!(cleanup_rows(&failed), vec![("All".to_string(), true)]);
     }
 
     #[test]

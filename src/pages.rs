@@ -1,11 +1,11 @@
 //! Top-level page navigation + rebindable keyboard actions.
 //!
-//! pwrde has Arc-style *pages*: Sessions (the terminal workspace), Cleanup
-//! (worktree hygiene via the `drop` CLI), Pull Requests, and Settings. The
-//! sidebar's bottom strip shows one slot per page — a subtle dot that
-//! crossfades into the page's glyph on hover, and stays a glyph on the active
-//! page. ⌘⇧←/→ cycle pages with wraparound; ⌘⇧↑/↓ cycle the sidebar's tabs
-//! (groups on Sessions, repos on Cleanup, sections on Settings) the same way.
+//! pwrde has Arc-style *pages*: Sessions (the terminal workspace), Pull
+//! Requests, one page per user-registered CLI tool (see [`crate::cli_tools`]),
+//! and Settings. The sidebar's bottom strip shows one slot per page — a subtle
+//! dot that crossfades into the page's glyph on hover, and stays a glyph on
+//! the active page. ⌘⇧←/→ cycle pages with wraparound; ⌘⇧↑/↓ cycle the
+//! sidebar's tabs (groups on Sessions, sections on Settings) the same way.
 //!
 //! Every ⌘ shortcut is an [`Action`] dispatched through a bindings table
 //! resolved from the settings store (`"keyboard.<action>"` keys, falling back
@@ -20,35 +20,41 @@ pub enum Page {
     /// openable into the shared detail view. (The Sessions PR tool is scoped to
     /// just the checked-out branch; this page is the wider view.)
     PullRequests,
-    /// Worktree hygiene page — lists all `drop`-managed worktrees and lets the
-    /// user multi-select and delete stale ones.
-    Cleanup,
+    /// A user-registered CLI tool (index into [`crate::cli_tools::tools`]):
+    /// a full-page, non-persisted terminal running that tool's command from
+    /// its configured directory.
+    Tool(usize),
     Settings,
 }
 
 impl Page {
-    /// Dot-strip order; `cycle` walks this.
-    pub const ALL: [Page; 4] = [
-        Page::Sessions,
-        Page::PullRequests,
-        Page::Cleanup,
-        Page::Settings,
-    ];
-
-    pub fn index(self) -> usize {
-        Self::ALL.iter().position(|p| *p == self).unwrap_or(0)
+    /// Dot-strip order for `n_tools` registered CLI tools; `cycle` walks
+    /// this. Tool pages sit between Pull Requests and Settings so the fixed
+    /// pages keep their ends of the strip.
+    pub fn all(n_tools: usize) -> Vec<Page> {
+        let mut v = vec![Page::Sessions, Page::PullRequests];
+        v.extend((0..n_tools).map(Page::Tool));
+        v.push(Page::Settings);
+        v
     }
 
-    /// Glyph shown in the page slot when active or hovered. The cog / broom /
+    /// Stable index within [`Self::all`] — what the slot animation is keyed
+    /// by, so gating a page never shifts the others.
+    pub fn index(self, n_tools: usize) -> usize {
+        Self::all(n_tools).iter().position(|p| *p == self).unwrap_or(0)
+    }
+
+    /// Glyph shown in the page slot when active or hovered. The cog /
     /// brackets are Nerd Font codepoints — the UI font guarantees coverage.
-    pub fn glyph(self) -> &'static str {
+    /// A tool page's glyph is whatever the user registered for it (any
+    /// string; Nerd Font codepoints render like the built-ins).
+    pub fn glyph(self, tools: &[crate::cli_tools::CliTool]) -> String {
         match self {
-            Page::Sessions => "<>",
+            Page::Sessions => "<>".into(),
             // U+F0629 = nf-md-source_pull (Material Design Icons via Nerd Fonts)
-            Page::PullRequests => "\u{f0629}",
-            // U+F00D4 = nf-md-broom (Material Design Icons via Nerd Fonts)
-            Page::Cleanup => "\u{f00d4}",
-            Page::Settings => "\u{f013}",
+            Page::PullRequests => "\u{f0629}".into(),
+            Page::Tool(i) => tools.get(i).map(|t| t.icon.clone()).unwrap_or_else(|| "?".into()),
+            Page::Settings => "\u{f013}".into(),
         }
     }
 }
@@ -69,17 +75,20 @@ pub enum Section {
     Keyboard,
     Terminal,
     Appearance,
+    /// Registered CLI tool pages (see [`crate::cli_tools`]).
+    Tools,
     Accessibility,
     Debug,
     FeatureFlags,
 }
 
 impl Section {
-    pub const ALL: [Section; 7] = [
+    pub const ALL: [Section; 8] = [
         Section::Sessions,
         Section::Keyboard,
         Section::Terminal,
         Section::Appearance,
+        Section::Tools,
         Section::Accessibility,
         Section::Debug,
         Section::FeatureFlags,
@@ -91,6 +100,7 @@ impl Section {
             Section::Keyboard => "Keyboard",
             Section::Terminal => "Terminal",
             Section::Appearance => "Appearance",
+            Section::Tools => "Tools",
             Section::Accessibility => "Accessibility",
             Section::Debug => "Debug",
             Section::FeatureFlags => "Feature Flags",
@@ -211,11 +221,17 @@ pub enum Action {
     ToggleToolPanel,
     IncreaseFontSize,
     DecreaseFontSize,
+    ScreenshotToClipboard,
+    ScreenshotToFile,
+    NewSection,
+    GoToSessions,
+    GoToPullRequests,
+    GoToTool,
 }
 
 impl Action {
     /// Keyboard-page row order.
-    pub const ALL: [Action; 33] = [
+    pub const ALL: [Action; 39] = [
         Action::SplitRight,
         Action::SplitDown,
         Action::NewTab,
@@ -249,6 +265,12 @@ impl Action {
         Action::ToggleToolPanel,
         Action::IncreaseFontSize,
         Action::DecreaseFontSize,
+        Action::ScreenshotToClipboard,
+        Action::ScreenshotToFile,
+        Action::NewSection,
+        Action::GoToSessions,
+        Action::GoToPullRequests,
+        Action::GoToTool,
     ];
 
     /// Stable identifier used in the settings key (`keyboard.<name>`).
@@ -287,6 +309,12 @@ impl Action {
             Action::ToggleToolPanel => "toggle_tool_panel",
             Action::IncreaseFontSize => "increase_font_size",
             Action::DecreaseFontSize => "decrease_font_size",
+            Action::ScreenshotToClipboard => "screenshot_to_clipboard",
+            Action::ScreenshotToFile => "screenshot_to_file",
+            Action::NewSection => "new_section",
+            Action::GoToSessions => "go_to_sessions",
+            Action::GoToPullRequests => "go_to_pull_requests",
+            Action::GoToTool => "go_to_tool",
         }
     }
 
@@ -325,6 +353,12 @@ impl Action {
             Action::ToggleToolPanel => "Toggle tool panel",
             Action::IncreaseFontSize => "Increase font size",
             Action::DecreaseFontSize => "Decrease font size",
+            Action::ScreenshotToClipboard => "Screenshot to clipboard",
+            Action::ScreenshotToFile => "Screenshot to file",
+            Action::NewSection => "New folder",
+            Action::GoToSessions => "Go to Sessions",
+            Action::GoToPullRequests => "Go to Pull Requests",
+            Action::GoToTool => "Go to first tool page",
         }
     }
 
@@ -333,43 +367,57 @@ impl Action {
     }
 
     pub fn default_binding(self) -> Binding {
-        let (shift, key) = match self {
-            Action::SplitRight => (false, "d"),
-            Action::SplitDown => (true, "d"),
-            Action::NewTab => (false, "t"),
-            Action::NewGroup => (true, "t"),
-            Action::Copy => (false, "c"),
-            Action::Paste => (false, "v"),
-            Action::CloseTab => (false, "w"),
-            Action::CloseGroup => (true, "w"),
-            Action::TogglePin => (true, "p"),
-            Action::Quit => (false, "q"),
-            Action::PrevTile => (false, "["),
-            Action::NextTile => (false, "]"),
-            Action::PrevTab => (true, "["),
-            Action::NextTab => (true, "]"),
-            Action::FocusLeft => (true, "h"),
-            Action::FocusDown => (true, "j"),
-            Action::FocusUp => (true, "k"),
-            Action::FocusRight => (true, "l"),
-            Action::ToggleCollapse => (true, "m"),
-            Action::ToggleFocusOthers => (true, "f"),
-            Action::PrevSidebarTab => (true, "up"),
-            Action::NextSidebarTab => (true, "down"),
-            Action::ToggleSidebar => (false, "s"),
-            Action::PrevPage => (true, "left"),
-            Action::NextPage => (true, "right"),
-            Action::OpenSettings => (false, ","),
-            Action::CommandPalette => (false, "p"),
-            Action::ToggleFlyover => (false, "`"),
-            Action::FlyoverPopout => (true, "`"),
-            Action::SaveWorkspace => (true, "s"),
-            Action::ToggleToolPanel => (true, "g"),
-            Action::IncreaseFontSize => (false, "="),
+        // (shift, alt, ctrl, key) — most app chords are cmd+key; alt/ctrl let a
+        // few actions avoid macOS system shortcuts and existing defaults.
+        let (shift, alt, ctrl, key) = match self {
+            Action::SplitRight => (false, false, false, "d"),
+            Action::SplitDown => (true, false, false, "d"),
+            Action::NewTab => (false, false, false, "t"),
+            Action::NewGroup => (true, false, false, "t"),
+            Action::Copy => (false, false, false, "c"),
+            Action::Paste => (false, false, false, "v"),
+            Action::CloseTab => (false, false, false, "w"),
+            Action::CloseGroup => (true, false, false, "w"),
+            Action::TogglePin => (true, false, false, "p"),
+            Action::Quit => (false, false, false, "q"),
+            Action::PrevTile => (false, false, false, "["),
+            Action::NextTile => (false, false, false, "]"),
+            Action::PrevTab => (true, false, false, "["),
+            Action::NextTab => (true, false, false, "]"),
+            Action::FocusLeft => (true, false, false, "h"),
+            Action::FocusDown => (true, false, false, "j"),
+            Action::FocusUp => (true, false, false, "k"),
+            Action::FocusRight => (true, false, false, "l"),
+            Action::ToggleCollapse => (true, false, false, "m"),
+            Action::ToggleFocusOthers => (true, false, false, "f"),
+            Action::PrevSidebarTab => (true, false, false, "up"),
+            Action::NextSidebarTab => (true, false, false, "down"),
+            Action::ToggleSidebar => (false, false, false, "s"),
+            Action::PrevPage => (true, false, false, "left"),
+            Action::NextPage => (true, false, false, "right"),
+            Action::OpenSettings => (false, false, false, ","),
+            Action::CommandPalette => (false, false, false, "p"),
+            Action::ToggleFlyover => (false, false, false, "`"),
+            Action::FlyoverPopout => (true, false, false, "`"),
+            Action::SaveWorkspace => (true, false, false, "s"),
+            Action::ToggleToolPanel => (true, false, false, "g"),
+            Action::IncreaseFontSize => (false, false, false, "="),
             // "minus" (not "-") because "-" is the binding token separator.
-            Action::DecreaseFontSize => (false, "minus"),
+            Action::DecreaseFontSize => (false, false, false, "minus"),
+            // ctrl+alt chords: avoid macOS system screenshot and existing defaults.
+            Action::ScreenshotToClipboard => (false, true, true, "c"),
+            Action::ScreenshotToFile => (false, true, true, "s"),
+            Action::NewSection => (false, true, true, "n"),
+            Action::GoToSessions => (false, true, true, "1"),
+            Action::GoToPullRequests => (false, true, true, "2"),
+            Action::GoToTool => (false, true, true, "3"),
         };
-        Binding { shift, alt: false, ctrl: false, key: key.into() }
+        Binding { shift, alt, ctrl, key: key.into() }
+    }
+
+    /// Look up an action by its stable `name()` string (e.g. `"split_right"`).
+    pub fn from_name(name: &str) -> Option<Action> {
+        Action::ALL.iter().copied().find(|a| a.name() == name)
     }
 
     /// The user's binding from settings, or the default. Resolved per lookup —
@@ -377,6 +425,15 @@ impl Action {
     pub fn binding(self) -> Binding {
         crate::settings::get_str(&self.setting_key())
             .and_then(|s| Binding::parse(&s))
+            // `go_to_tool` replaced `go_to_cleanup` when the Cleanup page
+            // became the first CLI tool page; honor the old key if it was
+            // customized so a rebinding survives the rename.
+            .or_else(|| {
+                (self == Action::GoToTool)
+                    .then(|| crate::settings::get_str("keyboard.go_to_cleanup"))
+                    .flatten()
+                    .and_then(|s| Binding::parse(&s))
+            })
             .unwrap_or_else(|| self.default_binding())
     }
 }
@@ -568,6 +625,13 @@ pub fn settings_index() -> Vec<SettingsEntry> {
         keywords: "export theme file save",
     });
 
+    // Tools
+    out.push(SettingsEntry {
+        section: Section::Tools,
+        label: "CLI tool pages",
+        keywords: "tool tools cli command page sidebar icon cwd drop cleanup register",
+    });
+
     // Accessibility
     out.push(SettingsEntry {
         section: Section::Accessibility,
@@ -626,6 +690,20 @@ pub fn search_settings(query: &str) -> Vec<SettingsEntry> {
 mod tests {
     use super::*;
     use gpui::Modifiers;
+
+
+    /// tool, and their stable index tracks the registered count.
+    #[test]
+    fn tool_pages_slot_between_prs_and_settings() {
+        assert_eq!(
+            Page::all(2),
+            vec![Page::Sessions, Page::PullRequests, Page::Tool(0), Page::Tool(1), Page::Settings]
+        );
+        assert_eq!(Page::all(0), vec![Page::Sessions, Page::PullRequests, Page::Settings]);
+        assert_eq!(Page::Tool(1).index(2), 3);
+        assert_eq!(Page::Settings.index(0), 2);
+        assert_eq!(Page::Settings.index(2), 4);
+    }
 
     #[test]
     fn appearance_dropdown_dark_polarity() {
@@ -887,6 +965,14 @@ mod tests {
                 action,
             );
         }
+    }
+
+    #[test]
+    fn from_name_roundtrips_all_and_rejects_unknown() {
+        for action in Action::ALL {
+            assert_eq!(Action::from_name(action.name()), Some(action));
+        }
+        assert_eq!(Action::from_name("nope"), None);
     }
 
     #[test]

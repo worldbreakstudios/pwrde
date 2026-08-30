@@ -66,6 +66,7 @@ impl App {
                     render_feature_flags(self, &theme, entity.clone())
                 }
                 Section::Appearance => render_appearance(self, &theme, entity.clone()),
+                Section::Tools => render_tools(self, &theme, entity.clone()),
             }
         };
 
@@ -384,6 +385,133 @@ fn render_keyboard(
             theme,
             vec![Table::new().child(body).into_any_element()],
         ))
+        .into_any_element()
+}
+
+// ── Tools ───────────────────────────────────────────────────────────────
+
+/// Registered CLI tool pages: a table of what's registered (name, icon,
+/// command, directory, Remove) over an add form. Only the command is
+/// required — see `App::add_tool_from_form` for the defaults.
+fn render_tools(app: &App, theme: &Theme, entity: gpui::WeakEntity<App>) -> AnyElement {
+    let tools = &app.tools;
+    let mut body = TableBody::new();
+    let count = tools.len();
+    for (ix, tool) in tools.iter().enumerate() {
+        let remove_entity = entity.clone();
+        let remove = Button::new(("tool-remove", ix))
+            .variant(ButtonVariant::Ghost)
+            .size(ButtonSize::Sm)
+            .child("Remove")
+            .on_click(move |_ev: &ClickEvent, _win: &mut Window, gpui_app: &mut GpuiApp| {
+                gpui_app.stop_propagation();
+                if let Some(entity) = remove_entity.upgrade() {
+                    entity.update(gpui_app, move |this, cx| {
+                        this.remove_tool(ix);
+                        cx.notify();
+                    });
+                }
+            });
+        body = body.child(
+            TableRow::new()
+                .id(("tool-row", ix))
+                .last(ix + 1 == count)
+                .child(TableCell::new().w(px(44.)).child(tool.icon.clone()))
+                .child(TableCell::new().flex(1.).child(tool.name.clone()))
+                .child(
+                    TableCell::new()
+                        .flex(1.5)
+                        .child(div().font_family("monospace").child(tool.command.clone())),
+                )
+                .child(
+                    TableCell::new()
+                        .flex(1.)
+                        .child(div().text_color(theme.muted_foreground).child(tool.cwd.clone())),
+                )
+                .child(
+                    TableCell::new()
+                        .w(px(96.))
+                        .child(div().flex().w_full().justify_end().child(remove)),
+                ),
+        );
+    }
+    let table: AnyElement = if count == 0 {
+        div()
+            .text_size(px(12.))
+            .text_color(theme.muted_foreground)
+            .child("No tools registered — add one below.")
+            .into_any_element()
+    } else {
+        Table::new().child(body).into_any_element()
+    };
+
+    let field = |label: &'static str, input: gpui::Entity<crate::ui::Input>, flex: f32| {
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .flex_basis(px(0.))
+            .flex_grow(flex)
+            .min_w(px(0.))
+            .child(div().text_size(px(11.)).text_color(theme.muted_foreground).child(label))
+            .child(input)
+            .into_any_element()
+    };
+    let add_entity = entity;
+    let add = Button::new("tool-add")
+        .variant(ButtonVariant::Outline)
+        .size(ButtonSize::Sm)
+        .child("Add tool")
+        .on_click(move |_ev: &ClickEvent, _win: &mut Window, gpui_app: &mut GpuiApp| {
+            if let Some(entity) = add_entity.upgrade() {
+                entity.update(gpui_app, |this, cx| {
+                    this.add_tool_from_form(cx);
+                    cx.notify();
+                });
+            }
+        });
+    let form = div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .w_full()
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .gap_2()
+                .w_full()
+                .child(field("Name", app.tool_form.name.clone(), 1.))
+                .child(field("Command", app.tool_form.command.clone(), 2.))
+                .child(field("Directory", app.tool_form.cwd.clone(), 1.))
+                .child(field("Icon", app.tool_form.icon.clone(), 0.5)),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap_4()
+                .child(
+                    div().flex_1().min_w(px(0.)).text_size(px(11.)).text_color(theme.muted_foreground).child(
+                        "Each tool gets a sidebar page running its command in a fresh terminal (not persisted). \
+                         Directory accepts ~; icon is any text — Nerd Font glyphs render like the built-ins.",
+                    ),
+                )
+                .child(add),
+        );
+
+    div()
+        .id("settings-rows")
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_h(px(0.))
+        .overflow_y_scroll()
+        .gap_4()
+        .child(settings_group(theme, vec![table]))
+        .child(div().child(group_label(theme, "Add a tool")).child(settings_group(theme, vec![form.into_any_element()])))
         .into_any_element()
 }
 
