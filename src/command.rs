@@ -640,7 +640,7 @@ pub fn action_group(action: Action) -> &'static str {
         | Action::ScreenshotToFile
         | Action::GoToSessions
         | Action::GoToPullRequests
-        | Action::GoToCleanup => "App",
+        | Action::GoToTool => "App",
     }
 }
 
@@ -685,7 +685,7 @@ pub fn action_glyph(action: Action) -> &'static str {
         Action::NewSection => "▤",
         Action::GoToSessions => "▣",
         Action::GoToPullRequests => "⇅",
-        Action::GoToCleanup => "♻",
+        Action::GoToTool => ">_",
     }
 }
 

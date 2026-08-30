@@ -77,13 +77,15 @@ impl App {
                 )),
             },
             Command::State => Reply::success(self.state_json()),
-            Command::GoToPage { page } => match page_from_name(&page) {
+            // A registered CLI tool's page answers to `tool:<index>` or to
+            // the tool's name (case-insensitive), e.g. `cleanup`.
+            Command::GoToPage { page } => match resolve_page(&page, &self.tools) {
                 Some(page) => {
                     self.set_page(page);
                     Reply::success(None)
                 }
                 None => Reply::err(format!(
-                    "unknown page {page:?}; expected one of sessions, pull_requests, cleanup, notes, settings"
+                    "unknown page {page:?}; expected one of sessions, pull_requests, notes, settings, tool:<n> or a registered tool's name"
                 )),
             },
             Command::NewSession { cwd, base, layout } => self.bus_new_session(cwd, base, layout),
@@ -396,20 +398,34 @@ pub(crate) fn page_from_name(name: &str) -> Option<Page> {
     match name.trim().to_ascii_lowercase().replace('-', "_").as_str() {
         "sessions" => Some(Page::Sessions),
         "pull_requests" | "prs" | "pullrequests" => Some(Page::PullRequests),
-        "cleanup" => Some(Page::Cleanup),
         "notes" => Some(Page::Notes),
         "settings" => Some(Page::Settings),
-        _ => None,
+        s => s.strip_prefix("tool:").and_then(|n| n.parse().ok()).map(Page::Tool),
     }
 }
 
-pub(crate) fn page_name(page: Page) -> &'static str {
+/// A page token resolved against the registered tools: the fixed names and
+/// `tool:<n>` via [`page_from_name`] (rejecting an unregistered index, so a
+/// client learns its navigation failed instead of landing on Sessions), or a
+/// tool's name, case-insensitively.
+pub(crate) fn resolve_page(name: &str, tools: &[crate::cli_tools::CliTool]) -> Option<Page> {
+    match page_from_name(name) {
+        Some(Page::Tool(i)) => (i < tools.len()).then_some(Page::Tool(i)),
+        Some(page) => Some(page),
+        None => tools
+            .iter()
+            .position(|t| t.name.eq_ignore_ascii_case(name.trim()))
+            .map(Page::Tool),
+    }
+}
+
+pub(crate) fn page_name(page: Page) -> String {
     match page {
-        Page::Sessions => "sessions",
-        Page::PullRequests => "pull_requests",
-        Page::Cleanup => "cleanup",
-        Page::Notes => "notes",
-        Page::Settings => "settings",
+        Page::Sessions => "sessions".into(),
+        Page::PullRequests => "pull_requests".into(),
+        Page::Tool(i) => format!("tool:{i}"),
+        Page::Notes => "notes".into(),
+        Page::Settings => "settings".into(),
     }
 }
 
@@ -741,9 +757,24 @@ mod tests {
 
     #[test]
     fn page_names_round_trip() {
-        for page in Page::ALL {
-            assert_eq!(page_from_name(page_name(page)), Some(page));
+        for page in Page::all(2) {
+            assert_eq!(page_from_name(&page_name(page)), Some(page));
         }
+        assert_eq!(page_from_name("tool:1"), Some(Page::Tool(1)));
+        assert_eq!(page_from_name("tool:x"), None);
+    }
+
+    /// Tool pages resolve by name (case-insensitive) or a registered index;
+    /// an unregistered index is an error, not a silent fallback.
+    #[test]
+    fn tool_pages_resolve_by_name_or_registered_index() {
+        let tools = crate::cli_tools::default_tools();
+        assert_eq!(resolve_page("cleanup", &tools), Some(Page::Tool(0)));
+        assert_eq!(resolve_page(" Cleanup ", &tools), Some(Page::Tool(0)));
+        assert_eq!(resolve_page("tool:0", &tools), Some(Page::Tool(0)));
+        assert_eq!(resolve_page("tool:1", &tools), None);
+        assert_eq!(resolve_page("settings", &tools), Some(Page::Settings));
+        assert_eq!(resolve_page("nope", &tools), None);
         assert_eq!(page_from_name("Pull-Requests"), Some(Page::PullRequests));
         assert_eq!(page_from_name("nope"), None);
     }

@@ -46,13 +46,6 @@ pub enum TermEvent {
     OpenDir { cwd: std::path::PathBuf },
     /// `drop` failed; show `message` in the picker overlay.
     GroupFailed { message: String },
-    /// `drop -d --json` completed: full list of managed worktrees.
-    CleanupScanned(Vec<crate::cleanup::WorktreeInfo>),
-    /// `drop -d --json` failed with an error message.
-    CleanupScanFailed(String),
-    /// `drop rm … --json` completed: counts of removed and failed worktrees,
-    /// plus the first failure's reason when there is one.
-    CleanupRemoved { removed: usize, failed: usize, error: Option<String> },
     /// A PR list finished loading (or failed). `all` distinguishes the
     /// holistic Pull Requests page (all open PRs) from the branch-scoped PR
     /// tool (`--head <current branch>`).
@@ -495,6 +488,11 @@ pub struct Session {
 impl Session {
     /// Spawn the user's shell on a fresh PTY. `cwd` sets the shell's working
     /// directory; `None` inherits pwrde's own working directory.
+    ///
+    /// When `command` is `Some(cmd)`, the login shell is spawned with
+    /// `["-lc", cmd]` instead of an interactive default program. Tool sessions
+    /// are never persisted: a non-`None` `command` takes precedence over
+    /// `shpool_session` (shpool is ignored in that case).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: u64,
@@ -504,6 +502,7 @@ impl Session {
         cell_height: u16,
         dpi: u32,
         cwd: Option<&std::path::Path>,
+        command: Option<&str>,
         events: Sender<TermEvent>,
         shpool_session: Option<String>,
     ) -> Self {
@@ -515,7 +514,12 @@ impl Session {
         };
         let pair = native_pty_system().openpty(pty_size).expect("openpty");
 
-        let shpool_name = shpool_session.clone();
+        // Tool sessions are never persisted — a command overrides shpool.
+        let shpool_name = if command.is_some() {
+            None
+        } else {
+            shpool_session.clone()
+        };
 
         let (cmd_opt, spawn_error) = if let Some(ref name) = shpool_name {
             if let Some(shpool_path) = shpool_binary() {
@@ -553,6 +557,21 @@ impl Session {
                 // Fail the pane loudly rather than silently losing persistence.
                 (None, Some("shpool not found — install it (brew install shell-pool/shpool/shpool) or disable Persist sessions\r\n"))
             }
+        } else if let Some(run) = command {
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+            let mut cmd = CommandBuilder::new(shell);
+            cmd.arg("-lc");
+            cmd.arg(run);
+            cmd.env("TERM", "xterm-256color");
+            cmd.env("COLORTERM", "truecolor");
+            cmd.env("PWRDE", "1");
+            // Only honor a cwd that still exists — a pinned/recent dir may have
+            // been deleted since it was saved, and spawning a shell in a missing
+            // directory would fail. Fall back to inheriting our own cwd.
+            if let Some(dir) = cwd.filter(|d| d.is_dir()) {
+                cmd.cwd(dir);
+            }
+            (Some(cmd), None)
         } else {
             let mut cmd = CommandBuilder::new_default_prog(); // user's shell
             cmd.env("TERM", "xterm-256color");
@@ -1419,5 +1438,50 @@ mod tests {
         ];
         assert_eq!(env_subtree_root(&table, needle), Some(60));
         assert_eq!(env_subtree_root(&table, "SHPOOL_SESSION_NAME=missing"), None);
+    }
+
+    /// A tool session (`command` set) runs that command through the login
+    /// shell from `cwd`, paints its output, and reports `Exit` when it ends —
+    /// the contract the CLI tool pages build on.
+    #[test]
+    fn command_session_runs_in_cwd_and_exits() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+        let dir = temp_dir("tool-cwd");
+        let (tx, rx) = mpsc::channel::<TermEvent>();
+        let session = Session::new(
+            7,
+            80,
+            24,
+            8,
+            16,
+            96,
+            Some(&dir),
+            Some("basename \"$PWD\""),
+            tx,
+            Some("ignored-when-command-is-set".into()),
+        );
+        let want = dir.file_name().unwrap().to_string_lossy().into_owned();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut exited = false;
+        while Instant::now() < deadline && !exited {
+            if let Ok(TermEvent::Exit(7)) = rx.recv_timeout(Duration::from_millis(100)) {
+                exited = true;
+            }
+        }
+        assert!(exited, "command session should report Exit");
+        let text = {
+            let term = session.term.lock().unwrap();
+            let screen = term.screen();
+            let rows = screen.physical_rows;
+            screen
+                .lines_in_phys_range(0..rows)
+                .iter()
+                .map(|l| l.as_str().into_owned())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(text.contains(&want), "expected {want:?} in grid, got {text:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
