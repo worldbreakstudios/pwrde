@@ -1467,22 +1467,17 @@ fn diff_removed(dark: bool) -> Hsla {
 /// drop shadow with the spec's inset top rim highlight, and the vertical
 /// material gradient.
 fn panel(theme: &Theme, w: f32) -> gpui::Div {
-    // The mock's panel is not a flat card — it is cool, blue-tinted glass that
-    // fades over its top 30% and then holds: `#eaf4fb -> #f4f8fb 30%`. Deriving
-    // the fill from `theme.card` alone (near-white in light chrome) is what made
-    // it read as flat white, so the chrome material is blended *toward* the
-    // mock's glass instead. The blend keeps a retinted chrome visible while the
-    // cast stays GANTRY's.
-    let (top, bottom) = if theme.dark {
-        // Dark glass is the same idea inverted: vitrine's dark material is a
-        // cool near-black, so lift the top slightly rather than tinting it.
-        (shade(theme.card, 0.04), shade(theme.card, -0.015))
-    } else {
-        (
-            mix_hsla(theme.card, gpui::rgb(0xeaf4fb).into(), GLASS_BLEND),
-            mix_hsla(theme.card, gpui::rgb(0xf4f8fb).into(), GLASS_BLEND),
-        )
-    };
+    // The mock's panel is accent-tinted glass that fades over its top 30% and
+    // then holds: `--sb1 -> --sb2 30%`, where the stops are the accent mixed
+    // into a near-white ground at 13% and 5%. `theme::from_accent` computes
+    // exactly those as the chrome's `gradient_from` / `gradient_to` (and the
+    // dark-ground equivalents), so the panel paints them directly — blending
+    // toward a fixed tint here is what made it read as flat blue-white.
+    let chrome = crate::theme::current();
+    let (top, bottom) = (
+        crate::renderer::color(chrome.gradient_from, 1.0),
+        crate::renderer::color(chrome.gradient_to, 1.0),
+    );
 
     div()
         .absolute()
@@ -1523,29 +1518,6 @@ fn panel(theme: &Theme, w: f32) -> gpui::Div {
                 inset: true,
             },
         ])
-}
-
-/// How far the panel's fill is pulled toward the mock's glass tint. High enough
-/// that the cast reads as GANTRY's, low enough that a retinted chrome theme
-/// still tells.
-const GLASS_BLEND: f32 = 0.72;
-
-/// Blend two colours in sRGB, `t` of the way from `a` to `b`.
-///
-/// Via `Rgba` rather than interpolating `Hsla` directly: hue interpolation
-/// between a near-grey and a tinted colour swings through whatever hue the grey
-/// nominally has, which is not a blend anyone asked for.
-fn mix_hsla(a: Hsla, b: Hsla, t: f32) -> Hsla {
-    let (a, b) = (gpui::Rgba::from(a), gpui::Rgba::from(b));
-    let t = t.clamp(0.0, 1.0);
-    let lerp = |x: f32, y: f32| x + (y - x) * t;
-    gpui::Rgba {
-        r: lerp(a.r, b.r),
-        g: lerp(a.g, b.g),
-        b: lerp(a.b, b.b),
-        a: lerp(a.a, b.a),
-    }
-    .into()
 }
 
 /// Header block: the titlebar-height strip plus the toggle / new-session
