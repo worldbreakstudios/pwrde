@@ -369,10 +369,11 @@ impl App {
                 .flex_col()
                 .gap(sp(8.0))
                 // The scroll container clips to its bounds, so the padding
-                // has to be wider than the card shadows (blur 28, y 8) or
-                // they end in a hard edge at the top and bottom.
+                // has to cover the card shadows' full rendered extent (gpui
+                // blurs well past the nominal radius — about 1.5×) or they
+                // end in a hard edge at the top and bottom.
                 .px(sp(40.0))
-                .py(sp(26.0));
+                .py(sp(30.0));
             for i in order {
                 let chat = &self.flow.chats[i];
                 let id = chat.id;
@@ -405,7 +406,8 @@ impl App {
                         .bg(theme.popover)
                         .border_1()
                         .border_color(theme.border)
-                        .shadow(shadow(28.0, 8.0, 0.16))
+                        // Kept tight so it fits inside the list padding.
+                        .shadow(shadow(12.0, 3.0, 0.14))
                         .cursor_pointer()
                         .on_click(move |_ev: &ClickEvent, _win: &mut Window, app: &mut GpuiApp| {
                             if let Some(e) = open_entity.upgrade() {
