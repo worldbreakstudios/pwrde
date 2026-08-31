@@ -190,6 +190,7 @@ impl App {
             self.tool_panel_w,
             div().flex().flex_col().gap_1().child(header_row).child(sub).into_any_element(),
             body.into_any_element(),
+            self.glass_backdrop_el(gpui::Corners::all(theme.radius_xl())),
         )
     }
 }

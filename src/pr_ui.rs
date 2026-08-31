@@ -38,7 +38,7 @@ use crate::gh::{self, CheckStatus, EventKind, PrDetail, PrSummary, TimelineEvent
 use crate::ui::theme::{alpha, Theme};
 use crate::ui::{
     Badge, BadgeVariant, Button, ButtonSize, ButtonVariant, Card, CardContent, CardHeader,
-    CardSize, CardTitle, Skeleton,
+    CardSize, CardTitle, Glass, Skeleton,
 };
 use crate::App;
 
@@ -53,16 +53,37 @@ pub(crate) fn tool_panel_overlay(
     panel_w: f32,
     header: gpui::AnyElement,
     body: gpui::AnyElement,
+    backdrop: Option<gpui::AnyElement>,
 ) -> gpui::AnyElement {
+    // With a blurred impression of the canvas beneath it the card can run
+    // the mock's own translucency; without one it stays legible-opaque.
+    let blurred = backdrop.is_some();
     tool_panel_root(floating, panel_w)
         .child(
             Card::new()
+                .map(|c| if blurred { c.liquid_glass_blurred() } else { c.liquid_glass() })
                 .h_full()
                 .when(floating, |c| c.floating())
+                .when_some(backdrop, |c, b| c.child(b))
                 .child(CardHeader::new().child(header))
                 .child(CardContent::new().flex_1().child(body)),
         )
         .into_any_element()
+}
+
+impl App {
+    /// A tool-panel card in the liquid-glass material: the blurred canvas
+    /// impression as its backdrop (mock translucency) when one is live, the
+    /// legible-opaque recipe otherwise. The wide PR layout's stream and
+    /// contact cards and the shared shell all build on this so every tool
+    /// panel reads as the same glass.
+    fn glass_panel_card(&self, theme: &Theme) -> Card {
+        let backdrop = self.glass_backdrop_el(gpui::Corners::all(theme.radius_xl()));
+        let blurred = backdrop.is_some();
+        Card::new()
+            .map(|c| if blurred { c.liquid_glass_blurred() } else { c.liquid_glass() })
+            .when_some(backdrop, |c, b| c.child(b))
+    }
 }
 
 /// The positioned, occluding root every tool-panel layout builds inside.
@@ -663,7 +684,8 @@ impl App {
                 .child(back_button("pr-back", "\u{2039}", entity.clone()))
                 .child(self.stream_header(&theme, entity.clone()))
                 .child(float_toggle_button(self.tool_panel_floating, entity.clone()));
-            let stream = Card::new()
+            let stream = self
+                .glass_panel_card(&theme)
                 .h_full()
                 .when(self.tool_panel_floating, |c| c.floating())
                 .child(CardHeader::new().child(header_row))
@@ -711,6 +733,7 @@ impl App {
             self.tool_panel_w,
             header_row.into_any_element(),
             body.into_any_element(),
+            self.glass_backdrop_el(gpui::Corners::all(theme.radius_xl())),
         )
     }
 
@@ -1224,6 +1247,7 @@ impl App {
             foot = foot.child(a);
         }
 
+        let glass = Glass::card(theme.dark);
         div()
             .id(id)
             .flex()
@@ -1231,7 +1255,8 @@ impl App {
             .rounded(px(10.))
             .border_1()
             .border_color(alpha(theme.primary, 0.4))
-            .bg(theme.card)
+            .bg(glass.fill)
+            .shadow(glass.shadows)
             .overflow_hidden()
             .when(acting, |d| d.opacity(0.6))
             .child(head)
@@ -1251,7 +1276,7 @@ impl App {
                 .w(px(CONTACT_CARD_W))
                 .h_full()
                 .child(
-                    Card::new()
+                    self.glass_panel_card(theme)
                         .h_full()
                         .when(self.tool_panel_floating, |c| c.floating())
                         .child(CardContent::new().flex_1().child(skeleton_list())),
@@ -1404,7 +1429,7 @@ impl App {
             .w(px(CONTACT_CARD_W))
             .h_full()
             .child(
-                Card::new()
+                self.glass_panel_card(theme)
                     .h_full()
                     .when(self.tool_panel_floating, |c| c.floating())
                     .child(CardContent::new().flex_1().child(
@@ -1543,11 +1568,13 @@ impl App {
             checks_row = checks_row.child(list);
         }
 
+        let glass = Glass::card(theme.dark);
         div()
             .rounded(px(12.))
             .border_1()
-            .border_color(theme.border)
-            .bg(theme.card)
+            .border_color(glass.rim)
+            .bg(glass.fill)
+            .shadow(glass.shadows)
             .overflow_hidden()
             .child(checks_row)
             .child(hairline())
@@ -2145,11 +2172,13 @@ impl App {
             surface,
             "diff-file",
         );
+        let glass = Glass::card(theme.dark);
         let mut card = div()
-            .border_1()
-            .border_color(theme.border)
             .rounded(px(12.))
-            .bg(theme.card)
+            .border_1()
+            .border_color(glass.rim)
+            .bg(glass.fill)
+            .shadow(glass.shadows)
             .overflow_hidden()
             .flex()
             .flex_col()
@@ -2463,14 +2492,16 @@ impl App {
             );
         }
 
+        let glass = Glass::card(theme.dark);
         div()
             .mx_2()
             .my_1()
             .ml(px(44.))
             .rounded(px(12.))
             .border_1()
-            .border_color(theme.border)
-            .bg(theme.card)
+            .border_color(glass.rim)
+            .bg(glass.fill)
+            .shadow(glass.shadows)
             .overflow_hidden()
             .child(col)
             .into_any_element()

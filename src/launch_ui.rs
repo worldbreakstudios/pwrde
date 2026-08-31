@@ -41,6 +41,7 @@ impl App {
             self.tool_panel_w,
             header,
             body,
+            self.glass_backdrop_el(gpui::Corners::all(theme.radius_xl())),
         )
     }
 }

@@ -19,6 +19,11 @@
 //! resting shadow for `shadow_lg` when the card floats over other content;
 //! [`Card::glass`] makes the card a translucent glass panel (see-through
 //! fill + stronger rim) for overlays sitting on the blurred vibrancy ground.
+//! `liquid_glass` renders the card with the full liquid-glass recipe
+//! ([`Glass::panel`]: translucent gradient fill, hairline rim, outer shadow
+//! plus inset top highlight) instead of the plain card surface.
+
+use crate::ui::Glass;
 
 use gpui::{
     AnyElement, App, FontWeight, IntoElement, ParentElement, RenderOnce, Styled, Window, div,
@@ -55,6 +60,8 @@ pub struct Card {
     full: bool,
     floating: bool,
     glass: bool,
+    liquid: bool,
+    liquid_blurred: bool,
     children: Vec<AnyElement>,
 }
 
@@ -65,6 +72,8 @@ impl Card {
             full: false,
             floating: false,
             glass: false,
+            liquid: false,
+            liquid_blurred: false,
             children: Vec::new(),
         }
     }
@@ -97,6 +106,24 @@ impl Card {
         self.glass = true;
         self
     }
+
+    /// Local addition: full liquid-glass surface from [`crate::ui::glass`] —
+    /// [`Glass::panel`] semantics replace the card's background, border color
+    /// and shadow stack (the recipe's outer drop shadow + inset top
+    /// highlight). Dark polarity follows the active [`Theme`].
+    pub fn liquid_glass(mut self) -> Self {
+        self.liquid = true;
+        self
+    }
+
+    /// Local addition: [`Card::liquid_glass`] at the mock's own translucency
+    /// ([`Glass::panel_blurred`]) — only when the caller also adds a blurred
+    /// `glass::backdrop` child, which is what makes the low alpha legible.
+    pub fn liquid_glass_blurred(mut self) -> Self {
+        self.liquid = true;
+        self.liquid_blurred = true;
+        self
+    }
 }
 
 impl Default for Card {
@@ -115,6 +142,9 @@ impl RenderOnce for Card {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
         let spacing = px(self.size.spacing());
+        let liquid = self.liquid.then(|| {
+            if self.liquid_blurred { Glass::panel_blurred(theme.dark) } else { Glass::panel(theme.dark) }
+        });
 
         div()
             .flex()
@@ -123,19 +153,27 @@ impl RenderOnce for Card {
             .gap(spacing)
             .overflow_hidden()
             .rounded(theme.radius_xl())
-            .bg(if self.glass {
-                alpha(theme.card, 0.45)
-            } else {
-                theme.card
+            .bg(match &liquid {
+                Some(glass) => glass.fill.clone(),
+                None if self.glass => alpha(theme.card, 0.45).into(),
+                None => theme.card.into(),
             })
             .py(spacing)
             .text_size(px(14.))
             .line_height(px(20.))
             .text_color(theme.card_foreground)
-            .when(self.floating, |el| el.shadow_lg())
-            .when(!self.floating, |el| el.shadow_xs())
             .border_1()
-            .border_color(alpha(theme.foreground, if self.glass { 0.16 } else { 0.1 }))
+            .when(!self.liquid, |el| {
+                el.when(self.floating, |el| el.shadow_lg())
+                    .when(!self.floating, |el| el.shadow_xs())
+                    .border_color(alpha(
+                        theme.foreground,
+                        if self.glass { 0.16 } else { 0.1 },
+                    ))
+            })
+            .when_some(liquid, |el, glass| {
+                el.shadow(glass.shadows).border_color(glass.rim)
+            })
             .children(self.children)
     }
 }

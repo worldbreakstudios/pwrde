@@ -28,6 +28,7 @@ use gpui_component::input::{InputEvent, Textarea, TextareaState};
 
 use crate::flow::{ActionStatus, FlowMsg, FlowView};
 use crate::pages::Action;
+use crate::ui::Glass;
 use crate::ui::theme::Theme;
 use crate::App;
 
@@ -303,6 +304,13 @@ impl App {
             }]
         };
         let ok_color = if theme.dark { gpui::rgb(0x3fb950) } else { gpui::rgb(0x1a7f37) };
+        // GANTRY liquid glass: gradient fill + white hairline rim + inset top
+        // highlight + deep drop shadow (gpui has no backdrop blur, so the big
+        // surfaces run a legible ~0.9 alpha instead of the mock's 0.5).
+        let blurred = self.glass_backdrop.is_some();
+        let panel_glass = if blurred { Glass::panel_blurred(theme.dark) } else { Glass::panel(theme.dark) };
+        let bar_glass = if blurred { Glass::bar_blurred(theme.dark) } else { Glass::bar(theme.dark) };
+        let card_glass = Glass::card(theme.dark);
 
         let busy = self.flow.active_chat().is_some_and(|c| c.busy);
 
@@ -390,16 +398,21 @@ impl App {
             // the seam is a faint top border.
             .map(|el| {
                 if in_chat {
-                    el.rounded_b(sp(18.0)).border_t_1().border_color(theme.border.opacity(0.5))
+                    el.rounded_b(sp(18.0)).border_t_1().border_color(bar_glass.rim.opacity(0.5))
                 } else {
-                    el.rounded(sp(24.0)).border_1().border_color(theme.border)
+                    el.rounded(sp(24.0)).border_1().border_color(bar_glass.rim)
                 }
             })
             .border_l_1()
             .border_r_1()
             .border_b_1()
-            .bg(theme.popover.opacity(0.94))
-            .shadow(shadow(24.0, 6.0, 0.22))
+            .bg(bar_glass.fill.clone())
+            .shadow(bar_glass.shadows.clone())
+            .children(self.glass_backdrop_el(if in_chat {
+                gpui::Corners { top_left: px(0.0), top_right: px(0.0), bottom_right: sp(18.0), bottom_left: sp(18.0) }
+            } else {
+                gpui::Corners::all(sp(24.0))
+            }))
             .cursor_text()
             .on_click(move |_ev: &ClickEvent, window: &mut Window, app: &mut GpuiApp| {
                 focus_editor.update(app, |s, cx| s.focus(window, cx));
@@ -464,11 +477,17 @@ impl App {
                         .px(sp(14.0))
                         .py(sp(10.0))
                         .rounded(sp(15.0))
-                        .bg(theme.popover)
+                        .bg(bar_glass.fill.clone())
                         .border_1()
-                        .border_color(theme.border)
-                        // Kept tight so it fits inside the list padding.
-                        .shadow(shadow(12.0, 3.0, 0.14))
+                        .border_color(bar_glass.rim)
+                        // Kept tight so it fits inside the list padding; the
+                        // inset highlight is the recipe's second shadow.
+                        .shadow({
+                            let mut sh = shadow(12.0, 3.0, 0.5);
+                            sh.extend(bar_glass.shadows.iter().filter(|b| b.inset).cloned());
+                            sh
+                        })
+                        .children(self.glass_backdrop_el(gpui::Corners::all(sp(15.0))))
                         .cursor_pointer()
                         .on_click(move |_ev: &ClickEvent, _win: &mut Window, app: &mut GpuiApp| {
                             if let Some(e) = open_entity.upgrade() {
@@ -707,7 +726,7 @@ impl App {
                         .rounded_tr(sp(16.0))
                         .rounded_bl(sp(16.0))
                         .rounded_br(sp(4.0))
-                        .bg(theme.primary)
+                        .map(|el| Glass::bubble_user(theme.dark, theme.primary).apply(el))
                         .text_color(theme.primary_foreground)
                         .child(text.clone())
                         .into_any_element(),
@@ -720,7 +739,7 @@ impl App {
                         .rounded_tr(sp(16.0))
                         .rounded_br(sp(16.0))
                         .rounded_bl(sp(4.0))
-                        .bg(theme.muted)
+                        .map(|el| Glass::bubble_assistant(theme.dark).apply(el))
                         .text_color(theme.foreground)
                         .child(text.clone())
                         .into_any_element(),
@@ -751,8 +770,7 @@ impl App {
                             .px(sp(12.0))
                             .py(sp(9.0))
                             .rounded(sp(12.0))
-                            .border_1()
-                            .border_color(theme.border)
+                            .map(|el| card_glass.clone().apply(el))
                             .child(div().flex_none().flex().items_center().justify_center().w(sp(14.0)).child(glyph))
                             .child(
                                 div()
@@ -806,11 +824,18 @@ impl App {
                 // Square bottom: the composer bar docks flush beneath it.
                 .rounded_t(sp(18.0))
                 .overflow_hidden()
-                .bg(theme.popover)
+                .bg(panel_glass.fill.clone())
                 .border_1()
                 .border_b_0()
-                .border_color(theme.border)
-                .shadow(shadow(50.0, 18.0, 0.22))
+                .border_color(panel_glass.rim)
+                .shadow(panel_glass.shadows.clone())
+                // Square bottom: the composer's crop continues this one.
+                .children(self.glass_backdrop_el(gpui::Corners {
+                    top_left: sp(18.0),
+                    top_right: sp(18.0),
+                    bottom_right: px(0.0),
+                    bottom_left: px(0.0),
+                }))
                 .child(header)
                 .child(body)
         });

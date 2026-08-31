@@ -16,6 +16,7 @@
 //! `Application`, a window, and a terminal `Element`. Terminal wakeups arrive
 //! over an `mpsc` channel drained on gpui's foreground executor.
 
+mod backdrop;
 mod bus;
 mod bus_exec;
 mod claude_hooks;
@@ -505,6 +506,13 @@ struct App {
     flow_backends: std::collections::HashMap<u64, Box<dyn crate::flow::AgentBackend>>,
     /// The pill bar's composer entity, created lazily on first render.
     flow_composer: Option<flow_ui::FlowComposer>,
+    /// Blurred impression of the canvas under the liquid-glass overlays
+    /// (`backdrop.rs`), rebuilt in `paint_terminal` only while a glass
+    /// surface is open and only when the picture changed.
+    glass_backdrop: Option<std::sync::Arc<gpui::RenderImage>>,
+    glass_backdrop_key: u64,
+    /// Logical window size the impression covers.
+    glass_backdrop_size: (f32, f32),
     // ── Git tools (PR + local diff), Sessions/git-group only ──────────────
     /// Pull Request tool state (list / detail / diff / write actions).
     pr: pr_ui::PrState,
@@ -517,6 +525,14 @@ struct App {
 }
 
 impl App {
+    /// The blurred canvas impression as a glass container's backdrop child
+    /// (`ui::glass::backdrop`), or `None` while no impression is live.
+    pub(crate) fn glass_backdrop_el(&self, corners: gpui::Corners<gpui::Pixels>) -> Option<gpui::AnyElement> {
+        self.glass_backdrop
+            .clone()
+            .map(|img| crate::ui::glass::backdrop(img, self.glass_backdrop_size, corners))
+    }
+
     fn scale(&self) -> f32 {
         self.renderer.scale
     }
@@ -5726,6 +5742,36 @@ impl App {
                 frame.hot.extend(flyover_hot);
             }
         }
+        // Impression blur for the liquid-glass overlays (`backdrop.rs`): only
+        // while one is on screen, and only re-blurred + re-uploaded when the
+        // coarse picture changed. Overlays are element trees rendered before
+        // this paint, so a fresh image asks for one more render to show up.
+        if self.open_tool.is_some() || self.flow_inset() > 0.0 || self.command.is_some() {
+            let ground = renderer::color(self.renderer.term_scheme_bg(), 1.0);
+            let mut imp = backdrop::rasterize(
+                &frame,
+                ground,
+                phys_w as f32,
+                phys_h as f32,
+                self.renderer.cell_width,
+                self.renderer.cell_height,
+            );
+            let key = imp.fingerprint();
+            if key != self.glass_backdrop_key || self.glass_backdrop.is_none() {
+                imp.blur(backdrop::BLUR_RADIUS);
+                imp.grade(backdrop::SATURATE, backdrop::BRIGHTNESS);
+                if let Some(old) = self.glass_backdrop.take() {
+                    let _ = window.drop_image(old);
+                }
+                self.glass_backdrop = Some(std::sync::Arc::new(imp.to_render_image()));
+                self.glass_backdrop_key = key;
+                self.glass_backdrop_size =
+                    (f32::from(bounds.size.width), f32::from(bounds.size.height));
+                window.refresh();
+            }
+        } else if let Some(old) = self.glass_backdrop.take() {
+            let _ = window.drop_image(old);
+        }
         // The frame's hot list is the authority on what's clickable this
         // paint. Recompute the hover index from it right away (rather than
         // trusting the value on_mouse_move derived from the previous frame)
@@ -6749,7 +6795,10 @@ fn main() {
                 }),
                 is_resizable: true,
                 app_owns_titlebar_drag: true,
-                window_background: gpui::WindowBackgroundAppearance::Blurred,
+                // Opaque: every glass surface blurs *in-app* content (`backdrop.rs`);
+                // window vibrancy would show the desktop through any
+                // transparent pixel and fight that effect.
+                window_background: gpui::WindowBackgroundAppearance::Opaque,
                 ..Default::default()
             },
             |window, cx| {
@@ -6969,6 +7018,9 @@ fn main() {
                         flow: crate::flow::FlowState::default(),
                         flow_backends: std::collections::HashMap::new(),
                         flow_composer: None,
+                        glass_backdrop: None,
+                        glass_backdrop_key: 0,
+                        glass_backdrop_size: (0.0, 0.0),
                         _lfg_events_child: crate::lfg::spawn_event_stream(events_tx.clone()),
                     };
                     // With persistence on, reattach to the previous session's
