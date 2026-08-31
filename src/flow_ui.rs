@@ -327,10 +327,9 @@ impl App {
             })
             .child("↑");
         let focus_editor = editor.clone();
-        let chip = |mb: f32| {
+        let chip = || {
             div()
                 .flex_none()
-                .mb(sp(mb))
                 .text_size(sp(10.5))
                 .text_color(theme.muted_foreground)
                 .border_1()
@@ -344,7 +343,6 @@ impl App {
             .flex_1()
             .w_full()
             .min_w_0()
-            .py(sp(5.0))
             .text_size(sp(13.0))
             .line_height(sp(19.0))
             .text_color(theme.foreground)
@@ -409,12 +407,11 @@ impl App {
             .map(|bar| {
                 if stacked {
                     bar.flex_col().gap(sp(4.0)).child(field).child(
-                        div().flex().items_center().justify_end().gap(sp(10.0)).child(chip(0.0)).child(send),
+                        div().flex().items_center().justify_end().gap(sp(10.0)).child(chip()).child(send),
                     )
                 } else {
-                    // Bottom-aligned so the chip and send button sit on the
-                    // baseline row even while a one-row field is taller.
-                    bar.items_end().gap(sp(10.0)).child(field).child(chip(4.0)).child(send)
+                    // One row: text, chip and send button share a centerline.
+                    bar.items_center().gap(sp(10.0)).child(field).child(chip()).child(send)
                 }
             });
 
