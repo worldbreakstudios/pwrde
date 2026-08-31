@@ -29,9 +29,22 @@ impl App {
         let inv = 1.0 / scale;
         let (surface_w, _) = self.renderer.surface_size();
         let entity = cx.entity().downgrade();
+        // The flyover panel is canvas-painted over the ribbon, and this
+        // layer sits above the canvas: a slot the open panel covers must not
+        // get a press target, or its click would toggle the tool instead of
+        // reaching the panel's window buttons underneath the cursor.
+        // Same gate as the flyover paint path (`flyover_ui`): the panel is on
+        // screen while it animates, and never in windowed mode.
+        let cover = (self.flyover_anim > 0.0
+            && !self.flyover_windowed
+            && !self.flyover_tabs.is_empty())
+        .then(|| self.flyover_rect_now());
         let mut layer = div().absolute().left(px(0.0)).top(px(0.0)).size_full();
         for (i, tool) in tools.into_iter().enumerate() {
             let slot = workspace::ribbon_slot_rect(i, surface_w, scale);
+            if cover.as_ref().is_some_and(|c| c.intersects(&slot)) {
+                continue;
+            }
             let entity = entity.clone();
             layer = layer.child(
                 div()

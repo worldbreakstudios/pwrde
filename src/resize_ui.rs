@@ -9,9 +9,10 @@
 //! the same `Drag` / `resize_hover` state the canvas did, then stopping
 //! propagation so the canvas path never also sees the press), and paints
 //! its grip when hovered or dragged. The drag itself — pointer moves and
-//! the release — is still driven by the canvas `on_mouse_move` /
-//! `on_mouse_up`, which is why the handles do not occlude: those listeners
-//! must keep hearing the pointer while it crosses the handle.
+//! the release — is driven by the canvas: window-level capture listeners
+//! registered in its paint closure while a `Drag` is armed, so the pointer
+//! is heard even over an occluding tool panel (the handles themselves also
+//! do not occlude).
 //!
 //! Hover detection (`resize_hover`) stays on the canvas `on_mouse_move` via
 //! `workspace::resize_hover_at`, which the sticky drag cursor also needs.
