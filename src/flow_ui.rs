@@ -17,6 +17,7 @@
 //! `render_flow` while it is on, and `toggle_flow`/`flow_send` refuse when
 //! it is off so the bus and the palette report a no-op instead of spawning.
 use std::cell::Cell;
+use std::rc::Rc;
 
 use gpui::{
     AppContext as _, div, point, prelude::FluentBuilder as _, px, AnyElement, App as GpuiApp, BoxShadow, ClickEvent,
@@ -52,6 +53,11 @@ const CHIPS: [&str; 3] = ["Spawn a session", "Review the open PR", "Archive merg
 /// reserve while the flag is on (`App::flow_inset`): inset + pill bar + gap,
 /// tracking the app font scale so a larger accessibility font still clears
 /// the bar.
+///
+/// Deliberately sized for a one-line bar: the composer can grow to nine
+/// rows, but reserving its live height would reflow every terminal row on
+/// each typed line. A tall draft overlays the tiles above it instead, like
+/// the panel does.
 pub fn safe_area_h() -> f32 {
     BOTTOM_INSET + BAR_H * crate::renderer::chrome_font_scale() + SAFE_GAP
 }
@@ -68,7 +74,23 @@ pub struct FlowComposer {
     /// scrolls the transcript to the bottom so the newest reply is visible —
     /// switching chats counts as a change.
     seen: Cell<(u64, usize)>,
+    /// Inline-vs-stacked bar layout, decided from the textarea's real wrap.
+    layout: Rc<ComposerLayout>,
     _sub: Subscription,
+}
+
+/// Which shape the composer bar takes, measured at prepaint (see the
+/// `on_children_prepainted` listener in `render_flow`): a single line keeps
+/// the inline pill (text beside the ⌘J chip and send button); once the
+/// textarea wraps, the bar stacks — the editor spans the full width and the
+/// controls drop to their own row beneath it, so long drafts wrap into the
+/// room the controls' column used to take.
+#[derive(Default)]
+struct ComposerLayout {
+    stacked: Cell<bool>,
+    /// The editor's width in the inline layout — the threshold for going
+    /// back to inline once a stacked draft shrinks to one row.
+    inline_w: Cell<f32>,
 }
 
 impl App {
@@ -189,7 +211,7 @@ impl App {
         }
         let editor = cx.new(|cx| {
             TextareaState::new(window, cx)
-                .auto_grow(1, 6)
+                .auto_grow(1, 9)
                 .submit_on_enter(true)
                 .placeholder("Ask Flow to do anything — spawn, review, merge…")
         });
@@ -208,6 +230,7 @@ impl App {
             scroll: ScrollHandle::new(),
             list_scroll: ScrollHandle::new(),
             seen: Cell::new((0, 0)),
+            layout: Rc::new(ComposerLayout { stacked: Cell::new(false), inline_w: Cell::new(f32::MAX) }),
             _sub: sub,
         });
     }
@@ -255,22 +278,20 @@ impl App {
             editor.update(cx, |s, cx| s.focus(window, cx));
         }
 
-        // Center over the tile area (between the sidebar and the ribbon).
+        // Center on the window, not the tile area: the sidebar and ribbon
+        // are asymmetric, so centering between them reads as off-center.
         let scale = self.scale();
         let (surface_w, surface_h) = self.renderer.surface_size();
         let (win_w, win_h) = (surface_w as f32 / scale, surface_h as f32 / scale);
-        let left_edge = self.sidebar_w();
-        let right_edge = win_w - crate::workspace::RIBBON_W;
-        let area_w = right_edge - left_edge;
-        let bar_w = (BAR_W * fs).min(area_w - 24.0).max(240.0);
-        let list_w = (LIST_W * fs).min(area_w - 24.0).max(240.0);
+        let bar_w = (BAR_W * fs).min(win_w - 24.0).max(240.0);
+        let list_w = (LIST_W * fs).min(win_w - 24.0).max(240.0);
         let open = self.flow.open;
         let in_list = open && self.flow.view == FlowView::List;
         let in_chat = open && self.flow.view == FlowView::Chat;
         // The column is as wide as its widest child so the list can outgrow
         // the bar while both stay centered on the tile area.
         let root_w = if in_list { bar_w.max(list_w) } else { bar_w };
-        let left = left_edge + (area_w - root_w) / 2.0;
+        let left = (win_w - root_w) / 2.0;
 
         let shadow = |blur: f32, y: f32, alpha: f32| {
             vec![BoxShadow {
@@ -306,53 +327,93 @@ impl App {
             })
             .child("↑");
         let focus_editor = editor.clone();
+        let chip = || {
+            div()
+                .flex_none()
+                .text_size(sp(10.5))
+                .text_color(theme.muted_foreground)
+                .border_1()
+                .border_color(theme.border)
+                .rounded(sp(6.0))
+                .px(sp(6.0))
+                .py(sp(2.0))
+                .child(Action::ToggleFlow.binding().display())
+        };
+        let field = div()
+            .flex_1()
+            .w_full()
+            .min_w_0()
+            .text_size(sp(13.0))
+            .line_height(sp(19.0))
+            .text_color(theme.foreground)
+            .child(Textarea::new(&editor).appearance(false).bordered(false));
+        let layout = self.flow_composer.as_ref().expect("ensured").layout.clone();
+        let stacked = layout.stacked.get();
+        let measure_editor = editor.clone();
         let bar = div()
+            // Pick inline vs. stacked from the textarea's own layout (the
+            // first child is the editor field in both shapes). Inline → stacked
+            // once it wraps; stacked → inline only when the draft is one row
+            // *and* narrower than the inline field was, so the two shapes can't
+            // ping-pong at the wrap boundary. A change repaints once.
+            .on_children_prepainted(move |bounds, window, app| {
+                let Some(field) = bounds.first() else { return };
+                let editor = measure_editor.read(app).base_state().read(app);
+                let rows = editor.visible_row_range().map(|r| r.len()).unwrap_or(1);
+                let len = editor.value().len();
+                let text_w = match len {
+                    0 => 0.0,
+                    _ => editor.range_to_bounds(&(0..len)).map(|b| f32::from(b.size.width)).unwrap_or(f32::MAX),
+                };
+                let was = layout.stacked.get();
+                let now = if was {
+                    rows > 1 || text_w > layout.inline_w.get() - 2.0
+                } else {
+                    layout.inline_w.set(f32::from(field.size.width));
+                    rows > 1
+                };
+                if now != was {
+                    layout.stacked.set(now);
+                    window.refresh();
+                }
+            })
             .id("flow-bar")
             .occlude()
             .w(px(bar_w))
             .flex_none()
             .flex()
-            .items_center()
-            .gap(sp(10.0))
             .pl(sp(16.0))
             .pr(sp(9.0))
-            .py(sp(7.0))
+            .py(sp(9.0))
+            // Closed: a pill at one line, a 24px-radius card once it grows. Open:
+            // docked flush under the panel, so only the bottom corners round and
+            // the seam is a faint top border.
             .map(|el| {
                 if in_chat {
-                    el.rounded_b(sp(18.0)).border_color(theme.border.opacity(0.5))
+                    el.rounded_b(sp(18.0)).border_t_1().border_color(theme.border.opacity(0.5))
                 } else {
-                    el.rounded(sp(999.0)).border_color(theme.border)
+                    el.rounded(sp(24.0)).border_1().border_color(theme.border)
                 }
             })
+            .border_l_1()
+            .border_r_1()
+            .border_b_1()
             .bg(theme.popover.opacity(0.94))
-            .border_1()
             .shadow(shadow(24.0, 6.0, 0.22))
             .cursor_text()
             .on_click(move |_ev: &ClickEvent, window: &mut Window, app: &mut GpuiApp| {
                 focus_editor.update(app, |s, cx| s.focus(window, cx));
             })
-            .child(div().flex_none().text_size(sp(14.0)).text_color(theme.primary).child("✳"))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .text_size(sp(13.0))
-                    .text_color(theme.foreground)
-                    .child(Textarea::new(&editor).appearance(false).bordered(false)),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .text_size(sp(10.5))
-                    .text_color(theme.muted_foreground)
-                    .border_1()
-                    .border_color(theme.border)
-                    .rounded(sp(6.0))
-                    .px(sp(6.0))
-                    .py(sp(2.0))
-                    .child(Action::ToggleFlow.binding().display()),
-            )
-            .child(send);
+            .map(|bar| {
+                if stacked {
+                    bar.flex_col().gap(sp(4.0)).child(field).child(
+                        div().flex().items_center().justify_end().gap(sp(10.0)).child(chip()).child(send),
+                    )
+                } else {
+                    // One row: text, chip and send button share a centerline.
+                    bar.items_center().gap(sp(10.0)).child(field).child(chip()).child(send)
+                }
+            });
 
         // ── Chat list ──
         let list = in_list.then(|| {
@@ -742,6 +803,7 @@ impl App {
                 .max_h(px(win_h * PANEL_MAX_FRAC))
                 .flex()
                 .flex_col()
+                // Square bottom: the composer bar docks flush beneath it.
                 .rounded_t(sp(18.0))
                 .overflow_hidden()
                 .bg(theme.popover)
