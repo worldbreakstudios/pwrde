@@ -1501,9 +1501,15 @@ fn panel(theme: &Theme, w: f32) -> gpui::Div {
     // dark-ground equivalents), so the panel paints them directly — blending
     // toward a fixed tint here is what made it read as flat blue-white.
     let chrome = crate::theme::current();
+    let alpha = 1.0;
+    // Messages-style accent glow, kept gentle so row contrast barely changes
+    // top to bottom: the top stop nudges `gradient_from` (already tinted
+    // 13–16%) a little further toward the accent, and the fade settles to
+    // the base tone by the panel's midpoint.
+    let glow = crate::theme::mix(chrome.gradient_from, chrome.accent, if theme.dark { 0.18 } else { 0.10 });
     let (top, bottom) = (
-        crate::renderer::color(chrome.gradient_from, 1.0),
-        crate::renderer::color(chrome.gradient_to, 1.0),
+        crate::renderer::color(glow, alpha),
+        crate::renderer::color(chrome.gradient_to, alpha),
     );
 
     div()
@@ -1516,15 +1522,16 @@ fn panel(theme: &Theme, w: f32) -> gpui::Div {
         .flex_col()
         .rounded(px(PANEL_RADIUS))
         .border_1()
-        // A hairline, not a drawn edge: the mock's is rgba(0,0,0,.08), which is
-        // lighter than the theme's general-purpose border token.
-        .border_color(theme.border.opacity(0.55))
+        // The liquid-glass rim (same as `ui::glass`): white in both
+        // polarities. An ink-mixed hairline read as a dark arc at the corners
+        // once the card went translucent — the antialiased border and the
+        // inset highlight stacked into a two-tone edge over the backdrop.
+        .border_color(gpui::white().opacity(if theme.dark { 0.16 } else { 0.55 }))
         .bg(linear_gradient(
             180.0,
             linear_color_stop(top, 0.0),
-            // Stops at .30, so — as in the mock — the fade happens in the top
-            // third and everything below it holds one tone.
-            linear_color_stop(bottom, 0.30),
+            // The glow is gone by the midpoint; the base tone holds below.
+            linear_color_stop(bottom, 0.50),
         ))
         .shadow(vec![
             // Top rim highlight (`--highlight-top`), the one-pixel lit edge

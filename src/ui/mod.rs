@@ -15,7 +15,9 @@
 //! (`Badge::color` status tints), and [`card`] (`Card::h_full` /
 //! `CardContent::flex_1` for page-filling cards, `Card::floating` for a
 //! raised shadow when floating over other content, `Card::glass` for a
-//! translucent glass panel over the blurred vibrancy ground), [`input`]
+//! translucent glass panel over the blurred vibrancy ground,
+//! `Card::liquid_glass` for the full [`Glass::panel`] liquid-glass recipe),
+//! [`input`]
 //! (`Input::set_text_size` so a bare field can match its host row's type),
 //! and [`alert_dialog`] (`AlertDialog::scrim` for the chrome's own scrim
 //! color, `AlertDialog::on_backdrop_click` for clicks on the scrim outside
@@ -38,6 +40,7 @@ pub use card::{
 pub use checkbox::Checkbox;
 #[allow(unused_imports)] // vendored rcn surface: kept exported while no caller uses it
 pub use dialog::{Dialog, DialogDescription, DialogFooter, DialogHeader, DialogTitle};
+pub use glass::Glass;
 #[allow(unused_imports)] // vendored rcn surface: kept exported while no caller uses it
 pub use hover_card::HoverCard;
 pub use input::Input;
@@ -56,6 +59,7 @@ pub mod button_group;
 pub mod card;
 pub mod checkbox;
 pub mod dialog;
+pub mod glass;
 pub mod hover_card;
 pub mod input;
 pub mod kbd;

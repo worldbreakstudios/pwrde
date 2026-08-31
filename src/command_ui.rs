@@ -700,9 +700,17 @@ impl App {
             .flex_col()
             .rounded(px(PANEL_RADIUS))
             .overflow_hidden()
-            .bg(theme.popover.opacity(0.94))
-            .border(px(0.5))
-            .border_color(theme.foreground.opacity(0.15))
+            // Liquid glass over the blurred canvas impression (`backdrop.rs`)
+            // when one is live; the legible-opaque recipe otherwise.
+            .map(|d| {
+                let glass = if self.glass_backdrop.is_some() {
+                    crate::ui::Glass::panel_blurred(theme.dark)
+                } else {
+                    crate::ui::Glass::panel(theme.dark)
+                };
+                d.bg(glass.fill).border_1().border_color(glass.rim)
+            })
+            .children(self.glass_backdrop_el(gpui::Corners::all(px(PANEL_RADIUS))))
             .shadow(vec![
                 BoxShadow {
                     color: crate::renderer::color(chrome.shadow, 0.35),

@@ -5590,6 +5590,7 @@ dependencies = [
  "gpui",
  "gpui-component",
  "gpui_platform",
+ "image",
  "libc",
  "objc",
  "pollster 0.4.0",
