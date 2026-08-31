@@ -469,15 +469,40 @@ pub fn titlebar(scale: f32, sidebar_w: f32) -> LayoutRect {
 /// now lands on the gutter.
 pub const TRAFFIC_LIGHT_ORIGIN: f32 = 20.0;
 
-/// The traffic lights' origin for the current sidebar state. Collapsed, the
-/// first tile's tab strip takes over the top-left corner, so the lights move
-/// back to sit centered on that 28px strip at the tile gap — essentially
-/// macOS's default spot.
-pub fn traffic_light_origin(sidebar_collapsed: bool) -> (f32, f32) {
-    if sidebar_collapsed {
-        (AREA_PAD + 9.0, AREA_PAD + (TILE_TAB_H - 12.0) / 2.0)
+/// Which surface owns the window's top-left corner, and so where the native
+/// traffic lights float.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrafficLightSpot {
+    /// The open sidebar's header strip.
+    Sidebar,
+    /// The top-left tile's tab strip once the sidebar collapses.
+    CollapsedTile,
+    /// A maximized flyover panel's tab strip, which fills the window from
+    /// (0, 0) and cedes its left end to the lights (`flyover_tab_rect`).
+    MaximizedFlyover,
+}
+
+/// The spot for the current chrome state: a maximized flyover covers
+/// everything else, so it wins over the sidebar state.
+pub fn traffic_light_spot(sidebar_collapsed: bool, flyover_maximized: bool) -> TrafficLightSpot {
+    if flyover_maximized {
+        TrafficLightSpot::MaximizedFlyover
+    } else if sidebar_collapsed {
+        TrafficLightSpot::CollapsedTile
     } else {
-        (TRAFFIC_LIGHT_ORIGIN, TRAFFIC_LIGHT_ORIGIN)
+        TrafficLightSpot::Sidebar
+    }
+}
+
+/// The traffic lights' origin for `spot`. Over a tab strip the lights sit
+/// centered on that 28px strip — at the tile gap for the collapsed sidebar
+/// (essentially macOS's default spot), flush with the window top for the
+/// maximized flyover whose strip starts at y = 0.
+pub fn traffic_light_origin(spot: TrafficLightSpot) -> (f32, f32) {
+    match spot {
+        TrafficLightSpot::Sidebar => (TRAFFIC_LIGHT_ORIGIN, TRAFFIC_LIGHT_ORIGIN),
+        TrafficLightSpot::CollapsedTile => (AREA_PAD + 9.0, AREA_PAD + (TILE_TAB_H - 12.0) / 2.0),
+        TrafficLightSpot::MaximizedFlyover => (AREA_PAD + 9.0, (TILE_TAB_H - 12.0) / 2.0),
     }
 }
 
@@ -1925,6 +1950,22 @@ mod flyover_tests {
     fn flyover_rect_maximized_fills_window() {
         let r = flyover_rect(1000, 800, 1.0, 1.0, 0.3, true);
         assert_eq!((r.x, r.y, r.w, r.h), (0.0, 0.0, 1000.0, 800.0));
+    }
+
+    /// The lights move onto a maximized flyover's strip, centered on it at
+    /// the window top, and that spot beats the sidebar state.
+    #[test]
+    fn traffic_lights_follow_the_maximized_flyover() {
+        use TrafficLightSpot::*;
+        assert_eq!(traffic_light_spot(false, false), Sidebar);
+        assert_eq!(traffic_light_spot(true, false), CollapsedTile);
+        assert_eq!(traffic_light_spot(false, true), MaximizedFlyover);
+        assert_eq!(traffic_light_spot(true, true), MaximizedFlyover);
+        let (x, y) = traffic_light_origin(MaximizedFlyover);
+        let panel = flyover_rect(1000, 800, 1.0, 1.0, 0.3, true);
+        let bar = flyover_tab_bar(&panel, 1.0);
+        assert!(x + 12.0 * 3.0 + 8.0 * 2.0 < TRAFFIC_LIGHT_SAFE_W);
+        assert_eq!(y + 6.0, bar.y + bar.h / 2.0);
     }
 
     /// A maximized panel's first tab clears the native traffic lights.

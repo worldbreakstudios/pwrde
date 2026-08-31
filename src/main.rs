@@ -336,9 +336,9 @@ struct App {
     /// Whether the sidebar is collapsed (⌘S toggle). Session-only, like the
     /// width; layout treats the effective width 0 as the collapsed state.
     sidebar_collapsed: bool,
-    /// The sidebar state the native traffic lights were last positioned for
-    /// (`workspace::traffic_light_origin`); `render` re-syncs on change.
-    traffic_lights_for_collapsed: Option<bool>,
+    /// The spot the native traffic lights were last positioned for
+    /// (`workspace::traffic_light_spot`); `render` re-syncs on change.
+    traffic_lights_for: Option<workspace::TrafficLightSpot>,
     modifiers: Modifiers,
     title: String,
     cursor: (f64, f64),
@@ -5284,12 +5284,19 @@ fn key_to_bytes(ks: &Keystroke) -> Option<Vec<u8>> {
 
 impl Render for App {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Native traffic lights follow the sidebar: inside the panel while it
-        // is open, back over the first tile's tab strip when it collapses.
-        if self.traffic_lights_for_collapsed != Some(self.sidebar_collapsed) {
-            let (x, y) = workspace::traffic_light_origin(self.sidebar_collapsed);
+        // Native traffic lights follow whichever surface owns the top-left
+        // corner: inside the sidebar panel while it is open, over the first
+        // tile's tab strip when it collapses, and over a maximized flyover's
+        // tab strip while that covers the window.
+        let flyover_maxed = self.flyover_open
+            && !self.flyover_windowed
+            && !self.flyover_tabs.is_empty()
+            && self.flyover_maximized;
+        let spot = workspace::traffic_light_spot(self.sidebar_collapsed, flyover_maxed);
+        if self.traffic_lights_for != Some(spot) {
+            let (x, y) = workspace::traffic_light_origin(spot);
             window.set_traffic_light_position(gpui::point(px(x), px(y)));
-            self.traffic_lights_for_collapsed = Some(self.sidebar_collapsed);
+            self.traffic_lights_for = Some(spot);
         }
         // Settings search field: focus lives in the window, so reflect it
         // into the flag the sidebar styles from, and drop it (and any stale
@@ -6798,7 +6805,7 @@ fn main() {
                         next_tile_id: 0,
                         sidebar_expanded_w: workspace::SIDEBAR_DEFAULT_W,
                         sidebar_collapsed: false,
-                        traffic_lights_for_collapsed: None,
+                        traffic_lights_for: None,
                         modifiers: Modifiers::default(),
                         mouse_report: None,
                         title: String::new(),
