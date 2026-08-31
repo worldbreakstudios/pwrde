@@ -5852,6 +5852,72 @@ impl App {
     }
 }
 
+/// The `NSWindow` behind a gpui window, for the AppKit surgery below.
+#[cfg(target_os = "macos")]
+fn ns_window(window: &Window) -> Option<*mut objc::runtime::Object> {
+    use objc::runtime::Object;
+    use objc::{msg_send, sel, sel_impl};
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    // Explicit trait call: gpui's `Window` has an inherent `window_handle()`
+    // (returning `AnyWindowHandle`) that would otherwise shadow the trait's.
+    let handle = HasWindowHandle::window_handle(window).ok()?;
+    let RawWindowHandle::AppKit(appkit) = handle.as_raw() else { return None };
+    let ns_view = appkit.ns_view.as_ptr() as *mut Object;
+    let ns_window: *mut Object = unsafe { msg_send![ns_view, window] };
+    (!ns_window.is_null()).then_some(ns_window)
+}
+
+/// Darwin kernel major version (`uname -r`), e.g. 25 on macOS 26 Tahoe.
+#[cfg(target_os = "macos")]
+fn darwin_major() -> u32 {
+    let mut u: libc::utsname = unsafe { std::mem::zeroed() };
+    if unsafe { libc::uname(&mut u) } != 0 {
+        return 0;
+    }
+    let release = unsafe { std::ffi::CStr::from_ptr(u.release.as_ptr()) };
+    release
+        .to_str()
+        .ok()
+        .and_then(|r| r.split('.').next()?.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Give the window an empty, invisible `NSToolbar` on macOS 26 (Tahoe) and
+/// later. Tahoe rounds windows two ways: titlebar-only windows get the compact
+/// corner radius, windows that carry a toolbar get the large one used by
+/// Messages, Calculator and the rest of the system apps. We draw our own
+/// chrome under a transparent titlebar, so the toolbar has no items and no
+/// separator — it exists only to opt into the larger radius. gpui re-frames
+/// the titlebar container around the traffic lights on every layout, so the
+/// toolbar adds no visible height either.
+#[cfg(target_os = "macos")]
+fn attach_empty_toolbar(window: &Window) {
+    use objc::runtime::{Object, NO};
+    use objc::{class, msg_send, sel, sel_impl};
+
+    if darwin_major() < 25 {
+        return;
+    }
+    let Some(ns_window) = ns_window(window) else { return };
+    unsafe {
+        let ident: *mut Object =
+            msg_send![class!(NSString), stringWithUTF8String: c"pwrde.window".as_ptr()];
+        let toolbar: *mut Object = msg_send![class!(NSToolbar), alloc];
+        let toolbar: *mut Object = msg_send![toolbar, initWithIdentifier: ident];
+        if toolbar.is_null() {
+            return;
+        }
+        let _: () = msg_send![toolbar, setShowsBaselineSeparator: NO];
+        let _: () = msg_send![toolbar, setAllowsUserCustomization: NO];
+        // NSWindowToolbarStyleUnified: the full-height toolbar layout whose
+        // radius matches Messages (`unifiedCompact` rounds less).
+        let _: () = msg_send![ns_window, setToolbarStyle: 3isize];
+        let _: () = msg_send![ns_window, setToolbar: toolbar];
+        let _: () = msg_send![toolbar, release];
+    }
+}
+
 /// Hide AppKit's private `_NSTitlebarDecorationView`, which draws a ~1px
 /// light highlight hairline across the top edge of the window frame. With our
 /// transparent titlebar over dark content that hairline shows as a stray
@@ -5862,18 +5928,9 @@ impl App {
 fn hide_titlebar_decoration(window: &Window) {
     use objc::runtime::{Object, YES};
     use objc::{msg_send, sel, sel_impl};
-    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
-    // Explicit trait call: gpui's `Window` has an inherent `window_handle()`
-    // (returning `AnyWindowHandle`) that would otherwise shadow the trait's.
-    let Ok(handle) = HasWindowHandle::window_handle(window) else { return };
-    let RawWindowHandle::AppKit(appkit) = handle.as_raw() else { return };
+    let Some(ns_window) = ns_window(window) else { return };
     unsafe {
-        let ns_view = appkit.ns_view.as_ptr() as *mut Object;
-        let ns_window: *mut Object = msg_send![ns_view, window];
-        if ns_window.is_null() {
-            return;
-        }
         let content: *mut Object = msg_send![ns_window, contentView];
         if content.is_null() {
             return;
@@ -6639,7 +6696,10 @@ fn main() {
             },
             |window, cx| {
                 #[cfg(target_os = "macos")]
-                hide_titlebar_decoration(window);
+                {
+                    attach_empty_toolbar(window);
+                    hide_titlebar_decoration(window);
+                }
 
                 let scale = window.scale_factor();
                 // Measure a monospace cell at the default font size; the first
