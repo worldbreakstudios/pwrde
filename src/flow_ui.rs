@@ -278,22 +278,20 @@ impl App {
             editor.update(cx, |s, cx| s.focus(window, cx));
         }
 
-        // Center over the tile area (between the sidebar and the ribbon).
+        // Center on the window, not the tile area: the sidebar and ribbon
+        // are asymmetric, so centering between them reads as off-center.
         let scale = self.scale();
         let (surface_w, surface_h) = self.renderer.surface_size();
         let (win_w, win_h) = (surface_w as f32 / scale, surface_h as f32 / scale);
-        let left_edge = self.sidebar_w();
-        let right_edge = win_w - crate::workspace::RIBBON_W;
-        let area_w = right_edge - left_edge;
-        let bar_w = (BAR_W * fs).min(area_w - 24.0).max(240.0);
-        let list_w = (LIST_W * fs).min(area_w - 24.0).max(240.0);
+        let bar_w = (BAR_W * fs).min(win_w - 24.0).max(240.0);
+        let list_w = (LIST_W * fs).min(win_w - 24.0).max(240.0);
         let open = self.flow.open;
         let in_list = open && self.flow.view == FlowView::List;
         let in_chat = open && self.flow.view == FlowView::Chat;
         // The column is as wide as its widest child so the list can outgrow
         // the bar while both stay centered on the tile area.
         let root_w = if in_list { bar_w.max(list_w) } else { bar_w };
-        let left = left_edge + (area_w - root_w) / 2.0;
+        let left = (win_w - root_w) / 2.0;
 
         let shadow = |blur: f32, y: f32, alpha: f32| {
             vec![BoxShadow {
