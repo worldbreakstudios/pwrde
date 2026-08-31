@@ -346,6 +346,11 @@ impl LayoutRect {
         px >= self.x && px < self.x + self.w && py >= self.y && py < self.y + self.h
     }
 
+    /// True when the two rects share any area (touching edges do not count).
+    pub fn intersects(&self, o: &LayoutRect) -> bool {
+        self.x < o.x + o.w && o.x < self.x + self.w && self.y < o.y + o.h && o.y < self.y + self.h
+    }
+
     /// Grown by `m` on every side (for forgiving divider hit-tests).
     pub fn inflate(&self, m: f32) -> LayoutRect {
         LayoutRect { x: self.x - m, y: self.y - m, w: self.w + 2.0 * m, h: self.h + 2.0 * m }
@@ -1828,6 +1833,14 @@ mod ribbon_tests {
         let open = terminal_area(w, h, scale, SIDEBAR_DEFAULT_W, RIBBON_W + 380.0, 0.0);
         assert_eq!(closed.w - open.w, 380.0 * scale);
         assert_eq!(closed.h, open.h);
+    }
+
+    #[test]
+    fn intersects_needs_shared_area() {
+        let a = LayoutRect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 };
+        assert!(a.intersects(&LayoutRect { x: 5.0, y: 5.0, w: 10.0, h: 10.0 }));
+        assert!(!a.intersects(&LayoutRect { x: 10.0, y: 0.0, w: 10.0, h: 10.0 }));
+        assert!(!a.intersects(&LayoutRect { x: 0.0, y: -10.0, w: 10.0, h: 10.0 }));
     }
 
     #[test]
