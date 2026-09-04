@@ -316,6 +316,10 @@ impl Renderer {
     /// Recompute terminal and chrome cell metrics for a new display scale or a
     /// changed font-size setting. The caller re-measures each cell width at the
     /// matching logical font via [`measure_cell_width`].
+    ///
+    /// Widths retain the text system's fractional advance: rounding here makes
+    /// glyph positions drift away from cell geometry across a row. Heights stay
+    /// integer-rounded so adjacent rows share physical-pixel boundaries.
     pub fn update_metrics(
         &mut self,
         scale: f32,
@@ -327,10 +331,16 @@ impl Renderer {
         self.scale = scale;
         self.term_font = term_font;
         self.chrome_font = chrome_font;
-        self.cell_width = term_cell_width.round();
+        self.cell_width = term_cell_width;
         self.cell_height = (term_font * scale * LINE_HEIGHT_FACTOR).round();
-        self.chrome_cell_width = chrome_cell_width.round();
+        self.chrome_cell_width = chrome_cell_width;
         self.chrome_cell_height = (chrome_font * scale * LINE_HEIGHT_FACTOR).round();
+    }
+
+    /// Integer physical-pixel metrics for the PTY protocol boundary. Rendering
+    /// continues to use the measured fractional width.
+    pub fn pty_cell_size(&self) -> (u16, u16) {
+        (self.cell_width.round() as u16, self.cell_height.round() as u16)
     }
 
     /// The logical (pre-scale) terminal / chrome font sizes currently in effect.
@@ -1634,5 +1644,33 @@ mod tests {
         assert!(!hot3.iter().any(|r| r.x == minr.x && r.y == minr.y));
     }
 
+    #[test]
+    fn fractional_cell_width_survives_until_pty_boundary() {
+        let mut renderer = Renderer::new(1.5, 10.8, 1600, 1000);
+        assert_eq!(renderer.cell_width, 10.8);
+        assert_eq!(renderer.chrome_cell_width, 10.8);
+        assert_eq!(renderer.pty_cell_size(), (11, 28));
 
+        renderer.update_metrics(1.5, 13.0, 9.4, 12.0, 8.6);
+        assert_eq!(renderer.cell_width, 9.4);
+        assert_eq!(renderer.chrome_cell_width, 8.6);
+        assert_eq!(renderer.pty_cell_size(), (9, 24));
+    }
+
+    #[test]
+    fn cumulative_column_positions_track_measured_advance() {
+        let renderer = Renderer::new(1.5, 10.8, 1600, 1000);
+        let origin = (100.0, 50.0);
+        let mut right = origin.0;
+
+        for col in 0..12 {
+            let q = renderer.cell_rect(origin, col, 0, 0.0, 0.0, 1.0, 1.0, (255, 0, 0), 1.0);
+            assert_eq!(q.x, right, "column {col} must share the previous edge");
+            right = q.x + q.w;
+        }
+
+        // Twelve fractional cells span 129.6 px, not the 132 px produced by
+        // rounding each cell to 11 px before laying out the grid.
+        assert!((right - origin.0 - 129.6).abs() <= 0.5);
+    }
 }
