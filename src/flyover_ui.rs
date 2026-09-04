@@ -67,7 +67,7 @@ impl App {
             .iter()
             .enumerate()
             .map(|(i, tab)| StripTab {
-                title: tab.session.title(),
+                title: tab.title(),
                 unread: tab.unread,
                 tab: workspace::flyover_tab_rect(&panel, i, n, scale, maximized),
                 close: workspace::flyover_tab_close_rect(&panel, i, n, scale, maximized),

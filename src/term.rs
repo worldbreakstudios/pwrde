@@ -46,6 +46,12 @@ pub enum TermEvent {
     OpenDir { cwd: std::path::PathBuf },
     /// `drop` failed; show `message` in the picker overlay.
     GroupFailed { message: String },
+    /// A Wry top-level navigation committed; folded into the owning tab on
+    /// the main thread so its address, title, and persisted URL stay current.
+    WebviewNavigated { id: u64, url: String },
+    /// Pointer focus entered a native child view; keep the owning tile as the
+    /// workspace focus target for tab and address-bar actions.
+    WebviewFocused { id: u64 },
     /// The branch-scoped PR list (`--head <current branch>`) finished loading
     /// (or failed).
     PrListLoaded { result: Result<Vec<crate::gh::PrSummary>, String> },

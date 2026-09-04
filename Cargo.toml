@@ -43,6 +43,8 @@ libc = "0.2"
 objc = "0.2"
 raw-window-handle = "0.6"
 serde = { version = "1", features = ["derive"] }
+# Native child webviews for webview tabs (WebViewBuilder::build_as_child).
+wry = { version = "0.56.1", features = ["devtools"] }
 serde_json = "1"
 dirs = "6"
 rusqlite = { version = "0.32", features = ["bundled"] }

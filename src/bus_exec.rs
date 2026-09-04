@@ -100,6 +100,7 @@ impl App {
                 )),
             },
             Command::NewSession { cwd, base, layout } => self.bus_new_session(cwd, base, layout),
+            Command::NewWebview { url, group } => self.bus_new_webview(url, group),
             Command::SendText { text, group } => {
                 let idx = match group {
                     Some(g) => match self.find_group(&g) {
@@ -111,15 +112,22 @@ impl App {
                 if self.is_empty_state() {
                     return Reply::err("no session is open");
                 }
-                let Some(tab) = self.workspaces[idx].focused().and_then(|t| t.active_tab()) else {
+                let Some(tab) = self
+                    .workspaces[idx]
+                    .focused_mut()
+                    .and_then(|tile| tile.active_tab_mut())
+                else {
                     return Reply::err("the target group has no focused pane");
                 };
                 // Raw keystrokes, not a bracketed paste: `--enter` appends
                 // "\r", and control bytes (^C, escapes) pass through.
-                let session_id = tab.session.id;
-                tab.session.write(text.as_bytes());
-                tab.session.scroll_to_bottom();
-                tab.session.clear_selection();
+                let Some(session) = tab.session_mut() else {
+                    return Reply::err("the focused pane is a webview, not a terminal");
+                };
+                let session_id = session.id;
+                session.write(text.as_bytes());
+                session.scroll_to_bottom();
+                session.clear_selection();
                 self.request_redraw();
                 Reply::success(json!({ "group": idx, "session": session_id }))
             }
@@ -317,6 +325,30 @@ impl App {
         Reply::success(json!({ "name": name, "group": self.active }))
     }
 
+    fn bus_new_webview(&mut self, url: String, group: Option<String>) -> Reply {
+        let url = match bus::validate_webview_url(&url) {
+            Ok(url) => url,
+            Err(error) => return Reply::err(error),
+        };
+        let group_idx = match group {
+            Some(group) => match self.find_group(&group) {
+                Some(index) => index,
+                None => return Reply::err(format!("no group matches {group:?}")),
+            },
+            None => self.active,
+        };
+        let tab_id = match self.add_webview_tab_to_group(group_idx, url.clone()) {
+            Ok(id) => id,
+            Err(error) => return Reply::err(error),
+        };
+        Reply::success(json!({
+            "group": group_idx,
+            "tab": tab_id,
+            "kind": "webview",
+            "url": url,
+        }))
+    }
+
     /// Resolve a group by exact name, case-insensitive name, sidebar title,
     /// or 0-based index.
     fn find_group(&self, key: &str) -> Option<usize> {
@@ -377,15 +409,23 @@ impl App {
                                 .tabs
                                 .iter()
                                 .enumerate()
-                                .map(|(ti, tab)| {
-                                    json!({
-                                        "session": tab.session.id,
-                                        "title": tab.session.title(),
+                                .map(|(ti, tab)| match tab.session() {
+                                    Some(session) => json!({
+                                        "kind": "terminal",
+                                        "session": session.id,
+                                        "title": tab.title(),
                                         "active": ti == t.active,
                                         "unread": tab.unread,
                                         "cols": tab.cols,
                                         "rows": tab.rows,
-                                    })
+                                    }),
+                                    None => json!({
+                                        "kind": "webview",
+                                        "tab": tab.webview_id(),
+                                        "url": tab.url(),
+                                        "title": tab.title(),
+                                        "active": ti == t.active,
+                                    }),
                                 })
                                 .collect();
                             json!({ "id": t.id, "focused": t.id == w.focused_tile, "tabs": tabs })
@@ -414,6 +454,7 @@ impl App {
             "groups": groups,
             "sections": sections,
             "command_palette_open": self.command.is_some(),
+            "new_webview_prompt_open": self.webview_prompt.is_some(),
             "flow": {
                 "enabled": crate::flow::enabled(),
                 "open": self.flow.open,
@@ -450,14 +491,17 @@ impl App {
                 .tiles()
                 .into_iter()
                 .find_map(|t| {
-                    let idx = t.tabs.iter().position(|tab| tab.session.id == id)?;
+                    let idx = t
+                        .tabs
+                        .iter()
+                        .position(|tab| tab.session().is_some_and(|session| session.id == id))?;
                     Some((i, t.id, idx == t.active))
                 })
         })
     }
 
-    /// Read-only pane discovery for `read_panes`: one flat row per tab in
-    /// every group (the `state` tree flattened), so an agent can find the
+    /// Read-only pane discovery for `read_panes`: one flat row per terminal
+    /// tab in every group, so an agent can find the
     /// session id to hand to `read_pane`. `query` keeps only panes whose
     /// title, group name, cwd, or foreground command contains it
     /// (case-insensitive). Never touches focus or scroll.
@@ -473,7 +517,7 @@ impl App {
             .iter()
             .flat_map(|w| w.root.tiles())
             .flat_map(|t| t.tabs.iter())
-            .map(|tab| foreground_spec(&tab.session))
+            .filter_map(|tab| tab.session().map(foreground_spec))
             .collect();
         let foregrounds: std::collections::HashMap<u64, String> =
             crate::term::foreground_titles(&specs).into_iter().collect();
@@ -481,14 +525,15 @@ impl App {
             let cwd = w.cwd.as_ref().map(|p| p.to_string_lossy().into_owned());
             for t in w.root.tiles() {
                 for (ti, tab) in t.tabs.iter().enumerate() {
-                    let title = tab.session.title();
-                    let foreground = foregrounds.get(&tab.session.id).map(String::as_str);
+                    let Some(session) = tab.session() else { continue };
+                    let title = tab.title();
+                    let foreground = foregrounds.get(&session.id).map(String::as_str);
                     if !pane_matches(query, &title, &w.name, cwd.as_deref(), foreground) {
                         continue;
                     }
                     let active = ti == t.active;
                     rows.push(json!({
-                        "session": tab.session.id,
+                        "session": session.id,
                         "title": title,
                         "group": { "index": gi, "name": w.name, "cwd": cwd },
                         "tile": t.id,

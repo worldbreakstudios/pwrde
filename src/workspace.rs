@@ -34,9 +34,27 @@
 
 use crate::term::Session;
 
+pub enum TabContent {
+    Terminal(Session),
+    Webview(WebviewTab),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct WebviewTab {
+    /// Runtime-only identity retained when a tab is moved or reordered.
+    pub id: u64,
+    pub url: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TabKind {
+    Terminal,
+    Webview,
+}
+
 pub struct Tab {
-    pub session: Session,
-    /// Cached grid size; used to skip redundant PTY resizes.
+    pub content: TabContent,
+    /// Cached grid size; meaningful only for terminal tabs.
     pub cols: usize,
     pub rows: usize,
     /// Whether this tab has unseen output (set by attention signal, cleared on focus).
@@ -50,8 +68,87 @@ pub struct Tab {
 
 impl Tab {
     pub fn new(session: Session) -> Self {
-        Self { session, cols: 0, rows: 0, unread: false, unread_at: None }
+        Self {
+            content: TabContent::Terminal(session),
+            cols: 0,
+            rows: 0,
+            unread: false,
+            unread_at: None,
+        }
     }
+
+    pub fn webview(id: u64, url: String) -> Self {
+        Self {
+            content: TabContent::Webview(WebviewTab { id, url }),
+            cols: 0,
+            rows: 0,
+            unread: false,
+            unread_at: None,
+        }
+    }
+
+    pub fn kind(&self) -> TabKind {
+        match &self.content {
+            TabContent::Terminal(_) => TabKind::Terminal,
+            TabContent::Webview(_) => TabKind::Webview,
+        }
+    }
+
+    pub fn session(&self) -> Option<&Session> {
+        match &self.content {
+            TabContent::Terminal(session) => Some(session),
+            TabContent::Webview(_) => None,
+        }
+    }
+
+    pub fn session_mut(&mut self) -> Option<&mut Session> {
+        match &mut self.content {
+            TabContent::Terminal(session) => Some(session),
+            TabContent::Webview(_) => None,
+        }
+    }
+
+    pub fn webview_id(&self) -> Option<u64> {
+        match &self.content {
+            TabContent::Terminal(_) => None,
+            TabContent::Webview(webview) => Some(webview.id),
+        }
+    }
+
+    pub fn url(&self) -> Option<&str> {
+        match &self.content {
+            TabContent::Terminal(_) => None,
+            TabContent::Webview(webview) => Some(&webview.url),
+        }
+    }
+
+    pub fn set_webview_url(&mut self, url: String) -> bool {
+        let TabContent::Webview(webview) = &mut self.content else { return false };
+        if webview.url == url {
+            return false;
+        }
+        webview.url = url;
+        true
+    }
+
+    pub fn title(&self) -> String {
+        match &self.content {
+            TabContent::Terminal(session) => session.title(),
+            TabContent::Webview(webview) => webview_title(&webview.url),
+        }
+    }
+}
+
+pub fn webview_title(url: &str) -> String {
+    let rest = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let host = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    if let Some((_, after_host)) = rest.split_once('/') {
+        let path = after_host.split(['?', '#']).next().unwrap_or("").trim_matches('/');
+        if let Some(segment) = path.split('/').next().filter(|part| !part.is_empty()) {
+            return format!("{host}/{segment}");
+        }
+    }
+    if host.is_empty() { url.to_string() } else { host.to_string() }
 }
 
 /// A leaf of the split tree: a tab strip + the active tab's terminal.
@@ -276,7 +373,7 @@ impl Workspace {
         self.root
             .find_tile(self.primary_tile)
             .and_then(|t| t.active_tab())
-            .map(|tab| tab.session.title())
+            .map(Tab::title)
             .filter(|t| !t.is_empty())
             .unwrap_or_else(|| self.name.clone())
     }
@@ -2060,6 +2157,19 @@ mod tests {
         // layout code always have something to work with.
         assert_eq!(ws.root.tiles().len(), 1);
         assert!(ws.focused().is_some());
+    }
+
+    #[test]
+    fn webview_tab_exposes_kind_identity_url_and_title() {
+        let mut tab = Tab::webview(42, "https://github.com/tauri-apps/wry".into());
+        assert_eq!(tab.kind(), TabKind::Webview);
+        assert_eq!(tab.webview_id(), Some(42));
+        assert_eq!(tab.url(), Some("https://github.com/tauri-apps/wry"));
+        assert_eq!(tab.title(), "github.com/tauri-apps");
+        assert!(tab.session().is_none());
+        assert!(tab.set_webview_url("https://example.com/docs".into()));
+        assert_eq!(tab.url(), Some("https://example.com/docs"));
+        assert!(!tab.set_webview_url("https://example.com/docs".into()));
     }
 
     #[test]

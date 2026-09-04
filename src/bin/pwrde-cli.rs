@@ -35,6 +35,7 @@ fn main() {
     }
 }
 
+#[derive(Debug)]
 enum CliError {
     Usage(String),
     Reply(String),
@@ -150,6 +151,34 @@ fn parse_command(sub: &str, args: &[String]) -> Result<Command, CliError> {
             let cwd = cwd.ok_or_else(|| CliError::Usage("new-session requires <dir>".into()))?;
             let cwd = canonicalize_dir(&cwd)?;
             Ok(Command::NewSession { cwd, base, layout })
+        }
+        "new-webview" => {
+            let mut url: Option<String> = None;
+            let mut group: Option<String> = None;
+            let mut i = 0;
+            while i < args.len() {
+                let a = &args[i];
+                if a == "--group" {
+                    i += 1;
+                    group = Some(
+                        args.get(i)
+                            .ok_or_else(|| CliError::Usage("--group requires a value".into()))?
+                            .clone(),
+                    );
+                } else if let Some(value) = a.strip_prefix("--group=") {
+                    group = Some(value.to_string());
+                } else if a.starts_with('-') {
+                    return Err(CliError::Usage(format!("unknown flag: {a}")));
+                } else if url.is_none() {
+                    url = Some(a.clone());
+                } else {
+                    return Err(CliError::Usage(format!("unexpected argument: {a}")));
+                }
+                i += 1;
+            }
+            let url = url.ok_or_else(|| CliError::Usage("new-webview requires <url>".into()))?;
+            let url = bus::validate_webview_url(&url).map_err(CliError::Usage)?;
+            Ok(Command::NewWebview { url, group })
         }
         "send-text" => {
             let mut text: Option<String> = None;
@@ -426,6 +455,7 @@ fn usage() -> String {
     let cli_names: &[(&str, &str)] = &[
         ("action", "action"),
         ("new_session", "new-session"),
+        ("new_webview", "new-webview"),
         ("send_text", "send-text"),
         ("flow_send", "flow-send"),
         ("key", "key"),
@@ -518,4 +548,35 @@ fn read_stdin() -> Result<String, CliError> {
         .read_to_string(&mut buf)
         .map_err(|e| CliError::Usage(format!("failed to read stdin: {e}")))?;
     Ok(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn parses_new_webview_with_optional_group() {
+        let command = parse_command(
+            "new-webview",
+            &args(&["https://example.com/docs", "--group", "work"]),
+        )
+        .unwrap();
+        assert_eq!(
+            command,
+            Command::NewWebview {
+                url: "https://example.com/docs".into(),
+                group: Some("work".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_non_http_webview_urls() {
+        assert!(parse_command("new-webview", &args(&["javascript:alert(1)"])).is_err());
+        assert!(parse_command("new-webview", &args(&["https:///missing-host"])).is_err());
+    }
 }

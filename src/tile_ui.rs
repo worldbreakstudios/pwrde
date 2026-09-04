@@ -346,7 +346,7 @@ impl App {
                 .iter()
                 .enumerate()
                 .map(|(ti, tab)| StripTab {
-                    title: tab.session.title(),
+                    title: tab.title(),
                     unread: tab.unread,
                     tab: workspace::tile_tab_rect(&strip, ti, n, scale, has_caret),
                     close: workspace::tile_tab_close_rect(&strip, ti, n, scale, has_caret),
