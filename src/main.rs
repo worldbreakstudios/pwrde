@@ -634,7 +634,7 @@ impl App {
 
     /// Cell size in physical px, rounded for the PTY resize (u16).
     fn cell_px(&self) -> (u16, u16) {
-        (self.renderer.cell_width as u16, self.renderer.cell_height as u16)
+        self.renderer.pty_cell_size()
     }
 
     fn spawn_session(&mut self) -> Session {
@@ -6425,7 +6425,7 @@ impl FlyoverPopout {
         let panel = self.panel_rect();
         let content = workspace::flyover_content(&panel, scale);
         let (cols, rows) = self.renderer.grid_size_for(&content);
-        let (cw, ch) = (self.renderer.cell_width as u16, self.renderer.cell_height as u16);
+        let (cw, ch) = self.renderer.pty_cell_size();
         let dpi = (96.0 * scale) as u32;
         let focused = window.is_window_active();
 
