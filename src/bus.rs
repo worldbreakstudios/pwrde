@@ -27,6 +27,11 @@ pub enum Command {
         #[serde(default)]
         layout: Option<String>,
     },
+    NewWebview {
+        url: String,
+        #[serde(default)]
+        group: Option<String>,
+    },
     SendText {
         text: String,
         #[serde(default)]
@@ -134,6 +139,12 @@ pub fn command_specs() -> Vec<CommandSpec> {
             read_only: false,
         },
         CommandSpec {
+            name: "new_webview",
+            args: "<url> [--group <name>]",
+            help: "Open an HTTP(S) webview tab in the focused pane of a group",
+            read_only: false,
+        },
+        CommandSpec {
             name: "send_text",
             args: "<text> [--group <name>]",
             help: "Send raw keystrokes to the focused (or named) group's pane (--enter appends \\r)",
@@ -212,6 +223,22 @@ pub fn command_specs() -> Vec<CommandSpec> {
             read_only: true,
         },
     ]
+}
+
+/// Validate the URL accepted by `new-webview` at both CLI and server edges.
+pub fn validate_webview_url(value: &str) -> Result<String, String> {
+    if value.is_empty() || value.chars().any(char::is_whitespace) {
+        return Err("URL must not be empty or contain whitespace".into());
+    }
+    let rest = value
+        .strip_prefix("https://")
+        .or_else(|| value.strip_prefix("http://"))
+        .ok_or_else(|| "URL must be absolute and use http:// or https://".to_string())?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.is_empty() || authority.starts_with(':') || authority.ends_with(':') {
+        return Err("URL must include a valid host".into());
+    }
+    Ok(value.to_string())
 }
 
 /// Socket path under `config_dir` for an optional worktree scope.
@@ -409,6 +436,7 @@ fn command_tag(cmd: &Command) -> &'static str {
     match cmd {
         Command::Action { .. } => "action",
         Command::NewSession { .. } => "new_session",
+        Command::NewWebview { .. } => "new_webview",
         Command::SendText { .. } => "send_text",
         Command::Key { .. } => "key",
         Command::FocusGroup { .. } => "focus_group",
@@ -447,6 +475,10 @@ mod tests {
                 cwd: PathBuf::from("/tmp/proj"),
                 base: None,
                 layout: None,
+            },
+            Command::NewWebview {
+                url: "https://example.com/docs".into(),
+                group: Some("g1".into()),
             },
             Command::SendText {
                 text: "hello".into(),
@@ -586,6 +618,10 @@ mod tests {
                 cwd: PathBuf::from("."),
                 base: None,
                 layout: None,
+            },
+            Command::NewWebview {
+                url: "https://example.com".into(),
+                group: None,
             },
             Command::SendText {
                 text: String::new(),
@@ -773,5 +809,16 @@ mod tests {
         std::fs::write(dir.join("bus.sock"), b"").unwrap();
         assert_eq!(resolve_socket_path(&dir), dir.join("bus.sock"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn webview_url_requires_absolute_http_host() {
+        assert_eq!(
+            validate_webview_url("https://example.com/path").unwrap(),
+            "https://example.com/path"
+        );
+        for invalid in ["", "example.com", "file:///tmp/a", "https:///path", "https://bad host"] {
+            assert!(validate_webview_url(invalid).is_err(), "accepted {invalid:?}");
+        }
     }
 }

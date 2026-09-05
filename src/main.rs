@@ -64,6 +64,8 @@ mod theme;
 // of the library surface are expected dead code in this bin crate.
 #[allow(dead_code)]
 mod ui;
+mod webview;
+mod webview_ui;
 mod workspace;
 
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -172,6 +174,7 @@ impl ConfirmClose {
     fn accept_label(&self) -> &'static str {
         match self.action {
             ConfirmAction::CloseGroup { .. } => "Close group",
+            ConfirmAction::ClearWebviewData { .. } => "Clear data",
         }
     }
 }
@@ -182,6 +185,13 @@ enum ConfirmAction {
     /// by primary tile id at confirm time so group reordering while the
     /// dialog is up can't misdirect the close.
     CloseGroup { primary_tile: u64 },
+    /// Clear the shared Wry website-data store after an explicit warning.
+    ClearWebviewData { id: u64 },
+}
+
+struct WebviewPrompt {
+    query: String,
+    error: Option<String>,
 }
 
 /// A CLI tool page's terminal. `exited` keeps the last frame on screen after
@@ -332,6 +342,19 @@ struct App {
     proc_title_refreshed_at: std::time::Instant,
     next_session_id: u64,
     next_tile_id: u64,
+    next_webview_id: u64,
+    /// Native child views stay on the foreground thread with the gpui window.
+    webviews: webview::Manager,
+    /// In-app New webview URL prompt, sharing the command palette input.
+    webview_prompt: Option<WebviewPrompt>,
+    /// One live address field is mounted in the focused webview toolbar.
+    webview_address: gpui::Entity<crate::ui::Input>,
+    webview_address_for: Option<u64>,
+    /// Find-in-page replaces the address field while active.
+    webview_find: gpui::Entity<crate::ui::Input>,
+    webview_find_for: Option<u64>,
+    /// Expanded site-information or browser-tools panel.
+    webview_panel: Option<webview_ui::Panel>,
     /// Sidebar width when expanded, logical px (user-resizable).
     sidebar_expanded_w: f32,
     /// Whether the sidebar is collapsed (⌘S toggle). Session-only, like the
@@ -642,6 +665,139 @@ impl App {
         self.spawn_session_in(cwd.as_deref())
     }
 
+    fn new_webview_tab(&mut self, url: String) -> Tab {
+        let id = self.next_webview_id;
+        self.next_webview_id += 1;
+        Tab::webview(id, url)
+    }
+
+    pub(crate) fn add_webview_tab_to_group(
+        &mut self,
+        group_idx: usize,
+        url: String,
+    ) -> Result<u64, String> {
+        if group_idx >= self.workspaces.len() || self.workspaces[group_idx].focused().is_none() {
+            return Err("the target group has no focused pane".into());
+        }
+        let tab = self.new_webview_tab(url);
+        let id = tab.webview_id().expect("webview constructor assigns an id");
+        let tile = self.workspaces[group_idx]
+            .focused_mut()
+            .expect("focused pane checked before tab allocation");
+        tile.tabs.push(tab);
+        tile.active = tile.tabs.len() - 1;
+        self.active = group_idx;
+        workspace::ensure_active_section_expanded(
+            &self.workspaces,
+            &mut self.sections,
+            self.active,
+        );
+        if self.page != Page::Sessions {
+            self.set_page(Page::Sessions);
+        } else {
+            self.sync_layout();
+            self.request_redraw();
+        }
+        self.persist_snapshot();
+        Ok(id)
+    }
+
+    fn set_webview_url(&mut self, id: u64, url: String) -> bool {
+        for workspace in &mut self.workspaces {
+            for tile in workspace.root.tiles_mut() {
+                if let Some(tab) = tile.tabs.iter_mut().find(|tab| tab.webview_id() == Some(id)) {
+                    return tab.set_webview_url(url);
+                }
+            }
+        }
+        false
+    }
+
+    fn open_new_webview_prompt(&mut self) {
+        self.command = None;
+        self.webview_panel = None;
+        self.webview_prompt = Some(WebviewPrompt { query: String::new(), error: None });
+        self.modal_search_reset = Some("Enter a URL or hostname…".into());
+        self.request_redraw();
+    }
+
+    fn submit_new_webview_prompt(&mut self) {
+        let raw = self
+            .webview_prompt
+            .as_ref()
+            .map(|prompt| prompt.query.clone())
+            .unwrap_or_default();
+        let url = match webview::normalize_input(&raw) {
+            Ok(url) => url,
+            Err(error) => {
+                if let Some(prompt) = self.webview_prompt.as_mut() {
+                    prompt.error = Some(error);
+                }
+                self.request_redraw();
+                return;
+            },
+        };
+        match self.add_webview_tab_to_group(self.active, url) {
+            Ok(_) => self.webview_prompt = None,
+            Err(error) => {
+                if let Some(prompt) = self.webview_prompt.as_mut() {
+                    prompt.error = Some(error);
+                }
+            },
+        }
+        self.request_redraw();
+    }
+
+    /// Keep Wry child views aligned with the visible active webview tabs.
+    fn sync_webviews(&mut self, window: &Window) {
+        let live: std::collections::HashSet<u64> = self
+            .workspaces
+            .iter()
+            .flat_map(|ws| ws.root.tiles())
+            .flat_map(|tile| tile.tabs.iter())
+            .filter_map(Tab::webview_id)
+            .collect();
+        if self.webview_panel.as_ref().is_some_and(|panel| !live.contains(&panel.id())) {
+            self.webview_panel = None;
+        }
+        let obscured = self.page != Page::Sessions
+            || self.modal_overlay_open()
+            || (self.flyover_anim > 0.0 && !self.flyover_windowed)
+            || (self.visible_tool().is_some() && self.tool_panel_floating)
+            || self.flow.open
+            || matches!(self.drag, Drag::Tab { .. } | Drag::Group { .. } | Drag::Section { .. });
+        let mut placements = Vec::new();
+        let mut focus = None;
+        if !obscured {
+            let ws = &self.workspaces[self.active];
+            let (tiles, _) = workspace::layout_tiles(&ws.root, self.area(), self.scale());
+            for (tile_id, rect) in tiles {
+                let Some(tile) = ws.root.find_tile(tile_id) else { continue };
+                if tile.collapsed || tile.collapse_anim > 0.0 {
+                    continue;
+                }
+                let Some(tab) = tile.active_tab() else { continue };
+                let (Some(id), Some(url)) = (tab.webview_id(), tab.url()) else { continue };
+                let content = workspace::tile_content(&rect, self.scale());
+                if content.w < 1.0 || content.h < 1.0 {
+                    continue;
+                }
+                let panel_h = webview_ui::panel_height(self.webview_panel.as_ref(), id);
+                let bounds = webview::child_bounds(content, self.scale(), panel_h);
+                placements.push(webview::Placement { id, url: url.to_string(), bounds });
+                if tile_id == ws.focused_tile {
+                    focus = Some(id);
+                }
+            }
+        }
+        if let Some(error) =
+            self.webviews.sync(window, &live, &placements, focus, &self.events_tx)
+        {
+            self.message = Some((format!("Could not open webview: {error}"), true));
+            self.request_redraw();
+        }
+    }
+
     /// Spawn a session whose shell starts in `cwd` (`None` inherits our own).
     /// With persistence on, the shell runs inside a freshly named shpool
     /// session so it survives app restarts.
@@ -758,16 +914,32 @@ impl App {
                     tabs.iter().filter(|t| t.tile_id == *tile).collect();
                 saved.sort_by_key(|t| t.tab_index);
                 let mut restored = Tile::empty(tile_id);
+                restored.active = saved.iter().position(|st| st.active).unwrap_or(0);
                 for st in &saved {
-                    let tab_cwd = st.cwd.as_ref().map(std::path::PathBuf::from);
-                    let session = self
-                        .spawn_session_named(tab_cwd.as_deref().or(cwd), st.shpool_session.clone());
-                    let mut tab = Tab::new(session);
+                    let mut tab = match st.kind {
+                        persist::SavedTabKind::Webview => {
+                            match st
+                                .url
+                                .as_deref()
+                                .and_then(|url| bus::validate_webview_url(url).ok())
+                            {
+                                Some(url) => self.new_webview_tab(url),
+                                None => Tab::new(self.spawn_session_named(cwd, None)),
+                            }
+                        },
+                        persist::SavedTabKind::Terminal => {
+                            let tab_cwd = st.cwd.as_ref().map(std::path::PathBuf::from);
+                            let session = self.spawn_session_named(
+                                tab_cwd.as_deref().or(cwd),
+                                st.shpool_session.clone(),
+                            );
+                            Tab::new(session)
+                        },
+                    };
                     tab.unread = st.unread;
                     tab.unread_at = persist::from_epoch_secs(st.unread_at);
                     restored.tabs.push(tab);
                 }
-                restored.active = saved.iter().position(|st| st.active).unwrap_or(0);
                 restored.collapsed = *collapsed;
                 restored.collapse_anim = if *collapsed { 1.0 } else { 0.0 };
                 Node::Leaf(restored)
@@ -862,7 +1034,9 @@ impl App {
                     if force || (cols, rows) != (tab.cols, tab.rows) {
                         tab.cols = cols;
                         tab.rows = rows;
-                        tab.session.resize(cols, rows, cw, ch, dpi);
+                        if let Some(session) = tab.session() {
+                            session.resize(cols, rows, cw, ch, dpi);
+                        }
                     }
                 }
             }
@@ -887,7 +1061,9 @@ impl App {
             if force || (cols, rows) != (tab.cols, tab.rows) {
                 tab.cols = cols;
                 tab.rows = rows;
-                tab.session.resize(cols, rows, cw, ch, dpi);
+                if let Some(session) = tab.session() {
+                    session.resize(cols, rows, cw, ch, dpi);
+                }
             }
         }
     }
@@ -962,7 +1138,9 @@ impl App {
             if force || (cols, rows) != (tab.cols, tab.rows) {
                 tab.cols = cols;
                 tab.rows = rows;
-                tab.session.resize(cols, rows, cw, ch, dpi);
+                if let Some(session) = tab.session() {
+                    session.resize(cols, rows, cw, ch, dpi);
+                }
             }
         }
     }
@@ -981,17 +1159,18 @@ impl App {
         }
         if let Some(bytes) = key_to_bytes(keystroke)
             && let Some(Some(ts)) = self.tool_sessions.get(i)
+            && let Some(session) = ts.tab.session()
         {
-            ts.tab.session.write(bytes);
-            ts.tab.session.scroll_to_bottom();
-            ts.tab.session.clear_selection();
+            session.write(bytes);
+            session.scroll_to_bottom();
+            session.clear_selection();
         }
     }
 
     /// ⌘C on a tool page: copy its terminal's selection.
     fn tool_copy(&mut self) {
         if let Some(ts) = self.active_tool_session()
-            && let Some(text) = ts.tab.session.selected_text()
+            && let Some(text) = ts.tab.session().and_then(Session::selected_text)
             && let Ok(mut clipboard) = arboard::Clipboard::new()
         {
             let _ = clipboard.set_text(text);
@@ -1003,7 +1182,7 @@ impl App {
     fn tool_paste(&mut self) {
         let Ok(mut clipboard) = arboard::Clipboard::new() else { return };
         let Some(ts) = self.active_tool_session().filter(|ts| !ts.exited) else { return };
-        let session = &ts.tab.session;
+        let Some(session) = ts.tab.session() else { return };
         match clipboard.get_text() {
             Ok(text) if !text.is_empty() => session.paste(&text),
             _ if clipboard.get_image().is_ok() => session.write([0x16u8]),
@@ -1301,7 +1480,7 @@ impl App {
         // Explicit close ends the persistent session too; a shell that merely
         // exited goes through remove_session instead, where the shpool session
         // is already gone.
-        if let Some(name) = tab.session.shpool_session.as_deref() {
+        if let Some(name) = tab.session().and_then(|session| session.shpool_session.as_deref()) {
             term::shpool_kill(name);
         }
         if tile.active >= tile.tabs.len() {
@@ -1416,7 +1595,7 @@ impl App {
         // Explicit close: end the group's persistent sessions too.
         for tile in self.workspaces[wi].root.tiles() {
             for tab in &tile.tabs {
-                if let Some(name) = tab.session.shpool_session.as_deref() {
+                if let Some(name) = tab.session().and_then(|session| session.shpool_session.as_deref()) {
                     term::shpool_kill(name);
                 }
             }
@@ -1476,6 +1655,12 @@ impl App {
                     self.close_group(wi);
                 }
             },
+            ConfirmAction::ClearWebviewData { id } => {
+                if let Err(error) = self.webviews.clear_browsing_data(id) {
+                    self.message = Some((error, true));
+                }
+                self.webview_panel = None;
+            },
         }
         self.request_redraw();
     }
@@ -1489,6 +1674,7 @@ impl App {
     fn on_scroll(&mut self, delta: gpui::ScrollDelta, cell_height: f32) {
         if self.confirm.is_some()
             || self.message.is_some()
+            || self.webview_prompt.is_some()
             || self.command.is_some()
         {
             return;
@@ -1507,8 +1693,11 @@ impl App {
                 };
                 let steps = scroll_steps(&mut self.scroll_accum, notches);
                 if steps != 0 {
-                    if let Some(tab) = self.flyover_tabs.get(self.flyover_active) {
-                        let session = &tab.session;
+                    if let Some(session) = self
+                        .flyover_tabs
+                        .get(self.flyover_active)
+                        .and_then(Tab::session)
+                    {
                         let up = steps > 0;
                         if session.app_consumes_wheel() {
                             let (col, row) =
@@ -1536,7 +1725,7 @@ impl App {
                 };
                 let steps = scroll_steps(&mut self.scroll_accum, notches);
                 if steps != 0 {
-                    let session = &ts.tab.session;
+                    let Some(session) = ts.tab.session() else { return };
                     let content = workspace::tile_content(&self.tool_area(), scale);
                     let up = steps > 0;
                     if session.app_consumes_wheel() {
@@ -1581,7 +1770,7 @@ impl App {
         let Some(tab) = ws.root.find_tile(*id).and_then(|t| t.active_tab()) else {
             return;
         };
-        let session = &tab.session;
+        let Some(session) = tab.session() else { return };
         let up = steps > 0;
 
         if session.app_consumes_wheel() {
@@ -1608,7 +1797,7 @@ impl App {
     fn copy(&mut self) {
         let ws = &self.workspaces[self.active];
         let Some(tab) = ws.focused().and_then(|t| t.active_tab()) else { return };
-        let Some(text) = tab.session.selected_text() else { return };
+        let Some(text) = tab.session().and_then(Session::selected_text) else { return };
         if let Ok(mut clipboard) = arboard::Clipboard::new() {
             let _ = clipboard.set_text(text);
         }
@@ -1618,14 +1807,15 @@ impl App {
         let Ok(mut clipboard) = arboard::Clipboard::new() else { return };
         let ws = &self.workspaces[self.active];
         let Some(tab) = ws.focused().and_then(|t| t.active_tab()) else { return };
+        let Some(session) = tab.session() else { return };
         match clipboard.get_text() {
-            Ok(text) if !text.is_empty() => tab.session.paste(&text),
-            _ if clipboard.get_image().is_ok() => tab.session.write([0x16u8]),
+            Ok(text) if !text.is_empty() => session.paste(&text),
+            _ if clipboard.get_image().is_ok() => session.write([0x16u8]),
             _ => return,
         }
         // Like typing: a paste follows the live output and drops any selection.
-        tab.session.scroll_to_bottom();
-        tab.session.clear_selection();
+        session.scroll_to_bottom();
+        session.clear_selection();
         self.request_redraw();
     }
 
@@ -1713,18 +1903,17 @@ impl App {
                 ws.root
                     .tiles()
                     .into_iter()
-                    .find_map(|t| t.tabs.iter().find(|tab| tab.session.id == id))
-                    .map(|tab| &tab.session)
+                    .flat_map(|t| t.tabs.iter())
+                    .filter_map(Tab::session)
+                    .find(|session| session.id == id)
             })
-            .or_else(|| {
-                self.flyover_tabs.iter().find(|tab| tab.session.id == id).map(|tab| &tab.session)
-            })
+            .or_else(|| self.flyover_tabs.iter().filter_map(Tab::session).find(|s| s.id == id))
             .or_else(|| {
                 self.tool_sessions
                     .iter()
                     .flatten()
-                    .find(|ts| ts.tab.session.id == id)
-                    .map(|ts| &ts.tab.session)
+                    .filter_map(|ts| ts.tab.session())
+                    .find(|session| session.id == id)
             })
     }
 
@@ -1735,7 +1924,11 @@ impl App {
         let showing =
             if self.flyover_windowed { self.flyover_window_visible } else { self.flyover_open };
         showing
-            && self.flyover_tabs.get(self.flyover_active).is_some_and(|tab| tab.session.id == id)
+            && self
+                .flyover_tabs
+                .get(self.flyover_active)
+                .and_then(Tab::session)
+                .is_some_and(|session| session.id == id)
     }
 
     /// True when the session is the *visible* tab of a tile in the active
@@ -1747,9 +1940,17 @@ impl App {
             .root
             .tiles()
             .iter()
-            .any(|t| !t.collapsed && t.active_tab().is_some_and(|tab| tab.session.id == id))
+            .any(|t| {
+                !t.collapsed
+                    && t.active_tab()
+                        .and_then(Tab::session)
+                        .is_some_and(|session| session.id == id)
+            })
             || self.flyover_visible(id)
-            || self.active_tool_session().is_some_and(|ts| ts.tab.session.id == id)
+            || self
+                .active_tool_session()
+                .and_then(|ts| ts.tab.session())
+                .is_some_and(|session| session.id == id)
     }
 
     /// Record that the tab owning session `id` asked for attention, without
@@ -1763,7 +1964,11 @@ impl App {
     /// Returns whether a stamp was written, so the caller knows to redraw.
     fn stamp_attention_by_session(&mut self, id: u64) -> bool {
         let now = SystemTime::now();
-        if let Some(tab) = self.flyover_tabs.iter_mut().find(|tab| tab.session.id == id) {
+        if let Some(tab) = self
+            .flyover_tabs
+            .iter_mut()
+            .find(|tab| tab.session().is_some_and(|session| session.id == id))
+        {
             if !tab.unread {
                 tab.unread_at = Some(now);
             }
@@ -1772,7 +1977,7 @@ impl App {
         let changed = self.workspaces.iter_mut().any(|ws| {
             ws.root.tiles_mut().into_iter().any(|t| {
                 t.tabs.iter_mut().any(|tab| {
-                    let hit = tab.session.id == id && !tab.unread;
+                    let hit = tab.session().is_some_and(|session| session.id == id) && !tab.unread;
                     if hit {
                         tab.unread_at = Some(now);
                     }
@@ -1791,7 +1996,11 @@ impl App {
     /// one pane don't churn the snapshot.
     fn set_unread_by_session(&mut self, id: u64) -> bool {
         // Flyover tabs aren't persisted, so their dots skip the snapshot.
-        if let Some(tab) = self.flyover_tabs.iter_mut().find(|tab| tab.session.id == id) {
+        if let Some(tab) = self
+            .flyover_tabs
+            .iter_mut()
+            .find(|tab| tab.session().is_some_and(|session| session.id == id))
+        {
             let hit = !tab.unread;
             tab.unread = true;
             if hit {
@@ -1802,7 +2011,7 @@ impl App {
         let changed = self.workspaces.iter_mut().any(|ws| {
             ws.root.tiles_mut().into_iter().any(|t| {
                 t.tabs.iter_mut().any(|tab| {
-                    let hit = tab.session.id == id && !tab.unread;
+                    let hit = tab.session().is_some_and(|session| session.id == id) && !tab.unread;
                     if hit {
                         tab.unread = true;
                         tab.unread_at = Some(SystemTime::now());
@@ -1857,6 +2066,7 @@ impl App {
         if self.page != Page::Sessions
             || self.confirm.is_some()
             || self.message.is_some()
+            || self.webview_prompt.is_some()
             || self.command.is_some()
         {
             return;
@@ -1933,7 +2143,7 @@ impl App {
 
     /// True while the command palette owns the shared search field.
     fn search_modal_open(&self) -> bool {
-        self.command.is_some()
+        self.command.is_some() || self.webview_prompt.is_some()
     }
 
     /// Point the shared search field at the palette's current stage: clear
@@ -2233,7 +2443,7 @@ impl App {
             },
             Action::Copy => {
                 if let Some(tab) = self.flyover_tabs.get(self.flyover_active)
-                    && let Some(text) = tab.session.selected_text()
+                    && let Some(text) = tab.session().and_then(Session::selected_text)
                     && let Ok(mut clipboard) = arboard::Clipboard::new()
                 {
                     let _ = clipboard.set_text(text);
@@ -2241,16 +2451,17 @@ impl App {
             },
             Action::Paste => {
                 if let Some(tab) = self.flyover_tabs.get(self.flyover_active)
+                    && let Some(session) = tab.session()
                     && let Ok(mut clipboard) = arboard::Clipboard::new()
                 {
                     match clipboard.get_text() {
                         Ok(text) if !text.is_empty() => {
-                            tab.session.paste(&text);
-                            tab.session.scroll_to_bottom();
-                            tab.session.clear_selection();
+                            session.paste(&text);
+                            session.scroll_to_bottom();
+                            session.clear_selection();
                         },
                         _ if clipboard.get_image().is_ok() => {
-                            tab.session.write([0x16u8]);
+                            session.write([0x16u8]);
                         },
                         _ => {},
                     }
@@ -2265,10 +2476,11 @@ impl App {
     fn flyover_write_key(&mut self, keystroke: &Keystroke) {
         if let Some(bytes) = key_to_bytes(keystroke)
             && let Some(tab) = self.flyover_tabs.get(self.flyover_active)
+            && let Some(session) = tab.session()
         {
-            tab.session.write(bytes);
-            tab.session.scroll_to_bottom();
-            tab.session.clear_selection();
+            session.write(bytes);
+            session.scroll_to_bottom();
+            session.clear_selection();
         }
     }
 
@@ -2350,8 +2562,9 @@ impl App {
         let cmd = settings::primary_command();
         if !cmd.trim().is_empty()
             && let Some(tab) = tile.tabs.first()
+            && let Some(session) = tab.session()
         {
-            self.pending_primary_cmd.insert(tab.session.id, cmd);
+            self.pending_primary_cmd.insert(session.id, cmd);
         }
         let ws = Workspace::new(name, tile, cwd);
         if empty {
@@ -2421,16 +2634,25 @@ impl App {
                 let tabs: &[pwrspace::ProfileTab] =
                     if leaf.tabs.is_empty() { &bare } else { &leaf.tabs };
                 for profile_tab in tabs {
-                    let session = self.spawn_session_in(cwd);
-                    if let Some(cmd) = profile_tab
-                        .command
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|c| !c.is_empty())
+                    if profile_tab.kind == pwrspace::ProfileTabKind::Webview
+                        && let Some(url) = profile_tab
+                            .url
+                            .as_deref()
+                            .and_then(|url| bus::validate_webview_url(url).ok())
                     {
-                        self.pending_primary_cmd.insert(session.id, cmd.to_string());
+                        tile.tabs.push(self.new_webview_tab(url));
+                    } else {
+                        let session = self.spawn_session_in(cwd);
+                        if let Some(cmd) = profile_tab
+                            .command
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|c| !c.is_empty())
+                        {
+                            self.pending_primary_cmd.insert(session.id, cmd.to_string());
+                        }
+                        tile.tabs.push(Tab::new(session));
                     }
-                    tile.tabs.push(Tab::new(session));
                 }
                 tile.active = leaf.active.min(tile.tabs.len() - 1);
                 Node::Leaf(tile)
@@ -3216,7 +3438,7 @@ impl App {
             }
             if let Some((col, row)) = self.renderer.cell_at(&content, px, py)
                 && let Some(tab) = ws.root.find_tile(*id).and_then(|t| t.active_tab())
-                && let Some(url) = tab.session.link_at(col, row)
+                && let Some(url) = tab.session().and_then(|session| session.link_at(col, row))
             {
                 let _ = std::process::Command::new("open").arg(url).spawn();
                 return true;
@@ -3239,13 +3461,13 @@ impl App {
     /// The session backing a mouse-report location, if it still exists.
     fn loc_session(&self, loc: MouseLoc) -> Option<&Session> {
         match loc {
-            MouseLoc::Flyover => self.flyover_tabs.get(self.flyover_active).map(|t| &t.session),
-            MouseLoc::Tool => self.active_tool_session().map(|ts| &ts.tab.session),
+            MouseLoc::Flyover => self.flyover_tabs.get(self.flyover_active).and_then(Tab::session),
+            MouseLoc::Tool => self.active_tool_session().and_then(|ts| ts.tab.session()),
             MouseLoc::Tile(id) => self.workspaces[self.active]
                 .root
                 .find_tile(id)
                 .and_then(|t| t.active_tab())
-                .map(|t| &t.session),
+                .and_then(Tab::session),
         }
     }
 
@@ -3367,6 +3589,7 @@ impl App {
         self.confirm.is_some()
             || self.message.is_some()
             || self.save_ws.is_some()
+            || self.webview_prompt.is_some()
             || self.command.is_some()
     }
 
@@ -3405,6 +3628,7 @@ impl App {
         if self.confirm.is_some()
             || self.message.is_some()
             || self.save_ws.is_some()
+            || self.webview_prompt.is_some()
             || self.command.is_some()
         {
             // Every modal is an element tree now (modal_ui / save_ui /
@@ -3458,8 +3682,12 @@ impl App {
                     }
                     let content = workspace::flyover_content(&panel, scale);
                     if let Some((col, row)) = self.renderer.cell_at(&content, px, py) {
-                        if let Some(tab) = self.flyover_tabs.get(self.flyover_active) {
-                            tab.session.begin_selection(col, row);
+                        if let Some(session) = self
+                            .flyover_tabs
+                            .get(self.flyover_active)
+                            .and_then(Tab::session)
+                        {
+                            session.begin_selection(col, row);
                         }
                         self.drag = Drag::FlyoverSelect;
                     }
@@ -3572,8 +3800,9 @@ impl App {
             }
             if let Some((col, row)) = self.renderer.cell_at(&content, px, py)
                 && let Some(ts) = self.active_tool_session()
+                && let Some(session) = ts.tab.session()
             {
-                ts.tab.session.begin_selection(col, row);
+                session.begin_selection(col, row);
                 self.drag = Drag::ToolSelect;
             }
             self.request_redraw();
@@ -3638,10 +3867,11 @@ impl App {
                 if let Some((col, row)) = self.renderer.cell_at(&content, px, py) {
                     if let Some(tab) =
                         self.workspaces[self.active].root.find_tile(*id).and_then(|t| t.active_tab())
+                        && let Some(session) = tab.session()
                     {
-                        tab.session.begin_selection(col, row);
+                        session.begin_selection(col, row);
+                        self.drag = Drag::Select { tile: *id };
                     }
-                    self.drag = Drag::Select { tile: *id };
                 }
                 self.mark_visible_read();
                 self.request_redraw();
@@ -3737,8 +3967,12 @@ impl App {
                 let panel = self.flyover_rect_now();
                 let content = workspace::flyover_content(&panel, scale);
                 if let Some((col, row)) = self.renderer.cell_at(&content, px, py) {
-                    if let Some(tab) = self.flyover_tabs.get(self.flyover_active) {
-                        tab.session.update_selection(col, row);
+                    if let Some(session) = self
+                        .flyover_tabs
+                        .get(self.flyover_active)
+                        .and_then(Tab::session)
+                    {
+                        session.update_selection(col, row);
                         self.request_redraw();
                     }
                 }
@@ -3749,8 +3983,9 @@ impl App {
                 let content = workspace::tile_content(&self.tool_area(), scale);
                 if let Some((col, row)) = self.renderer.cell_at(&content, px, py)
                     && let Some(ts) = self.active_tool_session()
+                    && let Some(session) = ts.tab.session()
                 {
-                    ts.tab.session.update_selection(col, row);
+                    session.update_selection(col, row);
                     self.request_redraw();
                 }
             },
@@ -3765,8 +4000,9 @@ impl App {
                             .root
                             .find_tile(tile)
                             .and_then(|t| t.active_tab())
+                        && let Some(session) = tab.session()
                     {
-                        tab.session.update_selection(col, row);
+                        session.update_selection(col, row);
                         self.request_redraw();
                     }
                 }
@@ -3781,6 +4017,7 @@ impl App {
                 // on_mouse_down exactly via workspace::resize_hover_at.
                 let hover = if self.confirm.is_some()
                     || self.message.is_some()
+                    || self.webview_prompt.is_some()
                     || self.command.is_some()
                 {
                     None
@@ -3832,6 +4069,7 @@ impl App {
                 let link_hover = if self.page != Page::Sessions
                     || self.confirm.is_some()
                     || self.message.is_some()
+                    || self.webview_prompt.is_some()
                     || self.command.is_some()
                 {
                     None
@@ -3848,7 +4086,7 @@ impl App {
                         if let Some((col, row)) = self.renderer.cell_at(&content, px, py)
                             && let Some(tab) =
                                 ws.root.find_tile(*id).and_then(|t| t.active_tab())
-                            && tab.session.link_at(col, row).is_some()
+                            && tab.session().is_some_and(|session| session.link_at(col, row).is_some())
                         {
                             found = Some((*id, col, row));
                         }
@@ -3967,9 +4205,16 @@ impl App {
         if self.confirm.is_some()
             || self.message.is_some()
             || self.save_ws.is_some()
+            || self.webview_prompt.is_some()
             || self.command.is_some()
         {
             self.handle_picker_key(ev);
+            return;
+        }
+        // Browser chrome fields own plain typing and their Enter/Escape
+        // semantics; no keystroke from them should leak into a terminal.
+        if self.webview_input_focused(window, cx) {
+            self.handle_webview_input_key(ev, window, cx);
             return;
         }
         // Flyover panel: when open AND focused it owns the keyboard (except
@@ -4046,12 +4291,16 @@ impl App {
         }
         if let Some(bytes) = key_to_bytes(&ev.keystroke) {
             let ws = &self.workspaces[self.active];
-            if let Some(tab) = ws.focused().and_then(|t| t.active_tab()) {
-                tab.session.write(bytes);
+            if let Some(session) = ws
+                .focused()
+                .and_then(|tile| tile.active_tab())
+                .and_then(Tab::session)
+            {
+                session.write(bytes);
                 // Typing snaps back to the live bottom and drops any
                 // selection, like every other terminal.
-                tab.session.scroll_to_bottom();
-                tab.session.clear_selection();
+                session.scroll_to_bottom();
+                session.clear_selection();
             }
         }
     }
@@ -4079,6 +4328,15 @@ impl App {
         if let Some((_, dismissable)) = self.message.as_ref() {
             if *dismissable {
                 self.message = None;
+            }
+            self.request_redraw();
+            return;
+        }
+        if self.webview_prompt.is_some() {
+            match key {
+                "enter" => self.submit_new_webview_prompt(),
+                "escape" => self.webview_prompt = None,
+                _ => {},
             }
             self.request_redraw();
             return;
@@ -4384,9 +4642,13 @@ impl App {
         if self.page != Page::Sessions {
             return false;
         }
-        // Empty state: there is no pane to act on. New tab / new group start
-        // a group via the picker; everything else is a no-op.
+        // Empty state: terminal actions need a group, but a webview can fill
+        // the placeholder tile directly because it does not require a cwd.
         if self.is_empty_state() {
+            if action == Action::NewWebview {
+                self.open_new_webview_prompt();
+                return true;
+            }
             if matches!(action, Action::NewTab | Action::NewGroup) {
                 self.open_picker();
                 return true;
@@ -4397,6 +4659,7 @@ impl App {
             Action::SplitRight => self.split(Dir::Row),
             Action::SplitDown => self.split(Dir::Column),
             Action::NewTab => self.new_tab(),
+            Action::NewWebview => self.open_new_webview_prompt(),
             Action::NewGroup => self.open_picker(),
             Action::Copy => self.copy(),
             Action::Paste => self.paste(),
@@ -4675,18 +4938,19 @@ impl App {
             .flat_map(|ws| ws.root.tiles())
             .flat_map(|tile| tile.tabs.iter())
             .chain(self.flyover_tabs.iter())
-            .filter(|tab| {
+            .filter_map(Tab::session)
+            .filter(|session| {
                 // A pane with neither a pid nor a shpool session can never
                 // resolve (placeholder, or a spawn that failed), and would
                 // otherwise keep the fast sweep alive for the life of the app.
-                (tab.session.child_pid.is_some() || tab.session.shpool_session.is_some())
-                    && tab.session.needs_proc_title()
+                (session.child_pid.is_some() || session.shpool_session.is_some())
+                    && session.needs_proc_title()
                     && (renew
-                        || (!tab.session.has_proc_title()
-                            && tab.session.proc_title_misses() < PROC_TITLE_MISS_LIMIT))
+                        || (!session.has_proc_title()
+                            && session.proc_title_misses() < PROC_TITLE_MISS_LIMIT))
             })
-            .map(|tab| {
-                (tab.session.id, tab.session.shpool_session.clone(), tab.session.child_pid)
+            .map(|session| {
+                (session.id, session.shpool_session.clone(), session.child_pid)
             })
             .collect();
         if specs.is_empty() {
@@ -4731,10 +4995,13 @@ impl App {
                     }
                     if self.is_visible(id) {
                         let ws = &self.workspaces[self.active];
-                        if let Some(tab) = ws.focused().and_then(|t| t.active_tab())
-                            && tab.session.id == id
+                        if let Some(session) = ws
+                            .focused()
+                            .and_then(|tile| tile.active_tab())
+                            .and_then(Tab::session)
+                            && session.id == id
                         {
-                            let title = tab.session.title();
+                            let title = session.title();
                             if title != self.title {
                                 self.title = title;
                             }
@@ -4746,6 +5013,28 @@ impl App {
                     self.pending_primary_cmd.remove(&id);
                     self.remove_session(id);
                     redraw = true;
+                },
+                TermEvent::WebviewNavigated { id, url } => {
+                    if crate::bus::validate_webview_url(&url).is_ok()
+                        && self.set_webview_url(id, url)
+                    {
+                        self.persist_snapshot();
+                        redraw = true;
+                    }
+                },
+                TermEvent::WebviewFocused { id } => {
+                    let tile = self.workspaces[self.active].root.tiles().iter().find_map(|tile| {
+                        tile.active_tab()
+                            .is_some_and(|tab| tab.webview_id() == Some(id))
+                            .then_some(tile.id)
+                    });
+                    if let Some(tile) = tile
+                        && self.workspaces[self.active].focused_tile != tile
+                    {
+                        self.workspaces[self.active].focused_tile = tile;
+                        self.mark_visible_read();
+                        redraw = true;
+                    }
                 },
                 // The `ps` sweep came back: fill in the fallback names. Every
                 // surface reads `Session::title()`, so a redraw is all it takes
@@ -4976,13 +5265,22 @@ impl App {
 
     fn remove_session(&mut self, id: u64) {
         // A tool page's command ended: keep its last frame up (⏎ relaunches).
-        if let Some(ts) = self.tool_sessions.iter_mut().flatten().find(|ts| ts.tab.session.id == id) {
+        if let Some(ts) = self
+            .tool_sessions
+            .iter_mut()
+            .flatten()
+            .find(|ts| ts.tab.session().is_some_and(|session| session.id == id))
+        {
             ts.exited = true;
             return;
         }
         // Flyover shells live outside the workspace tree: drop the tab and
         // close the panel when the last one goes.
-        if let Some(ti) = self.flyover_tabs.iter().position(|tab| tab.session.id == id) {
+        if let Some(ti) = self
+            .flyover_tabs
+            .iter()
+            .position(|tab| tab.session().is_some_and(|session| session.id == id))
+        {
             self.flyover_tabs.remove(ti);
             if self.flyover_tabs.is_empty() {
                 self.flyover_open = false;
@@ -5000,7 +5298,7 @@ impl App {
                 ws.root.tiles().iter().find_map(|t| {
                     t.tabs
                         .iter()
-                        .position(|tab| tab.session.id == id)
+                        .position(|tab| tab.session().is_some_and(|session| session.id == id))
                         .map(|ti| (t.id, ti))
                 })
             };
@@ -5047,18 +5345,24 @@ impl App {
         for ws in &self.workspaces {
             for tile in ws.root.tiles() {
                 if let Some(tab) = tile.active_tab() {
-                    tab.session.begin_frame();
+                    if let Some(session) = tab.session() {
+                        session.begin_frame();
+                    }
                 }
             }
         }
         // Also call begin_frame on all flyover sessions every frame.
         for tab in &self.flyover_tabs {
-            tab.session.begin_frame();
+            if let Some(session) = tab.session() {
+                session.begin_frame();
+            }
         }
         // And the tool pages' terminals — they coalesce wakeups the same
         // way, so a skipped reset would freeze a tool after its first paint.
         for ts in self.tool_sessions.iter().flatten() {
-            ts.tab.session.begin_frame();
+            if let Some(session) = ts.tab.session() {
+                session.begin_frame();
+            }
         }
     }
 }
@@ -5081,7 +5385,17 @@ fn capture_profile_node(node: &Node) -> pwrspace::ProfileNode {
             tabs: tile
                 .tabs
                 .iter()
-                .map(|tab| pwrspace::ProfileTab { command: tab_command(tab) })
+                .map(|tab| match tab.url() {
+                    Some(url) => pwrspace::ProfileTab {
+                        kind: pwrspace::ProfileTabKind::Webview,
+                        command: None,
+                        url: Some(url.to_string()),
+                    },
+                    None => pwrspace::ProfileTab {
+                        command: tab_command(tab),
+                        ..Default::default()
+                    },
+                })
                 .collect(),
             active: tile.active,
         }),
@@ -5102,7 +5416,7 @@ fn capture_profile_node(node: &Node) -> pwrspace::ProfileNode {
 /// session shell instead (the pane's own child is just `shpool attach`).
 /// `None` — including every failure — saves the tab as a bare shell.
 fn tab_command(tab: &workspace::Tab) -> Option<String> {
-    let session = &tab.session;
+    let session = tab.session()?;
     let cmd = if let Some(name) = &session.shpool_session {
         term::shpool_foreground_command(name)
     } else {
@@ -5342,6 +5656,7 @@ impl Render for App {
         {
             window.focus(&self.focus_handle, cx);
         }
+        self.sync_webview_input_focus(window, cx);
 
         // A full-window canvas element that paints the terminal frame.
         let view = cx.entity();
@@ -5503,6 +5818,9 @@ impl Render for App {
             // Tile tab strips: pixels on the element tree, clipped per
             // strip; clicks and drags still resolve on the canvas rects.
             .child(self.render_tile_chrome(cx))
+            // Browser chrome sits in the strip reserved above each native
+            // child webview and remains GPUI-owned for consistent controls.
+            .child(self.render_webview_chrome(window, cx))
             // Flyover tab strip: same pixels-on-elements split (`flyover_ui`).
             .child(self.render_flyover_chrome(cx))
             .child(self.render_sidebar(cx))
@@ -5542,6 +5860,7 @@ impl Render for App {
             // Command palette and the pickers (element trees; see
             // `palette_ui` / `picker_ui`).
             .child(self.render_command(cx))
+            .child(self.render_new_webview_prompt(cx))
             // Save-as-workspace modal (element tree; see `save_ui`).
             .child(self.render_save(cx))
             // Modal overlays (confirm dialog, message panel): last, so they
@@ -5581,15 +5900,14 @@ impl App {
             self.sync_flyover_layout(true);
             self.sync_tool_layout(true);
         }
+        self.sync_webviews(window);
         self.begin_frame();
 
         // Cursor style must be set during paint (gpui asserts the phase). Sticky
         // resize_hover keeps the resize cursor for the whole drag, even when the
         // pointer strays off the handle. An overlay opened by keyboard while
         // hovering leaves resize_hover stale, so overlays suppress it here too.
-        let overlay_open = self.confirm.is_some()
-            || self.message.is_some()
-            || self.command.is_some();
+        let overlay_open = self.modal_overlay_open();
         let resize_hover = if overlay_open
             || !matches!(
                 self.drag,
@@ -5746,7 +6064,7 @@ impl App {
         // while one is on screen, and only re-blurred + re-uploaded when the
         // coarse picture changed. Overlays are element trees rendered before
         // this paint, so a fresh image asks for one more render to show up.
-        if self.open_tool.is_some() || self.flow_inset() > 0.0 || self.command.is_some() {
+        if self.open_tool.is_some() || self.flow_inset() > 0.0 || self.search_modal_open() {
             let ground = renderer::color(self.renderer.term_scheme_bg(), 1.0);
             let mut imp = backdrop::rasterize(
                 &frame,
@@ -6243,7 +6561,8 @@ impl FlyoverPopout {
         let app = self.app.read(cx);
         app.flyover_tabs
             .get(app.flyover_active)
-            .is_some_and(|t| t.session.app_grabs_mouse())
+            .and_then(Tab::session)
+            .is_some_and(Session::app_grabs_mouse)
     }
 
     /// Forward one button event to the popout's active terminal as a mouse
@@ -6256,8 +6575,12 @@ impl FlyoverPopout {
         let (col, row) = self.renderer.cell_at(&content, mx, my).unwrap_or((0, 0));
         let m = self.modifiers;
         self.app.update(cx, |app, _| {
-            if let Some(tab) = app.flyover_tabs.get(app.flyover_active) {
-                tab.session.forward_mouse(phase, btn, col, row, m.shift, m.alt, m.control);
+            if let Some(session) = app
+                .flyover_tabs
+                .get(app.flyover_active)
+                .and_then(Tab::session)
+            {
+                session.forward_mouse(phase, btn, col, row, m.shift, m.alt, m.control);
             }
         });
     }
@@ -6320,8 +6643,12 @@ impl FlyoverPopout {
         }
         if let Some((col, row)) = cell {
             self.app.update(cx, |app, _| {
-                if let Some(tab) = app.flyover_tabs.get(app.flyover_active) {
-                    tab.session.begin_selection(col, row);
+                if let Some(session) = app
+                    .flyover_tabs
+                    .get(app.flyover_active)
+                    .and_then(Tab::session)
+                {
+                    session.begin_selection(col, row);
                 }
                 app.request_redraw();
             });
@@ -6363,8 +6690,12 @@ impl FlyoverPopout {
         let content = workspace::flyover_content(&panel, scale);
         if let Some((col, row)) = self.renderer.cell_at(&content, mx, my) {
             self.app.update(cx, |app, _| {
-                if let Some(tab) = app.flyover_tabs.get(app.flyover_active) {
-                    tab.session.update_selection(col, row);
+                if let Some(session) = app
+                    .flyover_tabs
+                    .get(app.flyover_active)
+                    .and_then(Tab::session)
+                {
+                    session.update_selection(col, row);
                     app.request_redraw();
                 }
             });
@@ -6388,15 +6719,19 @@ impl FlyoverPopout {
         }
         let cell = self.renderer.cell_at(&content, mx, my);
         self.app.update(cx, |app, _| {
-            if let Some(tab) = app.flyover_tabs.get(app.flyover_active) {
+            if let Some(session) = app
+                .flyover_tabs
+                .get(app.flyover_active)
+                .and_then(Tab::session)
+            {
                 let up = steps > 0;
-                if tab.session.app_consumes_wheel() {
+                if session.app_consumes_wheel() {
                     let (col, row) = cell.unwrap_or((0, 0));
                     for _ in 0..steps.unsigned_abs() {
-                        tab.session.forward_wheel(up, col, row);
+                        session.forward_wheel(up, col, row);
                     }
                 } else {
-                    tab.session.scroll_by(steps * 3);
+                    session.scroll_by(steps * 3);
                 }
                 app.request_redraw();
             }
@@ -6443,7 +6778,9 @@ impl FlyoverPopout {
                 if (cols, rows) != (tab.cols, tab.rows) {
                     tab.cols = cols;
                     tab.rows = rows;
-                    tab.session.resize(cols, rows, cw, ch, dpi);
+                    if let Some(session) = tab.session() {
+                        session.resize(cols, rows, cw, ch, dpi);
+                    }
                 }
             }
             renderer.flyover_overlay(
@@ -6852,6 +7189,23 @@ fn main() {
                         proc_title_refreshed_at: std::time::Instant::now(),
                         next_session_id: 0,
                         next_tile_id: 0,
+                        next_webview_id: 0,
+                        webviews: webview::Manager::default(),
+                        webview_prompt: None,
+                        webview_address: cx.new(|cx| {
+                            let mut input = crate::ui::Input::new(cx);
+                            input.set_bare(true);
+                            input
+                        }),
+                        webview_address_for: None,
+                        webview_find: cx.new(|cx| {
+                            let mut input = crate::ui::Input::new(cx);
+                            input.set_bare(true);
+                            input.placeholder("Find in page…");
+                            input
+                        }),
+                        webview_find_for: None,
+                        webview_panel: None,
                         sidebar_expanded_w: workspace::SIDEBAR_DEFAULT_W,
                         sidebar_collapsed: false,
                         traffic_lights_for: None,
@@ -6947,6 +7301,10 @@ fn main() {
                                 // The palette's current stage takes the query.
                                 let changed = if let Some(p) = this.command.as_mut() {
                                     p.set_query(&text);
+                                    true
+                                } else if let Some(prompt) = this.webview_prompt.as_mut() {
+                                    prompt.query = text;
+                                    prompt.error = None;
                                     true
                                 } else {
                                     false

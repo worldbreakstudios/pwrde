@@ -66,6 +66,14 @@ pub struct SavedTab {
     pub cwd: Option<String>,
     pub unread: bool,
     pub unread_at: Option<i64>,
+    pub kind: SavedTabKind,
+    pub url: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SavedTabKind {
+    Terminal,
+    Webview,
 }
 
 /// Compose the DB path under `data_dir`, optionally scoped to a worktree slug.
@@ -117,7 +125,9 @@ fn open_db(path: &Path) -> SqlResult<Connection> {
             tab_index INTEGER NOT NULL,
             active INTEGER NOT NULL,
             shpool_session TEXT,
-            cwd TEXT
+            cwd TEXT,
+            content_kind TEXT NOT NULL DEFAULT 'terminal',
+            url TEXT
         )",
         [],
     )?;
@@ -130,6 +140,11 @@ fn open_db(path: &Path) -> SqlResult<Connection> {
     let _ = conn.execute("ALTER TABLE tabs ADD COLUMN unread INTEGER", []);
     // Migrate pre-attention DBs; duplicate-column errors are intentionally ignored.
     let _ = conn.execute("ALTER TABLE tabs ADD COLUMN unread_at INTEGER", []);
+    let _ = conn.execute(
+        "ALTER TABLE tabs ADD COLUMN content_kind TEXT NOT NULL DEFAULT 'terminal'",
+        [],
+    );
+    let _ = conn.execute("ALTER TABLE tabs ADD COLUMN url TEXT", []);
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS sections (
@@ -200,8 +215,8 @@ pub fn save_snapshot(
 
         for tab in &group.tabs {
             tx.execute(
-                "INSERT INTO tabs (group_id, tile_id, tab_index, active, shpool_session, cwd, unread, unread_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT INTO tabs (group_id, tile_id, tab_index, active, shpool_session, cwd, unread, unread_at, content_kind, url)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 (
                     group_id,
                     tab.tile_id,
@@ -211,6 +226,11 @@ pub fn save_snapshot(
                     &tab.cwd,
                     if tab.unread { 1 } else { 0 },
                     tab.unread_at,
+                    match tab.kind {
+                        SavedTabKind::Terminal => "terminal",
+                        SavedTabKind::Webview => "webview",
+                    },
+                    &tab.url,
                 ),
             )?;
         }
@@ -326,7 +346,7 @@ fn load_groups(conn: &Connection) -> Vec<SavedGroup> {
         };
 
         let mut tab_stmt = match conn.prepare(
-            "SELECT tile_id, tab_index, active, shpool_session, cwd, unread, unread_at
+            "SELECT tile_id, tab_index, active, shpool_session, cwd, unread, unread_at, content_kind, url
              FROM tabs WHERE group_id = ?1 ORDER BY tile_id, tab_index",
         ) {
             Ok(s) => s,
@@ -345,6 +365,11 @@ fn load_groups(conn: &Connection) -> Vec<SavedGroup> {
                 cwd: row.get(4)?,
                 unread: row.get::<_, Option<i64>>(5)?.map(|v| v != 0).unwrap_or(false),
                 unread_at: row.get::<_, Option<i64>>(6)?,
+                kind: match row.get::<_, Option<String>>(7)?.as_deref() {
+                    Some("webview") => SavedTabKind::Webview,
+                    _ => SavedTabKind::Terminal,
+                },
+                url: row.get(8)?,
             })
         }) {
             Ok(r) => r,
@@ -456,10 +481,15 @@ fn node_to_layout_rec(node: &crate::workspace::Node, tabs: &mut Vec<SavedTab>) -
                     tile_id: tile.id as usize,
                     tab_index,
                     active: tab_index == tile.active,
-                    shpool_session: tab.session.shpool_session.clone(),
+                    shpool_session: tab.session().and_then(|session| session.shpool_session.clone()),
                     cwd: None, // cwd is not tracked on Session; shpool will preserve it
                     unread: tab.unread,
                     unread_at: to_epoch_secs(tab.unread_at),
+                    kind: match tab.kind() {
+                        crate::workspace::TabKind::Terminal => SavedTabKind::Terminal,
+                        crate::workspace::TabKind::Webview => SavedTabKind::Webview,
+                    },
+                    url: tab.url().map(str::to_string),
                 });
             }
             LayoutNode::Leaf {
@@ -533,6 +563,8 @@ mod tests {
                 cwd: Some("/home/user".into()),
                 unread: false,
                 unread_at: None,
+                kind: SavedTabKind::Terminal,
+                url: None,
             }],
             section_id,
             pinned: false,
@@ -589,6 +621,8 @@ mod tests {
                         cwd: Some("/home/user".into()),
                         unread: false,
                         unread_at: None,
+                        kind: SavedTabKind::Terminal,
+                        url: None,
                     },
                     SavedTab {
                         tile_id: 1,
@@ -598,6 +632,8 @@ mod tests {
                         cwd: Some("/tmp".into()),
                         unread: false,
                         unread_at: None,
+                        kind: SavedTabKind::Terminal,
+                        url: None,
                     },
                     SavedTab {
                         tile_id: 2,
@@ -607,6 +643,8 @@ mod tests {
                         cwd: None,
                         unread: false,
                         unread_at: None,
+                        kind: SavedTabKind::Terminal,
+                        url: None,
                     },
                 ],
                 section_id: None,
@@ -626,6 +664,8 @@ mod tests {
                     cwd: Some("/var/log".into()),
                     unread: false,
                     unread_at: None,
+                    kind: SavedTabKind::Terminal,
+                    url: None,
                 }],
                 section_id: None,
                 pinned: false,
@@ -891,6 +931,8 @@ mod tests {
                     cwd: None,
                     unread: true,
                     unread_at: Some(1_700_000_000),
+                    kind: SavedTabKind::Terminal,
+                    url: None,
                 },
                 SavedTab {
                     tile_id: 1,
@@ -900,6 +942,8 @@ mod tests {
                     cwd: None,
                     unread: false,
                     unread_at: None,
+                    kind: SavedTabKind::Terminal,
+                    url: None,
                 },
             ],
             section_id: None,
@@ -928,6 +972,30 @@ mod tests {
         assert_eq!(from_epoch_secs(to_epoch_secs(Some(time))), Some(time));
         assert_eq!(to_epoch_secs(Some(UNIX_EPOCH - Duration::from_secs(1))), None);
         assert_eq!(from_epoch_secs(Some(-1)), None);
+    }
+
+    #[test]
+    fn webview_tab_roundtrips_kind_and_url() {
+        let path = temp_db("webview");
+        let mut group = sample_group(0, "web", None);
+        group.tabs.push(SavedTab {
+            tile_id: 1,
+            tab_index: 1,
+            active: true,
+            shpool_session: None,
+            cwd: None,
+            unread: false,
+            unread_at: None,
+            kind: SavedTabKind::Webview,
+            url: Some("https://example.com/docs".into()),
+        });
+        group.tabs[0].active = false;
+
+        save_snapshot(&[group], &[], &path).unwrap();
+        let (loaded, _) = load_snapshot(&path);
+        assert_eq!(loaded[0].tabs[1].kind, SavedTabKind::Webview);
+        assert_eq!(loaded[0].tabs[1].url.as_deref(), Some("https://example.com/docs"));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
@@ -985,6 +1053,8 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].tabs.len(), 1);
         assert!(!groups[0].tabs[0].unread, "pre-migration rows load as unread=false");
+        assert_eq!(groups[0].tabs[0].kind, SavedTabKind::Terminal);
+        assert!(groups[0].tabs[0].url.is_none());
         assert_eq!(
             groups[0].tabs[0].unread_at, None,
             "pre-migration rows have no attention stamp"

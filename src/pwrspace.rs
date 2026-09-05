@@ -1,8 +1,8 @@
 //! Workspace profiles: saved group layouts stored in `.pwrspace.json` files.
 //!
 //! A profile captures a split tree with ratios, per-tile tab strips, and
-//! per-tab commands. Profiles are offered when creating a new group so the
-//! user can restore a familiar layout instantly.
+//! per-tab terminal commands or webview URLs. Profiles are offered when
+//! creating a new group so the user can restore a familiar layout instantly.
 //!
 //! The file format mirrors `persist::LayoutNode`'s serde-untagged convention:
 //! leaves and splits are disambiguated by the presence of `"split"`.
@@ -38,12 +38,31 @@ pub struct WorkspaceProfile {
 
 /// One tab inside a leaf tile.
 ///
-/// An empty JSON object `{}` maps to `ProfileTab { command: None }` (bare shell).
+/// An empty JSON object `{}` maps to a bare terminal tab.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ProfileTab {
+    #[serde(default, skip_serializing_if = "ProfileTabKind::is_terminal")]
+    pub kind: ProfileTabKind,
     /// Command to run in the tab, if any. `None` means an interactive shell.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
+    /// URL loaded by a webview tab.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProfileTabKind {
+    #[default]
+    Terminal,
+    Webview,
+}
+
+impl ProfileTabKind {
+    fn is_terminal(&self) -> bool {
+        *self == Self::Terminal
+    }
 }
 
 /// A node in the profile layout tree — either a leaf tile or a binary split.
@@ -278,6 +297,23 @@ mod tests {
         assert_eq!(pf2.profiles[0].name, "agent-dev");
     }
 
+    #[test]
+    fn webview_tab_roundtrips_without_changing_legacy_terminal_shape() {
+        let tab = ProfileTab {
+            kind: ProfileTabKind::Webview,
+            command: None,
+            url: Some("https://example.com/docs".into()),
+        };
+        let json = serde_json::to_string(&tab).unwrap();
+        assert_eq!(json, r#"{"kind":"webview","url":"https://example.com/docs"}"#);
+        let restored: ProfileTab = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.kind, ProfileTabKind::Webview);
+        assert_eq!(restored.url.as_deref(), Some("https://example.com/docs"));
+
+        let bare = serde_json::to_string(&ProfileTab::default()).unwrap();
+        assert_eq!(bare, "{}");
+    }
+
     // -----------------------------------------------------------------------
     // load_profiles: missing / corrupt file
     // -----------------------------------------------------------------------
@@ -306,7 +342,10 @@ mod tests {
             name: name.to_string(),
             description: String::new(),
             layout: ProfileNode::Leaf(ProfileLeaf {
-                tabs: vec![ProfileTab { command: Some(cmd.to_string()) }],
+                tabs: vec![ProfileTab {
+                    command: Some(cmd.to_string()),
+                    ..Default::default()
+                }],
                 active: 0,
             }),
         }

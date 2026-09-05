@@ -694,6 +694,7 @@ pub fn action_group(action: Action) -> &'static str {
         Action::SplitRight
         | Action::SplitDown
         | Action::NewTab
+        | Action::NewWebview
         | Action::CloseTab
         | Action::ToggleCollapse
         | Action::ToggleFocusOthers => "Tiles",
@@ -737,6 +738,7 @@ pub fn action_glyph(action: Action) -> &'static str {
         Action::SplitRight => "◫",
         Action::SplitDown => "⬒",
         Action::NewTab => "＋",
+        Action::NewWebview => "◎",
         Action::CloseTab => "⌦",
         Action::ToggleCollapse => "⌃",
         Action::ToggleFocusOthers => "◎",
@@ -865,6 +867,14 @@ mod tests {
         palette.select(copy_row);
         assert_eq!(palette.enter(), Outcome::Run(Action::Copy));
         assert_eq!(palette.stage, Stage::Root);
+    }
+
+    #[test]
+    fn new_webview_is_a_searchable_one_shot_action() {
+        let mut palette = CommandPalette::root();
+        palette.set_query("webview");
+        assert_eq!(action_rows(&palette.root_rows), vec![Action::NewWebview]);
+        assert_eq!(palette.enter(), Outcome::Run(Action::NewWebview));
     }
 
     #[test]
@@ -1200,4 +1210,3 @@ mod tests {
         );
     }
 }
-

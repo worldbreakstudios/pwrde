@@ -710,7 +710,7 @@ impl Renderer {
                 let content = workspace::tile_content(rect, self.scale);
                 let origin = self.content_origin(&content);
                 if !collapsing
-                    && let Some(session) = tile.tabs.get(tile.active).map(|t| &t.session)
+                    && let Some(session) = tile.tabs.get(tile.active).and_then(|t| t.session())
                 {
                     let draw_cursor = Some(*id) == focused_tile && !chrome.element_modal;
                     let tile_hover = link_hover
@@ -929,7 +929,7 @@ impl Renderer {
             if !paint_strip {
                 continue;
             }
-            let title = tab.session.title();
+            let title = tab.title();
             let text = if title.is_empty() { "shell".to_string() } else { title };
             let mut text_left = tr.x + tab_text_pad;
             // Unread dot.
@@ -1028,10 +1028,10 @@ impl Renderer {
         quads.push(self.px_rect(&divider, pane_divider.0, pane_divider.1, 0.0));
 
         // Terminal content for the active tab.
-        if let Some(tab) = tabs.get(active) {
+        if let Some(session) = tabs.get(active).and_then(|tab| tab.session()) {
             let origin = self.content_origin(&content);
             let rows = self.snapshot_pane(
-                &tab.session,
+                session,
                 &term_palette,
                 origin,
                 draw_cursor && focused,
@@ -1040,7 +1040,7 @@ impl Renderer {
                 &mut fg_quads,
             );
             panes.push(PaneText { origin, rows });
-            self.selection_rects(&tab.session, origin, &mut fg_quads);
+            self.selection_rects(session, origin, &mut fg_quads);
         }
 
         (quads, panes, fg_quads, labels)
@@ -1099,8 +1099,16 @@ impl Renderer {
 
         let content = crate::workspace::tile_content(area, scale);
         let origin = self.content_origin(&content);
+        let Some(session) = tab.session() else {
+            return (
+                quads,
+                PaneText { origin, rows: Vec::new() },
+                fg_quads,
+                labels,
+            );
+        };
         let rows = self.snapshot_pane(
-            &tab.session,
+            session,
             &term_palette,
             origin,
             draw_cursor && !exited,
@@ -1108,7 +1116,7 @@ impl Renderer {
             &mut quads,
             &mut fg_quads,
         );
-        self.selection_rects(&tab.session, origin, &mut fg_quads);
+        self.selection_rects(session, origin, &mut fg_quads);
         (quads, PaneText { origin, rows }, fg_quads, labels)
     }
 
