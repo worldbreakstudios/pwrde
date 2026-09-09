@@ -26,6 +26,7 @@ mod command_ui;
 mod features;
 mod flow;
 mod flow_ui;
+mod folders_ui;
 mod flyover_ui;
 mod gh;
 mod git;
@@ -131,8 +132,6 @@ enum DropTarget {
     SidebarJoin { target: usize },
     /// Drop on the middle (or collapsed bottom) of a section header → append.
     SidebarAppend { section_id: u64 },
-    /// Move a dragged section block so it starts at top-level `dest_start`.
-    SectionMove { dest_start: usize },
 }
 
 impl DropTarget {
@@ -149,7 +148,6 @@ impl DropTarget {
                 | DropTarget::SidebarInsert { .. }
                 | DropTarget::SidebarJoin { .. }
                 | DropTarget::SidebarAppend { .. }
-                | DropTarget::SectionMove { .. }
         )
     }
 }
@@ -256,11 +254,6 @@ enum Drag {
     GroupPress { ws: usize, start: (f64, f64) },
     /// Dragging a sidebar workspace group tab.
     Group { ws: usize },
-    /// Section header pressed; may become a section drag. `click_count` is
-    /// preserved so mouse-up without a drag can still rename on double-click.
-    SectionPress { section_id: u64, start: (f64, f64), click_count: usize },
-    /// Dragging a whole section (header + contiguous member block).
-    Section { section_id: u64 },
 }
 
 /// Which pane a forwarded mouse report belongs to — a tile in the active
@@ -352,6 +345,8 @@ struct App {
     /// Whether the sidebar is collapsed (⌘S toggle). Session-only, like the
     /// width; layout treats the effective width 0 as the collapsed state.
     sidebar_collapsed: bool,
+    folders_open: bool,
+    folder_filter: Option<u64>,
     /// The spot the native traffic lights were last positioned for
     /// (`workspace::traffic_light_spot`); `render` re-syncs on change.
     traffic_lights_for: Option<workspace::TrafficLightSpot>,
@@ -436,7 +431,7 @@ struct App {
     /// accumulate into whole scroll steps instead of being lost.
     scroll_accum: f64,
     /// Registered CLI tool pages (see [`cli_tools`]), mirrored from settings
-    /// on each change so the dot strip and page cycling read one snapshot.
+    /// on each change so the folders card and page cycling read one snapshot.
     tools: Vec<cli_tools::CliTool>,
     /// One slot per registered tool: its terminal, spawned lazily on the
     /// first visit. Held outside the workspace tree, so never persisted and
@@ -450,11 +445,6 @@ struct App {
     section: Section,
     /// Keyboard-page row currently capturing a new binding, if any.
     recording: Option<Action>,
-    /// Dot↔glyph crossfade progress per page slot (0..1), advanced each tick
-    /// toward 1 for the hovered/active slot and 0 otherwise.
-    dot_anim: Vec<f32>,
-    /// Page slot currently under the pointer.
-    dot_hover: Option<usize>,
     /// Resize handle currently under the pointer (sidebar edge or tile divider).
     /// Drives the cursor style and hover highlight; sticky for the drag duration.
     resize_hover: Option<workspace::ResizeHover>,
@@ -538,17 +528,47 @@ impl App {
         self.renderer.scale
     }
 
-    /// Effective sidebar width for layout/hit-testing: 0 while collapsed
-    /// (`workspace` geometry treats 0 as collapsed), else the user's width.
+    /// Effective sidebar-region width for layout/hit-testing: 0 while
+    /// collapsed (`workspace` geometry treats 0 as collapsed), else the
+    /// sessions list plus the folders column — see
+    /// `workspace::sidebar_region_w`; the list itself is only the inner
+    /// column ([`App::sessions_list`]).
     fn sidebar_w(&self) -> f32 {
-        if self.sidebar_collapsed { 0.0 } else { self.sidebar_expanded_w }
+        if self.sidebar_collapsed {
+            0.0
+        } else {
+            workspace::sidebar_region_w(self.sidebar_expanded_w, self.folders_visible())
+        }
     }
 
-    /// Whether the current page paints the Messages-style preview cards, which
-    /// are taller than the one-line rows every other page uses. Drawing and
-    /// hit-testing both go through this so they can't drift apart.
+    /// Whether the folders card is showing: the user's toggle, except on the
+    /// Settings page, whose sidebar is its own section list and has no
+    /// folders to filter.
+    pub(crate) fn folders_visible(&self) -> bool {
+        self.folders_open && self.page != Page::Settings
+    }
+
+    /// The sessions list rect (physical px at `scale`) every row helper takes.
+    pub(crate) fn sessions_list(&self, scale: f32) -> workspace::LayoutRect {
+        let (_, h) = self.renderer.surface_size();
+        workspace::sessions_list_rect(self.sidebar_expanded_w, self.folders_visible(), h, scale)
+    }
+
+    /// The flat session rows the list paints and hit-tests: the active folder
+    /// filter applied to the non-pinned groups, and nothing on the Settings
+    /// page (its sidebar holds section tabs, not groups).
+    pub(crate) fn sidebar_rows(&self) -> Vec<workspace::SidebarRow> {
+        if self.page == Page::Settings {
+            return Vec::new();
+        }
+        workspace::sidebar_rows_filtered(&self.workspaces, &self.sections, self.folder_filter)
+    }
+
+    /// Whether the current page paints the session rows (every page but
+    /// Settings, whose sidebar is its section list). Drawing and hit-testing
+    /// both go through this so they can't drift apart.
     fn card_rows(&self) -> bool {
-        self.page == Page::Sessions
+        self.page != Page::Settings
     }
 
     /// The active group's cwd (or the process cwd when the group inherits it),
@@ -749,7 +769,7 @@ impl App {
             || self.modal_overlay_open()
             || (self.flyover_anim > 0.0 && !self.flyover_windowed)
             || self.flow.open
-            || matches!(self.drag, Drag::Tab { .. } | Drag::Group { .. } | Drag::Section { .. });
+            || matches!(self.drag, Drag::Tab { .. } | Drag::Group { .. });
         let mut placements = Vec::new();
         let mut focus = None;
         if !obscured {
@@ -879,6 +899,18 @@ impl App {
         }
         self.active = 0;
         workspace::normalize_section_anchors(&self.workspaces, &mut self.sections);
+        // Load the saved folder filter (absent = all sessions), then drop
+        // it if the restored sections no longer contain that id — a stale
+        // filter would otherwise show a permanently empty list.
+        if self.folder_filter.is_none() {
+            self.folder_filter = settings::get_str("sidebar.folder").and_then(|s| s.parse::<u64>().ok());
+        }
+        if self
+            .folder_filter
+            .is_some_and(|id| !self.sections.iter().any(|s| s.id == id))
+        {
+            self.folder_filter = None;
+        }
         true
     }
 
@@ -1175,12 +1207,11 @@ impl App {
     }
 
     /// Re-read the registered tools after a settings change, keeping the
-    /// session slots and the dot-strip animation aligned with the list.
+    /// session slots aligned with the list.
     fn reload_tools(&mut self) {
         self.tools = cli_tools::tools();
         let n = self.tools.len();
         self.tool_sessions.resize_with(n, || None);
-        self.dot_anim.resize(Page::all(n).len(), 0.0);
         if let Page::Tool(i) = self.page
             && i >= n
         {
@@ -1371,16 +1402,43 @@ impl App {
         self.request_redraw();
     }
 
-    /// A press on a section header: the delete chip (when the header isn't
-    /// being renamed) deletes; anything else arms a section press whose
-    /// click / double-click / drag resolve on mouse-up and move.
-    pub(crate) fn press_section_header(&mut self, section_id: u64, delete: bool, click_count: usize) {
+    /// A press on a folder row in the folders card: the delete chip (when the
+    /// row isn't being renamed) deletes; a double-click opens the inline
+    /// rename; any click selects the folder as the list's filter.
+    pub(crate) fn press_folder_row(&mut self, section_id: u64, delete: bool, click_count: usize) {
         let editing_this = self.editing_section.as_ref().is_some_and(|(id, _)| *id == section_id);
         if delete && !editing_this {
             self.delete_section(section_id);
             return;
         }
-        self.drag = Drag::SectionPress { section_id, start: self.cursor, click_count };
+        let Some(sec) = self.sections.iter().find(|s| s.id == section_id) else { return };
+        if click_count >= 2 {
+            let buf = if sec.emoji.is_empty() {
+                sec.name.clone()
+            } else {
+                format!("{} {}", sec.emoji, sec.name)
+            };
+            self.editing_section = Some((section_id, buf));
+        }
+        self.set_folder_filter(Some(section_id));
+    }
+
+    /// Select which folder the sessions list shows (`None` = All sessions)
+    /// and remember it under `sidebar.folder`. A Tool page hops back to
+    /// Sessions so the filtered list is what the user is looking at.
+    pub(crate) fn set_folder_filter(&mut self, filter: Option<u64>) {
+        if filter.is_some_and(|id| !self.sections.iter().any(|s| s.id == id)) {
+            return;
+        }
+        self.folder_filter = filter;
+        match filter {
+            Some(id) => crate::settings::set("sidebar.folder", serde_json::Value::String(id.to_string())),
+            None => crate::settings::set("sidebar.folder", serde_json::Value::Null),
+        }
+        if let Page::Tool(_) = self.page {
+            self.set_page(Page::Sessions);
+        }
+        self.request_redraw();
     }
 
     /// A press on a group card arms a group press; the click fires on
@@ -1599,6 +1657,14 @@ impl App {
     /// Delete a sidebar section, keeping its groups: members are ungrouped
     /// (they stay as top-level groups), then the section entry is removed.
     /// Nothing is closed — this only undoes the grouping.
+    /// ⌥⌘S / palette: show or hide the folders card beside the sessions
+    /// list. Persisted under `sidebar.folders` like the collapse flag.
+    fn toggle_folders(&mut self) {
+        self.folders_open = !self.folders_open;
+        crate::settings::set("sidebar.folders", self.folders_open.into());
+        self.request_redraw();
+    }
+
     fn delete_section(&mut self, section_id: u64) {
         if !workspace::delete_section(
             &mut self.sections,
@@ -1613,6 +1679,10 @@ impl App {
             .is_some_and(|(id, _)| *id == section_id)
         {
             self.editing_section = None;
+        }
+        // Dropping a folder clears an active filter on it.
+        if self.folder_filter == Some(section_id) {
+            self.folder_filter = None;
         }
         self.request_redraw();
         self.persist_snapshot();
@@ -2050,31 +2120,28 @@ impl App {
         let (_, h) = self.renderer.surface_size();
 
         if workspace::sidebar(h, scale, self.sidebar_w()).contains(px, py) {
-            let rows = workspace::sidebar_rows(&self.workspaces, &self.sections);
+            let rows = self.sidebar_rows();
             for (ri, row) in rows.iter().enumerate() {
                 let rect = workspace::sidebar_row_rect(
                     &rows,
                     ri,
                     &self.workspaces,
                     scale,
-                    self.sidebar_w(),
-                    self.card_rows(),
+                    &self.sessions_list(scale),
                 );
                 if !rect.contains(px, py) {
                     continue;
                 }
-                if let workspace::SidebarRow::Group { ws_idx } = *row {
-                    let ws = &mut self.workspaces[ws_idx];
-                    let primary = ws.primary_tile;
-                    if let Some(tab) =
-                        ws.root.find_tile_mut(primary).and_then(|t| t.active_tab_mut())
-                        && !tab.unread
-                    {
-                        tab.unread = true;
-                        tab.unread_at = Some(SystemTime::now());
-                        self.persist_snapshot();
-                        self.request_redraw();
-                    }
+                let workspace::SidebarRow { ws_idx } = *row;
+                let ws = &mut self.workspaces[ws_idx];
+                let primary = ws.primary_tile;
+                if let Some(tab) = ws.root.find_tile_mut(primary).and_then(|t| t.active_tab_mut())
+                    && !tab.unread
+                {
+                    tab.unread = true;
+                    tab.unread_at = Some(SystemTime::now());
+                    self.persist_snapshot();
+                    self.request_redraw();
                 }
                 return;
             }
@@ -2775,34 +2842,23 @@ impl App {
             return Some(DropTarget::Center { tile: *id });
         }
         // Terminal-tab → sidebar group: hit-test via the shared row list.
-        // Section headers of collapsed sections target the section's first
-        // member when one exists; empty headers are ignored.
         let (_, h) = self.renderer.surface_size();
         if workspace::sidebar(h, scale, self.sidebar_w()).contains(px, py) {
-            let rows = workspace::sidebar_rows(&self.workspaces, &self.sections);
+            let rows = self.sidebar_rows();
             for (ri, row) in rows.iter().enumerate() {
                 let rect = workspace::sidebar_row_rect(
                     &rows,
                     ri,
                     &self.workspaces,
                     scale,
-                    self.sidebar_w(),
-                    self.card_rows(),
+                    &self.sessions_list(scale),
                 );
                 if !rect.contains(px, py) {
                     continue;
                 }
                 match *row {
-                    workspace::SidebarRow::Group { ws_idx } => {
+                    workspace::SidebarRow { ws_idx } => {
                         return Some(DropTarget::Group { ws: ws_idx });
-                    },
-                    workspace::SidebarRow::SectionHeader { section_idx } => {
-                        let sid = self.sections[section_idx].id;
-                        if let Some((start, _)) =
-                            workspace::section_member_range(&self.workspaces, sid)
-                        {
-                            return Some(DropTarget::Group { ws: start });
-                        }
                     },
                 }
             }
@@ -2818,7 +2874,31 @@ impl App {
         if !workspace::sidebar(h, scale, self.sidebar_w()).contains(px, py) {
             return None;
         }
-        let rows = workspace::sidebar_rows(&self.workspaces, &self.sections);
+        // Folder rows in the folders card: drop into that folder ("All
+        // sessions" drops the group out of every folder, at the end).
+        if self.folders_visible() {
+            let card = workspace::folders_card_rect(h, scale);
+            if card.contains(px, py) {
+                let rows = workspace::folder_rows(self.tools.len(), self.sections.len());
+                for (i, row) in rows.iter().enumerate() {
+                    if !workspace::folder_row_rect(&card, &rows, i, scale).contains(px, py) {
+                        continue;
+                    }
+                    return match *row {
+                        workspace::FolderRow::Section(si) => {
+                            Some(DropTarget::SidebarAppend { section_id: self.sections[si].id })
+                        },
+                        workspace::FolderRow::AllSessions => Some(DropTarget::SidebarInsert {
+                            before: self.workspaces.len(),
+                            section: None,
+                        }),
+                        _ => None,
+                    };
+                }
+                return None;
+            }
+        }
+        let rows = self.sidebar_rows();
         if rows.is_empty() {
             return Some(DropTarget::SidebarInsert { before: 0, section: None });
         }
@@ -2829,8 +2909,7 @@ impl App {
                 ri,
                 &self.workspaces,
                 scale,
-                self.sidebar_w(),
-                self.card_rows(),
+                &self.sessions_list(scale),
             );
             // Full sidebar x-span for the row's y band (indented members still hit).
             let side = workspace::sidebar(h, scale, self.sidebar_w());
@@ -2850,7 +2929,7 @@ impl App {
             }
             let rel = (py - hit.y) / hit.h.max(1.0);
             match *row {
-                workspace::SidebarRow::Group { ws_idx } => {
+                workspace::SidebarRow { ws_idx } => {
                     if rel < EDGE {
                         return Some(self.sidebar_insert_at(ws_idx, false));
                     }
@@ -2858,26 +2937,6 @@ impl App {
                         return Some(self.sidebar_insert_at(ws_idx + 1, true));
                     }
                     return Some(DropTarget::SidebarJoin { target: ws_idx });
-                },
-                workspace::SidebarRow::SectionHeader { section_idx } => {
-                    let sid = self.sections[section_idx].id;
-                    let range = workspace::section_member_range(&self.workspaces, sid);
-                    if rel < EDGE {
-                        let before = range.map(|(s, _)| s).unwrap_or(self.workspaces.len());
-                        return Some(DropTarget::SidebarInsert { before, section: None });
-                    }
-                    if rel > 1.0 - EDGE {
-                        match range {
-                            Some((start, _)) if !self.sections[section_idx].collapsed => {
-                                return Some(DropTarget::SidebarInsert {
-                                    before: start,
-                                    section: Some(sid),
-                                });
-                            },
-                            _ => return Some(DropTarget::SidebarAppend { section_id: sid }),
-                        }
-                    }
-                    return Some(DropTarget::SidebarAppend { section_id: sid });
                 },
             }
         }
@@ -2888,8 +2947,7 @@ impl App {
                 last,
                 &self.workspaces,
                 scale,
-                self.sidebar_w(),
-                self.card_rows(),
+                &self.sessions_list(scale),
             );
             if py >= rect.y + rect.h {
                 return Some(DropTarget::SidebarInsert {
@@ -2919,101 +2977,6 @@ impl App {
         DropTarget::SidebarInsert { before, section }
     }
 
-    /// Resolve a section-header drag to a top-level insertion point.
-    fn resolve_section_drop(&self, px: f32, py: f32, section_id: u64) -> Option<DropTarget> {
-        let scale = self.scale();
-        let (_, h) = self.renderer.surface_size();
-        if !workspace::sidebar(h, scale, self.sidebar_w()).contains(px, py) {
-            return None;
-        }
-        let rows = workspace::sidebar_rows(&self.workspaces, &self.sections);
-        // Empty sections have no member block, so they fall through to the same
-        // top-level gap logic as populated ones: the resulting `dest_start` is
-        // mapped to an anchor (following group) in `apply_section_drop`.
-        const EDGE: f32 = 0.4;
-        // Top-level gaps: edges of ungrouped groups + section headers (not
-        // interiors of foreign member runs).
-        for (ri, row) in rows.iter().enumerate() {
-            let rect = workspace::sidebar_row_rect(
-                &rows,
-                ri,
-                &self.workspaces,
-                scale,
-                self.sidebar_w(),
-                self.card_rows(),
-            );
-            let side = workspace::sidebar(h, scale, self.sidebar_w());
-            if py < rect.y || py >= rect.y + rect.h {
-                if ri == 0 && py < rect.y {
-                    return Some(DropTarget::SectionMove { dest_start: 0 });
-                }
-                continue;
-            }
-            if px < side.x || px > side.x + side.w {
-                continue;
-            }
-            let rel = (py - rect.y) / rect.h.max(1.0);
-            match *row {
-                workspace::SidebarRow::Group { ws_idx } => {
-                    // Only ungrouped rows are top-level drop targets.
-                    if self.workspaces[ws_idx].section.is_some() {
-                        // Snap to the boundary of this foreign section.
-                        if let Some(sid) = self.workspaces[ws_idx].section {
-                            if sid == section_id {
-                                return None; // over own members
-                            }
-                            if let Some((start, end)) =
-                                workspace::section_member_range(&self.workspaces, sid)
-                            {
-                                let dest = if rel < 0.5 { start } else { end };
-                                return Some(DropTarget::SectionMove { dest_start: dest });
-                            }
-                        }
-                        continue;
-                    }
-                    let dest = if rel < 0.5 { ws_idx } else { ws_idx + 1 };
-                    return Some(DropTarget::SectionMove { dest_start: dest });
-                },
-                workspace::SidebarRow::SectionHeader { section_idx } => {
-                    let sid = self.sections[section_idx].id;
-                    if sid == section_id {
-                        return None;
-                    }
-                    let range = workspace::section_member_range(&self.workspaces, sid);
-                    match range {
-                        Some((start, end)) => {
-                            let dest = if rel < EDGE { start } else { end };
-                            return Some(DropTarget::SectionMove { dest_start: dest });
-                        },
-                        None => {
-                            // Empty header at end — place block before trailing empties
-                            // (i.e. at end of workspaces).
-                            return Some(DropTarget::SectionMove {
-                                dest_start: self.workspaces.len(),
-                            });
-                        },
-                    }
-                },
-            }
-        }
-        if let Some(last) = rows.len().checked_sub(1) {
-            let rect = workspace::sidebar_row_rect(
-                &rows,
-                last,
-                &self.workspaces,
-                scale,
-                self.sidebar_w(),
-                self.card_rows(),
-            );
-            if py >= rect.y + rect.h {
-                return Some(DropTarget::SectionMove {
-                    dest_start: self.workspaces.len(),
-                });
-            }
-        }
-        None
-    }
-
     /// The landing zone the pointer is over right now, if a drag is live.
     ///
     /// The canvas hint and the sidebar's own element-tree feedback both read
@@ -3027,7 +2990,6 @@ impl App {
         match self.drag {
             Drag::Tab { tile, .. } => self.resolve_drop(x, y, tile),
             Drag::Group { .. } => self.resolve_sidebar_group_drop(x, y),
-            Drag::Section { section_id } => self.resolve_section_drop(x, y, section_id),
             _ => None,
         }
     }
@@ -3040,69 +3002,57 @@ impl App {
     /// the tile arms read `self.area()`, which is physical — so element-tree
     /// callers must keep to [`DropTarget::in_sidebar`] targets.
     fn drop_hint(&self, target: DropTarget, scale: f32) -> Option<workspace::LayoutRect> {
-        let rows = workspace::sidebar_rows(&self.workspaces, &self.sections);
+        let rows = self.sidebar_rows();
         let line_h = (2.0 * scale).max(1.0);
         match target {
             DropTarget::Group { ws } => {
                 // Find the group row rect via the shared list.
                 for (ri, row) in rows.iter().enumerate() {
-                    if let workspace::SidebarRow::Group { ws_idx } = *row {
-                        if ws_idx == ws {
-                            return Some(workspace::sidebar_row_rect(
-                                &rows,
-                                ri,
-                                &self.workspaces,
-                                scale,
-                                self.sidebar_w(),
-                                self.card_rows(),
-                            ));
-                        }
+                    let workspace::SidebarRow { ws_idx } = *row;
+                    if ws_idx == ws {
+                        return Some(workspace::sidebar_row_rect(
+                            &rows,
+                            ri,
+                            &self.workspaces,
+                            scale,
+                            &self.sessions_list(scale),
+                        ));
                     }
                 }
-                Some(workspace::tab_rect(ws, scale, self.sidebar_w()))
+                Some(workspace::tab_rect(ws, scale, &self.sessions_list(scale)))
             },
             DropTarget::SidebarJoin { target } => {
                 for (ri, row) in rows.iter().enumerate() {
-                    if let workspace::SidebarRow::Group { ws_idx } = *row {
-                        if ws_idx == target {
-                            return Some(workspace::sidebar_row_rect(
-                                &rows,
-                                ri,
-                                &self.workspaces,
-                                scale,
-                                self.sidebar_w(),
-                                self.card_rows(),
-                            ));
-                        }
+                    let workspace::SidebarRow { ws_idx } = *row;
+                    if ws_idx == target {
+                        return Some(workspace::sidebar_row_rect(
+                            &rows,
+                            ri,
+                            &self.workspaces,
+                            scale,
+                            &self.sessions_list(scale),
+                        ));
                     }
                 }
                 None
             },
             DropTarget::SidebarAppend { section_id } => {
-                let section_idx = self.sections.iter().position(|s| s.id == section_id)?;
-                for (ri, row) in rows.iter().enumerate() {
-                    if let workspace::SidebarRow::SectionHeader { section_idx: si } = *row {
-                        if si == section_idx {
-                            return Some(workspace::sidebar_row_rect(
-                                &rows,
-                                ri,
-                                &self.workspaces,
-                                scale,
-                                self.sidebar_w(),
-                                self.card_rows(),
-                            ));
-                        }
-                    }
+                // Highlight the folder's row in the folders card.
+                if !self.folders_visible() {
+                    return None;
                 }
-                None
+                let section_idx = self.sections.iter().position(|s| s.id == section_id)?;
+                let (_, h) = self.renderer.surface_size();
+                let card = workspace::folders_card_rect(h, scale);
+                let rows = workspace::folder_rows(self.tools.len(), self.sections.len());
+                let index = rows
+                    .iter()
+                    .position(|r| *r == workspace::FolderRow::Section(section_idx))?;
+                Some(workspace::folder_row_rect(&card, &rows, index, scale))
             },
             DropTarget::SidebarInsert { before, .. } => {
                 // Thin insertion line at the gap before `before`.
                 let y = self.sidebar_gap_y(before, &rows, scale);
-                Some(self.sidebar_insert_line(y, &rows, scale, line_h))
-            },
-            DropTarget::SectionMove { dest_start } => {
-                let y = self.sidebar_gap_y(dest_start, &rows, scale);
                 Some(self.sidebar_insert_line(y, &rows, scale, line_h))
             },
             DropTarget::TabBar { tile, .. }
@@ -3168,24 +3118,11 @@ impl App {
                 ri,
                 &self.workspaces,
                 scale,
-                self.sidebar_w(),
-                self.card_rows(),
+                &self.sessions_list(scale),
             );
             match *row {
-                workspace::SidebarRow::Group { ws_idx } if ws_idx >= before => {
+                workspace::SidebarRow { ws_idx } if ws_idx >= before => {
                     return rect.y;
-                },
-                workspace::SidebarRow::SectionHeader { section_idx } => {
-                    let sid = self.sections[section_idx].id;
-                    if let Some((start, _)) =
-                        workspace::section_member_range(&self.workspaces, sid)
-                    {
-                        if start >= before {
-                            return rect.y;
-                        }
-                    } else if before >= self.workspaces.len() {
-                        return rect.y;
-                    }
                 },
                 _ => {},
             }
@@ -3196,14 +3133,13 @@ impl App {
                 last,
                 &self.workspaces,
                 scale,
-                self.sidebar_w(),
-                self.card_rows(),
+                &self.sessions_list(scale),
             );
             return rect.y + rect.h;
         }
-        // Empty sidebar: below the button row.
-        let btn = workspace::new_group_button(scale, self.sidebar_w());
-        btn.y + btn.h + (6.0 * scale).round()
+        // Empty list: just below its header.
+        let list = self.sessions_list(scale);
+        list.y + (workspace::SESSIONS_HEADER_H * scale).round() + (6.0 * scale).round()
     }
 
     /// Thin horizontal insertion-line rect centered on gap `y`, spanning the
@@ -3224,8 +3160,7 @@ impl App {
                 ri,
                 &self.workspaces,
                 scale,
-                self.sidebar_w(),
-                self.card_rows(),
+                &self.sessions_list(scale),
             );
             x = if ri == 0 { r.x } else { x.min(r.x) };
         }
@@ -3250,8 +3185,7 @@ impl App {
             // Terminal-tab drops only land on tile/group targets.
             DropTarget::SidebarInsert { .. }
             | DropTarget::SidebarJoin { .. }
-            | DropTarget::SidebarAppend { .. }
-            | DropTarget::SectionMove { .. } => return,
+            | DropTarget::SidebarAppend { .. } => return,
             _ => {},
         }
 
@@ -3352,49 +3286,6 @@ impl App {
             &mut self.sections,
             self.active,
         );
-        self.sync_layout();
-        self.request_redraw();
-        self.persist_snapshot();
-    }
-
-    /// Apply a section-header drag landing on `target`.
-    fn apply_section_drop(&mut self, section_id: u64, target: DropTarget) {
-        match target {
-            DropTarget::SectionMove { dest_start } => {
-                if workspace::section_member_range(&self.workspaces, section_id).is_none() {
-                    // Empty section: nothing to relocate — just re-anchor it to
-                    // the group at `dest_start` (None = trailing end).
-                    let anchor = self.workspaces.get(dest_start).map(|w| w.primary_tile);
-                    if let Some(sec) =
-                        self.sections.iter_mut().find(|s| s.id == section_id)
-                    {
-                        sec.anchor = anchor;
-                    }
-                } else {
-                    // Track the active workspace across the block move by its
-                    // primary tile (unique per group), not by index.
-                    let active_tile =
-                        self.workspaces.get(self.active).map(|w| w.primary_tile);
-                    if workspace::relocate_section_block(
-                        &mut self.workspaces,
-                        section_id,
-                        dest_start,
-                    )
-                    .is_some()
-                    {
-                        if let Some(tile) = active_tile
-                            && let Some(i) = self
-                                .workspaces
-                                .iter()
-                                .position(|w| w.primary_tile == tile)
-                        {
-                            self.active = i;
-                        }
-                    }
-                }
-            },
-            _ => return,
-        }
         self.sync_layout();
         self.request_redraw();
         self.persist_snapshot();
@@ -3703,14 +3594,11 @@ impl App {
 
         // Sidebar: titlebar strip = traffic lights + window drag handle.
         if sidebar.contains(px, py) {
-            // The header chips ("＋" makes a group, "⇤" folds the sidebar)
-            // are element click targets that occlude the canvas
-            // (`sidebar_ui::header_chips`), so a press that reaches here is
-            // never on one of them. (Sections are made by dragging one group
-            // onto another, not by a button.)
-            // Page-dot strip at the sidebar's bottom: the slots are element
-            // click targets now (`sidebar_ui::page_dot_layer`), which occlude
-            // the canvas, so nothing to resolve here.
+            // The header chips (show folders / focus terminals / "＋" /
+            // gear) and the whole folders card are element click targets
+            // that occlude the canvas (`sidebar_ui::sessions_header`,
+            // `folders_ui`), so a press that reaches here is never on one of
+            // them.
             if self.page == Page::Settings {
                 // The search field and the section rows are element click
                 // targets now (`sidebar_ui::settings_row_layer`), occluding
@@ -3842,8 +3730,11 @@ impl App {
 
         match &self.drag {
             Drag::Sidebar => {
+                // The grab band rides the region's right edge; the pointer x
+                // is the region width, so take the folders column back off
+                // before it becomes the sessions-list width.
                 self.sidebar_expanded_w =
-                    (px / scale).clamp(workspace::SIDEBAR_MIN_W, workspace::SIDEBAR_MAX_W);
+                    workspace::sessions_w_for_pointer(px / scale, self.folders_open);
                 self.sync_layout();
                 self.request_redraw();
             },
@@ -3878,14 +3769,6 @@ impl App {
                 }
             },
             Drag::Group { .. } => self.request_redraw(),
-            Drag::SectionPress { section_id, start, .. } => {
-                let (sx, sy) = *start;
-                if (self.cursor.0 - sx).abs() + (self.cursor.1 - sy).abs() > DRAG_THRESHOLD {
-                    self.drag = Drag::Section { section_id: *section_id };
-                    self.request_redraw();
-                }
-            },
-            Drag::Section { .. } => self.request_redraw(),
             Drag::FlyoverResize => {
                 // Top edge follows the pointer; PTYs resize on release.
                 let (_, h) = self.renderer.surface_size();
@@ -3944,9 +3827,6 @@ impl App {
                 let _ = area;
             },
             Drag::None => {
-                // Page-dot hover: the crossfade animation is driven by the
-                // 16ms tick in drain_events; here we only track the target.
-                self.dot_hover = self.page_slot_at(px, py);
                 // Resize-handle hover: suppress while any overlay is open so the
                 // cursor/highlight don't fight the modal. Hit-test matches
                 // on_mouse_down exactly via workspace::resize_hover_at.
@@ -4058,6 +3938,9 @@ impl App {
             },
             // Sidebar group click (no drag): activate the workspace.
             Drag::GroupPress { ws, .. } => {
+                if let Page::Tool(_) = self.page {
+                    self.set_page(Page::Sessions);
+                }
                 self.switch_workspace(ws);
             },
             // Sidebar group drag: resolve against the shared row list.
@@ -4065,39 +3948,6 @@ impl App {
                 let (px, py) = (self.cursor.0 as f32, self.cursor.1 as f32);
                 if let Some(target) = self.resolve_sidebar_group_drop(px, py) {
                     self.apply_sidebar_group_drop(ws, target);
-                }
-                self.request_redraw();
-            },
-            // Section header click (no drag): rename on double-click, else toggle.
-            Drag::SectionPress { section_id, click_count, .. } => {
-                if let Some(section_idx) =
-                    self.sections.iter().position(|s| s.id == section_id)
-                {
-                    if click_count >= 2 {
-                        // The double-click's first click already toggled
-                        // collapse below; undo it before opening the editor.
-                        self.sections[section_idx].collapsed =
-                            !self.sections[section_idx].collapsed;
-                        let sec = &self.sections[section_idx];
-                        let buf = if sec.emoji.is_empty() {
-                            sec.name.clone()
-                        } else {
-                            format!("{} {}", sec.emoji, sec.name)
-                        };
-                        self.editing_section = Some((sec.id, buf));
-                    } else {
-                        self.sections[section_idx].collapsed =
-                            !self.sections[section_idx].collapsed;
-                        self.persist_snapshot();
-                    }
-                    self.request_redraw();
-                }
-            },
-            // Section header drag: move the whole block top-level only.
-            Drag::Section { section_id } => {
-                let (px, py) = (self.cursor.0 as f32, self.cursor.1 as f32);
-                if let Some(target) = self.resolve_section_drop(px, py, section_id) {
-                    self.apply_section_drop(section_id, target);
                 }
                 self.request_redraw();
             },
@@ -4499,6 +4349,7 @@ impl App {
             Action::PrevSidebarTab => self.cycle_sidebar_tab(-1),
             Action::NextSidebarTab => self.cycle_sidebar_tab(1),
             Action::ToggleSidebar => self.toggle_sidebar(),
+            Action::ToggleFolders => self.toggle_folders(),
             Action::OpenSettings => self.set_page(Page::Settings),
             Action::Quit => {
                 // Take the agent children down before the abrupt exit below;
@@ -4594,6 +4445,7 @@ impl App {
             Action::PrevSidebarTab
             | Action::NextSidebarTab
             | Action::ToggleSidebar
+            | Action::ToggleFolders
             | Action::PrevPage
             | Action::NextPage
             | Action::OpenSettings
@@ -4698,19 +4550,6 @@ impl App {
             }
         }
         self.request_redraw();
-    }
-
-    /// The page slot under a point in the sidebar's bottom strip, if any
-    /// (slightly inflated so the small dots are easy to hit).
-    fn page_slot_at(&self, px: f32, py: f32) -> Option<usize> {
-        let (_, h) = self.renderer.surface_size();
-        let scale = self.scale();
-        let n = Page::all(self.n_tools()).len();
-        (0..n).find(|&i| {
-            workspace::page_slot_rect(i, n, h, scale, self.sidebar_w())
-                .inflate((3.0 * scale).round())
-                .contains(px, py)
-        })
     }
 
     /// Refresh the per-group git/PR aggregates the sidebar cards read.
@@ -5004,18 +4843,6 @@ impl App {
                     self.flow.apply(chat, ev, crate::flow::now_epoch());
                     redraw = true;
                 },
-            }
-        }
-        // Advance the page-dot crossfades: hovered or active slots head to 1,
-        // the rest back to 0. Redraw while any slot is mid-flight.
-        let active = self.page.index(self.tools.len());
-        for (i, p) in self.dot_anim.iter_mut().enumerate() {
-            let target = if i == active || Some(i) == self.dot_hover { 1.0 } else { 0.0 };
-            let next =
-                if *p < target { (*p + 0.15).min(target) } else { (*p - 0.15).max(target) };
-            if next != *p {
-                *p = next;
-                redraw = true;
             }
         }
         // Advance pane collapse/expand animations the same way. PTY grids are
@@ -5658,6 +5485,9 @@ impl Render for App {
             // Flyover tab strip: same pixels-on-elements split (`flyover_ui`).
             .child(self.render_flyover_chrome(cx))
             .child(self.render_sidebar(cx))
+            // Floating "Show sessions" button beside the relocated traffic
+            // lights while the whole region is hidden.
+            .child(self.render_collapsed_overlay(cx))
             // Sessions empty state ("New group" pill + hint): element tree in
             // the terminal area; its click resolves on the element.
             .child(self.render_empty_state(cx))
@@ -7020,6 +6850,13 @@ fn main() {
                         webview_panel: None,
                         sidebar_expanded_w: workspace::SIDEBAR_DEFAULT_W,
                         sidebar_collapsed: false,
+                        folders_open: settings::get_bool("sidebar.folders", true),
+                        // Restored here so the first frame (and the bus
+                        // snapshot) already carry the persisted filter; the
+                        // persistence load validates it against the
+                        // sections once they exist.
+                        folder_filter: settings::get_str("sidebar.folder")
+                            .and_then(|s| s.parse::<u64>().ok()),
                         traffic_lights_for: None,
                         modifiers: Modifiers::default(),
                         mouse_report: None,
@@ -7139,13 +6976,6 @@ fn main() {
                         page: Page::Sessions,
                         section: Section::Keyboard,
                         recording: None,
-                        // The active page's slot starts fully glyphed.
-                        dot_anim: {
-                            let mut v = vec![0.0; Page::all(tools.len()).len()];
-                            v[Page::Sessions.index(tools.len())] = 1.0;
-                            v
-                        },
-                        dot_hover: None,
                         resize_hover: None,
                         tool_sessions: (0..tools.len()).map(|_| None).collect(),
                         tools,

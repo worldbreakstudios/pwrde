@@ -1,10 +1,10 @@
 //! Top-level page navigation + rebindable keyboard actions.
 //!
 //! pwrde has Arc-style *pages*: Sessions (the terminal workspace), one page
-//! per user-registered CLI tool (see [`crate::cli_tools`]), and Settings. The
-//! sidebar's bottom strip shows one slot per page — a subtle dot that
-//! crossfades into the page's glyph on hover, and stays a glyph on the active
-//! page. ⌘⇧←/→ cycle pages with wraparound; ⌘⇧↑/↓ cycle the
+//! per user-registered CLI tool (see [`crate::cli_tools`]), and Settings.
+//! Tool pages are opened from the folders card's pinned-tool rows and
+//! Settings from the sessions header's gear chip (`crate::folders_ui`,
+//! `crate::sidebar_ui`). ⌘⇧←/→ cycle pages with wraparound; ⌘⇧↑/↓ cycle the
 //! sidebar's tabs (groups on Sessions, sections on Settings) the same way.
 //!
 //! Every ⌘ shortcut is an [`Action`] dispatched through a bindings table
@@ -24,9 +24,8 @@ pub enum Page {
 }
 
 impl Page {
-    /// Dot-strip order for `n_tools` registered CLI tools; `cycle` walks
-    /// this. Tool pages sit between Sessions and Settings so the fixed
-    /// pages keep their ends of the strip.
+    /// Page order for `n_tools` registered CLI tools; `cycle` (⌘⇧←/→)
+    /// walks it. Tool pages sit between Sessions and Settings.
     pub fn all(n_tools: usize) -> Vec<Page> {
         let mut v = vec![Page::Sessions];
         v.extend((0..n_tools).map(Page::Tool));
@@ -34,23 +33,6 @@ impl Page {
         v
     }
 
-    /// Stable index within [`Self::all`] — what the slot animation is keyed
-    /// by, so gating a page never shifts the others.
-    pub fn index(self, n_tools: usize) -> usize {
-        Self::all(n_tools).iter().position(|p| *p == self).unwrap_or(0)
-    }
-
-    /// Glyph shown in the page slot when active or hovered. The cog /
-    /// brackets are Nerd Font codepoints — the UI font guarantees coverage.
-    /// A tool page's glyph is whatever the user registered for it (any
-    /// string; Nerd Font codepoints render like the built-ins).
-    pub fn glyph(self, tools: &[crate::cli_tools::CliTool]) -> String {
-        match self {
-            Page::Sessions => "<>".into(),
-            Page::Tool(i) => tools.get(i).map(|t| t.icon.clone()).unwrap_or_else(|| "?".into()),
-            Page::Settings => "\u{f013}".into(),
-        }
-    }
 }
 
 /// Wrapping cycle: the index `delta` steps from `i` among `n` entries.
@@ -158,6 +140,7 @@ pub enum Action {
     PrevSidebarTab,
     NextSidebarTab,
     ToggleSidebar,
+    ToggleFolders,
     PrevPage,
     NextPage,
     OpenSettings,
@@ -178,7 +161,7 @@ pub enum Action {
 
 impl Action {
     /// Keyboard-page row order.
-    pub const ALL: [Action; 40] = [
+    pub const ALL: [Action; 41] = [
         Action::SplitRight,
         Action::SplitDown,
         Action::NewTab,
@@ -203,6 +186,7 @@ impl Action {
         Action::PrevSidebarTab,
         Action::NextSidebarTab,
         Action::ToggleSidebar,
+        Action::ToggleFolders,
         Action::PrevPage,
         Action::NextPage,
         Action::OpenSettings,
@@ -248,6 +232,7 @@ impl Action {
             Action::PrevSidebarTab => "prev_sidebar_tab",
             Action::NextSidebarTab => "next_sidebar_tab",
             Action::ToggleSidebar => "toggle_sidebar",
+            Action::ToggleFolders => "toggle_folders",
             Action::PrevPage => "prev_page",
             Action::NextPage => "next_page",
             Action::OpenSettings => "open_settings",
@@ -292,7 +277,8 @@ impl Action {
             Action::ToggleFocusOthers => "Collapse/expand other panes",
             Action::PrevSidebarTab => "Previous sidebar tab",
             Action::NextSidebarTab => "Next sidebar tab",
-            Action::ToggleSidebar => "Toggle sidebar",
+            Action::ToggleSidebar => "Focus terminals",
+            Action::ToggleFolders => "Toggle folders",
             Action::PrevPage => "Previous page",
             Action::NextPage => "Next page",
             Action::OpenSettings => "Open settings",
@@ -361,6 +347,8 @@ impl Action {
             Action::ScreenshotToClipboard => (false, true, true, "c"),
             Action::ScreenshotToFile => (false, true, true, "s"),
             Action::NewSection => (false, true, true, "n"),
+            // ⌥⌘S rather than the mock’s ⇧⌘S: SaveWorkspace owns ⇧⌘S.
+            Action::ToggleFolders => (false, true, false, "s"),
             Action::GoToSessions => (false, true, true, "1"),
             Action::GoToTool => (false, true, true, "3"),
         };
@@ -637,8 +625,8 @@ mod tests {
     use super::*;
     use gpui::Modifiers;
 
-
-    /// tool, and their stable index tracks the registered count.
+    /// Tool pages sit between Sessions and Settings, one per registered
+    /// tool.
     #[test]
     fn tool_pages_slot_between_sessions_and_settings() {
         assert_eq!(
@@ -646,9 +634,6 @@ mod tests {
             vec![Page::Sessions, Page::Tool(0), Page::Tool(1), Page::Settings]
         );
         assert_eq!(Page::all(0), vec![Page::Sessions, Page::Settings]);
-        assert_eq!(Page::Tool(1).index(2), 2);
-        assert_eq!(Page::Settings.index(0), 1);
-        assert_eq!(Page::Settings.index(2), 3);
     }
 
     #[test]
@@ -804,6 +789,22 @@ mod tests {
             key_char: None,
         };
         assert_eq!(match_action(&ks), Some(Action::CloseGroup));
+    }
+
+    /// ⌥⌘S (folders toggle; ⇧⌘S is SaveWorkspace’s) must resolve through the
+    /// shared lookup and round-trip its settings encoding.
+    #[test]
+    fn toggle_folders_binds_alt_cmd_s() {
+        let b = Action::ToggleFolders.default_binding();
+        assert_eq!(b, Binding { shift: false, alt: true, ctrl: false, key: "s".into() });
+        assert_eq!(b.serialize(), "cmd-alt-s");
+        assert_eq!(Binding::parse(&b.serialize()), Some(b));
+        let ks = Keystroke {
+            modifiers: Modifiers { platform: true, alt: true, ..Default::default() },
+            key: "s".into(),
+            key_char: None,
+        };
+        assert_eq!(match_action(&ks), Some(Action::ToggleFolders));
     }
 
     /// ⌘S must reach the sidebar toggle through the same lookup every hotkey

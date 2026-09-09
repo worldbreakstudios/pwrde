@@ -242,7 +242,7 @@ impl App {
             || self.flow.open
             || matches!(
                 self.drag,
-                crate::Drag::Tab { .. } | crate::Drag::Group { .. } | crate::Drag::Section { .. }
+                crate::Drag::Tab { .. } | crate::Drag::Group { .. }
             )
         {
             return Vec::new();

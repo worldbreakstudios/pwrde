@@ -712,6 +712,7 @@ pub fn action_group(action: Action) -> &'static str {
         | Action::NextPage => "Navigate",
         Action::Copy | Action::Paste => "Edit",
         Action::ToggleSidebar
+        | Action::ToggleFolders
         | Action::ToggleFlyover
         | Action::FlyoverPopout
         | Action::OpenPrInGithub
@@ -755,6 +756,7 @@ pub fn action_glyph(action: Action) -> &'static str {
         Action::PrevPage => "⇈",
         Action::NextPage => "⇊",
         Action::ToggleSidebar => "⌷",
+        Action::ToggleFolders => "◱",
         Action::ToggleFlyover => "⤓",
         Action::FlyoverPopout => "⇱",
         Action::OpenPrInGithub => "↗",
