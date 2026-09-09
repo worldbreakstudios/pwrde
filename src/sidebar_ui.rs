@@ -48,7 +48,7 @@ const ROW_RADIUS: f32 = 9.0;
 /// with the PR palette below).
 const STATUS_ICON: f32 = 12.0;
 /// Side of the SVG glyph inside a header chip (mock: 17px chips).
-const HEADER_ICON: f32 = 15.0;
+const HEADER_ICON: f32 = 17.0;
 /// Extra left inset for an indented simple row (a section member).
 const ROW_INDENT: f32 = 14.0;
 /// Placeholder text of the Settings page search box; `main.rs` reads it
@@ -186,9 +186,9 @@ impl App {
             })
             .child(
                 gpui::svg()
-                    .path(crate::ui::assets::ICON_PANEL_LEFT_OPEN)
-                    .w(px(14.0))
-                    .h(px(14.0))
+                    .path(crate::ui::assets::ICON_PANEL_LEFT)
+                    .w(px(16.0))
+                    .h(px(16.0))
                     .text_color(if hovered { theme.foreground } else { theme.muted_foreground }),
             )
             .into_any_element()
@@ -464,7 +464,7 @@ impl App {
             let n = self.sidebar_rows().len();
             (title, format!("{n} session{}", if n == 1 { "" } else { "s" }))
         };
-        let title_w = (chips.focus.x - scaled(6.0) - title_x).max(0.0);
+        let title_w = (chips.focus.x - scaled(4.0) - title_x).max(0.0);
 
         let mut layer = div()
             .absolute()
@@ -503,7 +503,7 @@ impl App {
 
         if let Some(show) = chips.show_folders {
             layer = layer.child(
-                icon_chip(theme, &show, hovered(&show), false, crate::ui::assets::ICON_PANEL_LEFT_OPEN)
+                icon_chip(theme, &show, hovered(&show), false, crate::ui::assets::ICON_PANEL_LEFT)
                     .id("sidebar-show-folders")
                     .occlude()
                     .when(!modal, |c| {
@@ -519,7 +519,7 @@ impl App {
                     &chips.focus,
                     hovered(&chips.focus),
                     false,
-                    crate::ui::assets::ICON_PANEL_LEFT_CLOSE,
+                    crate::ui::assets::ICON_MAXIMIZE,
                 )
                 .id("sidebar-collapse")
                 .occlude()

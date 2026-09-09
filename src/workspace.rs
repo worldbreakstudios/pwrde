@@ -511,12 +511,22 @@ fn sidebar_row_h(font_scale: f32) -> f32 {
 
 /// Vertical gap between the sidebar's rounded group rows.
 const TAB_GAP: f32 = 3.0;
-/// Side of the square header chips ("⇤" collapse, "＋" new group). Both sit
-/// right-aligned inside [`TITLEBAR_H`], opposite the native traffic lights, so
-/// the chrome costs one strip instead of two.
-const HEADER_CHIP: f32 = 22.0;
-/// Gap between the two header chips.
-const HEADER_CHIP_GAP: f32 = 6.0;
+/// Side of the square header chips (the folders card's hide/new-folder pair
+/// and the sessions header's show-folders/focus/plus/gear). The mock draws
+/// bare 17px glyphs on an 8px pitch; a 20px hit square on a 4px gap keeps
+/// that pitch while giving each glyph a hover well.
+const HEADER_CHIP: f32 = 20.0;
+/// Gap between neighbouring header chips.
+const HEADER_CHIP_GAP: f32 = 4.0;
+/// Gap between the "Show folders" chip and the header's title block (the
+/// mock's 6px icon margin plus its 8px flex gap, less the chip's own
+/// glyph inset).
+const HEADER_TITLE_GAP: f32 = 4.0;
+/// Gap between the native traffic lights and the "Show folders" chip while
+/// the folders card is hidden — the mock leaves 16px of air after the green
+/// light; with the chip's glyph ~2px inside its square this gives 14px,
+/// the most the title beside it can spare at the default list width.
+const SHOW_FOLDERS_GAP: f32 = 12.0;
 /// Height of the horizontal tab strip atop each tile.
 const TILE_TAB_H: f32 = 28.0;
 /// Gap between tile cards; doubles as the divider drag handle (hit tests
@@ -739,7 +749,7 @@ pub struct SessionsHeaderChips {
 }
 
 /// Right inset of the header chip cluster from the list's edge.
-const HEADER_CHIP_INSET: f32 = 4.0;
+const HEADER_CHIP_INSET: f32 = 2.0;
 
 pub fn sessions_header_chips(list: &LayoutRect, folders_open: bool, scale: f32) -> SessionsHeaderChips {
     let side = (HEADER_CHIP * scale).round().min(list.w.max(0.0));
@@ -750,7 +760,7 @@ pub fn sessions_header_chips(list: &LayoutRect, folders_open: bool, scale: f32) 
     let plus = LayoutRect { x: gear.x - gap - side, y, w: side, h: side };
     let focus = LayoutRect { x: plus.x - gap - side, y, w: side, h: side };
     let show_folders = (!folders_open).then(|| LayoutRect {
-        x: ((TRAFFIC_LIGHT_END + HEADER_CHIP_GAP) * scale).round().max(list.x),
+        x: ((TRAFFIC_LIGHT_END + SHOW_FOLDERS_GAP) * scale).round().max(list.x),
         y,
         w: side,
         h: side,
@@ -763,7 +773,7 @@ pub fn sessions_header_chips(list: &LayoutRect, folders_open: bool, scale: f32) 
 pub fn sessions_header_title_x(list: &LayoutRect, folders_open: bool, scale: f32) -> f32 {
     let chips = sessions_header_chips(list, folders_open, scale);
     match chips.show_folders {
-        Some(chip) => chip.x + chip.w + (HEADER_CHIP_GAP * scale).round(),
+        Some(chip) => chip.x + chip.w + (HEADER_TITLE_GAP * scale).round(),
         None => list.x + (REGION_PAD * scale).round(),
     }
 }
@@ -857,15 +867,16 @@ pub fn traffic_light_origin(spot: TrafficLightSpot) -> (f32, f32) {
 }
 
 /// Logical width of the top-left corner the native traffic lights occupy.
-/// The buttons themselves end around x=72 (three 12px lights, 8px apart,
-/// from [`TRAFFIC_LIGHT_ORIGIN`]); the extra headroom keeps the first tab
+/// The buttons themselves end at [`TRAFFIC_LIGHT_END`]; the extra headroom keeps the first tab
 /// from crowding them.
 pub const TRAFFIC_LIGHT_SAFE_W: f32 = 90.0;
-/// Where the third traffic light ends (three 12px lights, 8px apart, from
-/// [`TRAFFIC_LIGHT_ORIGIN`]) — the sessions-list header's "Show folders"
-/// chip hugs this rather than the roomier [`TRAFFIC_LIGHT_SAFE_W`], so the
-/// title beside it keeps enough room to read at the default list width.
-pub const TRAFFIC_LIGHT_END: f32 = TRAFFIC_LIGHT_ORIGIN + 3.0 * 12.0 + 2.0 * 8.0;
+/// Where the third traffic light ends. macOS 26 draws the lights 14px wide
+/// on a 23px pitch from [`TRAFFIC_LIGHT_ORIGIN`] (measured off a window
+/// capture: 20–34, 43–57, 66–80), not the nominal 12px/8px — the
+/// sessions-list header's "Show folders" chip hugs this rather than the
+/// roomier [`TRAFFIC_LIGHT_SAFE_W`], so the title beside it keeps enough
+/// room to read at the default list width.
+pub const TRAFFIC_LIGHT_END: f32 = TRAFFIC_LIGHT_ORIGIN + 2.0 * 23.0 + 14.0;
 
 /// The window-drag corner while the sidebar is collapsed: the traffic-light
 /// span of the top-left tile's tab strip, plus the sliver of padding above.
@@ -2785,11 +2796,14 @@ mod tests {
         let closed = sessions_list_rect(SIDEBAR_DEFAULT_W, false, 1000, scale);
         let chips = sessions_header_chips(&closed, false, scale);
         let show = chips.show_folders.expect("show-folders chip while the card is hidden");
-        assert_eq!(show.x, ((TRAFFIC_LIGHT_END + HEADER_CHIP_GAP) * scale).round());
+        assert_eq!(show.x, ((TRAFFIC_LIGHT_END + SHOW_FOLDERS_GAP) * scale).round());
         assert!(show.x >= (TRAFFIC_LIGHT_END * scale).round());
         assert_eq!(show.y, chips.gear.y);
         assert!(show.x + show.w < chips.focus.x);
-        assert_eq!(sessions_header_title_x(&closed, false, scale), show.x + side + gap);
+        assert_eq!(
+            sessions_header_title_x(&closed, false, scale),
+            show.x + side + (HEADER_TITLE_GAP * scale).round()
+        );
 
         // Collapsed (no list): the chips shrink to nothing and hit nothing.
         let none = sessions_list_rect(0.0, true, 1000, scale);

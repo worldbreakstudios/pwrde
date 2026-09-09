@@ -103,7 +103,7 @@ impl App {
         // Header chips (the traffic lights float over the header's left).
         root = root
             .child(
-                icon_chip(theme, &rel(&hide, &card), hovered(&hide), false, crate::ui::assets::ICON_PANEL_LEFT_CLOSE)
+                icon_chip(theme, &rel(&hide, &card), hovered(&hide), false, crate::ui::assets::ICON_PANEL_LEFT)
                     .id("folders-hide")
                     .when(!modal, |c| {
                         c.cursor_pointer()

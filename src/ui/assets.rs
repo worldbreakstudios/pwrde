@@ -220,13 +220,17 @@ const ICONS: &[(&str, &[u8])] = &[
         "icons/pin.svg",
         br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17v5"/><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z"/></svg>"##,
     ),
+    // Traced from the GANTRY sidebar mock (stroke 1.8 like its other chrome
+    // glyphs): the plain panel-left frame is every folders/sessions toggle
+    // ("Show folders", "Hide folders", "Show sessions"), and the four corner
+    // brackets are "Focus terminals".
     (
-        "icons/panel-left-close.svg",
-        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/><path d="m16 15-3-3 3-3"/></svg>"##,
+        "icons/panel-left.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/></svg>"##,
     ),
     (
-        "icons/panel-left-open.svg",
-        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/><path d="m14 9 3 3-3 3"/></svg>"##,
+        "icons/maximize.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M21 8V5a2 2 0 0 0-2-2h-3"/><path d="M3 16v3a2 2 0 0 0 2 2h3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/></svg>"##,
     ),
     (
         "icons/settings.svg",
@@ -274,8 +278,8 @@ pub const ICON_CIRCLE_CHECK: &str = "icons/circle-check.svg";
 pub const ICON_FOLDER: &str = "icons/folder.svg";
 pub const ICON_FOLDER_PLUS: &str = "icons/folder-plus.svg";
 pub const ICON_PIN: &str = "icons/pin.svg";
-pub const ICON_PANEL_LEFT_CLOSE: &str = "icons/panel-left-close.svg";
-pub const ICON_PANEL_LEFT_OPEN: &str = "icons/panel-left-open.svg";
+pub const ICON_PANEL_LEFT: &str = "icons/panel-left.svg";
+pub const ICON_MAXIMIZE: &str = "icons/maximize.svg";
 pub const ICON_SETTINGS: &str = "icons/settings.svg";
 pub const ICON_PLUS: &str = "icons/plus.svg";
 
