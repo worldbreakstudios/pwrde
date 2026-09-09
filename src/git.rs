@@ -12,7 +12,6 @@ use std::io::Read;
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::diff::{DiffFile, DiffHunk, DiffLine, FileStatus, LineKind};
 
 /// One branch offered as a fork source.
 pub struct Branch {
@@ -365,26 +364,6 @@ pub fn worktree_scope() -> Option<String> {
         .clone()
 }
 
-// ── Local diff (the "Local diff" tool) ────────────────────────────────────
-
-/// Which local changes the diff tool shows.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DiffMode {
-    /// Uncommitted working-tree changes vs `HEAD` (plus untracked files).
-    Working,
-    /// This branch's committed changes vs its merge-base with the base branch.
-    Branch,
-}
-
-/// A local diff result: the parsed files plus the human label for what they
-/// were diffed against.
-#[derive(Clone, Debug)]
-pub struct LocalDiff {
-    pub files: Vec<DiffFile>,
-    /// e.g. `HEAD` (working mode) or `origin/main` (branch mode).
-    pub base_ref: String,
-}
-
 /// The current branch name (`git rev-parse --abbrev-ref HEAD`), or `None` when
 /// detached / not a repo. Used to scope the PR tool to the checked-out branch.
 pub fn current_branch(dir: &Path) -> Option<String> {
@@ -485,9 +464,9 @@ fn parse_shortstat(text: &str) -> DirtyStats {
 /// a card whose pull request had thousands.
 ///
 /// Two `--shortstat` calls rather than the pull request's own
-/// `additions`/`deletions`: those live only on `PrDetail` (one PR per request),
-/// this works with no PR at all, and it costs one cheap git call instead of a
-/// heavier `pr list` payload.
+/// `additions`/`deletions`: `PrSummary` doesn't carry them, this works with no
+/// PR at all, and it costs one cheap git call instead of a heavier `pr list`
+/// payload.
 ///
 /// `None` when the base cannot be resolved (no remote, unborn HEAD) or git
 /// fails — the card then falls back to what it can show.
@@ -512,7 +491,7 @@ pub fn branch_stats(dir: &Path) -> Option<DirtyStats> {
 
 /// Uncommitted change counts for `dir` (`git diff HEAD --shortstat`).
 ///
-/// Far cheaper than [`local_diff`] + `diff::parse`, which is why the per-group
+/// Far cheaper than parsing a full `git diff`, which is why the per-group
 /// status card uses it. `None` when git is unavailable, `dir` is not a repo, or
 /// there is no `HEAD` yet (a fresh repo with no commits).
 pub fn dirty_stats(dir: &Path) -> Option<DirtyStats> {
@@ -523,180 +502,6 @@ pub fn dirty_stats(dir: &Path) -> Option<DirtyStats> {
     }
     Some(parse_shortstat(&String::from_utf8_lossy(&out.stdout)))
 }
-
-/// Upper bound on an untracked file's bytes we'll render as a diff; larger
-/// files are listed as an add with no hunk body (mirrors h20's guard).
-const UNTRACKED_MAX_BYTES: usize = 256 * 1024;
-
-/// Read the full new-side content of `path` at git revision `rev` (or the
-/// working tree when `rev` is None), split into lines with no trailing newline.
-/// `None` when it can't be read (missing object, binary, or larger than the
-/// untracked cap) — expansion then stays disabled for that file.
-pub fn file_lines_at(
-    dir: &Path,
-    rev: Option<&str>,
-    path: &str,
-) -> Option<std::sync::Arc<Vec<String>>> {
-    let bytes: Vec<u8> = match rev {
-        None => std::fs::read(dir.join(path)).ok()?,
-        Some(r) => {
-            let out =
-                output_within(git(dir).args(["show", &format!("{r}:{path}")]), TIMEOUT_HISTORY)
-                    .ok()?;
-            if !out.status.success() {
-                return None;
-            }
-            out.stdout
-        }
-    };
-    if bytes.len() > UNTRACKED_MAX_BYTES {
-        return None;
-    }
-    if bytes.iter().take(8000).any(|&b| b == 0) {
-        return None; // binary
-    }
-    let text = String::from_utf8_lossy(&bytes);
-    Some(std::sync::Arc::new(text.lines().map(str::to_string).collect()))
-}
-
-/// Gather + parse a local diff. `base_override` (branch mode only) forces the
-/// base branch; otherwise the remote default branch is used.
-pub fn local_diff(
-    dir: &Path,
-    mode: DiffMode,
-    base_override: Option<&str>,
-) -> Result<LocalDiff, String> {
-    match mode {
-        DiffMode::Working => {
-            let out = git(dir)
-                .args(["diff", "HEAD", "-M"])
-                .output()
-                .map_err(|e| format!("git diff: {e}"))?;
-            if !out.status.success() {
-                return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
-            }
-            let text = String::from_utf8_lossy(&out.stdout);
-            let mut files = crate::diff::parse(&text);
-            // New side = the working tree. Untracked files are appended after
-            // this (all-add, no gaps), so they keep `new_lines: None`.
-            for f in &mut files {
-                if !f.binary {
-                    f.new_lines = file_lines_at(dir, None, &f.path);
-                }
-            }
-            files.extend(untracked_files(dir));
-            Ok(LocalDiff { files, base_ref: "HEAD".into() })
-        }
-        DiffMode::Branch => {
-            let base = base_override
-                .map(str::to_string)
-                .or_else(|| default_remote_branch(dir))
-                .ok_or_else(|| "no base branch (no remote default)".to_string())?;
-            // Diff against the merge-base so only this branch's own commits show.
-            let mb_out =
-                output_within(git(dir).args(["merge-base", "HEAD", &base]), TIMEOUT_HISTORY);
-            let base_rev = match mb_out {
-                Ok(o) if o.status.success() => {
-                    String::from_utf8_lossy(&o.stdout).trim().to_string()
-                }
-                // No shared ancestor (or base missing): fall back to the base ref.
-                _ => base.clone(),
-            };
-            // `base_rev..HEAD` shows only this branch's *committed* changes —
-            // naming HEAD explicitly excludes uncommitted work (which is what
-            // the working mode is for), so the two modes stay disjoint.
-            let out = git(dir)
-                .args(["diff", &base_rev, "HEAD", "-M"])
-                .output()
-                .map_err(|e| format!("git diff: {e}"))?;
-            if !out.status.success() {
-                return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
-            }
-            let text = String::from_utf8_lossy(&out.stdout);
-            let mut files = crate::diff::parse(&text);
-            // New side = HEAD (this mode shows committed work only).
-            for f in &mut files {
-                if !f.binary {
-                    f.new_lines = file_lines_at(dir, Some("HEAD"), &f.path);
-                }
-            }
-            Ok(LocalDiff { files, base_ref: base })
-        }
-    }
-}
-
-/// Synthesize `DiffFile`s for untracked (but not ignored) files, rendered as
-/// pure additions — `git diff` omits them, but a working-tree review wants to
-/// see brand-new files.
-fn untracked_files(dir: &Path) -> Vec<DiffFile> {
-    let Ok(out) = output_within(
-        git(dir).args(["ls-files", "--others", "--exclude-standard", "-z"]),
-        TIMEOUT_HISTORY,
-    ) else {
-        return Vec::new();
-    };
-    if !out.status.success() {
-        return Vec::new();
-    }
-    let mut files = Vec::new();
-    for name in out.stdout.split(|&b| b == 0) {
-        if name.is_empty() {
-            continue;
-        }
-        let rel = String::from_utf8_lossy(name).into_owned();
-        files.push(untracked_entry(dir, &rel));
-    }
-    files
-}
-
-/// Build one untracked file's `DiffFile` (an add). Binary or oversized files
-/// get no hunk body.
-fn untracked_entry(dir: &Path, rel: &str) -> DiffFile {
-    let bytes = std::fs::read(dir.join(rel)).unwrap_or_default();
-    let too_big = bytes.len() > UNTRACKED_MAX_BYTES;
-    let is_binary = bytes.iter().take(8000).any(|&b| b == 0);
-    if is_binary || too_big {
-        return DiffFile {
-            path: rel.to_string(),
-            previous_path: None,
-            status: FileStatus::Added,
-            additions: 0,
-            deletions: 0,
-            binary: is_binary,
-            hunks: Vec::new(),
-            new_lines: None,
-        };
-    }
-    let content = String::from_utf8_lossy(&bytes);
-    let lines: Vec<&str> = content.lines().collect();
-    let n = lines.len() as u32;
-    let hunk_lines: Vec<DiffLine> = lines
-        .into_iter()
-        .enumerate()
-        .map(|(i, text)| DiffLine {
-            kind: LineKind::Add,
-            old_no: None,
-            new_no: Some(i as u32 + 1),
-            text: text.to_string(),
-        })
-        .collect();
-    let hunks = if hunk_lines.is_empty() {
-        Vec::new()
-    } else {
-        vec![DiffHunk { header: format!("@@ -0,0 +1,{n} @@"), lines: hunk_lines }]
-    };
-    DiffFile {
-        path: rel.to_string(),
-        previous_path: None,
-        status: FileStatus::Added,
-        additions: n,
-        deletions: 0,
-        binary: false,
-        hunks,
-        new_lines: None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -391,9 +391,8 @@ pub fn now_epoch() -> i64 {
 }
 
 /// Age of a chat for the list card: "now" (< 60s), then floored "Nm" /
-/// "Nh" / "Nd" — deliberately terser than `pr_ui.rs`'s `format_ago` (no
-/// rounding, no " ago") because it sits in a narrow card corner; no chrono,
-/// just epoch seconds in.
+/// "Nh" / "Nd" — deliberately terse (no rounding, no " ago") because it sits
+/// in a narrow card corner; no chrono, just epoch seconds in.
 pub fn format_age(now: i64, then: i64) -> String {
     let s = (now - then).max(0);
     if s < 60 {

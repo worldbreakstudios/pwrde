@@ -1,7 +1,7 @@
 //! Resize handles as gpui elements: the sidebar edge, the split dividers
-//! between tiles, the tool panel's left edge and the flyover's top edge.
+//! between tiles and the flyover's top edge.
 //!
-//! The canvas mouse path used to hit-test all four by hand in
+//! The canvas mouse path used to hit-test all three by hand in
 //! `on_mouse_down` (a `GRAB`-inflated band around each edge) and painted the
 //! hover grip — an ink line with a centered pill — from `resize_hover`.
 //! Each handle is now a thin element at that same band: it owns the cursor
@@ -11,8 +11,8 @@
 //! its grip when hovered or dragged. The drag itself — pointer moves and
 //! the release — is driven by the canvas: window-level capture listeners
 //! registered in its paint closure while a `Drag` is armed, so the pointer
-//! is heard even over an occluding tool panel (the handles themselves also
-//! do not occlude).
+//! is heard even over occluding overlays (the handles themselves do not
+//! occlude).
 //!
 //! Hover detection (`resize_hover`) stays on the canvas `on_mouse_move` via
 //! `workspace::resize_hover_at`, which the sticky drag cursor also needs.
@@ -48,9 +48,8 @@ fn grip_pill(rect: &LayoutRect, vertical: bool) -> LayoutRect {
 }
 
 /// The grip line for an edge at `x` (logical px): `GRIP_W` wide, centered on
-/// the edge, spanning `y..y + h` — the tool panel's left edge and the tile
-/// dividers' lines are laid out this way; the sidebar's hugs the panel one
-/// gutter further left.
+/// the edge, spanning `y..y + h` — the tile dividers' lines are laid out
+/// this way; the sidebar's hugs the panel one gutter further left.
 fn edge_line(x: f32, y: f32, h: f32) -> LayoutRect {
     LayoutRect { x: x - GRIP_W / 2.0, y, w: GRIP_W, h }
 }
@@ -99,7 +98,7 @@ impl App {
         let theme = Theme::of(cx).clone();
         let scale = self.scale();
         let inv = 1.0 / scale;
-        let (surface_w, surface_h) = self.renderer.surface_size();
+        let (_, surface_h) = self.renderer.surface_size();
         let win_h = surface_h as f32 * inv;
         let grab = crate::GRAB;
         let entity = cx.entity().downgrade();
@@ -203,30 +202,6 @@ impl App {
             }
         }
 
-        // Tool panel's left edge (it sits over the tile area, so it is
-        // appended after the dividers and wins against them).
-        if self.visible_tool().is_some() {
-            let panel = workspace::tool_panel(
-                surface_w,
-                surface_h,
-                scale,
-                self.tool_panel_w,
-                self.tool_panel_floating,
-            );
-            let pgrab = workspace::TOOL_PANEL_RESIZE_GRAB;
-            let (x, y, h) = (panel.x * inv, panel.y * inv, panel.h * inv);
-            let band = LayoutRect { x: x - pgrab, y, w: 2.0 * pgrab, h };
-            let lit = self.resize_hover == Some(ResizeHover::ToolPanel)
-                || matches!(self.drag, crate::Drag::ToolPanelResize);
-            let line = edge_line(x, y, h);
-            under = under
-                .when(lit, |d| d.child(grip(&theme, &line, true)))
-                .child(handle(band, CursorStyle::ResizeLeftRight).on_mouse_down(
-                    MouseButton::Left,
-                    arm(entity.clone(), crate::Drag::ToolPanelResize, Some(ResizeHover::ToolPanel)),
-                ));
-        }
-
         let mut layer = div().absolute().left(px(0.0)).top(px(0.0)).size_full().child(under);
 
         // Flyover top edge: a height-resize drag (not when maximized — there
@@ -260,7 +235,7 @@ mod tests {
     use super::*;
 
     /// The grip line is `GRIP_W` wide and centered on its edge, the way the
-    /// canvas drew the tool panel and divider grips.
+    /// canvas drew the divider grips.
     #[test]
     fn edge_line_is_centered_on_the_edge() {
         let line = edge_line(400.0, 10.0, 500.0);

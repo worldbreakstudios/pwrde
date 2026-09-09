@@ -130,36 +130,6 @@ pub fn term_options(dark: bool) -> Vec<Option<&'static crate::term_theme::TermTh
     v
 }
 
-// ── Tool ribbon ─────────────────────────────────────────────────────────
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Tool {
-    Pr,
-    LocalDiff,
-    Launch,
-}
-
-impl Tool {
-    pub const ALL: [Tool; 3] = [Tool::Pr, Tool::LocalDiff, Tool::Launch];
-
-    /// Stable identifier used in the settings key (`toolpanel.tool`).
-    pub fn name(self) -> &'static str {
-        match self {
-            Tool::Pr => "pr",
-            Tool::LocalDiff => "local_diff",
-            Tool::Launch => "launch",
-        }
-    }
-
-    pub fn title(self) -> &'static str {
-        match self {
-            Tool::Pr => "Pull Request",
-            Tool::LocalDiff => "Local diff",
-            Tool::Launch => "Launch",
-        }
-    }
-}
-
 // ── Rebindable actions ──────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -195,7 +165,7 @@ pub enum Action {
     ToggleFlyover,
     FlyoverPopout,
     SaveWorkspace,
-    ToggleToolPanel,
+    OpenPrInGithub,
     ToggleFlow,
     IncreaseFontSize,
     DecreaseFontSize,
@@ -240,7 +210,7 @@ impl Action {
         Action::ToggleFlyover,
         Action::FlyoverPopout,
         Action::SaveWorkspace,
-        Action::ToggleToolPanel,
+        Action::OpenPrInGithub,
         Action::ToggleFlow,
         Action::IncreaseFontSize,
         Action::DecreaseFontSize,
@@ -285,7 +255,7 @@ impl Action {
             Action::ToggleFlyover => "toggle_flyover",
             Action::FlyoverPopout => "flyover_popout",
             Action::SaveWorkspace => "save_workspace",
-            Action::ToggleToolPanel => "toggle_tool_panel",
+            Action::OpenPrInGithub => "open_pr_in_github",
             Action::ToggleFlow => "toggle_flow",
             Action::IncreaseFontSize => "increase_font_size",
             Action::DecreaseFontSize => "decrease_font_size",
@@ -330,7 +300,7 @@ impl Action {
             Action::ToggleFlyover => "Toggle Flyover Terminal",
             Action::FlyoverPopout => "Flyover: panel ↔ window",
             Action::SaveWorkspace => "Save as workspace",
-            Action::ToggleToolPanel => "Toggle tool panel",
+            Action::OpenPrInGithub => "Open PR in GitHub",
             Action::ToggleFlow => "Toggle Flow agent",
             Action::IncreaseFontSize => "Increase font size",
             Action::DecreaseFontSize => "Decrease font size",
@@ -382,7 +352,7 @@ impl Action {
             Action::ToggleFlyover => (false, false, false, "`"),
             Action::FlyoverPopout => (true, false, false, "`"),
             Action::SaveWorkspace => (true, false, false, "s"),
-            Action::ToggleToolPanel => (true, false, false, "g"),
+            Action::OpenPrInGithub => (true, false, false, "g"),
             Action::ToggleFlow => (false, false, false, "j"),
             Action::IncreaseFontSize => (false, false, false, "="),
             // "minus" (not "-") because "-" is the binding token separator.
@@ -409,7 +379,11 @@ impl Action {
             .and_then(|s| Binding::parse(&s))
             // `go_to_tool` replaced `go_to_cleanup` when the Cleanup page
             // became the first CLI tool page; honor the old key if it was
-            // customized so a rebinding survives the rename.
+            // customized so a rebinding survives the rename. (The retired
+            // `keyboard.toggle_tool_panel` is deliberately *not* carried over
+            // to `open_pr_in_github`: opening a browser tab is a different
+            // effect than toggling a panel, so an old rebinding shouldn't
+            // silently acquire it.)
             .or_else(|| {
                 (self == Action::GoToTool)
                     .then(|| crate::settings::get_str("keyboard.go_to_cleanup"))

@@ -346,6 +346,16 @@ impl GitContextCache {
         }
     }
 
+    /// [`mark_all_stale`] for one directory: the next poll re-fetches it,
+    /// its values staying on screen meanwhile. No-op for an unknown directory.
+    ///
+    /// [`mark_all_stale`]: Self::mark_all_stale
+    pub fn mark_stale(&mut self, dir: &Path) {
+        if let Some(entry) = self.entries.get_mut(dir) {
+            entry.stale = true;
+        }
+    }
+
     /// How many snapshots are held. Mostly here so the bound is testable.
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -400,6 +410,7 @@ mod tests {
             review_decision: None,
             mergeable: None,
             checks: Vec::new(),
+            url: String::new(),
         }
     }
 

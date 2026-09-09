@@ -281,8 +281,8 @@ impl App {
         let scale = self.scale();
         let width = (surface_w as f32 / scale).round() as u32;
         let height = (surface_h as f32 / scale).round() as u32;
-        let cta = crate::workspace::empty_state_cta(width, height, 1.0, self.sidebar_w(), self.right_w());
-        let hint = crate::workspace::empty_state_hint(width, height, 1.0, self.sidebar_w(), self.right_w());
+        let cta = crate::workspace::empty_state_cta(width, height, 1.0, self.sidebar_w());
+        let hint = crate::workspace::empty_state_hint(width, height, 1.0, self.sidebar_w());
 
         // Same glass as the canvas `Renderer::pill`: dark chrome lifts the
         // card fill 30% toward white so it reads as light glass on the
@@ -1458,9 +1458,8 @@ fn pr_merged(dark: bool) -> Hsla {
     }
 }
 
-/// Diff green. The diff viewer keeps its own private copies of these
-/// (`pr_ui::green`/`pr_ui::red`), so the values are matched here rather than
-/// shared — they are the one colour pair the theme has no token for.
+/// Diff green. These are the one colour pair the theme has no token for, so
+/// they live here beside the card rollups that paint them.
 fn diff_added(dark: bool) -> Hsla {
     if dark {
         gpui::rgb(0x78be8c).into()

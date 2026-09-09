@@ -256,8 +256,8 @@ pub struct DiffstatLine {
 ///
 /// The numbers come from `ctx.dirty`. A PR's own additions/deletions would be
 /// preferable, but `gh::PrSummary` — what `GitContext` carries — does not have
-/// them; only the heavier `gh::PrDetail` does, and the sidebar does not fetch
-/// details per row. So the working tree is the source, PR or no PR.
+/// them and the sidebar does not fetch per-PR detail. So the working tree is
+/// the source, PR or no PR.
 ///
 /// The minus sign is ASCII `-`; the mock's typographic `−` is a rendering
 /// choice and belongs to the element tree, not to the model.
@@ -768,6 +768,7 @@ mod tests {
             review_decision: None,
             mergeable: None,
             checks: Vec::new(),
+            url: String::new(),
         }
     }
 

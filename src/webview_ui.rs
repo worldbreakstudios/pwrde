@@ -239,7 +239,6 @@ impl App {
         if self.page != crate::pages::Page::Sessions
             || self.modal_overlay_open()
             || (self.flyover_anim > 0.0 && !self.flyover_windowed)
-            || (self.visible_tool().is_some() && self.tool_panel_floating)
             || self.flow.open
             || matches!(
                 self.drag,

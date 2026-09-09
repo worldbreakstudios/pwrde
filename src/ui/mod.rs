@@ -47,9 +47,8 @@ pub use input::Input;
 pub use kbd::Kbd;
 #[allow(unused_imports)] // vendored rcn surface: kept exported while no caller uses it
 pub use label::Label;
-pub use skeleton::Skeleton;
 pub use switch::Switch;
-pub use table::{Table, TableBody, TableCell, TableHead, TableHeader, TableRow};
+pub use table::{Table, TableBody, TableCell, TableRow};
 
 pub mod alert_dialog;
 pub mod assets;
@@ -67,7 +66,6 @@ pub mod label;
 pub mod motion;
 pub mod select;
 pub mod separator;
-pub mod skeleton;
 pub mod switch;
 pub mod table;
 pub mod theme;
