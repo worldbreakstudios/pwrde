@@ -169,6 +169,26 @@ impl App {
                 );
         }
 
+        // Folders card edge: the band sits in the card/list gap.
+        if sidebar_w > 0.0
+            && let Some(fx) = workspace::folders_edge_x(self.folders_w, self.folders_visible())
+        {
+            let top = workspace::TITLEBAR_H;
+            let bottom = (win_h - workspace::AREA_PAD).max(top);
+            let band = LayoutRect { x: fx - grab, y: top, w: 2.0 * grab, h: bottom - top };
+            let lit = self.resize_hover == Some(ResizeHover::Folders)
+                || matches!(self.drag, crate::Drag::Folders);
+            let line = edge_line(fx, top, bottom - top);
+            under = under
+                .when(lit, |d| d.child(grip(&theme, &line, true)))
+                .child(
+                    handle(band, CursorStyle::ResizeLeftRight).on_mouse_down(
+                        MouseButton::Left,
+                        arm(entity.clone(), crate::Drag::Folders, Some(ResizeHover::Folders)),
+                    ),
+                );
+        }
+
         // Split dividers between tiles (Sessions only, never in the empty state).
         if self.page == crate::Page::Sessions && !self.is_empty_state() {
             let ws = &self.workspaces[self.active];

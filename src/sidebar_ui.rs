@@ -182,10 +182,19 @@ impl App {
     pub(crate) fn list_rect(&self) -> crate::workspace::LayoutRect {
         crate::workspace::sessions_list_rect(
             self.sidebar_expanded_w,
+            self.folders_w,
             self.folders_visible(),
             self.logical_height(),
             1.0,
         )
+    }
+
+    /// [`App::list_rect`] shifted up by the wheel scroll — the rect the row
+    /// stack lays out in (the logical twin of `App::sessions_rows_list`).
+    pub(crate) fn rows_list_rect(&self) -> crate::workspace::LayoutRect {
+        let mut list = self.list_rect();
+        list.y -= self.sessions_scroll().round();
+        list
     }
 
     /// The window's logical height, rounded like the row rects are.
@@ -384,7 +393,7 @@ impl App {
         // against an already-tinted row.
         let line = matches!(
             target,
-            crate::DropTarget::SidebarInsert { .. }
+            crate::DropTarget::SidebarInsert { .. } | crate::DropTarget::FolderInsert { .. }
         );
         let mark = div()
             .absolute()
@@ -628,28 +637,80 @@ impl App {
 
     fn card_row_layer(&self, theme: &Theme, entity: gpui::WeakEntity<Self>) -> gpui::Div {
         let rows = self.sidebar_rows();
-        let list = self.list_rect();
+        let list = self.rows_list_rect();
         let hover = self.sidebar_cursor();
         let active =
             crate::workspace::active_row_index(&rows, self.active);
 
         let n_pinned = crate::workspace::pinned_run(&rows, &self.workspaces);
         let mut layer = div().absolute().left(px(0.0)).top(px(0.0)).size_full();
-        if n_pinned > 0 {
+        // The "Pinned" caption heads the list whether or not anything is
+        // pinned: it is the drop zone that pins a dragged group, and a
+        // click folds the run. A rail under the run marks where it ends.
+        {
             let cap = crate::workspace::pinned_caption_rect(1.0, &list);
+            let n_pins = self
+                .workspaces
+                .iter()
+                .filter(|w| w.pinned && self.folder_filter.is_none_or(|f| w.section == Some(f)))
+                .count();
+            let chevron = if self.pinned_collapsed {
+                crate::ui::assets::ICON_CHEVRON_RIGHT
+            } else {
+                crate::ui::assets::ICON_CHEVRON_DOWN
+            };
+            let cap_hover = hover.is_some_and(|(x, y)| cap.contains(x, y));
+            let ink = if cap_hover { theme.foreground } else { theme.muted_foreground };
             layer = layer.child(
                 div()
+                    .id("sessions-pinned-caption")
                     .absolute()
                     .left(px(cap.x + scaled(ROW_PAD)))
                     .top(px(cap.y))
+                    .w(px((cap.w - 2.0 * scaled(ROW_PAD)).max(0.0)))
                     .h(px(cap.h))
                     .flex()
                     .items_end()
+                    .gap(px(scaled(4.0)))
                     .pb(px(scaled(3.0)))
-                    .text_size(px(scaled(10.5)))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme.muted_foreground)
-                    .child("Pinned"),
+                    .cursor_pointer()
+                    .child(
+                        gpui::svg()
+                            .flex_none()
+                            .path(chevron)
+                            .w(px(scaled(11.0)))
+                            .h(px(scaled(11.0)))
+                            .text_color(ink),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(scaled(10.5)))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(ink)
+                            .child("Pinned"),
+                    )
+                    .when(n_pins > 0 && self.pinned_collapsed, |d| {
+                        d.child(
+                            div()
+                                .text_size(px(scaled(10.5)))
+                                .text_color(theme.muted_foreground)
+                                .child(format!("{n_pins}")),
+                        )
+                    })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        press(entity.clone(), |this, _ev, _cx| this.toggle_pinned_collapsed()),
+                    ),
+            );
+            let rail = crate::workspace::pinned_divider_rect(&rows, &self.workspaces, 1.0, &list);
+            layer = layer.child(
+                div()
+                    .absolute()
+                    .left(px(rail.x))
+                    .top(px(rail.y))
+                    .w(px(rail.w.max(0.0)))
+                    .h(px(rail.h))
+                    .bg(theme.border),
             );
         }
         for (i, row) in rows.iter().enumerate() {

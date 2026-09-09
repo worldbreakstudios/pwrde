@@ -13,7 +13,8 @@
 //! the canvas underneath.
 use gpui::{
     App as GpuiApp, ClickEvent, Context, FontWeight, InteractiveElement, MouseButton,
-    MouseMoveEvent, ParentElement, StatefulInteractiveElement, Styled, Window, div,
+    MouseMoveEvent, ParentElement, ScrollWheelEvent, StatefulInteractiveElement, Styled, Window,
+    div,
     prelude::FluentBuilder as _, px,
 };
 
@@ -47,7 +48,7 @@ fn tool_green() -> gpui::Hsla {
 impl App {
     /// The folders card in logical px (the element tree's unit).
     pub(crate) fn card_rect(&self) -> LayoutRect {
-        crate::workspace::folders_card_rect(self.logical_height(), 1.0)
+        crate::workspace::folders_card_rect(self.logical_height(), self.folders_w, 1.0)
     }
 
     /// Whether `row` is the one the card highlights: the tool page that is
@@ -73,7 +74,8 @@ impl App {
         let modal = self.modal_overlay_open();
         let hover = self.sidebar_cursor();
         let hovered = |r: &LayoutRect| hover.is_some_and(|(x, y)| r.contains(x, y));
-        let rows = crate::workspace::folder_rows(self.tools.len(), self.sections.len());
+        let rows = self.folder_rows();
+        let scroll = self.folders_scroll().round();
         let footer = crate::workspace::folders_footer_rect(&card, 1.0);
         let (hide, new) = crate::workspace::folders_header_chips(&card, 1.0);
         let handler = |entity: gpui::WeakEntity<Self>, act: fn(&mut Self)| {
@@ -108,6 +110,12 @@ impl App {
                 app.note_cursor(ev.position);
                 cx.notify();
             }))
+            // Same story for the wheel: the card is its own scroll container.
+            .on_scroll_wheel(cx.listener(|app, ev: &ScrollWheelEvent, _win, cx| {
+                app.note_cursor(ev.position);
+                app.scroll_folders(ev.delta);
+                cx.notify();
+            }))
             .children(self.glass_backdrop_el(corners));
 
         // Header chips (the traffic lights float over the header's left).
@@ -140,12 +148,18 @@ impl App {
             .h(px(body.h))
             .overflow_hidden();
         for (i, row) in rows.iter().enumerate() {
-            let rect = crate::workspace::folder_row_rect(&card, &rows, i, 1.0);
+            let rect = crate::workspace::folder_row_rect(&card, &rows, i, scroll, 1.0);
             let r = rel(&rect, &body);
             let selected = self.folder_row_selected(*row);
             let row_hovered = hovered(&rect);
             let el = match *row {
-                FolderRow::PinnedHeader => self.pinned_header_row(theme, &r),
+                FolderRow::PinnedHeader => self
+                    .pinned_header_row(theme, &r, row_hovered)
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        press(entity.clone(), |this, _ev, _cx| this.toggle_tools_collapsed()),
+                    ),
                 FolderRow::Tool(ti) => {
                     let Some(tool) = self.tools.get(ti) else { continue };
                     self.tool_row(theme, &r, tool, selected, row_hovered)
@@ -175,7 +189,7 @@ impl App {
             };
             rows_layer = rows_layer.child(el);
         }
-        if let Some(sep) = crate::workspace::folder_separator_rect(&card, &rows, 1.0) {
+        if let Some(sep) = crate::workspace::folder_separator_rect(&card, &rows, scroll, 1.0) {
             let s = rel(&sep, &body);
             rows_layer = rows_layer.child(
                 div()
@@ -208,9 +222,16 @@ impl App {
         )
     }
 
-    /// The "Pinned tools" caption row: pin icon, label, tool count.
-    fn pinned_header_row(&self, theme: &Theme, r: &LayoutRect) -> gpui::Stateful<gpui::Div> {
-        row_shell(r, false, false, theme)
+    /// The "Pinned tools" caption row: pin icon, label, tool count, and a
+    /// fold chevron — a click folds the tool rows away
+    /// ([`App::toggle_tools_collapsed`]).
+    fn pinned_header_row(&self, theme: &Theme, r: &LayoutRect, hovered: bool) -> gpui::Stateful<gpui::Div> {
+        let chevron = if self.tools_collapsed {
+            crate::ui::assets::ICON_CHEVRON_RIGHT
+        } else {
+            crate::ui::assets::ICON_CHEVRON_DOWN
+        };
+        row_shell(r, false, hovered, theme)
             .id("folders-pinned")
             .child(
                 gpui::svg()
@@ -229,6 +250,14 @@ impl App {
                     .child("Pinned tools"),
             )
             .child(count_badge(theme, self.tools.len(), false))
+            .child(
+                gpui::svg()
+                    .flex_none()
+                    .path(chevron)
+                    .w(px(scaled(ROW_ICON)))
+                    .h(px(scaled(ROW_ICON)))
+                    .text_color(theme.muted_foreground),
+            )
     }
 
     /// One pinned CLI-tool row: green dot + the tool's command in monospace.
@@ -307,7 +336,11 @@ impl App {
             .on_mouse_down(
                 MouseButton::Left,
                 press(entity.clone(), move |this, ev, _cx| {
-                    this.press_folder_row(section_id, false, ev.click_count)
+                    this.press_folder_row(section_id, false, ev.click_count);
+                    // …and arm the re-order drag (live past the threshold).
+                    if let Some(si) = this.sections.iter().position(|s| s.id == section_id) {
+                        this.press_folder_drag(si);
+                    }
                 }),
             );
         if show_delete {

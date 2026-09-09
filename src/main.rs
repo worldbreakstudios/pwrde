@@ -134,6 +134,9 @@ enum DropTarget {
     SidebarInsert { before: usize, section: Option<u64>, pinned: Option<bool>, gap: usize },
     /// Drop on the middle (or collapsed bottom) of a section header → append.
     SidebarAppend { section_id: u64 },
+    /// Re-order a folder: insert the dragged section before section index
+    /// `before`; `gap` is the folders-card row gap the line previews at.
+    FolderInsert { before: usize, gap: usize },
 }
 
 impl DropTarget {
@@ -149,6 +152,7 @@ impl DropTarget {
             DropTarget::Group { .. }
                 | DropTarget::SidebarInsert { .. }
                 | DropTarget::SidebarAppend { .. }
+                | DropTarget::FolderInsert { .. }
         )
     }
 }
@@ -237,6 +241,12 @@ enum Drag {
     None,
     /// Resizing the sidebar.
     Sidebar,
+    /// Resizing the folders card (the band in the card/list gap).
+    Folders,
+    /// Folder row pressed; may become a folder drag past the threshold.
+    FolderPress { si: usize, start: (f64, f64) },
+    /// Dragging a folder row to re-order the folders card.
+    Folder { si: usize },
     /// Resizing a split divider at `path`.
     Divider { path: Vec<u8> },
     /// A tab was pressed; may become a drag past the threshold.
@@ -348,6 +358,17 @@ struct App {
     sidebar_collapsed: bool,
     folders_open: bool,
     folder_filter: Option<u64>,
+    /// Folders card width, logical px (user-resizable; session-only like
+    /// the sidebar width).
+    folders_w: f32,
+    /// Wheel scroll of the sessions rows / the folders-card rows, logical px
+    /// (clamped on read — see `sessions_scroll` / `folders_scroll`).
+    sessions_scroll: f32,
+    folders_scroll: f32,
+    /// The folders card's "Pinned tools" run is folded (`sidebar.tools_collapsed`).
+    tools_collapsed: bool,
+    /// The sessions list's "Pinned" run is folded (`sidebar.pinned_collapsed`).
+    pinned_collapsed: bool,
     /// The spot the native traffic lights were last positioned for
     /// (`workspace::traffic_light_spot`); `render` re-syncs on change.
     traffic_lights_for: Option<workspace::TrafficLightSpot>,
@@ -538,7 +559,11 @@ impl App {
         if self.sidebar_collapsed {
             0.0
         } else {
-            workspace::sidebar_region_w(self.sidebar_expanded_w, self.folders_visible())
+            workspace::sidebar_region_w(
+                self.sidebar_expanded_w,
+                self.folders_w,
+                self.folders_visible(),
+            )
         }
     }
 
@@ -552,7 +577,116 @@ impl App {
     /// The sessions list rect (physical px at `scale`) every row helper takes.
     pub(crate) fn sessions_list(&self, scale: f32) -> workspace::LayoutRect {
         let (_, h) = self.renderer.surface_size();
-        workspace::sessions_list_rect(self.sidebar_expanded_w, self.folders_visible(), h, scale)
+        workspace::sessions_list_rect(
+            self.sidebar_expanded_w,
+            self.folders_w,
+            self.folders_visible(),
+            h,
+            scale,
+        )
+    }
+
+    /// The sessions list rect the *rows* lay out in: [`App::sessions_list`]
+    /// shifted up by the wheel scroll, so every row helper (paint, hit-test,
+    /// drop preview) sees the same scrolled stack. The header and the clip
+    /// band keep the unshifted rect.
+    pub(crate) fn sessions_rows_list(&self, scale: f32) -> workspace::LayoutRect {
+        let mut list = self.sessions_list(scale);
+        list.y -= (self.sessions_scroll() * scale).round();
+        list
+    }
+
+    /// The sessions list's wheel scroll, logical px, clamped so the last
+    /// row never scrolls above the bottom of the viewport.
+    pub(crate) fn sessions_scroll(&self) -> f32 {
+        self.sessions_scroll.clamp(0.0, self.sessions_scroll_max())
+    }
+
+    fn sessions_scroll_max(&self) -> f32 {
+        let scale = self.scale();
+        let list = self.sessions_list(scale);
+        let rows = self.sidebar_rows();
+        let extent = workspace::sidebar_rows_extent(&rows, &self.workspaces, scale, &list);
+        let viewport = (list.h - (workspace::SESSIONS_HEADER_H * scale).round()).max(0.0);
+        workspace::max_scroll(extent, viewport) / scale
+    }
+
+    /// The folders card rect (physical px at `scale`) every folder-row
+    /// helper takes.
+    pub(crate) fn folders_card(&self, scale: f32) -> workspace::LayoutRect {
+        let (_, h) = self.renderer.surface_size();
+        workspace::folders_card_rect(h, self.folders_w, scale)
+    }
+
+    /// The folders card's rows in paint order, with the "Pinned tools" run
+    /// folded away when collapsed.
+    pub(crate) fn folder_rows(&self) -> Vec<workspace::FolderRow> {
+        workspace::folder_rows(self.tools.len(), self.tools_collapsed, self.sections.len())
+    }
+
+    /// The folders card's wheel scroll, logical px, clamped like
+    /// [`App::sessions_scroll`].
+    pub(crate) fn folders_scroll(&self) -> f32 {
+        self.folders_scroll.clamp(0.0, self.folders_scroll_max())
+    }
+
+    fn folders_scroll_max(&self) -> f32 {
+        let scale = self.scale();
+        let card = self.folders_card(scale);
+        let rows = self.folder_rows();
+        let extent = workspace::folder_rows_extent(&card, &rows, scale);
+        let footer = workspace::folders_footer_rect(&card, scale);
+        let viewport = (footer.y - card.y - (workspace::FOLDERS_HEADER_H * scale).round()).max(0.0);
+        workspace::max_scroll(extent, viewport) / scale
+    }
+
+    /// Wheel travel in logical px for the sidebar's scroll containers: a
+    /// line notch is ~40px, trackpad pixels pass through.
+    fn wheel_px(delta: gpui::ScrollDelta) -> f32 {
+        match delta {
+            gpui::ScrollDelta::Lines(p) => p.y * 40.0,
+            gpui::ScrollDelta::Pixels(p) => f32::from(p.y),
+        }
+    }
+
+    /// Scroll the folders card's rows by a wheel event (clamped).
+    pub(crate) fn scroll_folders(&mut self, delta: gpui::ScrollDelta) {
+        let next =
+            (self.folders_scroll() - Self::wheel_px(delta)).clamp(0.0, self.folders_scroll_max());
+        if next != self.folders_scroll {
+            self.folders_scroll = next;
+            self.request_redraw();
+        }
+    }
+
+    /// Scroll the sessions rows by a wheel event (clamped).
+    fn scroll_sessions(&mut self, delta: gpui::ScrollDelta) {
+        let next =
+            (self.sessions_scroll() - Self::wheel_px(delta)).clamp(0.0, self.sessions_scroll_max());
+        if next != self.sessions_scroll {
+            self.sessions_scroll = next;
+            self.request_redraw();
+        }
+    }
+
+    /// Fold or unfold the folders card's "Pinned tools" run.
+    pub(crate) fn toggle_tools_collapsed(&mut self) {
+        self.tools_collapsed = !self.tools_collapsed;
+        settings::set("sidebar.tools_collapsed", self.tools_collapsed.into());
+        self.request_redraw();
+    }
+
+    /// Fold or unfold the sessions list's "Pinned" run.
+    pub(crate) fn toggle_pinned_collapsed(&mut self) {
+        self.pinned_collapsed = !self.pinned_collapsed;
+        settings::set("sidebar.pinned_collapsed", self.pinned_collapsed.into());
+        self.request_redraw();
+    }
+
+    /// A folder row press: select the folder now (`press_folder_row`) and
+    /// arm a re-order drag that goes live past the drag threshold.
+    pub(crate) fn press_folder_drag(&mut self, si: usize) {
+        self.drag = Drag::FolderPress { si, start: self.cursor };
     }
 
     /// The flat session rows the list paints and hit-tests: the active folder
@@ -562,7 +696,12 @@ impl App {
         if self.page == Page::Settings {
             return Vec::new();
         }
-        workspace::sidebar_rows_filtered(&self.workspaces, &self.sections, self.folder_filter)
+        workspace::sidebar_rows_filtered(
+            &self.workspaces,
+            &self.sections,
+            self.folder_filter,
+            self.pinned_collapsed,
+        )
     }
 
     /// Whether the current page paints the session rows (every page but
@@ -770,7 +909,7 @@ impl App {
             || self.modal_overlay_open()
             || (self.flyover_anim > 0.0 && !self.flyover_windowed)
             || self.flow.open
-            || matches!(self.drag, Drag::Tab { .. } | Drag::Group { .. });
+            || matches!(self.drag, Drag::Tab { .. } | Drag::Group { .. } | Drag::Folder { .. });
         let mut placements = Vec::new();
         let mut focus = None;
         if !obscured {
@@ -1759,6 +1898,20 @@ impl App {
                 return;
             }
         }
+        // The sidebar's scroll containers: the folders card and the sessions
+        // rows (Settings' tab list is short and never scrolls).
+        if !self.sidebar_collapsed {
+            let scale = self.scale();
+            let (px, py) = (self.cursor.0 as f32, self.cursor.1 as f32);
+            if self.folders_visible() && self.folders_card(scale).contains(px, py) {
+                self.scroll_folders(delta);
+                return;
+            }
+            if self.page != Page::Settings && self.sessions_list(scale).contains(px, py) {
+                self.scroll_sessions(delta);
+                return;
+            }
+        }
         // A tool page's terminal takes the wheel (a TUI usually claims it).
         if let Page::Tool(i) = self.page {
             if let Some(Some(ts)) = self.tool_sessions.get(i) {
@@ -2128,7 +2281,7 @@ impl App {
                     ri,
                     &self.workspaces,
                     scale,
-                    &self.sessions_list(scale),
+                    &self.sessions_rows_list(scale),
                 );
                 if !rect.contains(px, py) {
                     continue;
@@ -2608,7 +2761,9 @@ impl App {
         {
             self.pending_primary_cmd.insert(session.id, cmd);
         }
-        let ws = Workspace::new(name, tile, cwd);
+        let mut ws = Workspace::new(name, tile, cwd);
+        // A group made while a folder is showing belongs to that folder.
+        ws.section = self.folder_filter;
         if empty {
             self.workspaces[0] = ws;
             self.active = 0;
@@ -2642,7 +2797,7 @@ impl App {
             focused_tile: primary_tile,
             cwd,
             primary_tile,
-            section: None,
+            section: self.folder_filter,
             pinned: false,
         };
         ws.fix_focus();
@@ -2852,7 +3007,7 @@ impl App {
                     ri,
                     &self.workspaces,
                     scale,
-                    &self.sessions_list(scale),
+                    &self.sessions_rows_list(scale),
                 );
                 if !rect.contains(px, py) {
                     continue;
@@ -2878,11 +3033,12 @@ impl App {
         // Folder rows in the folders card: drop into that folder ("All
         // sessions" drops the group out of every folder, at the end).
         if self.folders_visible() {
-            let card = workspace::folders_card_rect(h, scale);
+            let card = self.folders_card(scale);
             if card.contains(px, py) {
-                let rows = workspace::folder_rows(self.tools.len(), self.sections.len());
+                let rows = self.folder_rows();
+                let scroll = self.folders_scroll() * scale;
                 for (i, row) in rows.iter().enumerate() {
-                    if !workspace::folder_row_rect(&card, &rows, i, scale).contains(px, py) {
+                    if !workspace::folder_row_rect(&card, &rows, i, scroll, scale).contains(px, py) {
                         continue;
                     }
                     return match *row {
@@ -2902,6 +3058,32 @@ impl App {
             }
         }
         let rows = self.sidebar_rows();
+        // The "Pinned" caption is a landing zone of its own: drop there to
+        // pin (at the head of the run), whatever folder the group is in.
+        let zone = workspace::pinned_drop_zone(
+            &rows,
+            &self.workspaces,
+            scale,
+            &self.sessions_rows_list(scale),
+        );
+        if zone.contains(px, py) {
+            let own = match self.drag {
+                Drag::Group { ws } => self.workspaces.get(ws).and_then(|w| w.section),
+                _ => None,
+            };
+            let before = self
+                .workspaces
+                .iter()
+                .position(|w| w.pinned)
+                .or_else(|| rows.first().map(|r| r.ws_idx))
+                .unwrap_or(self.workspaces.len());
+            return Some(DropTarget::SidebarInsert {
+                before,
+                section: self.folder_filter.or(own),
+                pinned: Some(true),
+                gap: 0,
+            });
+        }
         if rows.is_empty() {
             return Some(DropTarget::SidebarInsert { before: 0, section: None, pinned: None, gap: 0 });
         }
@@ -2911,7 +3093,7 @@ impl App {
                 ri,
                 &self.workspaces,
                 scale,
-                &self.sessions_list(scale),
+                &self.sessions_rows_list(scale),
             );
             // Full sidebar x-span for the row's y band (indented members still hit).
             let side = workspace::sidebar(h, scale, self.sidebar_w());
@@ -2947,7 +3129,7 @@ impl App {
                 last,
                 &self.workspaces,
                 scale,
-                &self.sessions_list(scale),
+                &self.sessions_rows_list(scale),
             );
             if py >= rect.y + rect.h {
                 return Some(DropTarget::SidebarInsert {
@@ -3004,8 +3186,52 @@ impl App {
         match self.drag {
             Drag::Tab { tile, .. } => self.resolve_drop(x, y, tile),
             Drag::Group { .. } => self.resolve_sidebar_group_drop(x, y),
+            Drag::Folder { .. } => self.resolve_folder_drop(x, y),
             _ => None,
         }
+    }
+
+    /// Where a dragged folder row lands: the top half of a folder row sorts
+    /// before it, the bottom half after; the run's top/bottom slack maps to
+    /// its ends. Only the folders card's section rows are landing zones.
+    fn resolve_folder_drop(&self, px: f32, py: f32) -> Option<DropTarget> {
+        if !self.folders_visible() {
+            return None;
+        }
+        let scale = self.scale();
+        let card = self.folders_card(scale);
+        if !card.contains(px, py) {
+            return None;
+        }
+        let rows = self.folder_rows();
+        let scroll = self.folders_scroll() * scale;
+        let mut first: Option<(usize, usize)> = None;
+        let mut last: Option<(usize, usize, workspace::LayoutRect)> = None;
+        for (i, row) in rows.iter().enumerate() {
+            let workspace::FolderRow::Section(si) = *row else { continue };
+            let rect = workspace::folder_row_rect(&card, &rows, i, scroll, scale);
+            first.get_or_insert((i, si));
+            last = Some((i, si, rect));
+            if py < rect.y || py >= rect.y + rect.h {
+                continue;
+            }
+            let rel = (py - rect.y) / rect.h.max(1.0);
+            return Some(if rel < 0.5 {
+                DropTarget::FolderInsert { before: si, gap: i }
+            } else {
+                DropTarget::FolderInsert { before: si + 1, gap: i + 1 }
+            });
+        }
+        let (fi, fsi) = first?;
+        let (li, lsi, lrect) = last?;
+        let frect = workspace::folder_row_rect(&card, &rows, fi, scroll, scale);
+        if py < frect.y {
+            return Some(DropTarget::FolderInsert { before: fsi, gap: fi });
+        }
+        if py >= lrect.y + lrect.h {
+            return Some(DropTarget::FolderInsert { before: lsi + 1, gap: li + 1 });
+        }
+        None
     }
 
     /// The translucent highlight rect for a resolved drop target, at `scale`.
@@ -3029,7 +3255,7 @@ impl App {
                             ri,
                             &self.workspaces,
                             scale,
-                            &self.sessions_list(scale),
+                            &self.sessions_rows_list(scale),
                         ));
                     }
                 }
@@ -3041,18 +3267,54 @@ impl App {
                     return None;
                 }
                 let section_idx = self.sections.iter().position(|s| s.id == section_id)?;
-                let (_, h) = self.renderer.surface_size();
-                let card = workspace::folders_card_rect(h, scale);
-                let rows = workspace::folder_rows(self.tools.len(), self.sections.len());
-                let index = rows
+                let card = self.folders_card(scale);
+                let frows = self.folder_rows();
+                let index = frows
                     .iter()
                     .position(|r| *r == workspace::FolderRow::Section(section_idx))?;
-                Some(workspace::folder_row_rect(&card, &rows, index, scale))
+                let scroll = self.folders_scroll() * scale;
+                Some(workspace::folder_row_rect(&card, &frows, index, scroll, scale))
             },
-            DropTarget::SidebarInsert { gap, .. } => {
-                // Thin insertion line at the visual row gap.
-                let y = self.sidebar_gap_y(gap, &rows, scale);
+            DropTarget::SidebarInsert { gap, pinned, .. } => {
+                // Thin insertion line at the visual row gap. A drop that
+                // pins at the end of the pinned run previews above the
+                // section divider, not under it.
+                let n_pinned = workspace::pinned_run(&rows, &self.workspaces);
+                let y = if pinned == Some(true) && gap == n_pinned && gap > 0 {
+                    let r = workspace::sidebar_row_rect(
+                        &rows,
+                        gap - 1,
+                        &self.workspaces,
+                        scale,
+                        &self.sessions_rows_list(scale),
+                    );
+                    r.y + r.h
+                } else {
+                    self.sidebar_gap_y(gap, &rows, scale)
+                };
                 Some(self.sidebar_insert_line(y, &rows, scale, line_h))
+            },
+            DropTarget::FolderInsert { gap, .. } => {
+                if !self.folders_visible() {
+                    return None;
+                }
+                let card = self.folders_card(scale);
+                let frows = self.folder_rows();
+                let scroll = self.folders_scroll() * scale;
+                let y = if gap < frows.len() {
+                    workspace::folder_row_rect(&card, &frows, gap, scroll, scale).y
+                } else {
+                    let last = frows.len().checked_sub(1)?;
+                    let r = workspace::folder_row_rect(&card, &frows, last, scroll, scale);
+                    r.y + r.h
+                };
+                let inset = (8.0 * scale).round();
+                Some(workspace::LayoutRect {
+                    x: card.x + inset,
+                    y: y - line_h / 2.0,
+                    w: (card.w - 2.0 * inset).max(0.0),
+                    h: line_h,
+                })
             },
             DropTarget::TabBar { tile, .. }
             | DropTarget::Center { tile }
@@ -3116,7 +3378,7 @@ impl App {
                 gap,
                 &self.workspaces,
                 scale,
-                &self.sessions_list(scale),
+                &self.sessions_rows_list(scale),
             )
             .y;
         }
@@ -3126,12 +3388,12 @@ impl App {
                 last,
                 &self.workspaces,
                 scale,
-                &self.sessions_list(scale),
+                &self.sessions_rows_list(scale),
             );
             return rect.y + rect.h;
         }
         // Empty list: just below its header.
-        let list = self.sessions_list(scale);
+        let list = self.sessions_rows_list(scale);
         list.y + (workspace::SESSIONS_HEADER_H * scale).round() + (6.0 * scale).round()
     }
 
@@ -3153,7 +3415,7 @@ impl App {
                 ri,
                 &self.workspaces,
                 scale,
-                &self.sessions_list(scale),
+                &self.sessions_rows_list(scale),
             );
             x = if ri == 0 { r.x } else { x.min(r.x) };
         }
@@ -3708,7 +3970,12 @@ impl App {
                 // is the region width, so take the folders column back off
                 // before it becomes the sessions-list width.
                 self.sidebar_expanded_w =
-                    workspace::sessions_w_for_pointer(px / scale, self.folders_open);
+                    workspace::sessions_w_for_pointer(px / scale, self.folders_w, self.folders_open);
+                self.sync_layout();
+                self.request_redraw();
+            },
+            Drag::Folders => {
+                self.folders_w = workspace::folders_w_for_pointer(px / scale);
                 self.sync_layout();
                 self.request_redraw();
             },
@@ -3743,6 +4010,14 @@ impl App {
                 }
             },
             Drag::Group { .. } => self.request_redraw(),
+            Drag::FolderPress { si, start } => {
+                let (sx, sy) = *start;
+                if (self.cursor.0 - sx).abs() + (self.cursor.1 - sy).abs() > DRAG_THRESHOLD {
+                    self.drag = Drag::Folder { si: *si };
+                    self.request_redraw();
+                }
+            },
+            Drag::Folder { .. } => self.request_redraw(),
             Drag::FlyoverResize => {
                 // Top edge follows the pointer; PTYs resize on release.
                 let (_, h) = self.renderer.surface_size();
@@ -3825,11 +4100,18 @@ impl App {
                     let dividers_active =
                         self.page == Page::Sessions && !self.is_empty_state();
                     let ws = &self.workspaces[self.active];
+                    let folders_edge_x = if self.sidebar_collapsed {
+                        None
+                    } else {
+                        workspace::folders_edge_x(self.folders_w, self.folders_visible())
+                            .map(|x| x * scale)
+                    };
                     workspace::resize_hover_at(
                         &ws.root,
                         self.area(),
                         scale,
                         sidebar_edge_x,
+                        folders_edge_x,
                         grab,
                         dividers_active,
                         px,
@@ -3922,6 +4204,18 @@ impl App {
                 let (px, py) = (self.cursor.0 as f32, self.cursor.1 as f32);
                 if let Some(target) = self.resolve_sidebar_group_drop(px, py) {
                     self.apply_sidebar_group_drop(ws, target);
+                }
+                self.request_redraw();
+            },
+            // Folder drag: re-order the folders card (persisted with the
+            // sections' positions).
+            Drag::Folder { si } => {
+                let (px, py) = (self.cursor.0 as f32, self.cursor.1 as f32);
+                if let Some(DropTarget::FolderInsert { before, .. }) =
+                    self.resolve_folder_drop(px, py)
+                {
+                    workspace::reorder_section(&mut self.sections, si, before);
+                    self.persist_snapshot();
                 }
                 self.request_redraw();
             },
@@ -5532,7 +5826,7 @@ impl App {
         let resize_hover = if overlay_open
             || !matches!(
                 self.drag,
-                Drag::None | Drag::Sidebar | Drag::Divider { .. }
+                Drag::None | Drag::Sidebar | Drag::Folders | Drag::Divider { .. }
             )
         {
             None
@@ -6831,6 +7125,11 @@ fn main() {
                         // sections once they exist.
                         folder_filter: settings::get_str("sidebar.folder")
                             .and_then(|s| s.parse::<u64>().ok()),
+                        folders_w: workspace::FOLDERS_CARD_W,
+                        sessions_scroll: 0.0,
+                        folders_scroll: 0.0,
+                        tools_collapsed: settings::get_bool("sidebar.tools_collapsed", false),
+                        pinned_collapsed: settings::get_bool("sidebar.pinned_collapsed", false),
                         traffic_lights_for: None,
                         modifiers: Modifiers::default(),
                         mouse_report: None,
