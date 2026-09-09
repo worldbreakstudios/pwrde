@@ -736,6 +736,17 @@ impl App {
 
         let dismiss_entity = entity;
         let top = (win_h * PANEL_TOP_FRAC).max(PANEL_TOP_MIN);
+        // The click-to-dismiss layer spans the window, but the dimming scrim
+        // only covers the content area: the sidebar keeps its colours so the
+        // folders card does not read as blacked out behind the palette.
+        let scrim_x = self.sidebar_w();
+        let scrim = div()
+            .absolute()
+            .left(px(scrim_x))
+            .top(px(0.0))
+            .w(px((win_w - scrim_x).max(0.0)))
+            .h(px(win_h))
+            .bg(crate::renderer::color(chrome.scrim, 0.30));
         let backdrop = div()
             .id("command-scrim")
             .occlude()
@@ -745,7 +756,7 @@ impl App {
             .justify_center()
             .items_start()
             .pt(px(top))
-            .bg(crate::renderer::color(chrome.scrim, 0.30))
+            .child(scrim)
             .on_click(move |_ev: &ClickEvent, _win: &mut Window, app: &mut GpuiApp| {
                 if let Some(entity) = dismiss_entity.upgrade() {
                     entity.update(app, |this, cx| {

@@ -1485,9 +1485,15 @@ impl App {
     /// Record a pointer position from an element event (logical px) in the
     /// physical-px form the canvas mouse path keeps.
     pub(crate) fn note_pointer(&mut self, ev: &MouseDownEvent) {
-        let s = self.scale() as f64;
-        self.cursor = (f64::from(ev.position.x) * s, f64::from(ev.position.y) * s);
+        self.note_cursor(ev.position);
         self.modifiers = ev.modifiers;
+    }
+
+    /// Record a logical pointer position as the physical `cursor`, for
+    /// element-tree layers that occlude the canvas mouse-move listener.
+    pub(crate) fn note_cursor(&mut self, position: gpui::Point<Pixels>) {
+        let s = self.scale() as f64;
+        self.cursor = (f64::from(position.x) * s, f64::from(position.y) * s);
     }
 
     fn close_active_tab(&mut self) {
@@ -2126,6 +2132,7 @@ impl App {
                     &rows,
                     ri,
                     &self.workspaces,
+                    self.folder_filter,
                     scale,
                     &self.sessions_list(scale),
                 );
@@ -2850,6 +2857,7 @@ impl App {
                     &rows,
                     ri,
                     &self.workspaces,
+                    self.folder_filter,
                     scale,
                     &self.sessions_list(scale),
                 );
@@ -2908,7 +2916,8 @@ impl App {
                 &rows,
                 ri,
                 &self.workspaces,
-                scale,
+                self.folder_filter,
+                    scale,
                 &self.sessions_list(scale),
             );
             // Full sidebar x-span for the row's y band (indented members still hit).
@@ -2946,7 +2955,8 @@ impl App {
                 &rows,
                 last,
                 &self.workspaces,
-                scale,
+                self.folder_filter,
+                    scale,
                 &self.sessions_list(scale),
             );
             if py >= rect.y + rect.h {
@@ -3014,7 +3024,8 @@ impl App {
                             &rows,
                             ri,
                             &self.workspaces,
-                            scale,
+                            self.folder_filter,
+                    scale,
                             &self.sessions_list(scale),
                         ));
                     }
@@ -3029,7 +3040,8 @@ impl App {
                             &rows,
                             ri,
                             &self.workspaces,
-                            scale,
+                            self.folder_filter,
+                    scale,
                             &self.sessions_list(scale),
                         ));
                     }
@@ -3117,7 +3129,8 @@ impl App {
                 rows,
                 ri,
                 &self.workspaces,
-                scale,
+                self.folder_filter,
+                    scale,
                 &self.sessions_list(scale),
             );
             match *row {
@@ -3132,7 +3145,8 @@ impl App {
                 rows,
                 last,
                 &self.workspaces,
-                scale,
+                self.folder_filter,
+                    scale,
                 &self.sessions_list(scale),
             );
             return rect.y + rect.h;
@@ -3159,7 +3173,8 @@ impl App {
                 rows,
                 ri,
                 &self.workspaces,
-                scale,
+                self.folder_filter,
+                    scale,
                 &self.sessions_list(scale),
             );
             x = if ri == 0 { r.x } else { x.min(r.x) };

@@ -40,8 +40,8 @@ use crate::ui::theme::Theme;
 
 /// Horizontal padding inside a session row (mock: `10px 12px`).
 const ROW_PAD: f32 = 12.0;
-/// Unread / attention dot in a row's left gutter.
-const UNREAD_DOT: f32 = 7.0;
+/// Unread / attention dot under a row's PR-state icon.
+const UNREAD_DOT: f32 = 6.0;
 /// Corner radius of a session row's selection / hover fill (mock: 9px).
 const ROW_RADIUS: f32 = 9.0;
 /// Side of the PR-state icon on a row's first line (mock: 11px, tinted
@@ -142,11 +142,11 @@ impl App {
             .into_any_element()
     }
 
-    /// The floating "Show sessions" button beside the relocated traffic
-    /// lights while the whole region is hidden (⌘S): a round glass button
-    /// over the top-left tile's tab strip (which
-    /// `workspace::COLLAPSED_STRIP_INSET` keeps clear of it) that reopens
-    /// the sidebar. Empty while the sidebar is open.
+    /// The floating "Show sessions" chip beside the relocated traffic lights
+    /// while the whole region is hidden (⌘S): the inward-bracket twin of the
+    /// header's "Focus terminals" glyph, bare over the top-left tile's tab
+    /// strip (which `workspace::COLLAPSED_STRIP_INSET` keeps clear of it),
+    /// reopening the sidebar. Empty while the sidebar is open.
     pub fn render_collapsed_overlay(&self, cx: &mut Context<Self>) -> AnyElement {
         if !self.sidebar_collapsed || self.flyover_ceiling() == Some(0.0) {
             return div().into_any_element();
@@ -157,19 +157,7 @@ impl App {
         let hovered = self.sidebar_cursor().is_some_and(|(x, y)| rect.contains(x, y));
         let modal = self.modal_overlay_open();
         let entity = cx.entity().downgrade();
-        crate::ui::glass::Glass::bar(theme.dark)
-            .apply(
-                div()
-                    .absolute()
-                    .left(px(rect.x))
-                    .top(px(rect.y))
-                    .w(px(rect.w))
-                    .h(px(rect.h))
-                    .rounded_full()
-                    .flex()
-                    .items_center()
-                    .justify_center(),
-            )
+        icon_chip(&theme, &rect, hovered, false, crate::ui::assets::ICON_MINIMIZE)
             .id("show-sessions")
             .occlude()
             .when(!modal, |d| {
@@ -184,13 +172,6 @@ impl App {
                     },
                 )
             })
-            .child(
-                gpui::svg()
-                    .path(crate::ui::assets::ICON_PANEL_LEFT)
-                    .w(px(16.0))
-                    .h(px(16.0))
-                    .text_color(if hovered { theme.foreground } else { theme.muted_foreground }),
-            )
             .into_any_element()
     }
 
@@ -431,7 +412,6 @@ impl App {
         let list = self.list_rect();
         let folders = self.folders_visible();
         let chips = crate::workspace::sessions_header_chips(&list, folders, 1.0);
-        let title_x = crate::workspace::sessions_header_title_x(&list, folders, 1.0);
         let cur = self.sidebar_cursor();
         let hovered = |r: &crate::workspace::LayoutRect| cur.is_some_and(|(x, y)| r.contains(x, y));
         let modal = self.modal_overlay_open();
@@ -447,59 +427,7 @@ impl App {
         };
 
         let settings = self.page == crate::Page::Settings;
-        let (title, subtitle) = if settings {
-            ("Settings".to_string(), "Preferences".to_string())
-        } else {
-            let title = self
-                .folder_filter
-                .and_then(|id| self.sections.iter().find(|s| s.id == id))
-                .map(|s| {
-                    if s.emoji.is_empty() {
-                        s.name.clone()
-                    } else {
-                        format!("{} {}", s.emoji, s.name)
-                    }
-                })
-                .unwrap_or_else(|| "All sessions".to_string());
-            let n = self.sidebar_rows().len();
-            (title, format!("{n} session{}", if n == 1 { "" } else { "s" }))
-        };
-        let title_w = (chips.focus.x - scaled(4.0) - title_x).max(0.0);
-
-        let mut layer = div()
-            .absolute()
-            .left(px(0.0))
-            .top(px(0.0))
-            .size_full()
-            .child(
-                div()
-                    .absolute()
-                    .left(px(title_x))
-                    .top(px(list.y))
-                    .w(px(title_w))
-                    .h(px(crate::workspace::SESSIONS_HEADER_H))
-                    .flex()
-                    .flex_col()
-                    .justify_center()
-                    .overflow_hidden()
-                    .child(
-                        div()
-                            .text_size(px(scaled(13.0)))
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(theme.foreground)
-                            .whitespace_nowrap()
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .child(title),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(scaled(11.0)))
-                            .text_color(theme.muted_foreground)
-                            .whitespace_nowrap()
-                            .child(subtitle),
-                    ),
-            );
+        let mut layer = div().absolute().left(px(0.0)).top(px(0.0)).size_full();
 
         if let Some(show) = chips.show_folders {
             layer = layer.child(
@@ -710,7 +638,7 @@ impl App {
             let Some(ws) = self.workspaces.get(ws_idx) else {
                 continue;
             };
-            let rect = crate::workspace::sidebar_row_rect(&rows, i, &self.workspaces, 1.0, &list);
+            let rect = crate::workspace::sidebar_row_rect(&rows, i, &self.workspaces, self.folder_filter, 1.0, &list);
             let selected = active == Some(i);
             let last = i + 1 == rows.len();
             layer = layer.child(
@@ -723,7 +651,7 @@ impl App {
         if rows.is_empty() && self.folder_filter.is_some() {
             // A folder with no (unpinned) members: say so where its first
             // row would sit, so the list never reads as broken.
-            let rect = crate::workspace::sidebar_row_rect(&rows, 0, &self.workspaces, 1.0, &list);
+            let rect = crate::workspace::sidebar_row_rect(&rows, 0, &self.workspaces, self.folder_filter, 1.0, &list);
             layer = layer.child(
                 div()
                     .absolute()
@@ -734,7 +662,7 @@ impl App {
                     .child("No sessions in this folder"),
             );
         }
-        let pinned = crate::workspace::pinned_indices(&self.workspaces);
+        let pinned = crate::workspace::pinned_indices(&self.workspaces, self.folder_filter);
         for (k, &ws_idx) in pinned.iter().enumerate() {
             let Some(ws) = self.workspaces.get(ws_idx) else {
                 continue;
@@ -962,8 +890,8 @@ impl App {
     /// [`crate::workspace::sidebar_row_rect`]), in the GANTRY mock's style:
     /// line one is the title, the relative time and the PR-state icon; line
     /// two the diffstat as `+A −R · N uncommitted` (or "no code changes").
-    /// The unread dot sits in the left gutter; a hairline separator closes
-    /// every row but the last.
+    /// The unread dot sits under the PR-state icon; a hairline separator
+    /// closes every row but the last.
     fn session_row(
         &self,
         theme: &Theme,
@@ -1060,38 +988,58 @@ impl App {
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(scaled(4.0)))
-                    .text_size(px(scaled(11.0)))
-                    .font_family(crate::renderer::FONT_FAMILY)
-                    .text_color(soft)
-                    .whitespace_nowrap()
-                    .overflow_hidden()
-                    .map(|d| match diff {
-                        Some(line) => d
-                            .child(div().text_color(diff_added(theme.dark)).child(line.added))
-                            .child(
-                                div()
-                                    .text_color(diff_removed(theme.dark))
-                                    .child(typographic_minus(&line.removed)),
-                            )
-                            .when_some(line.uncommitted, |d, note| {
-                                d.child(div().child(format!("· {note}")))
+                    .gap(px(scaled(6.0)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .flex()
+                            .items_center()
+                            .gap(px(scaled(4.0)))
+                            .text_size(px(scaled(11.0)))
+                            .font_family(crate::renderer::FONT_FAMILY)
+                            .text_color(soft)
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .map(|d| match diff {
+                                Some(line) => d
+                                    .child(
+                                        div()
+                                            .text_color(diff_added(theme.dark))
+                                            .child(line.added),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_color(diff_removed(theme.dark))
+                                            .child(typographic_minus(&line.removed)),
+                                    )
+                                    .when_some(line.uncommitted, |d, note| {
+                                        d.child(div().child(format!("· {note}")))
+                                    }),
+                                None => d.child("no code changes"),
                             }),
-                        None => d.child("no code changes"),
-                    }),
+                    )
+                    // The unread dot sits under the PR-state icon: a column
+                    // as wide as the icon, so the text edge never shifts.
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(scaled(STATUS_ICON)))
+                            .h(px(scaled(STATUS_ICON)))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .when(ws.any_unread(), |d| {
+                                d.child(
+                                    div()
+                                        .w(px(scaled(UNREAD_DOT)))
+                                        .h(px(scaled(UNREAD_DOT)))
+                                        .rounded_full()
+                                        .bg(theme.primary),
+                                )
+                            }),
+                    ),
             )
-            .when(ws.any_unread(), |d| {
-                d.child(
-                    div()
-                        .absolute()
-                        .left(px(scaled((ROW_PAD - UNREAD_DOT) / 2.0)))
-                        .top(px((rect.h - scaled(UNREAD_DOT)).max(0.0) / 2.0))
-                        .w(px(scaled(UNREAD_DOT)))
-                        .h(px(scaled(UNREAD_DOT)))
-                        .rounded_full()
-                        .bg(theme.primary),
-                )
-            })
             .when(!last, |d| {
                 d.child(
                     div()

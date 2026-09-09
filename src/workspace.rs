@@ -415,15 +415,17 @@ impl Workspace {
     }
 }
 
-/// Indices of pinned workspaces, in the order they appear in `workspaces`.
+/// Indices of the pinned workspaces the bubble strip shows under `filter`
+/// (a folder id, or `None` for "All sessions"), in `workspaces` order. A
+/// pinned group belongs to one folder, so another folder's strip omits it.
 ///
-/// The Sessions sidebar uses this both to paint the bubble strip and to
-/// hit-test clicks against those bubbles — one order, shared by paint and input.
-pub fn pinned_indices(workspaces: &[Workspace]) -> Vec<usize> {
+/// The Sessions sidebar uses this both to paint the bubble strip and to lay
+/// the rows out beneath it — one order, shared by paint and geometry.
+pub fn pinned_indices(workspaces: &[Workspace], filter: Option<u64>) -> Vec<usize> {
     workspaces
         .iter()
         .enumerate()
-        .filter(|(_, w)| w.pinned)
+        .filter(|(_, w)| w.pinned && filter.is_none_or(|id| w.section == Some(id)))
         .map(|(i, _)| i)
         .collect()
 }
@@ -518,14 +520,9 @@ const TAB_GAP: f32 = 3.0;
 const HEADER_CHIP: f32 = 20.0;
 /// Gap between neighbouring header chips.
 const HEADER_CHIP_GAP: f32 = 4.0;
-/// Gap between the "Show folders" chip and the header's title block (the
-/// mock's 6px icon margin plus its 8px flex gap, less the chip's own
-/// glyph inset).
-const HEADER_TITLE_GAP: f32 = 4.0;
 /// Gap between the native traffic lights and the "Show folders" chip while
 /// the folders card is hidden — the mock leaves 16px of air after the green
-/// light; with the chip's glyph ~2px inside its square this gives 14px,
-/// the most the title beside it can spare at the default list width.
+/// light; with the chip's glyph ~2px inside its square this gives 14px.
 const SHOW_FOLDERS_GAP: f32 = 12.0;
 /// Height of the horizontal tab strip atop each tile.
 const TILE_TAB_H: f32 = 28.0;
@@ -768,15 +765,6 @@ pub fn sessions_header_chips(list: &LayoutRect, folders_open: bool, scale: f32) 
     SessionsHeaderChips { show_folders, focus, plus, gear }
 }
 
-/// Left edge of the sessions header's title block: after the "Show folders"
-/// chip while the card is hidden, else the list's own left inset.
-pub fn sessions_header_title_x(list: &LayoutRect, folders_open: bool, scale: f32) -> f32 {
-    let chips = sessions_header_chips(list, folders_open, scale);
-    match chips.show_folders {
-        Some(chip) => chip.x + chip.w + (HEADER_TITLE_GAP * scale).round(),
-        None => list.x + (REGION_PAD * scale).round(),
-    }
-}
 
 /// Flat sessions rows for the GANTRY list: one [`SidebarRow`] per group
 /// — no section headers — for the groups `filter` admits. `None` (All
@@ -1064,23 +1052,26 @@ pub fn sidebar_row_rect(
     rows: &[SidebarRow],
     index: usize,
     workspaces: &[Workspace],
+    filter: Option<u64>,
     scale: f32,
     list: &LayoutRect,
 ) -> LayoutRect {
-    sidebar_row_rect_at(rows, index, workspaces, scale, row_font_scale(), list)
+    sidebar_row_rect_at(rows, index, workspaces, filter, scale, row_font_scale(), list)
 }
 
 /// [`sidebar_row_rect`] at an explicit text-size factor. Pure, so the tests can
-/// pin the row pitch at a non-default size.
+/// pin the row pitch at a non-default size. `filter` is the folder whose
+/// pinned strip the rows sit under ([`pinned_indices`]).
 fn sidebar_row_rect_at(
     rows: &[SidebarRow],
     index: usize,
     workspaces: &[Workspace],
+    filter: Option<u64>,
     scale: f32,
     font_scale: f32,
     list: &LayoutRect,
 ) -> LayoutRect {
-    let n_pinned = workspaces.iter().filter(|w| w.pinned).count();
+    let n_pinned = pinned_indices(workspaces, filter).len();
     let top0 = list.y + (SESSIONS_HEADER_H * scale).round() + pinned_strip_h(n_pinned, scale, list);
     let w = list.w.max(0.0);
     let mut y = top0;
@@ -2467,8 +2458,8 @@ mod tests {
         let rows = [SidebarRow { ws_idx: 0 }, SidebarRow { ws_idx: 1 }];
         let workspaces = [ws("a", None), ws("b", None)];
         let pitch = |f: f32| {
-            let a = sidebar_row_rect_at(&rows, 0, &workspaces, scale, f, &list);
-            let b = sidebar_row_rect_at(&rows, 1, &workspaces, scale, f, &list);
+            let a = sidebar_row_rect_at(&rows, 0, &workspaces, None, scale, f, &list);
+            let b = sidebar_row_rect_at(&rows, 1, &workspaces, None, scale, f, &list);
             (a.h, b.y - a.y)
         };
         let (h1, pitch1) = pitch(1.0);
@@ -2488,7 +2479,7 @@ mod tests {
             header_bottom + 2.0 * (TAB_GAP * scale).round()
         );
         assert_eq!(
-            sidebar_row_rect_at(&rows, 0, &workspaces, scale, 2.0, &list).y,
+            sidebar_row_rect_at(&rows, 0, &workspaces, None, scale, 2.0, &list).y,
             header_bottom
         );
 
@@ -2728,9 +2719,9 @@ mod tests {
         let scale = 1.0;
         let list = sessions_list_rect(300.0, false, 1000, scale);
 
-        let before = sidebar_row_rect(&rows, 0, &workspaces, scale, &list);
+        let before = sidebar_row_rect(&rows, 0, &workspaces, None, scale, &list);
         workspaces[0].pinned = true;
-        let after = sidebar_row_rect(&rows, 0, &workspaces, scale, &list);
+        let after = sidebar_row_rect(&rows, 0, &workspaces, None, scale, &list);
 
         assert_eq!(after.y, before.y + pinned_strip_h(1, scale, &list));
         assert_eq!(before.x, list.x);
@@ -2760,7 +2751,7 @@ mod tests {
         let rows = sidebar_rows_filtered(&workspaces, &[], None);
         let list = sessions_list_rect(SIDEBAR_DEFAULT_W, true, h, scale);
         for i in 0..rows.len() {
-            let r = sidebar_row_rect(&rows, i, &workspaces, scale, &list);
+            let r = sidebar_row_rect(&rows, i, &workspaces, None, scale, &list);
             assert!(r.x + r.w <= area.x);
             assert!(r.x >= list.x);
         }
@@ -2768,8 +2759,7 @@ mod tests {
 
     /// The sessions-list header carries the chips: focus / ＋ / gear
     /// right-clustered inside the header band, plus a "Show folders" chip
-    /// clear of the traffic lights only while the card is hidden — the
-    /// title slides right to make room for it.
+    /// clear of the traffic lights only while the card is hidden.
     #[test]
     fn sessions_header_chips_cluster_right_and_show_folders_only_when_closed() {
         let scale = 2.0;
@@ -2788,10 +2778,6 @@ mod tests {
         assert_eq!(chips.focus.x + side + gap, chips.plus.x);
         assert!(chips.gear.y >= list.y);
         assert!(chips.gear.y + side <= list.y + (SESSIONS_HEADER_H * scale).round());
-        assert_eq!(
-            sessions_header_title_x(&list, true, scale),
-            list.x + (REGION_PAD * scale).round()
-        );
 
         let closed = sessions_list_rect(SIDEBAR_DEFAULT_W, false, 1000, scale);
         let chips = sessions_header_chips(&closed, false, scale);
@@ -2800,10 +2786,6 @@ mod tests {
         assert!(show.x >= (TRAFFIC_LIGHT_END * scale).round());
         assert_eq!(show.y, chips.gear.y);
         assert!(show.x + show.w < chips.focus.x);
-        assert_eq!(
-            sessions_header_title_x(&closed, false, scale),
-            show.x + side + (HEADER_TITLE_GAP * scale).round()
-        );
 
         // Collapsed (no list): the chips shrink to nothing and hit nothing.
         let none = sessions_list_rect(0.0, true, 1000, scale);

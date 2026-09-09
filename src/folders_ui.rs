@@ -13,7 +13,7 @@
 //! the canvas underneath.
 use gpui::{
     App as GpuiApp, ClickEvent, Context, FontWeight, InteractiveElement, MouseButton,
-    ParentElement, StatefulInteractiveElement, Styled, Window, div,
+    MouseMoveEvent, ParentElement, StatefulInteractiveElement, Styled, Window, div,
     prelude::FluentBuilder as _, px,
 };
 
@@ -34,6 +34,9 @@ const ROW_ICON: f32 = 15.0;
 const ROW_GAP: f32 = 9.0;
 /// The pinned tool rows' green "running" dot (mock: `#3fb950`, 6px).
 const TOOL_DOT: f32 = 6.0;
+/// Unread dot on a folder row whose members want attention (matches the
+/// session rows' dot).
+const UNREAD_DOT: f32 = 6.0;
 /// Side of the hover-only delete chip on a folder row.
 const DELETE_CHIP: f32 = 16.0;
 
@@ -98,6 +101,13 @@ impl App {
             )
             .id("folders-card")
             .occlude()
+            // The card occludes the canvas, so its mouse moves never reach
+            // the canvas listener that records `cursor`; record them here or
+            // rows only look hot after a click (`note_pointer`).
+            .on_mouse_move(cx.listener(|app, ev: &MouseMoveEvent, _win, cx| {
+                app.note_cursor(ev.position);
+                cx.notify();
+            }))
             .children(self.glass_backdrop_el(corners));
 
         // Header chips (the traffic lights float over the header's left).
@@ -150,7 +160,7 @@ impl App {
                     // Every group: pinned ones are still in the list, as
                     // bubbles above the rows.
                     let count = self.workspaces.len();
-                    folder_row(theme, &r, None, "All sessions".into(), count, selected, row_hovered)
+                    folder_row(theme, &r, None, "All sessions".into(), Some(count), false, selected, row_hovered)
                         .on_mouse_down(
                             MouseButton::Left,
                             press(entity.clone(), move |this, _ev, _cx| {
@@ -273,7 +283,12 @@ impl App {
         entity: gpui::WeakEntity<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let section_id = section.id;
-        let members = self.workspaces.iter().filter(|w| w.section == Some(section_id)).count();
+        let mut members = 0;
+        let mut unread = false;
+        for w in self.workspaces.iter().filter(|w| w.section == Some(section_id)) {
+            members += 1;
+            unread |= w.any_unread();
+        }
         let editing = self
             .editing_section
             .as_ref()
@@ -284,14 +299,18 @@ impl App {
         let emoji = (!section.emoji.is_empty()).then(|| section.emoji.clone());
         let label = editing.clone().map_or_else(|| section.name.clone(), |buf| format!("{buf}▏"));
 
-        let mut row = folder_row(theme, r, emoji, label, members, selected, hovered)
+        // On hover the delete chip takes the count's slot instead of
+        // covering it.
+        let show_delete = hovered && editing.is_none();
+        let count = (!show_delete).then_some(members);
+        let mut row = folder_row(theme, r, emoji, label, count, unread, selected, hovered)
             .on_mouse_down(
                 MouseButton::Left,
                 press(entity.clone(), move |this, ev, _cx| {
                     this.press_folder_row(section_id, false, ev.click_count)
                 }),
             );
-        if hovered && editing.is_none() {
+        if show_delete {
             let d = rel(&del, abs);
             let ink = if selected { theme.primary_foreground } else { theme.muted_foreground };
             row = row.child(
@@ -349,14 +368,17 @@ fn row_shell(r: &LayoutRect, selected: bool, hovered: bool, theme: &Theme) -> gp
         .pr(px(scaled(ROW_PAD_X)))
 }
 
-/// A folder-style row: folder icon (or the section's emoji), a label and a
-/// trailing count.
+/// A folder-style row: folder icon (or the section's emoji), a label, an
+/// unread dot when a member wants attention, and the trailing count (`None`
+/// leaves its slot empty for the delete chip).
+#[allow(clippy::too_many_arguments)]
 fn folder_row(
     theme: &Theme,
     r: &LayoutRect,
     emoji: Option<String>,
     label: String,
-    count: usize,
+    count: Option<usize>,
+    unread: bool,
     selected: bool,
     hovered: bool,
 ) -> gpui::Stateful<gpui::Div> {
@@ -395,7 +417,17 @@ fn folder_row(
                 .text_color(ink)
                 .child(label),
         )
-        .child(count_badge(theme, count, selected))
+        .when(unread, |d| {
+            d.child(
+                div()
+                    .flex_none()
+                    .w(px(scaled(UNREAD_DOT)))
+                    .h(px(scaled(UNREAD_DOT)))
+                    .rounded_full()
+                    .bg(if selected { theme.primary_foreground } else { theme.primary }),
+            )
+        })
+        .when_some(count, |d, n| d.child(count_badge(theme, n, selected)))
 }
 
 /// The trailing count: 11px, muted — 80% white on a selected row.

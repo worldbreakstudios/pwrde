@@ -347,8 +347,7 @@ impl Action {
             Action::ScreenshotToClipboard => (false, true, true, "c"),
             Action::ScreenshotToFile => (false, true, true, "s"),
             Action::NewSection => (false, true, true, "n"),
-            // ⌥⌘S rather than the mock’s ⇧⌘S: SaveWorkspace owns ⇧⌘S.
-            Action::ToggleFolders => (false, true, false, "s"),
+            Action::ToggleFolders => (false, false, false, "\\"),
             Action::GoToSessions => (false, true, true, "1"),
             Action::GoToTool => (false, true, true, "3"),
         };
@@ -791,17 +790,17 @@ mod tests {
         assert_eq!(match_action(&ks), Some(Action::CloseGroup));
     }
 
-    /// ⌥⌘S (folders toggle; ⇧⌘S is SaveWorkspace’s) must resolve through the
-    /// shared lookup and round-trip its settings encoding.
+    /// ⌘\ (folders toggle) must resolve through the shared lookup and
+    /// round-trip its settings encoding.
     #[test]
-    fn toggle_folders_binds_alt_cmd_s() {
+    fn toggle_folders_binds_cmd_backslash() {
         let b = Action::ToggleFolders.default_binding();
-        assert_eq!(b, Binding { shift: false, alt: true, ctrl: false, key: "s".into() });
-        assert_eq!(b.serialize(), "cmd-alt-s");
+        assert_eq!(b, Binding { shift: false, alt: false, ctrl: false, key: "\\".into() });
+        assert_eq!(b.serialize(), "cmd-\\");
         assert_eq!(Binding::parse(&b.serialize()), Some(b));
         let ks = Keystroke {
-            modifiers: Modifiers { platform: true, alt: true, ..Default::default() },
-            key: "s".into(),
+            modifiers: Modifiers { platform: true, ..Default::default() },
+            key: "\\".into(),
             key_char: None,
         };
         assert_eq!(match_action(&ks), Some(Action::ToggleFolders));
