@@ -415,19 +415,13 @@ impl Workspace {
     }
 }
 
-/// Indices of the pinned workspaces the bubble strip shows under `filter`
-/// (a folder id, or `None` for "All sessions"), in `workspaces` order. A
-/// pinned group belongs to one folder, so another folder's strip omits it.
-///
-/// The Sessions sidebar uses this both to paint the bubble strip and to lay
-/// the rows out beneath it — one order, shared by paint and geometry.
-pub fn pinned_indices(workspaces: &[Workspace], filter: Option<u64>) -> Vec<usize> {
-    workspaces
-        .iter()
-        .enumerate()
-        .filter(|(_, w)| w.pinned && filter.is_none_or(|id| w.section == Some(id)))
-        .map(|(i, _)| i)
-        .collect()
+/// How many leading rows of `rows` are pinned groups. [`sidebar_rows_filtered`]
+/// lists a folder's pins first, so this is the size of the "Pinned" section
+/// the list draws above the rest — zero means no section at all.
+pub fn pinned_run(rows: &[SidebarRow], workspaces: &[Workspace]) -> usize {
+    rows.iter()
+        .take_while(|r| workspaces.get(r.ws_idx).is_some_and(|w| w.pinned))
+        .count()
 }
 
 // ─── Layout ─────────────────────────────────────────────────────────────
@@ -768,20 +762,20 @@ pub fn sessions_header_chips(list: &LayoutRect, folders_open: bool, scale: f32) 
 
 /// Flat sessions rows for the GANTRY list: one [`SidebarRow`] per group
 /// — no section headers — for the groups `filter` admits. `None` (All
-/// sessions) admits every non-pinned group in `workspaces` order,
-/// regardless of any section's `collapsed` flag (the list has no headers to
-/// fold under); `Some` admits only that section's members, in the same
-/// order. An unknown or dangling section id filters to nothing, which the
-/// list surfaces as its empty state. Pinned groups never appear: they live
-/// in the bubble strip.
+/// sessions) admits every group in `workspaces` order, regardless of any
+/// section's `collapsed` flag (the list has no headers to fold under);
+/// `Some` admits only that section's members, in the same order. An unknown
+/// or dangling section id filters to nothing, which the list surfaces as its
+/// empty state. The admitted pinned groups come first, in their own order:
+/// they form the "Pinned" section at the top of the list ([`pinned_run`]).
 pub fn sidebar_rows_filtered(
     workspaces: &[Workspace],
     sections: &[Section],
     filter: Option<u64>,
 ) -> Vec<SidebarRow> {
     let admit = |ws: &Workspace| match filter {
-        None => !ws.pinned,
-        Some(id) => ws.section == Some(id) && !ws.pinned,
+        None => true,
+        Some(id) => ws.section == Some(id),
     };
     if let Some(id) = filter
         && !sections.iter().any(|s| s.id == id)
@@ -789,10 +783,10 @@ pub fn sidebar_rows_filtered(
         // An id no section owns filters to nothing.
         return Vec::new();
     }
-    workspaces
-        .iter()
-        .enumerate()
-        .filter(|(_, ws)| admit(ws))
+    let admitted = || workspaces.iter().enumerate().filter(|(_, ws)| admit(ws));
+    admitted()
+        .filter(|(_, ws)| ws.pinned)
+        .chain(admitted().filter(|(_, ws)| !ws.pinned))
         .map(|(ws_idx, _)| SidebarRow { ws_idx })
         .collect()
 }
@@ -878,9 +872,13 @@ pub fn collapsed_drag_zone(scale: f32) -> LayoutRect {
     }
 }
 
-/// Side of the round "Show sessions" button that floats beside the traffic
+/// Side of the "Show sessions" button that floats beside the traffic
 /// lights while the whole region is hidden.
 pub const SHOW_SESSIONS_BTN: f32 = 26.0;
+/// Gap between the last traffic light and that button's box; the glyph
+/// inside is inset another 4.5px, so the visible gap matches the one the
+/// tab strip keeps on the button's other side.
+pub const SHOW_SESSIONS_GAP: f32 = 4.0;
 
 /// Rect of that button (physical px): just past the traffic-light safe
 /// span, vertically centred on the top-left tile's tab strip, which
@@ -888,7 +886,7 @@ pub const SHOW_SESSIONS_BTN: f32 = 26.0;
 pub fn show_sessions_button(scale: f32) -> LayoutRect {
     let side = (SHOW_SESSIONS_BTN * scale).round();
     LayoutRect {
-        x: (TRAFFIC_LIGHT_SAFE_W * scale).round(),
+        x: ((TRAFFIC_LIGHT_END + SHOW_SESSIONS_GAP) * scale).round(),
         y: ((AREA_PAD + (TILE_TAB_H - SHOW_SESSIONS_BTN) / 2.0) * scale).round(),
         w: side,
         h: side,
@@ -896,9 +894,11 @@ pub fn show_sessions_button(scale: f32) -> LayoutRect {
 }
 
 /// Left inset the top-left tile's tab strip cedes while the sidebar is
-/// collapsed: the traffic-light safe span plus the floating "Show sessions"
-/// button beside it (`sidebar_ui::render_collapsed_overlay`).
-pub const COLLAPSED_STRIP_INSET: f32 = 124.0;
+/// collapsed: the traffic lights, the floating "Show sessions" button
+/// beside them (`sidebar_ui::render_collapsed_overlay`) and a gap that
+/// reads the same as the one before the button.
+pub const COLLAPSED_STRIP_INSET: f32 =
+    TRAFFIC_LIGHT_END + SHOW_SESSIONS_GAP + SHOW_SESSIONS_BTN + SHOW_SESSIONS_GAP;
 
 /// A tile's rect adjusted for tab-strip geometry: while the sidebar is
 /// collapsed (`sidebar_w == 0.0`), the tile owning the area's top-left
@@ -964,87 +964,27 @@ pub struct SidebarRow {
     pub ws_idx: usize,
 }
 
-/// Column width of one pinned-session bubble in the Sessions strip.
-const PINNED_COL_W: f32 = 84.0;
-/// Diameter of the round avatar disc inside a pinned bubble.
-const PINNED_AVATAR: f32 = 64.0;
-/// Gap between the avatar disc and the name label under it.
-const PINNED_LABEL_GAP: f32 = 5.0;
-/// Text line height under a pinned bubble avatar.
-const PINNED_LABEL_H: f32 = 14.0;
-/// Total height of one pinned-bubble column: avatar + label gap + label.
-const PINNED_COL_H: f32 = PINNED_AVATAR + PINNED_LABEL_GAP + PINNED_LABEL_H; // 83
-/// Horizontal gap between adjacent pinned-bubble columns.
-const PINNED_COL_GAP: f32 = 14.0;
-/// Vertical gap between wrapped rows of pinned bubbles.
-const PINNED_ROW_GAP: f32 = 8.0;
-/// Top padding inside the pinned-bubble strip.
-const PINNED_STRIP_PAD_TOP: f32 = 6.0;
-/// Bottom padding inside the pinned-bubble strip.
-const PINNED_STRIP_PAD_BOTTOM: f32 = 12.0;
+/// Height of the "Pinned" caption above the pinned rows (logical px).
+pub const PINNED_CAPTION_H: f32 = 22.0;
+/// Blank band between the last pinned row and the first unpinned one.
+pub const PINNED_SECTION_GAP: f32 = 10.0;
 
-/// How many pinned-bubble columns fit across the sessions list's width
-/// (logical px).
-///
-/// Pure floor division on logical px so paint and hit-test wrap at the same
-/// count regardless of the live display scale.
-fn pinned_per_row(list_w: f32) -> usize {
-    let inner_w = list_w.max(0.0);
-    (((inner_w + PINNED_COL_GAP) / (PINNED_COL_W + PINNED_COL_GAP)).floor() as usize).max(1)
-}
-
-/// Height of the pinned-bubble strip above the session rows, in device px.
-///
-/// Zero when nothing is pinned so the row ladder keeps its old top. Otherwise
-/// top pad + N rows of 83-tall columns + 8px inter-row gaps + bottom pad, all
-/// scaled — painting and `sidebar_row_rect` both read this so the strip never
-/// collides with the first row.
-pub fn pinned_strip_h(n_pinned: usize, scale: f32, list: &LayoutRect) -> f32 {
-    if n_pinned == 0 {
-        return 0.0;
-    }
-    let per_row = pinned_per_row(list.w / scale);
-    let rows = (n_pinned + per_row - 1) / per_row;
-    let h = PINNED_STRIP_PAD_TOP
-        + (rows as f32) * PINNED_COL_H
-        + ((rows.saturating_sub(1)) as f32) * PINNED_ROW_GAP
-        + PINNED_STRIP_PAD_BOTTOM;
-    h * scale
-}
-
-/// Device-px column rect for the `k`-th pinned bubble in a strip of `n_pinned`.
-///
-/// Columns are 84×83 logical px and lay out left-to-right, wrapping when the
-/// list's width cannot hold another; each row is centered on its own bubble
-/// count so a short final row still sits under the middle of the strip. The
-/// strip starts just below the list header, plus its 6px top pad — paint and
-/// hit-test share this helper so a click never misses the disc the user sees.
-pub fn pinned_bubble_rect(k: usize, n_pinned: usize, scale: f32, list: &LayoutRect) -> LayoutRect {
-    let per_row = pinned_per_row(list.w / scale);
-    let r = k / per_row;
-    let c = k % per_row;
-    let row_count = (n_pinned - r * per_row).min(per_row);
-
-    let strip_top = list.y + (SESSIONS_HEADER_H * scale).round() + PINNED_STRIP_PAD_TOP * scale;
-
-    let col_w = PINNED_COL_W * scale;
-    let col_h = PINNED_COL_H * scale;
-    let col_gap = PINNED_COL_GAP * scale;
-    let row_gap = PINNED_ROW_GAP * scale;
-
-    let row_w = (row_count as f32) * col_w + ((row_count.saturating_sub(1)) as f32) * col_gap;
-    let row_x0 = (list.x + (list.w - row_w) / 2.0).round();
-
+/// Device-px rect of the "Pinned" caption: the band just under the list
+/// header that the pinned rows hang from. Only meaningful when
+/// [`pinned_run`] is non-zero — the rows sit straight under the header
+/// otherwise.
+pub fn pinned_caption_rect(scale: f32, list: &LayoutRect) -> LayoutRect {
     LayoutRect {
-        x: row_x0 + (c as f32) * (col_w + col_gap),
-        y: strip_top + (r as f32) * (col_h + row_gap),
-        w: col_w,
-        h: col_h,
+        x: list.x,
+        y: list.y + (SESSIONS_HEADER_H * scale).round(),
+        w: list.w.max(0.0),
+        h: (PINNED_CAPTION_H * scale).round(),
     }
 }
 
 /// Pixel rect for `rows[index]` inside `list` (the [`sessions_list_rect`]):
-/// rows stack below the list header and the pinned-bubble strip, span the
+/// rows stack below the list header (and the "Pinned" caption when the
+/// list opens with pins), the pinned run then a gap, span the
 /// list's full width and touch (the row paints its own hairline separator).
 /// Painting, hit-testing, and drop resolution must all use this so they
 /// never disagree.
@@ -1052,35 +992,37 @@ pub fn sidebar_row_rect(
     rows: &[SidebarRow],
     index: usize,
     workspaces: &[Workspace],
-    filter: Option<u64>,
     scale: f32,
     list: &LayoutRect,
 ) -> LayoutRect {
-    sidebar_row_rect_at(rows, index, workspaces, filter, scale, row_font_scale(), list)
+    sidebar_row_rect_at(rows, index, workspaces, scale, row_font_scale(), list)
 }
 
 /// [`sidebar_row_rect`] at an explicit text-size factor. Pure, so the tests can
-/// pin the row pitch at a non-default size. `filter` is the folder whose
-/// pinned strip the rows sit under ([`pinned_indices`]).
+/// pin the row pitch at a non-default size.
 fn sidebar_row_rect_at(
     rows: &[SidebarRow],
     index: usize,
     workspaces: &[Workspace],
-    filter: Option<u64>,
     scale: f32,
     font_scale: f32,
     list: &LayoutRect,
 ) -> LayoutRect {
-    let n_pinned = pinned_indices(workspaces, filter).len();
-    let top0 = list.y + (SESSIONS_HEADER_H * scale).round() + pinned_strip_h(n_pinned, scale, list);
+    let n_pinned = pinned_run(rows, workspaces);
+    let mut y = list.y + (SESSIONS_HEADER_H * scale).round();
+    if n_pinned > 0 {
+        y += (PINNED_CAPTION_H * scale).round();
+    }
     let w = list.w.max(0.0);
-    let mut y = top0;
     let h = (sidebar_row_h(font_scale) * scale).round();
     for i in 0..rows.len() {
         if i == index {
             return LayoutRect { x: list.x, y, w, h };
         }
         y += h;
+        if n_pinned > 0 && i + 1 == n_pinned {
+            y += (PINNED_SECTION_GAP * scale).round();
+        }
     }
     // Out-of-range fallback: empty rect at the stack end.
     LayoutRect { x: list.x, y, w, h: 0.0 }
@@ -1273,45 +1215,6 @@ pub fn append_to_section(
         None => workspaces.len(),
     };
     relocate_workspace(workspaces, from, insert_before, Some(section_id))
-}
-
-/// Drop workspace `from` onto the middle of group `target`.
-///
-/// - Target in a section → join that section, placed after the target.
-/// - Target ungrouped → create a new expanded section named "section" containing
-///   `[target, from]` and return its id.
-///
-/// Returns `(new_index_of_from, created_section_id)`.
-pub fn join_onto_group(
-    workspaces: &mut Vec<Workspace>,
-    sections: &mut Vec<Section>,
-    next_section_id: &mut u64,
-    from: usize,
-    target: usize,
-) -> (usize, Option<u64>) {
-    if from >= workspaces.len() || target >= workspaces.len() || from == target {
-        return (from, None);
-    }
-    if let Some(sid) = workspaces[target].section {
-        let new_idx = relocate_workspace(workspaces, from, target + 1, Some(sid));
-        return (new_idx, None);
-    }
-    // Create a section around [target, from].
-    let id = *next_section_id;
-    *next_section_id += 1;
-    sections.push(Section {
-        id,
-        name: "section".into(),
-        emoji: String::new(),
-        collapsed: false,
-        anchor: None,
-    });
-    // Place `from` immediately after `target`, then tag both.
-    let new_from = relocate_workspace(workspaces, from, target + 1, Some(id));
-    let new_target = if from < target { target - 1 } else { target };
-    workspaces[new_target].section = Some(id);
-    workspaces[new_from].section = Some(id);
-    (new_from, Some(id))
 }
 
 /// Delete `section_id`: ungroup its member groups — they survive as top-level
@@ -2458,8 +2361,8 @@ mod tests {
         let rows = [SidebarRow { ws_idx: 0 }, SidebarRow { ws_idx: 1 }];
         let workspaces = [ws("a", None), ws("b", None)];
         let pitch = |f: f32| {
-            let a = sidebar_row_rect_at(&rows, 0, &workspaces, None, scale, f, &list);
-            let b = sidebar_row_rect_at(&rows, 1, &workspaces, None, scale, f, &list);
+            let a = sidebar_row_rect_at(&rows, 0, &workspaces, scale, f, &list);
+            let b = sidebar_row_rect_at(&rows, 1, &workspaces, scale, f, &list);
             (a.h, b.y - a.y)
         };
         let (h1, pitch1) = pitch(1.0);
@@ -2479,7 +2382,7 @@ mod tests {
             header_bottom + 2.0 * (TAB_GAP * scale).round()
         );
         assert_eq!(
-            sidebar_row_rect_at(&rows, 0, &workspaces, None, scale, 2.0, &list).y,
+            sidebar_row_rect_at(&rows, 0, &workspaces, scale, 2.0, &list).y,
             header_bottom
         );
 
@@ -2571,7 +2474,7 @@ mod tests {
     }
 
     /// The flat list is Group-only rows in workspace order: no section
-    /// headers, pinned groups stay out (they live in the bubble strip), a
+    /// headers, the folder's pinned groups first (the "Pinned" section), a
     /// section filter keeps just its members, and an id nothing owns
     /// filters to nothing.
     #[test]
@@ -2587,21 +2490,24 @@ mod tests {
         ];
         let sections = vec![sec(7, false), sec(8, false)];
 
-        // No filter: every non-pinned group, workspace order, no headers.
+        // No filter: every group, pins first, then workspace order.
+        let rows = sidebar_rows_filtered(&workspaces, &sections, None);
         assert_eq!(
-            sidebar_rows_filtered(&workspaces, &sections, None),
+            rows,
             vec![
+                SidebarRow { ws_idx: 1 },
                 SidebarRow { ws_idx: 0 },
                 SidebarRow { ws_idx: 2 },
                 SidebarRow { ws_idx: 3 },
                 SidebarRow { ws_idx: 4 },
             ]
         );
+        assert_eq!(pinned_run(&rows, &workspaces), 1);
 
-        // A section filter keeps only that section's members.
+        // A section filter keeps only that section's members, its pin first.
         assert_eq!(
             sidebar_rows_filtered(&workspaces, &sections, Some(7)),
-            vec![SidebarRow { ws_idx: 2 }]
+            vec![SidebarRow { ws_idx: 1 }, SidebarRow { ws_idx: 2 }]
         );
 
         // Unknown or dangling ids filter to nothing.
@@ -2667,66 +2573,33 @@ mod tests {
 
     // --- (c) geometry ---
 
+    /// A pinned run opens the list with the caption and closes with the
+    /// section gap; an unpinned list sits straight under the header and
+    /// keeps its old row pitch.
     #[test]
-    fn pinned_strip_h_zero_one_and_wrap() {
-        let list = sessions_list_rect(SIDEBAR_DEFAULT_W, true, 1000, 1.0);
-        assert_eq!(list.w, 260.0);
-        assert_eq!(pinned_strip_h(0, 1.0, &list), 0.0);
-        // One row: 6 + 83 + 12 = 101.
-        assert_eq!(pinned_strip_h(1, 1.0, &list), 101.0);
-        // per_row = floor((260+14)/(84+14)) = 2, so 4 pins wrap to 2 rows:
-        // 6 + 2*83 + 8 + 12 = 192.
-        assert_eq!(pinned_per_row(list.w), 2);
-        assert_eq!(pinned_strip_h(4, 1.0, &list), 192.0);
-        // Scale multiplies the whole strip (the list rect is physical too).
-        let list2 = sessions_list_rect(SIDEBAR_DEFAULT_W, true, 1000, 2.0);
-        assert_eq!(pinned_strip_h(1, 2.0, &list2), 202.0);
-    }
-
-    /// Bubbles in a single row are equal-width, non-overlapping, and the
-    /// row is centered in the list (first.x + last.x + col_w ≈ 2·x + w).
-    #[test]
-    fn pinned_bubble_rects_centered_non_overlapping() {
-        // The GANTRY default (260) fits only two pins per row; three in one
-        // row — the case this centering check pins — needs a wider list.
-        let list = LayoutRect { x: 30.0, y: 10.0, w: 480.0, h: 900.0 };
-        let scale = 1.0;
-        let n = 3;
-        let rects: Vec<_> = (0..n)
-            .map(|k| pinned_bubble_rect(k, n, scale, &list))
-            .collect();
-        for r in &rects {
-            assert_eq!(r.w, PINNED_COL_W * scale);
-            assert_eq!(r.h, PINNED_COL_H * scale);
-            assert!(r.y > list.y + SESSIONS_HEADER_H * scale);
-        }
-        for i in 1..n {
-            assert!(rects[i].x >= rects[i - 1].x + rects[i - 1].w);
-        }
-        // Symmetric about the list's midline within 1px.
-        let first = &rects[0];
-        let last = &rects[n - 1];
-        let sum = first.x + last.x + PINNED_COL_W * scale;
-        assert!((sum - (2.0 * list.x + list.w)).abs() < 1.0, "sum={sum}");
-    }
-
-    /// Rows shift down by exactly the strip height when something is pinned,
-    /// and always span the list from its left edge.
-    #[test]
-    fn sidebar_row_rect_shifts_for_pinned_strip() {
-        let mut workspaces = vec![ws("a", None), ws("b", None)];
-        let rows = [SidebarRow { ws_idx: 0 }];
+    fn sidebar_row_rect_carves_out_the_pinned_section() {
+        let mut workspaces = vec![ws("a", None), ws("b", None), ws("c", None)];
         let scale = 1.0;
         let list = sessions_list_rect(300.0, false, 1000, scale);
+        let plain = [SidebarRow { ws_idx: 0 }, SidebarRow { ws_idx: 1 }];
+        let r0 = sidebar_row_rect(&plain, 0, &workspaces, scale, &list);
+        let r1 = sidebar_row_rect(&plain, 1, &workspaces, scale, &list);
+        assert_eq!(r0.y, list.y + SESSIONS_HEADER_H * scale);
+        assert_eq!(r0.x, list.x);
+        assert_eq!(r0.w, list.w);
+        assert_eq!(r1.y, r0.y + r0.h);
 
-        let before = sidebar_row_rect(&rows, 0, &workspaces, None, scale, &list);
-        workspaces[0].pinned = true;
-        let after = sidebar_row_rect(&rows, 0, &workspaces, None, scale, &list);
-
-        assert_eq!(after.y, before.y + pinned_strip_h(1, scale, &list));
-        assert_eq!(before.x, list.x);
-        assert_eq!(before.w, list.w);
-        assert_eq!(before.y, list.y + SESSIONS_HEADER_H * scale);
+        workspaces[2].pinned = true;
+        let pinned = [SidebarRow { ws_idx: 2 }, SidebarRow { ws_idx: 0 }, SidebarRow { ws_idx: 1 }];
+        assert_eq!(pinned_run(&pinned, &workspaces), 1);
+        let caption = pinned_caption_rect(scale, &list);
+        let p0 = sidebar_row_rect(&pinned, 0, &workspaces, scale, &list);
+        let p1 = sidebar_row_rect(&pinned, 1, &workspaces, scale, &list);
+        let p2 = sidebar_row_rect(&pinned, 2, &workspaces, scale, &list);
+        assert_eq!(caption.y, list.y + SESSIONS_HEADER_H * scale);
+        assert_eq!(p0.y, caption.y + caption.h);
+        assert_eq!(p1.y, p0.y + p0.h + PINNED_SECTION_GAP);
+        assert_eq!(p2.y, p1.y + p1.h);
     }
 
     #[test]
@@ -2751,7 +2624,7 @@ mod tests {
         let rows = sidebar_rows_filtered(&workspaces, &[], None);
         let list = sessions_list_rect(SIDEBAR_DEFAULT_W, true, h, scale);
         for i in 0..rows.len() {
-            let r = sidebar_row_rect(&rows, i, &workspaces, None, scale, &list);
+            let r = sidebar_row_rect(&rows, i, &workspaces, scale, &list);
             assert!(r.x + r.w <= area.x);
             assert!(r.x >= list.x);
         }
@@ -2873,8 +2746,11 @@ mod tests {
         let btn = show_sessions_button(scale);
         assert_eq!(btn.w, (SHOW_SESSIONS_BTN * scale).round());
         assert_eq!(btn.h, btn.w);
-        assert_eq!(btn.x, (TRAFFIC_LIGHT_SAFE_W * scale).round());
+        assert_eq!(btn.x, ((TRAFFIC_LIGHT_END + SHOW_SESSIONS_GAP) * scale).round());
         assert!(btn.x + btn.w <= (COLLAPSED_STRIP_INSET * scale).round());
+        // The strip keeps the same breathing room after the button as the
+        // lights keep before it.
+        assert_eq!((COLLAPSED_STRIP_INSET * scale).round() - (btn.x + btn.w), (SHOW_SESSIONS_GAP * scale).round());
         assert!(btn.y >= (AREA_PAD * scale).round());
     }
 
@@ -2903,37 +2779,6 @@ mod tests {
         assert_eq!(workspaces[final_idx].section, Some(1));
         assert_eq!(workspaces[active].name, "d");
         let _ = sections;
-    }
-
-    #[test]
-    fn join_onto_ungrouped_creates_section() {
-        let mut workspaces = vec![ws("a", None), ws("b", None), ws("c", None)];
-        let mut sections = Vec::new();
-        let mut next_id = 1u64;
-        let (new_from, created) = join_onto_group(&mut workspaces, &mut sections, &mut next_id, 2, 0);
-        assert_eq!(created, Some(1));
-        assert_eq!(sections.len(), 1);
-        assert_eq!(sections[0].name, "section");
-        assert!(!sections[0].collapsed);
-        assert!(sections_are_contiguous(&workspaces));
-        // Order: a, c (joined), b
-        assert_eq!(workspaces[0].name, "a");
-        assert_eq!(workspaces[0].section, Some(1));
-        assert_eq!(workspaces[new_from].name, "c");
-        assert_eq!(workspaces[new_from].section, Some(1));
-        assert_eq!(new_from, 1);
-    }
-
-    #[test]
-    fn join_onto_section_member_appends_adjacent() {
-        let mut workspaces = vec![ws("a", Some(5)), ws("b", Some(5)), ws("c", None)];
-        let mut sections = vec![sec(5, false)];
-        let mut next_id = 10u64;
-        let (new_from, created) = join_onto_group(&mut workspaces, &mut sections, &mut next_id, 2, 0);
-        assert!(created.is_none());
-        assert_eq!(workspaces[new_from].section, Some(5));
-        assert!(sections_are_contiguous(&workspaces));
-        assert_eq!(section_member_range(&workspaces, 5), Some((0, 3)));
     }
 
     #[test]

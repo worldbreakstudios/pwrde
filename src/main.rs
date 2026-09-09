@@ -126,10 +126,12 @@ enum DropTarget {
     /// Drop a terminal tab onto a group's sidebar row.
     Group { ws: usize },
     /// Insert a dragged sidebar group before workspace index `before`
-    /// (len = append), assigning `section` membership.
-    SidebarInsert { before: usize, section: Option<u64> },
-    /// Drop on the middle of a group row: join its section or create one.
-    SidebarJoin { target: usize },
+    /// (len = append), assigning `section` membership and, when `pinned`
+    /// is set, moving it into or out of the list's "Pinned" section. `gap`
+    /// is the visual row gap the insertion line is drawn at (rows.len() =
+    /// below the last row) — with pins listed first, workspace index and
+    /// row order no longer coincide.
+    SidebarInsert { before: usize, section: Option<u64>, pinned: Option<bool>, gap: usize },
     /// Drop on the middle (or collapsed bottom) of a section header → append.
     SidebarAppend { section_id: u64 },
 }
@@ -146,7 +148,6 @@ impl DropTarget {
             self,
             DropTarget::Group { .. }
                 | DropTarget::SidebarInsert { .. }
-                | DropTarget::SidebarJoin { .. }
                 | DropTarget::SidebarAppend { .. }
         )
     }
@@ -1396,12 +1397,6 @@ impl App {
         self.request_redraw();
     }
 
-    /// A press on a pinned bubble switches groups without arming a drag.
-    pub(crate) fn press_pinned(&mut self, ws_idx: usize) {
-        self.switch_workspace(ws_idx);
-        self.request_redraw();
-    }
-
     /// A press on a folder row in the folders card: the delete chip (when the
     /// row isn't being renamed) deletes; a double-click opens the inline
     /// rename; any click selects the folder as the list's filter.
@@ -2132,7 +2127,6 @@ impl App {
                     &rows,
                     ri,
                     &self.workspaces,
-                    self.folder_filter,
                     scale,
                     &self.sessions_list(scale),
                 );
@@ -2857,7 +2851,6 @@ impl App {
                     &rows,
                     ri,
                     &self.workspaces,
-                    self.folder_filter,
                     scale,
                     &self.sessions_list(scale),
                 );
@@ -2899,6 +2892,8 @@ impl App {
                         workspace::FolderRow::AllSessions => Some(DropTarget::SidebarInsert {
                             before: self.workspaces.len(),
                             section: None,
+                            pinned: None,
+                            gap: self.sidebar_rows().len(),
                         }),
                         _ => None,
                     };
@@ -2908,16 +2903,14 @@ impl App {
         }
         let rows = self.sidebar_rows();
         if rows.is_empty() {
-            return Some(DropTarget::SidebarInsert { before: 0, section: None });
+            return Some(DropTarget::SidebarInsert { before: 0, section: None, pinned: None, gap: 0 });
         }
-        const EDGE: f32 = 0.28;
         for (ri, row) in rows.iter().enumerate() {
             let rect = workspace::sidebar_row_rect(
                 &rows,
                 ri,
                 &self.workspaces,
-                self.folder_filter,
-                    scale,
+                scale,
                 &self.sessions_list(scale),
             );
             // Full sidebar x-span for the row's y band (indented members still hit).
@@ -2932,22 +2925,20 @@ impl App {
                 // Allow first-row top slack / last-row bottom handled below.
                 if ri == 0 && py < hit.y && py >= hit.y - hit.h * 0.5 {
                     // above first row → insert at start
-                    return Some(self.sidebar_insert_at(0, false));
+                    let ws_idx = row.ws_idx;
+                    return Some(self.sidebar_insert_at(ws_idx, false, 0, ws_idx));
                 }
                 continue;
             }
+            // The row is two landing zones, its top half and its bottom
+            // half: a sort, never a join (dropping a group onto another used
+            // to make a folder; folders come from the card now).
             let rel = (py - hit.y) / hit.h.max(1.0);
-            match *row {
-                workspace::SidebarRow { ws_idx } => {
-                    if rel < EDGE {
-                        return Some(self.sidebar_insert_at(ws_idx, false));
-                    }
-                    if rel > 1.0 - EDGE {
-                        return Some(self.sidebar_insert_at(ws_idx + 1, true));
-                    }
-                    return Some(DropTarget::SidebarJoin { target: ws_idx });
-                },
+            let ws_idx = row.ws_idx;
+            if rel < 0.5 {
+                return Some(self.sidebar_insert_at(ws_idx, false, ri, ws_idx));
             }
+            return Some(self.sidebar_insert_at(ws_idx + 1, true, ri + 1, ws_idx));
         }
         // Below the last row → append ungrouped.
         if let Some(last) = rows.len().checked_sub(1) {
@@ -2955,14 +2946,15 @@ impl App {
                 &rows,
                 last,
                 &self.workspaces,
-                self.folder_filter,
-                    scale,
+                scale,
                 &self.sessions_list(scale),
             );
             if py >= rect.y + rect.h {
                 return Some(DropTarget::SidebarInsert {
                     before: self.workspaces.len(),
                     section: None,
+                    pinned: Some(false),
+                    gap: rows.len(),
                 });
             }
         }
@@ -2970,9 +2962,21 @@ impl App {
     }
 
     /// Build a `SidebarInsert` for gap `before`, preferring the left neighbor's
-    /// section when `prefer_left` (bottom-edge drop) is set.
-    fn sidebar_insert_at(&self, before: usize, prefer_left: bool) -> DropTarget {
+    /// section when `prefer_left` (bottom-edge drop) is set. `edge` is the row
+    /// whose edge was hit: the drop takes its pinned state, so a group sorted
+    /// into the "Pinned" section pins and one sorted out of it unpins. A pin
+    /// keeps its folder (the filter's, or its own under "All sessions") — the
+    /// pinned run is one visual section over any number of folders.
+    fn sidebar_insert_at(&self, before: usize, prefer_left: bool, gap: usize, edge: usize) -> DropTarget {
         let before = before.min(self.workspaces.len());
+        if self.workspaces.get(edge).is_some_and(|w| w.pinned) {
+            let own = match self.drag {
+                Drag::Group { ws } => self.workspaces.get(ws).and_then(|w| w.section),
+                _ => None,
+            };
+            let section = self.folder_filter.or(own);
+            return DropTarget::SidebarInsert { before, section, pinned: Some(true), gap };
+        }
         let left = before
             .checked_sub(1)
             .and_then(|i| self.workspaces.get(i))
@@ -2984,7 +2988,7 @@ impl App {
             (_, Some(b)) if !prefer_left => Some(b),
             _ => None,
         };
-        DropTarget::SidebarInsert { before, section }
+        DropTarget::SidebarInsert { before, section, pinned: Some(false), gap }
     }
 
     /// The landing zone the pointer is over right now, if a drag is live.
@@ -3024,29 +3028,12 @@ impl App {
                             &rows,
                             ri,
                             &self.workspaces,
-                            self.folder_filter,
-                    scale,
+                            scale,
                             &self.sessions_list(scale),
                         ));
                     }
                 }
                 Some(workspace::tab_rect(ws, scale, &self.sessions_list(scale)))
-            },
-            DropTarget::SidebarJoin { target } => {
-                for (ri, row) in rows.iter().enumerate() {
-                    let workspace::SidebarRow { ws_idx } = *row;
-                    if ws_idx == target {
-                        return Some(workspace::sidebar_row_rect(
-                            &rows,
-                            ri,
-                            &self.workspaces,
-                            self.folder_filter,
-                    scale,
-                            &self.sessions_list(scale),
-                        ));
-                    }
-                }
-                None
             },
             DropTarget::SidebarAppend { section_id } => {
                 // Highlight the folder's row in the folders card.
@@ -3062,9 +3049,9 @@ impl App {
                     .position(|r| *r == workspace::FolderRow::Section(section_idx))?;
                 Some(workspace::folder_row_rect(&card, &rows, index, scale))
             },
-            DropTarget::SidebarInsert { before, .. } => {
-                // Thin insertion line at the gap before `before`.
-                let y = self.sidebar_gap_y(before, &rows, scale);
+            DropTarget::SidebarInsert { gap, .. } => {
+                // Thin insertion line at the visual row gap.
+                let y = self.sidebar_gap_y(gap, &rows, scale);
                 Some(self.sidebar_insert_line(y, &rows, scale, line_h))
             },
             DropTarget::TabBar { tile, .. }
@@ -3120,33 +3107,25 @@ impl App {
         }
     }
 
-    /// Y coordinate of the insertion gap before workspace index `before`.
-    fn sidebar_gap_y(&self, before: usize, rows: &[workspace::SidebarRow], scale: f32) -> f32 {
-        // Prefer the top of the first row whose group index >= before, or the
-        // top of a section header whose first member >= before; else past last.
-        for (ri, row) in rows.iter().enumerate() {
-            let rect = workspace::sidebar_row_rect(
+    /// Y coordinate of visual row gap `gap`: the top of `rows[gap]`, or the
+    /// bottom of the last row when `gap` is past the end.
+    fn sidebar_gap_y(&self, gap: usize, rows: &[workspace::SidebarRow], scale: f32) -> f32 {
+        if gap < rows.len() {
+            return workspace::sidebar_row_rect(
                 rows,
-                ri,
+                gap,
                 &self.workspaces,
-                self.folder_filter,
-                    scale,
+                scale,
                 &self.sessions_list(scale),
-            );
-            match *row {
-                workspace::SidebarRow { ws_idx } if ws_idx >= before => {
-                    return rect.y;
-                },
-                _ => {},
-            }
+            )
+            .y;
         }
         if let Some(last) = rows.len().checked_sub(1) {
             let rect = workspace::sidebar_row_rect(
                 rows,
                 last,
                 &self.workspaces,
-                self.folder_filter,
-                    scale,
+                scale,
                 &self.sessions_list(scale),
             );
             return rect.y + rect.h;
@@ -3173,8 +3152,7 @@ impl App {
                 rows,
                 ri,
                 &self.workspaces,
-                self.folder_filter,
-                    scale,
+                scale,
                 &self.sessions_list(scale),
             );
             x = if ri == 0 { r.x } else { x.min(r.x) };
@@ -3198,9 +3176,7 @@ impl App {
                 }
             },
             // Terminal-tab drops only land on tile/group targets.
-            DropTarget::SidebarInsert { .. }
-            | DropTarget::SidebarJoin { .. }
-            | DropTarget::SidebarAppend { .. } => return,
+            DropTarget::SidebarInsert { .. } | DropTarget::SidebarAppend { .. } => return,
             _ => {},
         }
 
@@ -3260,20 +3236,13 @@ impl App {
         if from >= self.workspaces.len() {
             return;
         }
-        let mut created_section: Option<u64> = None;
         let new_idx = match target {
-            DropTarget::SidebarInsert { before, section } => {
-                workspace::relocate_workspace(&mut self.workspaces, from, before, section)
-            },
-            DropTarget::SidebarJoin { target } => {
-                let (idx, created) = workspace::join_onto_group(
-                    &mut self.workspaces,
-                    &mut self.sections,
-                    &mut self.next_section_id,
-                    from,
-                    target,
-                );
-                created_section = created;
+            DropTarget::SidebarInsert { before, section, pinned, .. } => {
+                let idx =
+                    workspace::relocate_workspace(&mut self.workspaces, from, before, section);
+                if let Some(pinned) = pinned {
+                    self.workspaces[idx].pinned = pinned;
+                }
                 idx
             },
             DropTarget::SidebarAppend { section_id } => {
@@ -3285,17 +3254,6 @@ impl App {
             workspace::track_index_after_relocate(self.active, from, new_idx);
         // A section a group leaves stays put even when now empty; sections are
         // removed only by the explicit delete-section button.
-        if let Some(sid) = created_section {
-            // Open rename on the freshly created section.
-            if let Some(sec) = self.sections.iter().find(|s| s.id == sid) {
-                let buf = if sec.emoji.is_empty() {
-                    sec.name.clone()
-                } else {
-                    format!("{} {}", sec.emoji, sec.name)
-                };
-                self.editing_section = Some((sid, buf));
-            }
-        }
         workspace::ensure_active_section_expanded(
             &self.workspaces,
             &mut self.sections,
@@ -3622,8 +3580,9 @@ impl App {
                 self.blur_settings_search(window, cx);
                 return;
             }
-            // Every other sidebar row — the pinned bubbles, section headers (and their delete chip) and
-            // group cards — is an element click target now (`sidebar_ui`),
+            // Every other sidebar row — the session rows (pinned or not) and
+            // the folder rows with their delete chip — is an element click
+            // target now (`sidebar_ui`, `folders_ui`),
             // which arms the same presses this branch used to; a press that
             // reaches here landed between rows.
             return;
@@ -5044,7 +5003,7 @@ impl App {
 }
 
 /// Abbreviate `path` with `~` for display.
-fn tilde(path: &std::path::Path) -> String {
+pub(crate) fn tilde(path: &std::path::Path) -> String {
     if let Some(home) = dirs::home_dir()
         && let Ok(rest) = path.strip_prefix(&home)
     {
