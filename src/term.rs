@@ -52,26 +52,6 @@ pub enum TermEvent {
     /// Pointer focus entered a native child view; keep the owning tile as the
     /// workspace focus target for tab and address-bar actions.
     WebviewFocused { id: u64 },
-    /// The branch-scoped PR list (`--head <current branch>`) finished loading
-    /// (or failed).
-    PrListLoaded { result: Result<Vec<crate::gh::PrSummary>, String> },
-    /// A PR's detail finished loading, tagged with the PR number so a stale
-    /// result for a PR the user already navigated away from can be dropped.
-    PrDetailLoaded { number: u32, result: Result<crate::gh::PrDetail, String> },
-    /// A PR's diff finished loading (parsed + syntax-highlighted off-thread),
-    /// tagged with the PR number.
-    PrDiffLoaded {
-        number: u32,
-        result: Result<std::sync::Arc<crate::pr_ui::DiffRender>, String>,
-    },
-    /// A PR write action (approve/comment/merge/ready) completed.
-    PrActionDone(Result<String, String>),
-    /// The local diff tool finished gathering + highlighting a diff.
-    LocalDiffLoaded(Result<crate::pr_ui::LocalDiffRender, String>),
-    /// `lfg` reported a cache entry refreshed; the open PR view should re-fetch
-    /// to pick up the fresh data. `number` is the PR number when the event is
-    /// PR-scoped.
-    PrCacheUpdated { kind: String, number: Option<u32> },
     /// A background `git_context::fetch` finished for `cwd`. The blocking git
     /// and `gh` calls must never run on the main thread, so the aggregate
     /// comes back here and is folded into `App::git_contexts`.
@@ -79,10 +59,9 @@ pub enum TermEvent {
         cwd: std::path::PathBuf,
         ctx: crate::git_context::GitContext,
     },
-    /// A bare "please repaint" nudge from a background job whose result is read
-    /// from a shared cache rather than carried in the event (e.g. a finished
-    /// mermaid render). Carries no state — just marks the frame dirty.
-    Redraw,
+    /// `lfg` reported a cache entry refreshed: the sidebar's PR rollups
+    /// re-fetch so a card doesn't keep showing a merged/closed PR as open.
+    PrCacheUpdated,
     /// A request arrived on the command bus socket; the drain loop executes it on
     /// the main thread and sends exactly one Reply back.
     Bus {

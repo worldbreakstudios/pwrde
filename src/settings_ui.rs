@@ -41,7 +41,7 @@ impl App {
         let pad = crate::workspace::AREA_PAD;
         let sidebar = self.sidebar_w();
         let left = if sidebar == 0.0 { pad } else { sidebar };
-        let right = self.right_w() + pad;
+        let right = pad;
 
         let theme = Theme::of(cx).clone();
         let entity = cx.entity().downgrade();

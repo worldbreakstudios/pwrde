@@ -23,23 +23,15 @@ mod claude_hooks;
 mod cli_tools;
 mod command;
 mod command_ui;
-mod diff;
 mod features;
-mod file_tree;
 mod flow;
 mod flow_ui;
 mod flyover_ui;
 mod gh;
 mod git;
 mod git_context;
-mod highlight;
 mod lfg;
-mod launch_ui;
-mod local_diff_ui;
-mod markdown;
-mod mermaid;
 mod modal_ui;
-mod pr_ui;
 mod settings_ui;
 mod links;
 mod pages;
@@ -50,7 +42,6 @@ mod pwrspace;
 mod rect;
 mod renderer;
 mod resize_ui;
-mod ribbon_ui;
 mod save_ui;
 mod settings;
 mod sidebar_card;
@@ -261,8 +252,6 @@ enum Drag {
     ToolSelect,
     /// The flyover panel's top edge is being dragged to resize it.
     FlyoverResize,
-    /// The tool panel's left edge is being dragged to resize it.
-    ToolPanelResize,
     /// Sidebar group row pressed; may become a group drag past threshold.
     GroupPress { ws: usize, start: (f64, f64) },
     /// Dragging a sidebar workspace group tab.
@@ -326,6 +315,9 @@ struct App {
     /// True while the serial git-context worker is alive, so a burst of
     /// refresh triggers cannot fan out into N simultaneous `gh` calls.
     git_ctx_busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Guards the ⇧⌘G fallback lookup (`open_pr_in_github`): one `pr list`
+    /// in flight at a time, so repeated presses cannot pop several tabs.
+    open_pr_busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// A refresh trigger that arrived while the worker was busy. Remembered
     /// rather than dropped, and re-fired once the worker is done.
     git_ctx_pending: bool,
@@ -508,17 +500,8 @@ struct App {
     preview_dark: bool,
     /// The appearance dropdown that currently has its option menu open, if any.
     appearance_menu: Option<pages::AppearanceDropdown>,
-    // ── Right-side tool ribbon / panel ────────────────────────────────────
-    /// Which tool panel is currently open, if any. Kept even while the tool
-    /// is unregistered (wrong page / non-git group) so it reappears when its
-    /// context returns.
-    open_tool: Option<pages::Tool>,
-    /// Width of the open tool panel in logical px (drag-resizable).
-    tool_panel_w: f32,
-    /// Whether the tool panel floats over the tiles (vs. docking the edge).
-    tool_panel_floating: bool,
     /// Whether a group cwd sits inside a git checkout, memoized per path —
-    /// ribbon registration probes this on every frame and hit-test.
+    /// probed by git-backed actions on every invocation.
     git_cwd_cache: std::cell::RefCell<std::collections::HashMap<std::path::PathBuf, bool>>,
     // ── Flow agent (bottom pill + chat panel) ─────────────────────────────
     /// Transcript/panel state; updated only via `FlowState::apply` from
@@ -527,6 +510,10 @@ struct App {
     /// The agent process, spawned lazily on first open/send so no `claude`
     /// child exists until Flow is actually used.
     flow_backends: std::collections::HashMap<u64, Box<dyn crate::flow::AgentBackend>>,
+    /// The `lfg events` SSE tail process, kept alive while the app runs (its
+    /// reader thread forwards cache-updated events). `None` when the async path
+    /// is off or `lfg` couldn't launch.
+    _lfg_events_child: Option<std::process::Child>,
     /// The pill bar's composer entity, created lazily on first render.
     flow_composer: Option<flow_ui::FlowComposer>,
     /// Blurred impression of the canvas under the liquid-glass overlays
@@ -536,15 +523,6 @@ struct App {
     glass_backdrop_key: u64,
     /// Logical window size the impression covers.
     glass_backdrop_size: (f32, f32),
-    // ── Git tools (PR + local diff), Sessions/git-group only ──────────────
-    /// Pull Request tool state (list / detail / diff / write actions).
-    pr: pr_ui::PrState,
-    /// Local diff tool state (mode + gathered diff).
-    local_diff: local_diff_ui::LocalDiffState,
-    /// The `lfg events` SSE tail process, kept alive while the app runs (its
-    /// reader thread forwards cache-updated events). `None` when the async path
-    /// is off or `lfg` couldn't launch.
-    _lfg_events_child: Option<std::process::Child>,
 }
 
 impl App {
@@ -571,23 +549,6 @@ impl App {
     /// hit-testing both go through this so they can't drift apart.
     fn card_rows(&self) -> bool {
         self.page == Page::Sessions
-    }
-
-    /// Tools registered for `page`, resolved against the active group.
-    /// Sessions tools are contextual per group: PR only when the group's cwd
-    /// sits in a git checkout (its content is branch-scoped), Launch always.
-    /// Other pages register none, which hides the ribbon entirely.
-    fn tools_for(&self, page: Page) -> Vec<pages::Tool> {
-        if page != Page::Sessions {
-            return Vec::new();
-        }
-        let mut tools = Vec::new();
-        if self.active_cwd_is_git() {
-            tools.push(pages::Tool::Pr);
-            tools.push(pages::Tool::LocalDiff);
-        }
-        tools.push(pages::Tool::Launch);
-        tools
     }
 
     /// The active group's cwd (or the process cwd when the group inherits it),
@@ -618,37 +579,61 @@ impl App {
         hit
     }
 
-    /// The open tool, if it's registered in the current page/group context.
-    fn visible_tool(&self) -> Option<pages::Tool> {
-        self.open_tool.filter(|t| self.tools_for(self.page).contains(t))
-    }
-
-    fn right_w(&self) -> f32 {
-        self.right_w_for(self.page)
-    }
-
-    fn right_w_for(&self, page: Page) -> f32 {
-        let tools = self.tools_for(page);
-        if tools.is_empty() {
-            return 0.0;
+    /// ⇧⌘G (`Action::OpenPrInGithub`): open the active group's pull request
+    /// in the browser. The sidebar's git-context cache usually already holds
+    /// the PR its card shows, so the common case is instant. A cached "no
+    /// PR" is an honest no-op that also bumps that group's rollup stale, so a
+    /// PR opened since the last poll is picked up on the next press. Only a
+    /// group whose context hasn't been fetched yet falls back to one
+    /// background `pr list`, guarded by `open_pr_busy` so repeated presses
+    /// can't queue up browser tabs. Returns whether the action applied — the
+    /// tab was opened or the lookup that will open it was started — so the
+    /// bus can report a no-op everywhere else.
+    fn open_pr_in_github(&mut self) -> bool {
+        use std::sync::atomic::Ordering;
+        if self.page != Page::Sessions || self.is_empty_state() || !self.active_cwd_is_git() {
+            return false;
         }
-        // Docked reserves the panel's width (tiles sit beside it); floating
-        // reserves nothing (tiles fill the full width and the card floats over
-        // them). So the content behind a floating panel is at full size, never
-        // shrunk to make room — and resizing the floating card never reflows
-        // the tiles, since the reserved width stays 0 regardless of panel_w.
-        let panel = match self.open_tool {
-            Some(t) if tools.contains(&t) && !self.tool_panel_floating => self.tool_panel_w,
-            _ => 0.0,
+        let Some(cwd) = self.active_repo_dir() else {
+            return false;
         };
-        workspace::RIBBON_W + panel
-    }
-
-    fn toggle_tool_panel_floating(&mut self) {
-        self.tool_panel_floating = !self.tool_panel_floating;
-        settings::set("toolpanel.floating", self.tool_panel_floating.into());
-        self.sync_layout();
-        self.request_redraw();
+        if let Some(ctx) = self.git_contexts.get(&cwd) {
+            // Cached: open what the card shows, or report "no PR" honestly.
+            // An empty URL means a PR CLI that predates the `url` field.
+            match ctx.pr.as_ref().map(|pr| pr.url.as_str()) {
+                Some(url) if !url.is_empty() => {
+                    open_in_browser(url);
+                    return true;
+                },
+                _ => {
+                    self.git_contexts.mark_stale(&cwd);
+                    self.spawn_git_context_refresh();
+                    return false;
+                },
+            }
+        }
+        if self
+            .open_pr_busy
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            // A lookup is already in flight — possibly for another group,
+            // since the guard is global — so nothing new applied here.
+            return false;
+        }
+        let busy = self.open_pr_busy.clone();
+        std::thread::spawn(move || {
+            if let Some(branch) = git::current_branch(&cwd)
+                && let Some(pr) = gh::pr_list_for_branch(&cwd, &branch)
+                    .ok()
+                    .and_then(git_context::select_pr)
+                && !pr.url.is_empty()
+            {
+                open_in_browser(&pr.url);
+            }
+            busy.store(false, Ordering::Release);
+        });
+        true
     }
 
     fn dpi(&self) -> u32 {
@@ -763,7 +748,6 @@ impl App {
         let obscured = self.page != Page::Sessions
             || self.modal_overlay_open()
             || (self.flyover_anim > 0.0 && !self.flyover_windowed)
-            || (self.visible_tool().is_some() && self.tool_panel_floating)
             || self.flow.open
             || matches!(self.drag, Drag::Tab { .. } | Drag::Group { .. } | Drag::Section { .. });
         let mut placements = Vec::new();
@@ -975,7 +959,6 @@ impl App {
             h,
             self.scale(),
             self.sidebar_w(),
-            self.right_w(),
             self.flow_inset(),
         )
     }
@@ -1003,16 +986,15 @@ impl App {
         let scale = self.scale();
         let (cw, ch) = self.cell_px();
         let dpi = self.dpi();
-        // Pin PTY sizing to Sessions geometry: pages without tools drop the
-        // ribbon inset from `area()`, and shells must not get resized just
-        // because the user flipped to Settings and back.
+        // Pin PTY sizing to Sessions geometry: other pages drop the flow inset
+        // from `area()`, and shells must not get resized just because the user
+        // flipped to Settings and back.
         let (w, h) = self.renderer.surface_size();
         let area = workspace::terminal_area(
             w,
             h,
             scale,
             self.sidebar_w(),
-            self.right_w_for(Page::Sessions),
             self.flow_inset(),
         );
         let ws = &mut self.workspaces[self.active];
@@ -1074,11 +1056,10 @@ impl App {
         self.tools.len()
     }
 
-    /// The tool page's terminal card: the whole content area (these pages
-    /// have no tool panel, so no right inset).
+    /// The tool page's terminal card: the whole content area.
     fn tool_area(&self) -> workspace::LayoutRect {
         let (w, h) = self.renderer.surface_size();
-        workspace::terminal_area(w, h, self.scale(), self.sidebar_w(), 0.0, self.flow_inset())
+        workspace::terminal_area(w, h, self.scale(), self.sidebar_w(), self.flow_inset())
     }
 
     fn active_tool_session(&self) -> Option<&ToolSession> {
@@ -1279,18 +1260,11 @@ impl App {
         if wi < self.workspaces.len() {
             let changed = self.active != wi;
             self.active = wi;
-            // A different group means a different repo: reset the PR view and
-            // re-fetch whichever git surface is showing against the new cwd.
+            // A different group means a different repo: the sidebar card for
+            // the group we just left (and the one we arrived at) may be stale
+            // by now.
             if changed {
-                self.pr = pr_ui::PrState::default();
-                self.local_diff.data = pr_ui::Load::Idle;
-                self.reset_pr_surface();
-                // The sidebar card for the group we just left (and the one we
-                // arrived at) may be stale by now.
                 self.spawn_git_context_refresh();
-                if self.visible_tool() == Some(pages::Tool::LocalDiff) {
-                    self.spawn_local_diff();
-                }
             }
             // Activating a member of a collapsed section expands it so the
             // active group is visible in the sidebar.
@@ -3440,7 +3414,7 @@ impl App {
                 && let Some(tab) = ws.root.find_tile(*id).and_then(|t| t.active_tab())
                 && let Some(url) = tab.session().and_then(|session| session.link_at(col, row))
             {
-                let _ = std::process::Command::new("open").arg(url).spawn();
+                open_in_browser(&url);
                 return true;
             }
         }
@@ -3616,7 +3590,7 @@ impl App {
     fn on_mouse_down(&mut self, window: &mut Window, click_count: usize, cx: &mut Context<Self>) {
         let scale = self.renderer.scale;
         let (px, py) = (self.cursor.0 as f32, self.cursor.1 as f32);
-        let (w, h) = self.renderer.surface_size();
+        let (_, h) = self.renderer.surface_size();
 
         // A fresh click sequence forgets which pane the previous one expanded.
         if click_count <= 1 {
@@ -3709,7 +3683,7 @@ impl App {
             return;
         }
 
-        // The sidebar edge, the tile dividers and the tool panel edge are
+        // The sidebar edge, the tile dividers and the flyover edge are
         // element handles now (`resize_ui`): they arm their drags and stop
         // the press, so none of them reach here.
 
@@ -3717,36 +3691,6 @@ impl App {
         // while the sidebar is folded) start from an element now
         // (`sidebar_ui::render_window_drag_zones`), which stops the press,
         // so nothing reaches here from those regions.
-
-        // Tool ribbon / panel (right edge, pages/groups with registered
-        // tools). Panel edge resizes, ribbon slots toggle their tool; both
-        // consume the click so it never falls through to the tiles behind.
-        let ribbon_tools = self.tools_for(self.page);
-        if !ribbon_tools.is_empty() {
-            if self.visible_tool().is_some() {
-                // The panel body itself is an element tree (pr_ui /
-                // local_diff_ui / launch_ui) and resolves its own clicks; its
-                // resize edge is an element handle (`resize_ui`).
-            }
-            if workspace::ribbon(w, h, scale).contains(px, py) {
-                for (i, tool) in ribbon_tools.iter().enumerate() {
-                    if workspace::ribbon_slot_rect(i, w, scale).contains(px, py) {
-                        self.toggle_tool(*tool);
-                        break;
-                    }
-                }
-                return;
-            }
-            if self.visible_tool().is_some() && self.tool_panel_floating {
-                // Click landed outside the panel and outside the ribbon: only a
-                // floating panel dismisses on blur, so collapse it here. A docked
-                // panel reserves its own width and stays open until explicitly
-                // closed (ribbon slot toggle or close control). Either way the
-                // click falls through so the terminal tile under the cursor still
-                // gets focused.
-                self.close_tool();
-            }
-        }
 
         // Empty state (Sessions only): the centered CTA is an element-tree
         // button now (`sidebar_ui::render_empty_state`), so the content area
@@ -3903,15 +3847,6 @@ impl App {
                 self.sync_layout();
                 self.request_redraw();
             },
-            Drag::ToolPanelResize => {
-                let (w, _) = self.renderer.surface_size();
-                let win_w = w as f32 / scale;
-                let from_right = win_w - (px / scale) - workspace::RIBBON_W;
-                let max = (win_w - workspace::RIBBON_W - 200.0).max(workspace::TOOL_PANEL_MIN_W);
-                self.tool_panel_w = from_right.clamp(workspace::TOOL_PANEL_MIN_W, max);
-                self.sync_layout();
-                self.request_redraw();
-            },
             Drag::Divider { path } => {
                 let path = path.clone();
                 let area = self.area();
@@ -4030,36 +3965,22 @@ impl App {
                     // dividers — no resize affordance underneath it.
                     None
                 } else {
-                    let (w, h) = self.renderer.surface_size();
+                    let (_, h) = self.renderer.surface_size();
                     let sidebar_edge_x = workspace::sidebar(h, scale, self.sidebar_w()).w;
                     let grab = GRAB * scale;
                     let dividers_active =
                         self.page == Page::Sessions && !self.is_empty_state();
                     let ws = &self.workspaces[self.active];
-                    // Tool panel edge first: it sits over the tile area, so it
-                    // must win against the dividers behind it. Grab matches
-                    // on_mouse_down.
-                    let panel_edge = self.visible_tool().is_some() && {
-                        let panel = workspace::tool_panel(w, h, scale, self.tool_panel_w, self.tool_panel_floating);
-                        let pgrab = (workspace::TOOL_PANEL_RESIZE_GRAB * scale).max(1.0);
-                        (px - panel.x).abs() <= pgrab
-                            && py >= panel.y
-                            && py <= panel.y + panel.h
-                    };
-                    if panel_edge {
-                        Some(workspace::ResizeHover::ToolPanel)
-                    } else {
-                        workspace::resize_hover_at(
-                            &ws.root,
-                            self.area(),
-                            scale,
-                            sidebar_edge_x,
-                            grab,
-                            dividers_active,
-                            px,
-                            py,
-                        )
-                    }
+                    workspace::resize_hover_at(
+                        &ws.root,
+                        self.area(),
+                        scale,
+                        sidebar_edge_x,
+                        grab,
+                        dividers_active,
+                        px,
+                        py,
+                    )
                 };
                 if hover != self.resize_hover {
                     self.resize_hover = hover;
@@ -4123,11 +4044,6 @@ impl App {
                 if let Some(target) = self.resolve_drop(px, py, tile) {
                     self.apply_drop(tile, tab, target);
                 }
-                self.request_redraw();
-            },
-            // Panel resize released: keep the width for future launches.
-            Drag::ToolPanelResize => {
-                settings::set("toolpanel.width", format!("{:.1}", self.tool_panel_w).into());
                 self.request_redraw();
             },
             // Resize released: fit the PTYs to the final height and keep it
@@ -4268,18 +4184,6 @@ impl App {
                 self.handle_shortcut(ev);
             } else {
                 self.tool_write_key(&ev.keystroke);
-            }
-            self.request_redraw();
-            return;
-        }
-        // A focused PR composer owns the keyboard: the multi-line editor
-        // entity (and its own key bindings) handles editing, so keys don't
-        // reach the shell or ⌘ shortcuts. Escape discards the composer and
-        // hands focus back.
-        if self.pr_editor_focused(window, cx) {
-            if ev.keystroke.key == "escape" {
-                self.pr_close_composer();
-                window.focus(&self.focus_handle, cx);
             }
             self.request_redraw();
             return;
@@ -4705,15 +4609,10 @@ impl App {
             | Action::ToggleFlow => {},
             Action::ToggleFlyover => self.toggle_flyover(),
             Action::FlyoverPopout => self.flyover_toggle_windowed(),
-            // Closes whichever tool is open; opens the first registered tool
-            // when closed. No-op on pages/groups without tools.
-            Action::ToggleToolPanel => {
-                let tools = self.tools_for(self.page);
-                if let Some(&first) = tools.first() {
-                    let t = self.visible_tool().unwrap_or(first);
-                    self.toggle_tool(t);
-                }
-            },
+            // Open the active group's pull request in the browser; no-op (and
+            // reported as such over the bus) when the group is known to have
+            // no PR or isn't git-backed.
+            Action::OpenPrInGithub => return self.open_pr_in_github(),
         }
         true
     }
@@ -4740,41 +4639,6 @@ impl App {
         self.request_redraw();
     }
 
-    /// Toggle the given tool panel open/closed (clicking the active tool closes it).
-    pub(crate) fn toggle_tool(&mut self, tool: pages::Tool) {
-        if self.open_tool == Some(tool) {
-            self.open_tool = None;
-            settings::set("toolpanel.tool", "".into());
-        } else {
-            self.open_tool = Some(tool);
-            settings::set("toolpanel.tool", tool.name().into());
-            self.load_open_git_tool();
-        }
-        self.sync_layout();
-        self.request_redraw();
-    }
-
-    /// Collapse the currently-open tool panel (e.g. when it loses focus).
-    fn close_tool(&mut self) {
-        if self.open_tool.is_some() {
-            self.open_tool = None;
-            settings::set("toolpanel.tool", "".into());
-            self.sync_layout();
-            self.request_redraw();
-        }
-    }
-
-    /// Fetch data for the currently-open git tool (PR list/detail or local
-    /// diff). No-op when the open tool isn't a git tool or isn't visible.
-    fn load_open_git_tool(&mut self) {
-        match self.visible_tool() {
-            // The tool is branch-scoped and re-derives its detail from the
-            // current branch, so start fresh (this may auto-open a single PR).
-            Some(pages::Tool::Pr) => self.reset_pr_surface(),
-            Some(pages::Tool::LocalDiff) => self.spawn_local_diff(),
-            _ => {}
-        }
-    }
 
     /// ⌘⇧←/→: step through `Page::all`, wrapping at both ends.
     fn cycle_page(&mut self, delta: isize) {
@@ -4825,10 +4689,6 @@ impl App {
             if page == Page::Sessions {
                 self.sync_layout();
                 self.mark_visible_read();
-                // Re-derive the branch-scoped PR tool for the active group.
-                if self.open_tool == Some(pages::Tool::Pr) {
-                    self.reset_pr_surface();
-                }
             }
             // Entering a tool page launches its command (or relaunches one
             // that has since exited) and fits its PTY to the content area.
@@ -5123,31 +4983,8 @@ impl App {
                         redraw = true;
                     }
                 },
-                TermEvent::PrListLoaded { result } => {
-                    self.on_pr_list_loaded(result);
-                    redraw = true;
-                },
-                TermEvent::PrDetailLoaded { number, result } => {
-                    self.on_pr_detail_loaded(number, result);
-                    redraw = true;
-                },
-                TermEvent::PrDiffLoaded { number, result } => {
-                    self.on_pr_diff_loaded(number, result);
-                    redraw = true;
-                },
-                TermEvent::PrActionDone(result) => {
-                    self.on_pr_action_done(result);
-                    redraw = true;
-                },
-                TermEvent::LocalDiffLoaded(result) => {
-                    self.on_local_diff_loaded(result);
-                    redraw = true;
-                },
-                TermEvent::PrCacheUpdated { kind, number, .. } => {
-                    if self.on_pr_cache_updated(&kind, number) {
-                        redraw = true;
-                    }
-                    // The PR cache moved under us, so every aggregate that
+                TermEvent::PrCacheUpdated => {
+                    // The PR cache moved under us, so every card rollup that
                     // quotes it is due for a re-fetch — but a wipe would blink
                     // every card back to its bare title until some unrelated
                     // trigger refilled it. Bump staleness instead, keeping the
@@ -5161,9 +4998,6 @@ impl App {
                     // same way every other event here does: `redraw` is what
                     // the caller turns into `cx.notify()`.
                     self.git_contexts.insert(&cwd, ctx);
-                    redraw = true;
-                },
-                TermEvent::Redraw => {
                     redraw = true;
                 },
                 TermEvent::Flow { chat, ev } => {
@@ -5749,8 +5583,8 @@ impl Render for App {
                     move |bounds, _prepaint, window, cx| {
                         // While a drag is armed, drive it from window-level
                         // capture listeners instead of the hover-gated div
-                        // listeners above: the tool panels' roots `occlude()`,
-                        // so once the pointer crosses onto a panel the canvas
+                        // listeners above: overlay roots (Flow, Settings)
+                        // `occlude()`, so once the pointer crosses onto one the canvas
                         // stops being hovered and would never hear the
                         // release — leaving the resize following the mouse
                         // with no button down. Moves stop propagating so the
@@ -5830,33 +5664,16 @@ impl Render for App {
             // Settings page overlay: element tree over the canvas. Sidebar search +
             // section tabs stay canvas-painted; the content card is elements.
             .when(self.page == Page::Settings, |el| el.child(self.render_settings(cx)))
-            // Right-edge git tool panels: real element trees over the canvas
-            // placeholder, only for git-backed Sessions groups (visible_tool
-            // already gates that).
-            .when(
-                self.visible_tool() == Some(pages::Tool::Pr) && !self.modal_overlay_open(),
-                |el| el.child(self.render_pr(cx)),
-            )
-            .when(
-                self.visible_tool() == Some(pages::Tool::LocalDiff) && !self.modal_overlay_open(),
-                |el| el.child(self.render_local_diff(cx)),
-            )
-            .when(
-                self.visible_tool() == Some(pages::Tool::Launch) && !self.modal_overlay_open(),
-                |el| el.child(self.render_launch(cx)),
-            )
             // Flow agent (experimental, `features.flow`): bottom-centered pill
             // bar + chat panel, on every page so it follows the user (`flow_ui`).
             .when(
                 crate::flow::enabled() && !self.modal_overlay_open(),
                 |el| el.child(self.render_flow(window, cx)),
             )
-            // Resize handles (sidebar edge, dividers, tool panel edge, flyover
+            // Resize handles (sidebar edge, dividers, flyover
             // top edge): elements own the cursor and the drag start; the
             // canvas still drives the drag (`resize_ui`).
             .child(self.render_resize_handles(cx))
-            // Ribbon slot presses (the glyphs stay canvas-painted).
-            .child(self.render_ribbon_presses(cx))
             // Command palette and the pickers (element trees; see
             // `palette_ui` / `picker_ui`).
             .child(self.render_command(cx))
@@ -5911,7 +5728,7 @@ impl App {
         let resize_hover = if overlay_open
             || !matches!(
                 self.drag,
-                Drag::None | Drag::Sidebar | Drag::Divider { .. } | Drag::ToolPanelResize
+                Drag::None | Drag::Sidebar | Drag::Divider { .. }
             )
         {
             None
@@ -5955,13 +5772,8 @@ impl App {
             .filter(|t| !t.in_sidebar())
             .and_then(|t| self.drop_hint(t, scale));
 
-        let ribbon_tools = self.tools_for(self.page);
         let chrome = renderer::ChromeState {
             page: self.page,
-            ribbon_tools: &ribbon_tools,
-            open_tool: self.open_tool,
-            tool_panel_w: self.tool_panel_w,
-            tool_panel_floating: self.tool_panel_floating,
             flow_inset: self.flow_inset(),
             // Overlay scoping happens in the renderer (only overlay elements
             // hover while one is up). Here we suppress hover mid-drag, and
@@ -6064,7 +5876,7 @@ impl App {
         // while one is on screen, and only re-blurred + re-uploaded when the
         // coarse picture changed. Overlays are element trees rendered before
         // this paint, so a fresh image asks for one more render to show up.
-        if self.open_tool.is_some() || self.flow_inset() > 0.0 || self.search_modal_open() {
+        if self.flow_inset() > 0.0 || self.search_modal_open() {
             let ground = renderer::color(self.renderer.term_scheme_bg(), 1.0);
             let mut imp = backdrop::rasterize(
                 &frame,
@@ -6400,7 +6212,6 @@ fn paint_quad(
     let shadow = match q.shadow {
         renderer::Shadow::None => None,
         renderer::Shadow::Card => Some((0.22, 8.0, 28.0)),
-        renderer::Shadow::Soft => Some((0.10, 1.0, 3.0)),
     };
     if let Some((alpha, dy, blur)) = shadow {
         window.paint_drop_shadows(
@@ -7075,8 +6886,6 @@ fn main() {
     // Command bus: listen before any session spawns so child shells inherit
     // `PWRDE_SOCKET` and `pwrde-cli` inside a tab targets this instance.
     bus_exec::start(events_tx.clone());
-    // Let finished off-thread mermaid renders nudge a repaint.
-    crate::mermaid::init(events_tx.clone());
     // React to a directory arriving from outside the app. Registered on the
     // Application before `run` so a cold-launch `application:openURLs:`
     // (delivered just after launch) isn't missed — gpui drops the event when no
@@ -7166,6 +6975,9 @@ fn main() {
                         next_section_id: 0,
                         git_contexts: git_context::GitContextCache::new(),
                         git_ctx_busy: std::sync::Arc::new(
+                            std::sync::atomic::AtomicBool::new(false),
+                        ),
+                        open_pr_busy: std::sync::Arc::new(
                             std::sync::atomic::AtomicBool::new(false),
                         ),
                         git_ctx_pending: false,
@@ -7362,17 +7174,7 @@ fn main() {
                         pending_keys: Vec::new(),
                         preview_dark: theme::dark_active(),
                         appearance_menu: None,
-                        open_tool: settings::get_str("toolpanel.tool").and_then(|s| {
-                            pages::Tool::ALL.iter().copied().find(|t| t.name() == s)
-                        }),
-                        tool_panel_w: settings::get_str("toolpanel.width")
-                            .and_then(|s| s.parse::<f32>().ok())
-                            .map(|w| w.max(workspace::TOOL_PANEL_MIN_W))
-                            .unwrap_or(workspace::TOOL_PANEL_DEFAULT_W),
-                        tool_panel_floating: settings::get_bool("toolpanel.floating", false),
                         git_cwd_cache: Default::default(),
-                        pr: pr_ui::PrState::default(),
-                        local_diff: local_diff_ui::LocalDiffState::default(),
                         flow: crate::flow::FlowState::default(),
                         flow_backends: std::collections::HashMap::new(),
                         flow_composer: None,
@@ -7703,4 +7505,9 @@ mod proc_title_tests {
         );
         assert_eq!(proc_title_due(PROC_TITLE_POLL, PROC_TITLE_REFRESH), Some(true));
     }
+}
+
+/// Hand a URL to the default browser (macOS `open`), fire-and-forget.
+fn open_in_browser(url: &str) {
+    let _ = std::process::Command::new("open").arg(url).spawn();
 }

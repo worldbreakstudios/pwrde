@@ -49,13 +49,6 @@ serde_json = "1"
 dirs = "6"
 rusqlite = { version = "0.32", features = ["bundled"] }
 unicode-segmentation = "1"
-# Syntax highlighting for the PR / local-diff viewers. Pure-Rust regex engine
-# (fancy-regex) so there's no C `onig` build under sccache; `default-fancy`
-# bundles the default syntax + theme sets.
-syntect = { version = "5.2", default-features = false, features = ["default-fancy"] }
-# CommonMark parser for rendering PR / comment markdown. default-features off
-# drops the HTML renderer and CLI getopts we don't use — we walk events directly.
-pulldown-cmark = { version = "0.12", default-features = false }
 # gpui-component (longbridge) — shadcn-ish gpui widget library, used by the
 # experimental Notes page for markdown rendering (`text::markdown` -> TextView)
 # and the note editor (`input::{InputState, TextInput}` in multi-line mode).

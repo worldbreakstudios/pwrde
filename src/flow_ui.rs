@@ -1,7 +1,7 @@
 //! Flow agent surface: the bottom-centered pill bar plus the multi-chat
 //! surfaces above it — an iMessage-style chat list and one open conversation
 //! — as a gpui element tree mounted on every page (same overlay pattern as
-//! `local_diff_ui`; Flow follows the user around the app). This module owns
+//! `settings_ui`; Flow follows the user around the app). This module owns
 //! only presentation and the app-side glue (`toggle_flow`, `flow_send`,
 //! composer lifecycle); the chats it renders are `flow::FlowState`, reduced
 //! from backend events on the main thread, and each conversation talks to
@@ -21,7 +21,7 @@ use std::rc::Rc;
 
 use gpui::{
     AppContext as _, div, point, prelude::FluentBuilder as _, px, AnyElement, App as GpuiApp, BoxShadow, ClickEvent,
-    Context, Entity, InteractiveElement, IntoElement, ParentElement, ScrollHandle,
+    Context, Corners, Entity, FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement, ScrollHandle,
     StatefulInteractiveElement, Styled, Subscription, Window,
 };
 use gpui_component::input::{InputEvent, Textarea, TextareaState};
@@ -37,8 +37,11 @@ use crate::App;
 const BAR_W: f32 = 480.0;
 /// Chat-list width — wider than the bar, as in the mock.
 const LIST_W: f32 = 560.0;
-/// Pill bar height at the default app font size.
-const BAR_H: f32 = 46.0;
+/// Collapsed pill height at the default app font size (the `!flow.open`
+/// launcher row: 7px top/bottom padding + 18px orb + 1px borders). The pill
+/// is sized to `PILL_H * font_scale` outright, so at other sizes the padding
+/// absorbs the unscaled borders rather than the height drifting.
+const PILL_H: f32 = 34.0;
 /// Breathing room between the reserved safe area and the tile above it.
 const SAFE_GAP: f32 = 8.0;
 /// Gap between the bar and the window's bottom edge.
@@ -51,16 +54,16 @@ const LIST_MAX_FRAC: f32 = 0.38;
 const CHIPS: [&str; 3] = ["Spawn a session", "Review the open PR", "Archive merged sessions"];
 
 /// Logical height of the bottom safe area the Sessions/tool-page layouts
-/// reserve while the flag is on (`App::flow_inset`): inset + pill bar + gap,
-/// tracking the app font scale so a larger accessibility font still clears
-/// the bar.
+/// reserve while the flag is on (`App::flow_inset`): inset + collapsed pill
+/// + gap, tracking the app font scale so a larger accessibility font still
+/// clears it.
 ///
-/// Deliberately sized for a one-line bar: the composer can grow to nine
-/// rows, but reserving its live height would reflow every terminal row on
-/// each typed line. A tall draft overlays the tiles above it instead, like
-/// the panel does.
+/// Sized for the collapsed pill: once Flow opens, the bar and its composer
+/// can grow to nine rows, but reserving their live height would reflow every
+/// terminal row on each typed line. The open surface overlays the tiles
+/// above it instead, like the chat panel does.
 pub fn safe_area_h() -> f32 {
-    BOTTOM_INSET + BAR_H * crate::renderer::chrome_font_scale() + SAFE_GAP
+    BOTTOM_INSET + PILL_H * crate::renderer::chrome_font_scale() + SAFE_GAP
 }
 
 /// The pill bar's composer: a `gpui_component` textarea plus the transcript
@@ -279,8 +282,8 @@ impl App {
             editor.update(cx, |s, cx| s.focus(window, cx));
         }
 
-        // Center on the window, not the tile area: the sidebar and ribbon
-        // are asymmetric, so centering between them reads as off-center.
+        // Center on the window, not the tile area: the sidebar makes the tile
+        // area asymmetric, so centering inside it reads as off-center.
         let scale = self.scale();
         let (surface_w, surface_h) = self.renderer.surface_size();
         let (win_w, win_h) = (surface_w as f32 / scale, surface_h as f32 / scale);
@@ -393,9 +396,9 @@ impl App {
             .pl(sp(16.0))
             .pr(sp(9.0))
             .py(sp(9.0))
-            // Closed: a pill at one line, a 24px-radius card once it grows. Open:
-            // docked flush under the panel, so only the bottom corners round and
-            // the seam is a faint top border.
+            // Floating (chat list or nothing above): a 24px-radius card that
+            // grows with the draft. Under the chat sheet: docked flush, so
+            // only the bottom corners round and the seam is a faint top border.
             .map(|el| {
                 if in_chat {
                     el.rounded_b(sp(18.0)).border_t_1().border_color(bar_glass.rim.opacity(0.5))
@@ -427,6 +430,82 @@ impl App {
                     bar.items_center().gap(sp(10.0)).child(field).child(chip()).child(send)
                 }
             });
+
+        // ── Collapsed launcher pill (`!flow.open`) ──
+        // The mock's compact pill: orb + name + hotkey chip in one glass row.
+        // Its height is the PILL_H that `safe_area_h` reserves (the open bar
+        // overlays the extra space, like the chat sheet does). Clicking it
+        // toggles Flow open — the same toggle the ⌘J binding drives.
+        let pill_entity = entity.clone();
+        // The orb's light catch: one white hairline inset along the upper-left
+        // edge, the top_highlight cue rotated onto the accent.
+        let orb_highlight = |alpha: f32| {
+            vec![BoxShadow {
+                color: Hsla { h: 0.0, s: 0.0, l: 1.0, a: alpha },
+                offset: point(px(-0.5), px(-0.5)),
+                blur_radius: px(1.0),
+                spread_radius: px(0.0),
+                inset: true,
+            }]
+        };
+        let pill_orb = div()
+            .flex_none()
+            .size(sp(18.0))
+            .rounded_full()
+            .bg(theme.primary)
+            .shadow(orb_highlight(if theme.dark { 0.45 } else { 0.55 }))
+            .text_color(theme.primary_foreground);
+        let pill_chip = || {
+            div()
+                .flex_none()
+                .text_size(sp(10.0))
+                .text_color(theme.muted_foreground)
+                .border_1()
+                .border_color(theme.border)
+                .rounded(sp(5.0))
+                .px(sp(5.0))
+                .py(sp(1.0))
+                .child(Action::ToggleFlow.binding().display())
+        };
+        let pill = div()
+            .id("flow-pill")
+            .occlude()
+            .h(px((PILL_H * fs).round()))
+            .flex_none()
+            .flex()
+            .items_center()
+            .py(sp(7.0))
+            .pl(sp(10.0))
+            .pr(sp(12.0))
+            .gap(sp(8.0))
+            .rounded_full()
+            .border_1()
+            .border_color(bar_glass.rim)
+            .bg(bar_glass.fill.clone())
+            .shadow(bar_glass.shadows.clone())
+            .children(self.glass_backdrop_el(Corners::all(px(999.0))))
+            .cursor_pointer()
+            .on_click(move |_ev: &ClickEvent, _window: &mut Window, app: &mut GpuiApp| {
+                if let Some(e) = pill_entity.upgrade() {
+                    e.update(app, |this, cx| {
+                        this.toggle_flow();
+                        cx.notify();
+                    });
+                }
+            })
+            .child(pill_orb)
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_none()
+                    .text_size(sp(12.5))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.foreground)
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .child("Flow"),
+            )
+            .child(pill_chip());
 
         // ── Chat list ──
         let list = in_list.then(|| {
@@ -862,9 +941,12 @@ impl App {
             .items_center()
             // The sheet docks onto the bar; the detached list floats above it.
             .gap(if in_chat { px(0.0) } else { sp(10.0) })
+            // Closed, Flow is just the compact launcher pill; opening it
+            // swaps in the 480px bar (chat sheet docked / list floating).
+            .when(!open, |el| el.child(pill))
             .when_some(list, |el, list| el.child(list))
             .when_some(panel, |el, panel| el.child(panel))
-            .child(bar)
+            .when(open, |el| el.child(bar))
             .into_any_element()
     }
 }

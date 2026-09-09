@@ -714,7 +714,7 @@ pub fn action_group(action: Action) -> &'static str {
         Action::ToggleSidebar
         | Action::ToggleFlyover
         | Action::FlyoverPopout
-        | Action::ToggleToolPanel
+        | Action::OpenPrInGithub
         | Action::ToggleFlow
         | Action::IncreaseFontSize
         | Action::DecreaseFontSize
@@ -757,7 +757,7 @@ pub fn action_glyph(action: Action) -> &'static str {
         Action::ToggleSidebar => "⌷",
         Action::ToggleFlyover => "⤓",
         Action::FlyoverPopout => "⇱",
-        Action::ToggleToolPanel => "⌗",
+        Action::OpenPrInGithub => "↗",
         Action::ToggleFlow => "✳",
         Action::IncreaseFontSize => "␣",
         Action::DecreaseFontSize => "␡",

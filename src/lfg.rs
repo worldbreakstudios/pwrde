@@ -6,7 +6,7 @@
 //! `cache-updated` event over its SSE stream. Here we tail that stream (via
 //! `lfg events`, which handles the daemon connection + reconnection for us) on
 //! a dedicated thread and forward each event onto the app's `TermEvent` channel
-//! so the open PR panel can re-fetch and re-render with the fresh data.
+//! so the sidebar's PR card rollups re-fetch and repaint with fresh data.
 //!
 //! Only meaningful when the async path is active (`git.async` on and the CLI is
 //! `lfg`); otherwise there is no daemon to talk to and this does nothing.
@@ -58,10 +58,10 @@ fn parse_event(line: &str) -> Option<TermEvent> {
     if v.get("event")?.as_str()? != "cache-updated" {
         return None;
     }
-    let data = v.get("data")?;
-    let kind = data.get("kind")?.as_str()?.to_string();
-    let number = data.get("number").and_then(|n| n.as_u64()).map(|n| n as u32);
-    Some(TermEvent::PrCacheUpdated { kind, number })
+    // The frame names the entry (`kind`, `number`), but the sidebar re-fetches
+    // every rollup regardless, so only a well-formed frame matters here.
+    v.get("data")?.get("kind")?.as_str()?;
+    Some(TermEvent::PrCacheUpdated)
 }
 
 #[cfg(test)]
@@ -71,13 +71,7 @@ mod tests {
     #[test]
     fn parses_cache_updated_frame() {
         let line = r#"{"id":282,"event":"cache-updated","data":{"kind":"pr","repo":"o/r","number":94,"reason":"evict","ts":1}}"#;
-        match parse_event(line) {
-            Some(TermEvent::PrCacheUpdated { kind, number }) => {
-                assert_eq!(kind, "pr");
-                assert_eq!(number, Some(94));
-            }
-            other => panic!("expected PrCacheUpdated, got {other:?}"),
-        }
+        assert!(matches!(parse_event(line), Some(TermEvent::PrCacheUpdated)));
     }
 
     #[test]
