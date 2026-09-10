@@ -839,8 +839,8 @@ impl App {
     /// One flat two-line session row at `rect` (its
     /// [`crate::workspace::sidebar_row_rect`]), in the GANTRY mock's style:
     /// line one is the title, the relative time and the PR-state icon; line
-    /// two the diffstat as `+A −R · N uncommitted` (or the branch name when
-    /// the branch is clean; "no code changes" only on a detached HEAD).
+    /// two the diffstat as `+A −R · N uncommitted` (or `repo/branch` when the
+    /// branch is clean; "no code changes" only on a detached HEAD).
     /// The unread dot sits under the PR-state icon; a hairline separator
     /// closes every row but the last.
     fn session_row(
@@ -870,11 +870,14 @@ impl App {
         // nothing to say about code: its status is a plain dot and its
         // second line is the directory itself.
         let no_repo = ctx.is_some_and(|c| !c.is_git);
-        // A clean branch names itself instead of saying "no code changes":
-        // the branch is the more useful thing to read at a glance.
+        // A clean branch names itself as `repo/branch` instead of saying
+        // "no code changes": where the row lives is the more useful thing to
+        // read at a glance.
         let branch = ctx
-            .and_then(|c| c.branch.clone())
-            .filter(|b| !b.is_empty());
+            .and_then(|c| c.branch.as_deref().filter(|b| !b.is_empty()).map(|b| match &c.repo {
+                Some(repo) if !repo.is_empty() => format!("{repo}/{b}"),
+                _ => b.to_string(),
+            }));
         let second_line = match (&diff, no_repo) {
             (Some(_), _) => None,
             (None, false) => Some(branch.unwrap_or_else(|| "no code changes".to_string())),
