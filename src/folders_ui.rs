@@ -14,7 +14,7 @@
 use gpui::{
     App as GpuiApp, ClickEvent, Context, FontWeight, InteractiveElement, MouseButton,
     MouseMoveEvent, ParentElement, ScrollWheelEvent, StatefulInteractiveElement, Styled, Window,
-    div,
+    div, linear_color_stop, linear_gradient,
     prelude::FluentBuilder as _, px,
 };
 
@@ -89,7 +89,17 @@ impl App {
             }
         };
 
-        let corners = gpui::Corners::all(px(CARD_RADIUS));
+        // The mock's card is the accent-tinted material — `sb1 -> sb2 38%`,
+        // the chrome's `gradient_from` / `gradient_to` — painted opaque: the
+        // glass recipe's translucent fill over the blurred canvas read as a
+        // black slab against the region ground. Keep the recipe's rim and
+        // shadow stack; only the fill is the theme's gradient.
+        let chrome = crate::theme::current();
+        let material = linear_gradient(
+            180.,
+            linear_color_stop(crate::renderer::color(chrome.gradient_from, 1.0), 0.),
+            linear_color_stop(crate::renderer::color(chrome.gradient_to, 1.0), 0.38),
+        );
         let mut root = crate::ui::glass::Glass::card(theme.dark)
             .apply(
                 div()
@@ -101,6 +111,7 @@ impl App {
                     .rounded(px(CARD_RADIUS))
                     .overflow_hidden(),
             )
+            .bg(material)
             .id("folders-card")
             .occlude()
             // The card occludes the canvas, so its mouse moves never reach
@@ -115,8 +126,7 @@ impl App {
                 app.note_cursor(ev.position);
                 app.scroll_folders(ev.delta);
                 cx.notify();
-            }))
-            .children(self.glass_backdrop_el(corners));
+            }));
 
         // Header chips (the traffic lights float over the header's left).
         root = root
