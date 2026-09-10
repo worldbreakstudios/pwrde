@@ -875,6 +875,17 @@ impl App {
         false
     }
 
+    fn set_webview_title(&mut self, id: u64, title: String) -> bool {
+        for workspace in &mut self.workspaces {
+            for tile in workspace.root.tiles_mut() {
+                if let Some(tab) = tile.tabs.iter_mut().find(|tab| tab.webview_id() == Some(id)) {
+                    return tab.set_webview_title(title);
+                }
+            }
+        }
+        false
+    }
+
     fn open_new_webview_prompt(&mut self) {
         self.command = None;
         self.webview_panel = None;
@@ -5041,6 +5052,11 @@ impl App {
                         && self.set_webview_url(id, url)
                     {
                         self.persist_snapshot();
+                        redraw = true;
+                    }
+                },
+                TermEvent::WebviewTitleChanged { id, title } => {
+                    if self.set_webview_title(id, title) {
                         redraw = true;
                     }
                 },

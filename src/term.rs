@@ -49,6 +49,9 @@ pub enum TermEvent {
     /// A Wry top-level navigation committed; folded into the owning tab on
     /// the main thread so its address, title, and persisted URL stay current.
     WebviewNavigated { id: u64, url: String },
+    /// The native view's document title changed (empty while a new document
+    /// loads); folded into the owning tab so its strip label tracks `<title>`.
+    WebviewTitleChanged { id: u64, title: String },
     /// Pointer focus entered a native child view; keep the owning tile as the
     /// workspace focus target for tab and address-bar actions.
     WebviewFocused { id: u64 },

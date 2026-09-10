@@ -44,6 +44,10 @@ pub struct WebviewTab {
     /// Runtime-only identity retained when a tab is moved or reordered.
     pub id: u64,
     pub url: String,
+    /// The page's document title as last reported by the native view; empty
+    /// or absent while a document is loading, so `Tab::title` falls back to
+    /// the URL-derived label. Runtime-only: it arrives again on every load.
+    pub title: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,7 +83,7 @@ impl Tab {
 
     pub fn webview(id: u64, url: String) -> Self {
         Self {
-            content: TabContent::Webview(WebviewTab { id, url }),
+            content: TabContent::Webview(WebviewTab { id, url, title: None }),
             cols: 0,
             rows: 0,
             unread: false,
@@ -131,10 +135,26 @@ impl Tab {
         true
     }
 
+    /// Record the document title the native view reported. An empty title
+    /// (a new document starting to load) clears the cached one so the tab
+    /// shows the URL label again. Returns whether the cached title changed.
+    pub fn set_webview_title(&mut self, title: String) -> bool {
+        let TabContent::Webview(webview) = &mut self.content else { return false };
+        let next = Some(title.trim().to_string()).filter(|title| !title.is_empty());
+        if webview.title == next {
+            return false;
+        }
+        webview.title = next;
+        true
+    }
+
     pub fn title(&self) -> String {
         match &self.content {
             TabContent::Terminal(session) => session.title(),
-            TabContent::Webview(webview) => webview_title(&webview.url),
+            TabContent::Webview(webview) => webview
+                .title
+                .clone()
+                .unwrap_or_else(|| webview_title(&webview.url)),
         }
     }
 }
@@ -2187,6 +2207,22 @@ mod tests {
         assert!(tab.set_webview_url("https://example.com/docs".into()));
         assert_eq!(tab.url(), Some("https://example.com/docs"));
         assert!(!tab.set_webview_url("https://example.com/docs".into()));
+    }
+
+    #[test]
+    fn webview_tab_prefers_document_title_and_falls_back_to_url() {
+        let mut tab = Tab::webview(7, "https://www.google.com/".into());
+        assert_eq!(tab.title(), "www.google.com");
+        assert!(tab.set_webview_title("  Google  ".into()));
+        assert_eq!(tab.title(), "Google");
+        assert!(!tab.set_webview_title("Google".into()));
+        // A navigation keeps the last title until the new document reports one.
+        assert!(tab.set_webview_url("https://example.com/docs".into()));
+        assert_eq!(tab.title(), "Google");
+        // The native view reports an empty title while a document loads.
+        assert!(tab.set_webview_title(String::new()));
+        assert_eq!(tab.title(), "example.com/docs");
+        assert!(!tab.set_webview_title("   ".into()));
     }
 
     #[test]
