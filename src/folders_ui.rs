@@ -184,7 +184,7 @@ impl App {
                     // Every group: pinned ones are still in the list, as
                     // bubbles above the rows.
                     let count = self.workspaces.len();
-                    folder_row(theme, &r, None, "All sessions".into(), Some(count), false, selected, row_hovered)
+                    folder_row(theme, &r, None, "All sessions".into(), Some(count), true, false, selected, row_hovered)
                         .on_mouse_down(
                             MouseButton::Left,
                             press(entity.clone(), move |this, _ev, _cx| {
@@ -341,8 +341,7 @@ impl App {
         // On hover the delete chip takes the count's slot instead of
         // covering it.
         let show_delete = hovered && editing.is_none();
-        let count = (!show_delete).then_some(members);
-        let mut row = folder_row(theme, r, emoji, label, count, unread, selected, hovered)
+        let mut row = folder_row(theme, r, emoji, label, Some(members), !show_delete, unread, selected, hovered)
             .on_mouse_down(
                 MouseButton::Left,
                 press(entity.clone(), move |this, ev, _cx| {
@@ -421,6 +420,7 @@ fn folder_row(
     emoji: Option<String>,
     label: String,
     count: Option<usize>,
+    count_visible: bool,
     unread: bool,
     selected: bool,
     hovered: bool,
@@ -470,7 +470,11 @@ fn folder_row(
                     .bg(if selected { theme.primary_foreground } else { theme.primary }),
             )
         })
-        .when_some(count, |d, n| d.child(count_badge(theme, n, selected)))
+        // A hidden count still holds its slot, so the unread dot stays put
+        // when the delete chip takes the count's place on hover.
+        .when_some(count, |d, n| {
+            d.child(count_badge(theme, n, selected).when(!count_visible, |b| b.invisible()))
+        })
 }
 
 /// The trailing count: 11px, muted — 80% white on a selected row.
