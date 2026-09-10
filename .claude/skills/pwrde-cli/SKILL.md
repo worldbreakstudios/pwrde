@@ -44,7 +44,7 @@ When finished: `pkill -f target/debug/pwrde`.
 ## 3. Commands
 
 ```sh
-pwrde-cli state                                  # JSON: page, groups → tiles → tabs (title/active/unread/cols/rows), sections, palette open, status message
+pwrde-cli state                                  # JSON: page, groups → tiles → tabs (title/active/unread/cols/rows), sections, sidebar {collapsed, folders_open, folder, sessions_w, region_w}, palette open, status message
 pwrde-cli read panes [query]                     # read-only: one line per pane in every group (session id, group, title, foreground; focused *), filtered by substring; --json for rows
 pwrde-cli read pane <id> [--lines N|--all] [--json]   # read-only: a pane's text (screen, or scrollback tail/all) by session id; --json adds title/size/cursor/group/foreground. Never moves focus/scroll
 pwrde-cli commands                               # every bus command + every rebindable Action with its current key binding

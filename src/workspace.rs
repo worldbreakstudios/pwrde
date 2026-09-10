@@ -415,17 +415,13 @@ impl Workspace {
     }
 }
 
-/// Indices of pinned workspaces, in the order they appear in `workspaces`.
-///
-/// The Sessions sidebar uses this both to paint the bubble strip and to
-/// hit-test clicks against those bubbles — one order, shared by paint and input.
-pub fn pinned_indices(workspaces: &[Workspace]) -> Vec<usize> {
-    workspaces
-        .iter()
-        .enumerate()
-        .filter(|(_, w)| w.pinned)
-        .map(|(i, _)| i)
-        .collect()
+/// How many leading rows of `rows` are pinned groups. [`sidebar_rows_filtered`]
+/// lists a folder's pins first, so this is the size of the "Pinned" section
+/// the list draws above the rest — zero means no section at all.
+pub fn pinned_run(rows: &[SidebarRow], workspaces: &[Workspace]) -> usize {
+    rows.iter()
+        .take_while(|r| workspaces.get(r.ws_idx).is_some_and(|w| w.pinned))
+        .count()
 }
 
 // ─── Layout ─────────────────────────────────────────────────────────────
@@ -450,29 +446,26 @@ impl LayoutRect {
     }
 }
 
-/// Logical (pre-scale) dimensions.
-pub const SIDEBAR_MIN_W: f32 = 120.0;
-/// Default sidebar width.
-///
-/// Wider than the GANTRY mock's 300px on purpose: the mock's cards carry short
-/// branch names, while real ones (`tw-madrid-15…`, `chore/node-24`) ellipsize
-/// the title line well before the timestamp beside it does. The preview card is
-/// the whole point of the panel, so it gets the room.
-pub const SIDEBAR_DEFAULT_W: f32 = 360.0;
+/// Logical (pre-scale) dimensions. All three bound the **sessions list**
+/// width; the GANTRY region adds the folders column on top
+/// ([`sidebar_region_w`]).
+pub const SIDEBAR_MIN_W: f32 = 180.0;
+/// Default sessions-list width — the GANTRY mock's 260px.
+pub const SIDEBAR_DEFAULT_W: f32 = 260.0;
 /// Upper bound on the drag. Generous rather than snug, so the default is
 /// somewhere to start from rather than already at the ceiling.
 pub const SIDEBAR_MAX_W: f32 = 520.0;
 /// Top strip of the sidebar: native traffic lights float here and the rest
 /// is the window drag handle.
 pub const TITLEBAR_H: f32 = 44.0;
-/// Height of a one-line sidebar row (iTerm2/native-mac source-list style).
+/// Height of a one-line Settings sidebar row (iTerm2/native-mac source-list
+/// style).
 const TAB_H: f32 = 28.0;
-/// Height of a Sessions-page preview card row: 10px padding, a 38px avatar,
-/// 10px padding. Group rows use this instead of [`TAB_H`] on the pages that
-/// render the Messages-style sidebar; `tab_rect`'s pages keep [`TAB_H`].
-pub const CARD_H: f32 = 58.0;
-/// Slimmer height for section header rows in the sidebar.
-const SECTION_HEADER_H: f32 = 30.0;
+/// Height of a two-line session row (GANTRY mock): 10px padding, a 12.5px
+/// title line, a 2px gap and an 11px diffstat line, 10px padding, with
+/// headroom so descenders never clip. Group rows use this; `tab_rect`'s
+/// Settings rows keep [`TAB_H`].
+pub const CARD_H: f32 = 52.0;
 
 /// Ceiling on the sidebar's text-size factor.
 ///
@@ -505,33 +498,26 @@ fn cap_row_font_scale(f: f32) -> f32 {
     f.min(MAX_ROW_FONT_SCALE)
 }
 
-/// Height of a sidebar group row at `font_scale`, in logical px.
-///
-/// `card_rows` picks the Messages-style preview card ([`CARD_H`]) over the
-/// one-line [`TAB_H`] row. Pure, so the tests can pin the formula at a
-/// non-default text size instead of only at the ambient default.
-fn sidebar_row_h(card_rows: bool, font_scale: f32) -> f32 {
-    (if card_rows { CARD_H } else { TAB_H }) * font_scale
+/// Height of a sidebar session row at `font_scale`, in logical px. Pure, so
+/// the tests can pin the formula at a non-default text size instead of only
+/// at the ambient default.
+fn sidebar_row_h(font_scale: f32) -> f32 {
+    CARD_H * font_scale
 }
 
-/// Height of a sidebar section-header row at `font_scale`, in logical px.
-fn section_header_h(font_scale: f32) -> f32 {
-    SECTION_HEADER_H * font_scale
-}
-/// Extra left inset for group rows nested under a section.
-const MEMBER_INDENT: f32 = 12.0;
 /// Vertical gap between the sidebar's rounded group rows.
 const TAB_GAP: f32 = 3.0;
-/// Horizontal inset of the sidebar's rows from the sidebar (window) edges:
-/// `sidebar_ui::GUTTER` (8px, the panel's inset) plus the mock's 8px list
-/// padding inside the panel, so the rows stay clear of the panel edge.
-const SIDEBAR_PAD: f32 = 16.0;
-/// Side of the square header chips ("⇤" collapse, "＋" new group). Both sit
-/// right-aligned inside [`TITLEBAR_H`], opposite the native traffic lights, so
-/// the chrome costs one strip instead of two.
-const HEADER_CHIP: f32 = 22.0;
-/// Gap between the two header chips.
-const HEADER_CHIP_GAP: f32 = 6.0;
+/// Side of the square header chips (the folders card's hide/new-folder pair
+/// and the sessions header's show-folders/focus/plus/gear). The mock draws
+/// bare 17px glyphs on an 8px pitch; a 20px hit square on a 4px gap keeps
+/// that pitch while giving each glyph a hover well.
+const HEADER_CHIP: f32 = 20.0;
+/// Gap between neighbouring header chips.
+const HEADER_CHIP_GAP: f32 = 4.0;
+/// Gap between the native traffic lights and the "Show folders" chip while
+/// the folders card is hidden — the mock leaves 16px of air after the green
+/// light; with the chip's glyph ~2px inside its square this gives 14px.
+const SHOW_FOLDERS_GAP: f32 = 12.0;
 /// Height of the horizontal tab strip atop each tile.
 const TILE_TAB_H: f32 = 28.0;
 /// Gap between tile cards; doubles as the divider drag handle (hit tests
@@ -545,12 +531,356 @@ const TILE_GAP: f32 = 3.0;
 pub const AREA_PAD: f32 = TILE_GAP;
 const TILE_TAB_MAX_W: f32 = 180.0;
 
-/// `sidebar_w` is the user-adjustable sidebar width in logical px.
+// ─── GANTRY two-part sidebar region ─────────────────────────────────────
+//
+// The left region is two panels: a floating "folders" card (pinned CLI
+// tools, All sessions, one row per section — the mock's "folders") and,
+// beside it, a flat sessions list. `App::sidebar_expanded_w` is the
+// *sessions list* width; the region's full width adds the folders column
+// on top. These pure helpers are the single authority for that math, so
+// painting, hit-testing and `terminal_area`'s `sidebar_w` agree by
+// construction.
+
+/// Left inset the region keeps when the folders card is closed.
+pub const FOLDERS_CLOSED_INSET: f32 = 16.0;
+/// Default width of the folders card (mock spec); the user drags it between
+/// [`FOLDERS_MIN_W`] and [`FOLDERS_MAX_W`] on the band beside the card.
+pub const FOLDERS_CARD_W: f32 = 200.0;
+pub const FOLDERS_MIN_W: f32 = 150.0;
+pub const FOLDERS_MAX_W: f32 = 360.0;
+/// Region content inset: top, bottom and left. The list's right inset is
+/// [`REGION_RIGHT_PAD`]; the card→list gutter is [`REGION_GAP`].
+pub const REGION_PAD: f32 = 10.0;
+/// Right inset of the region's content — the resize grab band's home.
+pub const REGION_RIGHT_PAD: f32 = 6.0;
+/// Gap between the folders card and the sessions list (mock spec).
+pub const REGION_GAP: f32 = 10.0;
+/// Height of the sessions list's header block (title, "N sessions" and the
+/// chips) — one [`TITLEBAR_H`] strip, so the native traffic lights, which
+/// float at [`TRAFFIC_LIGHT_ORIGIN`], sit centred in it while the folders
+/// card is hidden.
+pub const SESSIONS_HEADER_H: f32 = TITLEBAR_H;
+/// Height of the folders card's header strip: the same [`TITLEBAR_H`] band
+/// for the same traffic-light reason (they land in the card while it is
+/// open — the card's 10px inset keeps [`TRAFFIC_LIGHT_ORIGIN`] inside it).
+pub const FOLDERS_HEADER_H: f32 = TITLEBAR_H;
+/// Height of the folders card's footer line ("N sessions").
+pub const FOLDERS_FOOTER_H: f32 = 34.0;
+/// Horizontal inset of the folder rows from the card edge (mock: body
+/// padding `0 8`).
+pub const FOLDER_BODY_PAD: f32 = 8.0;
+/// Height of a folder / "All sessions" / "Pinned tools" row (mock: 7px of
+/// padding around a 12.5px line).
+pub const FOLDER_ROW_H: f32 = 30.0;
+/// Height of a pinned CLI-tool row (mock: 6px around an 11.5px mono line).
+pub const TOOL_ROW_H: f32 = 26.0;
+/// Vertical gap between the folders card's rows.
+pub const FOLDER_ROW_GAP: f32 = 1.0;
+/// Space the separator between the pinned tools and the folders takes: a
+/// 1px line with 6px margins above and below.
+pub const FOLDER_SEPARATOR_H: f32 = 13.0;
+/// Inset of that separator (and the footer text) from the card's edges.
+const FOLDER_SEPARATOR_INSET: f32 = 12.0;
+
+/// Width of the whole left region in logical px: the sessions list plus
+/// the folders column when it is open, or the slim closed inset. A zero
+/// sessions width stays zero — that is the collapsed state's "region
+/// hidden" signal, which `terminal_area` keys off.
+pub fn sidebar_region_w(sessions_w: f32, folders_w: f32, folders_open: bool) -> f32 {
+    if sessions_w <= 0.0 {
+        return 0.0;
+    }
+    sessions_w + if folders_open { folders_col_w(folders_w) } else { FOLDERS_CLOSED_INSET }
+}
+
+/// The folders column's share of the region while the card shows: the
+/// card and the padding either side of it (plus the list's right pad, so
+/// the sessions width is exactly the list's width).
+fn folders_col_w(folders_w: f32) -> f32 {
+    REGION_PAD + folders_w + REGION_GAP + REGION_RIGHT_PAD
+}
+
+/// The folders-card width a resize drag should store when the pointer sits
+/// at logical `x` on the band between the card and the list: the band's
+/// centre tracks the pointer, then the clamp applies.
+pub fn folders_w_for_pointer(x: f32) -> f32 {
+    (x - REGION_PAD - REGION_GAP / 2.0).clamp(FOLDERS_MIN_W, FOLDERS_MAX_W)
+}
+
+/// How far past the region's narrowest width the sidebar resize drag has
+/// to travel before the region folds away (macOS-style fluid collapse), and
+/// the point it must come back past to reopen.
+pub const SIDEBAR_COLLAPSE_SLACK: f32 = 60.0;
+
+/// Whether a sidebar resize drag with the pointer at logical `x` should
+/// leave the region collapsed: the pointer is well inside the narrowest
+/// region the folders column and the minimum list width allow.
+pub fn sidebar_drag_collapses(x: f32, folders_w: f32, folders_open: bool) -> bool {
+    x < sidebar_region_w(SIDEBAR_MIN_W, folders_w, folders_open) - SIDEBAR_COLLAPSE_SLACK
+}
+
+/// The folders card's twin of [`SIDEBAR_COLLAPSE_SLACK`]: how far inside
+/// the card's minimum width its resize drag folds the card away.
+pub const FOLDERS_COLLAPSE_SLACK: f32 = 50.0;
+
+/// Whether a folders-card resize drag with the pointer at logical `x`
+/// should leave the card hidden (and reopen it once dragged back out).
+pub fn folders_drag_collapses(x: f32) -> bool {
+    x < REGION_PAD + REGION_GAP / 2.0 + FOLDERS_MIN_W - FOLDERS_COLLAPSE_SLACK
+}
+
+/// Logical x of the folders-card resize band's centre (the middle of the
+/// gap between the card and the list), or `None` while the card is hidden.
+pub fn folders_edge_x(folders_w: f32, folders_open: bool) -> Option<f32> {
+    folders_open.then(|| REGION_PAD + folders_w + REGION_GAP / 2.0)
+}
+
+/// The sessions-list width a resize drag should store when the pointer sits
+/// at logical `x` on the region's right-edge grab band: the folders column
+/// (or the slim closed inset) comes back off the region width, then the
+/// drag clamp applies. Only meaningful while the region is shown — the
+/// band is not armed while it is collapsed.
+pub fn sessions_w_for_pointer(x: f32, folders_w: f32, folders_open: bool) -> f32 {
+    let folders_col = if folders_open { folders_col_w(folders_w) } else { FOLDERS_CLOSED_INSET };
+    (x - folders_col).clamp(SIDEBAR_MIN_W, SIDEBAR_MAX_W)
+}
+
+/// Rect of the floating folders card, in physical px: full region height,
+/// [`FOLDERS_CARD_W`] wide, inset by [`REGION_PAD`]. Pure — painting and
+/// hit-testing both read this one rect.
+pub fn folders_card_rect(height: u32, folders_w: f32, scale: f32) -> LayoutRect {
+    let pad = (REGION_PAD * scale).round();
+    LayoutRect {
+        x: pad,
+        y: pad,
+        w: (folders_w * scale).round(),
+        h: (height as f32 - 2.0 * pad).max(0.0),
+    }
+}
+
+/// Rect of the flat sessions list in physical px: right of the folders
+/// column, inset by the region padding top and bottom. Its first
+/// [`SESSIONS_HEADER_H`] is the list header; rows start below that (see
+/// [`sidebar_row_rect`]).
+pub fn sessions_list_rect(
+    sessions_w: f32,
+    folders_w: f32,
+    folders_open: bool,
+    height: u32,
+    scale: f32,
+) -> LayoutRect {
+    let region = sidebar_region_w(sessions_w, folders_w, folders_open) * scale;
+    let pad = (REGION_PAD * scale).round();
+    let gap = (REGION_GAP * scale).round();
+    let x = if folders_open {
+        pad + (folders_w * scale).round() + gap
+    } else {
+        (FOLDERS_CLOSED_INSET * scale).round()
+    };
+    let right = (region - (REGION_RIGHT_PAD * scale).round()).max(x);
+    let bottom = (height as f32 - pad).max(pad);
+    LayoutRect { x, y: pad, w: right - x, h: bottom - pad }
+}
+
+/// One row of the folders card, top to bottom: the "Pinned tools" caption
+/// and one row per registered CLI tool (only when there are tools), then
+/// "All sessions" and one row per section.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FolderRow {
+    PinnedHeader,
+    Tool(usize),
+    AllSessions,
+    Section(usize),
+}
+
+/// The folders card's row list for `n_tools` CLI tools and `n_sections`
+/// sections, in paint order.
+pub fn folder_rows(n_tools: usize, tools_collapsed: bool, n_sections: usize) -> Vec<FolderRow> {
+    let mut rows = Vec::with_capacity(n_tools + n_sections + 2);
+    if n_tools > 0 {
+        rows.push(FolderRow::PinnedHeader);
+        if !tools_collapsed {
+            rows.extend((0..n_tools).map(FolderRow::Tool));
+        }
+    }
+    rows.push(FolderRow::AllSessions);
+    rows.extend((0..n_sections).map(FolderRow::Section));
+    rows
+}
+
+fn folder_row_h(row: FolderRow) -> f32 {
+    match row {
+        FolderRow::Tool(_) => TOOL_ROW_H,
+        _ => FOLDER_ROW_H,
+    }
+}
+
+/// Rect of `rows[index]` inside `card` (physical px): rows stack below the
+/// card header, inset by [`FOLDER_BODY_PAD`], with the separator's space
+/// opening above "All sessions" whenever tool rows precede it. Painting,
+/// hovering and group-drop hit-testing all read this one rect.
+pub fn folder_row_rect(
+    card: &LayoutRect,
+    rows: &[FolderRow],
+    index: usize,
+    scroll: f32,
+    scale: f32,
+) -> LayoutRect {
+    let pad = (FOLDER_BODY_PAD * scale).round();
+    let gap = (FOLDER_ROW_GAP * scale).round();
+    let x = card.x + pad;
+    let w = (card.w - 2.0 * pad).max(0.0);
+    let mut y = card.y + (FOLDERS_HEADER_H * scale).round() - scroll.round();
+    for (i, row) in rows.iter().enumerate() {
+        if matches!(row, FolderRow::AllSessions) && i > 0 {
+            y += (FOLDER_SEPARATOR_H * scale).round();
+        }
+        let h = (folder_row_h(*row) * scale).round();
+        if i == index {
+            return LayoutRect { x, y, w, h };
+        }
+        y += h + gap;
+    }
+    LayoutRect { x, y, w, h: 0.0 }
+}
+
+/// The 1px separator between the tool rows and "All sessions", centred in
+/// the [`FOLDER_SEPARATOR_H`] gap; `None` when no tool rows precede it.
+pub fn folder_separator_rect(
+    card: &LayoutRect,
+    rows: &[FolderRow],
+    scroll: f32,
+    scale: f32,
+) -> Option<LayoutRect> {
+    let i = rows.iter().position(|r| matches!(r, FolderRow::AllSessions))?;
+    if i == 0 {
+        return None;
+    }
+    let all = folder_row_rect(card, rows, i, scroll, scale);
+    let inset = (FOLDER_SEPARATOR_INSET * scale).round();
+    let line = scale.round().max(1.0);
+    Some(LayoutRect {
+        x: card.x + inset,
+        y: all.y - ((FOLDER_SEPARATOR_H * scale) / 2.0).round(),
+        w: (card.w - 2.0 * inset).max(0.0),
+        h: line,
+    })
+}
+
+/// Height of the folders card's row stack (unscrolled, device px): from the
+/// header's bottom to the last row's bottom. With the footer band this is
+/// what bounds the card's scroll ([`max_scroll`]).
+pub fn folder_rows_extent(card: &LayoutRect, rows: &[FolderRow], scale: f32) -> f32 {
+    match rows.len().checked_sub(1) {
+        Some(last) => {
+            let r = folder_row_rect(card, rows, last, 0.0, scale);
+            r.y + r.h - (card.y + (FOLDERS_HEADER_H * scale).round())
+        },
+        None => 0.0,
+    }
+}
+
+/// The largest scroll offset a stack `content_h` tall may take inside a
+/// `viewport_h` window: never negative, so a short list stays put.
+pub fn max_scroll(content_h: f32, viewport_h: f32) -> f32 {
+    (content_h - viewport_h).max(0.0)
+}
+
+/// The folders card's footer band (the "N sessions" line), pinned to the
+/// card's bottom edge; rows are clipped above it.
+pub fn folders_footer_rect(card: &LayoutRect, scale: f32) -> LayoutRect {
+    let h = (FOLDERS_FOOTER_H * scale).round().min(card.h);
+    LayoutRect { x: card.x, y: card.y + card.h - h, w: card.w, h }
+}
+
+/// The folders card's header chips, right-aligned in its header strip:
+/// `(hide_folders, new_folder)`.
+pub fn folders_header_chips(card: &LayoutRect, scale: f32) -> (LayoutRect, LayoutRect) {
+    let side = (HEADER_CHIP * scale).round();
+    let gap = (HEADER_CHIP_GAP * scale).round();
+    let y = card.y + (((FOLDERS_HEADER_H - HEADER_CHIP) / 2.0) * scale).round();
+    let right = card.x + card.w - (REGION_PAD * scale).round();
+    let new = LayoutRect { x: right - side, y, w: side, h: side };
+    let hide = LayoutRect { x: new.x - gap - side, y, w: side, h: side };
+    (hide, new)
+}
+
+/// The chips in the sessions list header, all [`HEADER_CHIP`] squares
+/// centred in [`SESSIONS_HEADER_H`]: `show_folders` at the left (only while
+/// the folders card is hidden — it sits past the traffic-light safe span the
+/// header then has to reserve), and `focus` (hide the whole region), `plus`
+/// (new session) and `gear` (Settings) clustered at the right.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SessionsHeaderChips {
+    pub show_folders: Option<LayoutRect>,
+    pub focus: LayoutRect,
+    pub plus: LayoutRect,
+    pub gear: LayoutRect,
+}
+
+/// Right inset of the header chip cluster from the list's edge.
+const HEADER_CHIP_INSET: f32 = 2.0;
+
+pub fn sessions_header_chips(list: &LayoutRect, folders_open: bool, scale: f32) -> SessionsHeaderChips {
+    let side = (HEADER_CHIP * scale).round().min(list.w.max(0.0));
+    let gap = (HEADER_CHIP_GAP * scale).round();
+    let y = list.y + (((SESSIONS_HEADER_H - HEADER_CHIP) / 2.0) * scale).round();
+    let right = list.x + list.w - (HEADER_CHIP_INSET * scale).round();
+    let gear = LayoutRect { x: right - side, y, w: side, h: side };
+    let plus = LayoutRect { x: gear.x - gap - side, y, w: side, h: side };
+    let focus = LayoutRect { x: plus.x - gap - side, y, w: side, h: side };
+    let show_folders = (!folders_open).then(|| LayoutRect {
+        x: ((TRAFFIC_LIGHT_END + SHOW_FOLDERS_GAP) * scale).round().max(list.x),
+        y,
+        w: side,
+        h: side,
+    });
+    SessionsHeaderChips { show_folders, focus, plus, gear }
+}
+
+
+/// Flat sessions rows for the GANTRY list: one [`SidebarRow`] per group
+/// — no section headers — for the groups `filter` admits. `None` (All
+/// sessions) admits every group in `workspaces` order, regardless of any
+/// section's `collapsed` flag (the list has no headers to fold under);
+/// `Some` admits only that section's members, in the same order. An unknown
+/// or dangling section id filters to nothing, which the list surfaces as its
+/// empty state. The admitted pinned groups come first, in their own order:
+/// they form the "Pinned" section at the top of the list ([`pinned_run`]) —
+/// folded away entirely while `pinned_collapsed`.
+pub fn sidebar_rows_filtered(
+    workspaces: &[Workspace],
+    sections: &[Section],
+    filter: Option<u64>,
+    pinned_collapsed: bool,
+) -> Vec<SidebarRow> {
+    let admit = |ws: &Workspace| match filter {
+        None => true,
+        Some(id) => ws.section == Some(id),
+    };
+    if let Some(id) = filter
+        && !sections.iter().any(|s| s.id == id)
+    {
+        // An id no section owns filters to nothing.
+        return Vec::new();
+    }
+    let admitted = || workspaces.iter().enumerate().filter(|(_, ws)| admit(ws));
+    admitted()
+        .filter(|(_, ws)| ws.pinned && !pinned_collapsed)
+        .chain(admitted().filter(|(_, ws)| !ws.pinned))
+        .map(|(ws_idx, _)| SidebarRow { ws_idx })
+        .collect()
+}
+
+/// The whole left region in physical px. `sidebar_w` is the region width in
+/// logical px ([`sidebar_region_w`]); 0 means collapsed.
 pub fn sidebar(height: u32, scale: f32, sidebar_w: f32) -> LayoutRect {
     LayoutRect { x: 0.0, y: 0.0, w: (sidebar_w * scale).round(), h: height as f32 }
 }
 
-/// The traffic-light / window-drag strip at the top of the sidebar.
+/// The window-drag strip across the top of the region: the folders card's
+/// header and the sessions list's header share this one [`TITLEBAR_H`]
+/// band, and the native traffic lights float in it.
 pub fn titlebar(scale: f32, sidebar_w: f32) -> LayoutRect {
     LayoutRect { x: 0.0, y: 0.0, w: (sidebar_w * scale).round(), h: (TITLEBAR_H * scale).round() }
 }
@@ -600,10 +930,16 @@ pub fn traffic_light_origin(spot: TrafficLightSpot) -> (f32, f32) {
 }
 
 /// Logical width of the top-left corner the native traffic lights occupy.
-/// The buttons themselves end around x=72 (three 12px lights, 8px apart,
-/// from [`TRAFFIC_LIGHT_ORIGIN`]); the extra headroom keeps the first tab
+/// The buttons themselves end at [`TRAFFIC_LIGHT_END`]; the extra headroom keeps the first tab
 /// from crowding them.
 pub const TRAFFIC_LIGHT_SAFE_W: f32 = 90.0;
+/// Where the third traffic light ends. macOS 26 draws the lights 14px wide
+/// on a 23px pitch from [`TRAFFIC_LIGHT_ORIGIN`] (measured off a window
+/// capture: 20–34, 43–57, 66–80), not the nominal 12px/8px — the
+/// sessions-list header's "Show folders" chip hugs this rather than the
+/// roomier [`TRAFFIC_LIGHT_SAFE_W`], so the title beside it keeps enough
+/// room to read at the default list width.
+pub const TRAFFIC_LIGHT_END: f32 = TRAFFIC_LIGHT_ORIGIN + 2.0 * 23.0 + 14.0;
 
 /// The window-drag corner while the sidebar is collapsed: the traffic-light
 /// span of the top-left tile's tab strip, plus the sliver of padding above.
@@ -617,53 +953,47 @@ pub fn collapsed_drag_zone(scale: f32) -> LayoutRect {
     }
 }
 
+/// Side of the "Show sessions" button that floats beside the traffic
+/// lights while the whole region is hidden.
+pub const SHOW_SESSIONS_BTN: f32 = 26.0;
+/// Gap between the last traffic light and that button's box; the glyph
+/// inside is inset another 4.5px, so the visible gap matches the one the
+/// tab strip keeps on the button's other side.
+pub const SHOW_SESSIONS_GAP: f32 = 4.0;
+
+/// Rect of that button (physical px): just past the traffic-light safe
+/// span, vertically centred on the top-left tile's tab strip, which
+/// [`COLLAPSED_STRIP_INSET`] pushes clear of it.
+pub fn show_sessions_button(scale: f32) -> LayoutRect {
+    let side = (SHOW_SESSIONS_BTN * scale).round();
+    LayoutRect {
+        x: ((TRAFFIC_LIGHT_END + SHOW_SESSIONS_GAP) * scale).round(),
+        y: ((AREA_PAD + (TILE_TAB_H - SHOW_SESSIONS_BTN) / 2.0) * scale).round(),
+        w: side,
+        h: side,
+    }
+}
+
+/// Left inset the top-left tile's tab strip cedes while the sidebar is
+/// collapsed: the traffic lights, the floating "Show sessions" button
+/// beside them (`sidebar_ui::render_collapsed_overlay`) and a gap that
+/// reads the same as the one before the button.
+pub const COLLAPSED_STRIP_INSET: f32 =
+    TRAFFIC_LIGHT_END + SHOW_SESSIONS_GAP + SHOW_SESSIONS_BTN + SHOW_SESSIONS_GAP;
+
 /// A tile's rect adjusted for tab-strip geometry: while the sidebar is
 /// collapsed (`sidebar_w == 0.0`), the tile owning the area's top-left
 /// corner cedes its strip's left end to the native traffic lights, pushing
-/// its tabs right. Every strip consumer (painting, hit-testing, drops) must
+/// its tabs right. The inset also clears the floating
+/// "Show sessions" button that rides beside the lights. Every strip consumer (painting, hit-testing, drops) must
 /// feed this to the `tile_tab_*` functions so they never disagree; the card
 /// and content keep the original rect.
 pub fn tab_strip_rect(area: LayoutRect, rect: &LayoutRect, scale: f32, sidebar_w: f32) -> LayoutRect {
     if sidebar_w != 0.0 || rect.x > area.x || rect.y > area.y {
         return *rect;
     }
-    let inset = ((TRAFFIC_LIGHT_SAFE_W * scale).round() - rect.x).clamp(0.0, rect.w);
+    let inset = ((COLLAPSED_STRIP_INSET * scale).round() - rect.x).clamp(0.0, rect.w);
     LayoutRect { x: rect.x + inset, w: rect.w - inset, ..*rect }
-}
-
-/// Shared geometry for the header chip row below the titlebar: the strip's
-/// left inset, the row's top edge, its usable width and the square chip side.
-/// The side collapses to zero along with the sidebar so a folded strip has no
-/// clickable chips left behind.
-fn header_chip_row(scale: f32, sidebar_w: f32) -> (f32, f32, f32, f32) {
-    let pad = (SIDEBAR_PAD * scale).round();
-    // Vertically centred in the titlebar strip rather than stacked below it:
-    // the native traffic lights own the left of that strip and nothing else
-    // does, so the chips ride along in the space already being spent.
-    let y = (((TITLEBAR_H - HEADER_CHIP) / 2.0) * scale).round();
-    let full_w = ((sidebar_w * scale).round() - 2.0 * pad).max(0.0);
-    let side = (HEADER_CHIP * scale).round().min(full_w);
-    (pad, y, full_w, side)
-}
-
-/// The "＋" chip at the top right of the header row. Clicking it opens the cwd
-/// picker, i.e. it makes a new GROUP. Tight to the painted chip: a small
-/// square, not half the row, so no dead pixels around it are clickable.
-/// (Sections are made by dragging one group onto another, never by a button.)
-pub fn new_group_button(scale: f32, sidebar_w: f32) -> LayoutRect {
-    let (pad, y, full_w, side) = header_chip_row(scale, sidebar_w);
-    LayoutRect { x: pad + full_w - side, y, w: side, h: side }
-}
-
-/// The "⇤" chip at the left of the header row, which folds the sidebar away.
-/// Mirrors [`new_group_button`] across the strip so the two read as a pair.
-pub fn sidebar_collapse_button(scale: f32, sidebar_w: f32) -> LayoutRect {
-    let (pad, y, full_w, side) = header_chip_row(scale, sidebar_w);
-    let gap = (HEADER_CHIP_GAP * scale).round();
-    // Immediately left of the "+" chip, so the pair reads as one cluster in
-    // the top-right corner.
-    let x = (pad + full_w - 2.0 * side - gap).max(pad);
-    LayoutRect { x, y, w: side, h: side }
 }
 
 /// Centered CTA used by the empty-state launch view.
@@ -686,274 +1016,175 @@ pub fn empty_state_hint(width: u32, height: u32, scale: f32, sidebar_w: f32) -> 
     LayoutRect { x: cta.x, y: cta.y + cta.h + (14.0 * scale).round(), w: cta.w, h: (22.0 * scale).round() }
 }
 
-/// Group tab `index` in the sidebar, stacked below the new-group button.
-/// Rows are inset from the sidebar edges (rounded pills, Arc-style).
-///
-/// Prefer [`sidebar_row_rect`] once the caller has a derived [`SidebarRow`]
-/// list — this flat-index helper remains for callers that still treat the
-/// sidebar as a uniform stack of group tabs.
-pub fn tab_rect(index: usize, scale: f32, sidebar_w: f32) -> LayoutRect {
-    tab_rect_at(index, scale, row_font_scale(), sidebar_w)
+/// One-line row `index` of the Settings sidebar, stacked below the list
+/// header inside `list` (the [`sessions_list_rect`]). Group rows use
+/// [`sidebar_row_rect`] instead — this flat-index helper is for the pages
+/// whose sidebar is a uniform stack.
+pub fn tab_rect(index: usize, scale: f32, list: &LayoutRect) -> LayoutRect {
+    tab_rect_at(index, scale, row_font_scale(), list)
 }
 
 /// [`tab_rect`] at an explicit text-size factor. Pure, so the tests can pin the
 /// wiring at a non-default size instead of only at the ambient default.
-fn tab_rect_at(index: usize, scale: f32, font_scale: f32, sidebar_w: f32) -> LayoutRect {
-    let pad = (SIDEBAR_PAD * scale).round();
-    let h = (sidebar_row_h(false, font_scale) * scale).round();
+fn tab_rect_at(index: usize, scale: f32, font_scale: f32, list: &LayoutRect) -> LayoutRect {
+    let h = (TAB_H * font_scale * scale).round();
     let gap = (TAB_GAP * scale).round();
-    let top = (TITLEBAR_H * scale).round() + 2.0 * gap;
-    LayoutRect {
-        x: pad,
-        y: top + index as f32 * (h + gap),
-        w: ((sidebar_w * scale).round() - 2.0 * pad).max(0.0),
-        h,
-    }
+    let top = list.y + (SESSIONS_HEADER_H * scale).round() + 2.0 * gap;
+    LayoutRect { x: list.x, y: top + index as f32 * (h + gap), w: list.w.max(0.0), h }
 }
 
 /// The search-box slot at the top of the Settings sidebar (index 0 slot).
-pub fn settings_search_rect(scale: f32, sidebar_w: f32) -> LayoutRect {
-    tab_rect(0, scale, sidebar_w)
+pub fn settings_search_rect(scale: f32, list: &LayoutRect) -> LayoutRect {
+    tab_rect(0, scale, list)
 }
 
-/// One visible row in the sidebar, derived from workspaces + sections.
+/// One visible row of the flat sessions list: the group it shows. Section
+/// headers left the list for the folders card, so a row is always a group.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SidebarRow {
-    SectionHeader { section_idx: usize },
-    Group { ws_idx: usize },
+pub struct SidebarRow {
+    pub ws_idx: usize,
 }
 
-/// Derive the ordered sidebar rows from workspace membership and section
-/// collapse state. Walks `workspaces` in order: at the first member of each
-/// populated section emits a header, then member group rows only when
-/// expanded; ungrouped workspaces emit a group row. An empty section (no
-/// member groups) renders its header immediately BEFORE the group whose
-/// `primary_tile == section.anchor`; empty sections with `anchor == None`
-/// or a dangling anchor (no such group present) trail at the end in
-/// `sections` order.
-///
-/// Pinned workspaces never get a group row — they are shown in the bubble
-/// strip instead ([`pinned_indices`]). A section whose members are all pinned
-/// still keeps its header, so the folder stays visible to unpin back into;
-/// it just has nothing to expand.
-pub fn sidebar_rows(workspaces: &[Workspace], sections: &[Section]) -> Vec<SidebarRow> {
-    let mut rows = Vec::new();
-    let mut emitted = vec![false; sections.len()];
-    // A section is empty when no workspace claims membership in it.
-    let is_empty: Vec<bool> = sections
-        .iter()
-        .map(|s| !workspaces.iter().any(|w| w.section == Some(s.id)))
-        .collect();
-    let mut i = 0;
-    while i < workspaces.len() {
-        // Before processing this workspace, emit any not-yet-emitted empty
-        // section whose anchor points at this group's primary_tile.
-        for section_idx in 0..sections.len() {
-            if !emitted[section_idx]
-                && is_empty[section_idx]
-                && sections[section_idx].anchor == Some(workspaces[i].primary_tile)
-            {
-                emitted[section_idx] = true;
-                rows.push(SidebarRow::SectionHeader { section_idx });
-            }
-        }
-        match workspaces[i].section {
-            Some(sid) => match sections.iter().position(|s| s.id == sid) {
-                Some(section_idx) if !emitted[section_idx] => {
-                    emitted[section_idx] = true;
-                    rows.push(SidebarRow::SectionHeader { section_idx });
-                    let collapsed = sections[section_idx].collapsed;
-                    while i < workspaces.len() && workspaces[i].section == Some(sid) {
-                        if !collapsed && !workspaces[i].pinned {
-                            rows.push(SidebarRow::Group { ws_idx: i });
-                        }
-                        i += 1;
-                    }
-                }
-                _ => {
-                    // Orphan id or non-contiguous repeat: show as a bare group.
-                    if !workspaces[i].pinned {
-                        rows.push(SidebarRow::Group { ws_idx: i });
-                    }
-                    i += 1;
-                }
-            },
-            None => {
-                if !workspaces[i].pinned {
-                    rows.push(SidebarRow::Group { ws_idx: i });
-                }
-                i += 1;
-            }
-        }
-    }
-    // Any still-unemitted empty section (anchor None or dangling) trails at
-    // the end, in `sections` order — matching old behavior for un-anchored
-    // sections.
-    for (section_idx, was_emitted) in emitted.iter().enumerate() {
-        if !was_emitted {
-            rows.push(SidebarRow::SectionHeader { section_idx });
-        }
-    }
-    rows
-}
+/// Height of the "Pinned" caption above the pinned rows (logical px).
+pub const PINNED_CAPTION_H: f32 = 22.0;
+/// Band between the last pinned row and the first unpinned one, with the
+/// section divider centred in it.
+pub const PINNED_SECTION_GAP: f32 = 12.0;
 
-/// Column width of one pinned-session bubble in the Sessions strip.
-const PINNED_COL_W: f32 = 84.0;
-/// Diameter of the round avatar disc inside a pinned bubble.
-const PINNED_AVATAR: f32 = 64.0;
-/// Gap between the avatar disc and the name label under it.
-const PINNED_LABEL_GAP: f32 = 5.0;
-/// Text line height under a pinned bubble avatar.
-const PINNED_LABEL_H: f32 = 14.0;
-/// Total height of one pinned-bubble column: avatar + label gap + label.
-const PINNED_COL_H: f32 = PINNED_AVATAR + PINNED_LABEL_GAP + PINNED_LABEL_H; // 83
-/// Horizontal gap between adjacent pinned-bubble columns.
-const PINNED_COL_GAP: f32 = 14.0;
-/// Vertical gap between wrapped rows of pinned bubbles.
-const PINNED_ROW_GAP: f32 = 8.0;
-/// Top padding inside the pinned-bubble strip.
-const PINNED_STRIP_PAD_TOP: f32 = 6.0;
-/// Bottom padding inside the pinned-bubble strip.
-const PINNED_STRIP_PAD_BOTTOM: f32 = 12.0;
-
-/// How many pinned-bubble columns fit across the sidebar's inner width.
-///
-/// Pure floor division on logical px so paint and hit-test wrap at the same
-/// count regardless of the live display scale.
-fn pinned_per_row(sidebar_w: f32) -> usize {
-    let inner_w = (sidebar_w - 2.0 * SIDEBAR_PAD).max(0.0);
-    (((inner_w + PINNED_COL_GAP) / (PINNED_COL_W + PINNED_COL_GAP)).floor() as usize).max(1)
-}
-
-/// Height of the pinned-bubble strip above the section/card list, in device px.
-///
-/// Zero when nothing is pinned so the card ladder keeps its old top. Otherwise
-/// top pad + N rows of 83-tall columns + 8px inter-row gaps + bottom pad, all
-/// scaled — painting and `sidebar_row_rect` both read this so the strip never
-/// collides with the first card.
-pub fn pinned_strip_h(n_pinned: usize, scale: f32, sidebar_w: f32) -> f32 {
-    if n_pinned == 0 {
-        return 0.0;
-    }
-    let per_row = pinned_per_row(sidebar_w);
-    let rows = (n_pinned + per_row - 1) / per_row;
-    let h = PINNED_STRIP_PAD_TOP
-        + (rows as f32) * PINNED_COL_H
-        + ((rows.saturating_sub(1)) as f32) * PINNED_ROW_GAP
-        + PINNED_STRIP_PAD_BOTTOM;
-    h * scale
-}
-
-/// Device-px column rect for the `k`-th pinned bubble in a strip of `n_pinned`.
-///
-/// Columns are 84×83 logical px and lay out left-to-right, wrapping when the
-/// sidebar's inner width cannot hold another; each row is centered on its own
-/// bubble count so a short final row still sits under the middle of the strip.
-/// The strip starts at the same `top0` the card rows used to, plus the strip's
-/// 6px top pad — paint and hit-test share this helper so a click never misses
-/// the disc the user sees.
-pub fn pinned_bubble_rect(k: usize, n_pinned: usize, scale: f32, sidebar_w: f32) -> LayoutRect {
-    let per_row = pinned_per_row(sidebar_w);
-    let r = k / per_row;
-    let c = k % per_row;
-    let row_count = (n_pinned - r * per_row).min(per_row);
-
-    let gap_rows = (TAB_GAP * scale).round();
-    let top0 = (TITLEBAR_H * scale).round() + 2.0 * gap_rows;
-    let strip_top = top0 + PINNED_STRIP_PAD_TOP * scale;
-
-    let col_w = PINNED_COL_W * scale;
-    let col_h = PINNED_COL_H * scale;
-    let col_gap = PINNED_COL_GAP * scale;
-    let row_gap = PINNED_ROW_GAP * scale;
-
-    // Same rounded inset and width `sidebar_row_rect_at` uses, so the strip
-    // and the card ladder share their left and right edges exactly.
-    let pad = (SIDEBAR_PAD * scale).round();
-    let inner_w = ((sidebar_w * scale).round() - 2.0 * pad).max(0.0);
-    let row_w = (row_count as f32) * col_w + ((row_count.saturating_sub(1)) as f32) * col_gap;
-    let row_x0 = (pad + (inner_w - row_w) / 2.0).round();
-
+/// Device-px rect of the "Pinned" caption: the band just under the list
+/// header that the pinned rows hang from. Always present — it is the
+/// fold toggle and the drop zone that pins a dragged row — so the rows
+/// (pinned or not) start under it. `list` is the *scrolled* list rect.
+pub fn pinned_caption_rect(scale: f32, list: &LayoutRect) -> LayoutRect {
     LayoutRect {
-        x: row_x0 + (c as f32) * (col_w + col_gap),
-        y: strip_top + (r as f32) * (col_h + row_gap),
-        w: col_w,
-        h: col_h,
+        x: list.x,
+        y: list.y + (SESSIONS_HEADER_H * scale).round(),
+        w: list.w.max(0.0),
+        h: (PINNED_CAPTION_H * scale).round(),
     }
 }
 
-/// Pixel rect for `rows[index]`. Header rows are slimmer; group rows that
-/// belong to a section are indented. Painting, hit-testing, and drop
-/// resolution must all use this so they never disagree.
-///
-/// `card_rows` selects the group-row height: the Messages-style preview cards
-/// ([`CARD_H`]) on the pages that render them, the one-line [`TAB_H`] rows
-/// everywhere else. It is threaded in rather than read off global state so
-/// every caller is forced to agree with whatever the page is painting.
+/// The hairline closing the "Pinned" section: centred in the gap under
+/// the last pinned row, or straight under the caption when nothing is
+/// pinned (or the section is folded). Device px; `list` is scrolled.
+pub fn pinned_divider_rect(
+    rows: &[SidebarRow],
+    workspaces: &[Workspace],
+    pinned_section: bool,
+    scale: f32,
+    list: &LayoutRect,
+) -> LayoutRect {
+    if !pinned_section {
+        return LayoutRect { x: list.x, y: list.y, w: 0.0, h: 0.0 };
+    }
+    let cap = pinned_caption_rect(scale, list);
+    let n_pinned = pinned_run(rows, workspaces);
+    let h = (sidebar_row_h(row_font_scale()) * scale).round();
+    let gap = (PINNED_SECTION_GAP * scale).round();
+    let inset = (12.0 * scale).round();
+    LayoutRect {
+        x: list.x + inset,
+        y: cap.y + cap.h + n_pinned as f32 * h + (gap / 2.0).round(),
+        w: (list.w - 2.0 * inset).max(0.0),
+        h: scale.round().max(1.0),
+    }
+}
+
+/// The band a dragged row can be dropped on to pin it: the caption plus,
+/// when nothing is pinned, the empty gap under it.
+pub fn pinned_drop_zone(
+    rows: &[SidebarRow],
+    workspaces: &[Workspace],
+    pinned_section: bool,
+    scale: f32,
+    list: &LayoutRect,
+) -> LayoutRect {
+    if !pinned_section {
+        return LayoutRect { x: list.x, y: list.y, w: 0.0, h: 0.0 };
+    }
+    let cap = pinned_caption_rect(scale, list);
+    let extra = if pinned_run(rows, workspaces) == 0 {
+        (PINNED_SECTION_GAP * scale).round()
+    } else {
+        0.0
+    };
+    LayoutRect { h: cap.h + extra, ..cap }
+}
+
+/// Height of the sessions list's row stack (unscrolled, device px): from
+/// the header's bottom to the last row's bottom, caption and section gap
+/// included. Bounds the list's scroll ([`max_scroll`]).
+pub fn sidebar_rows_extent(
+    rows: &[SidebarRow],
+    workspaces: &[Workspace],
+    pinned_section: bool,
+    scale: f32,
+    list: &LayoutRect,
+) -> f32 {
+    let top = list.y + (SESSIONS_HEADER_H * scale).round();
+    match rows.len().checked_sub(1) {
+        Some(last) => {
+            let r = sidebar_row_rect(rows, last, workspaces, pinned_section, scale, list);
+            r.y + r.h - top
+        },
+        None if pinned_section => {
+            let d = pinned_divider_rect(rows, workspaces, true, scale, list);
+            d.y + (PINNED_SECTION_GAP * scale).round() / 2.0 - top
+        },
+        None => 0.0,
+    }
+}
+
+/// Pixel rect for `rows[index]` inside `list` (the [`sessions_list_rect`]):
+/// rows stack below the list header and the "Pinned" caption, the pinned
+/// run then the section gap, span the
+/// list's full width and touch (the row paints its own hairline separator).
+/// Painting, hit-testing, and drop resolution must all use this so they
+/// never disagree.
 pub fn sidebar_row_rect(
     rows: &[SidebarRow],
     index: usize,
     workspaces: &[Workspace],
+    pinned_section: bool,
     scale: f32,
-    sidebar_w: f32,
-    card_rows: bool,
+    list: &LayoutRect,
 ) -> LayoutRect {
-    sidebar_row_rect_at(rows, index, workspaces, scale, row_font_scale(), sidebar_w, card_rows)
+    sidebar_row_rect_at(rows, index, workspaces, pinned_section, scale, row_font_scale(), list)
 }
 
 /// [`sidebar_row_rect`] at an explicit text-size factor. Pure, so the tests can
 /// pin the row pitch at a non-default size.
-#[allow(clippy::too_many_arguments)]
 fn sidebar_row_rect_at(
     rows: &[SidebarRow],
     index: usize,
     workspaces: &[Workspace],
+    pinned_section: bool,
     scale: f32,
     font_scale: f32,
-    sidebar_w: f32,
-    card_rows: bool,
+    list: &LayoutRect,
 ) -> LayoutRect {
-    let pad = (SIDEBAR_PAD * scale).round();
-    let gap = (TAB_GAP * scale).round();
-    // Rows start below the titlebar and the header chip row — exactly where
-    // `tab_rect`'s one-line rows start, so every page's ladder shares a top.
-    // On the Sessions card ladder the pinned-bubble strip (if any) sits above
-    // the cards, so shift `top0` down by its height; Cleanup/Settings
-    // one-line rows keep the unshifted origin.
-    let mut top0 = (TITLEBAR_H * scale).round() + 2.0 * gap;
-    if card_rows {
-        let n_pinned = workspaces.iter().filter(|w| w.pinned).count();
-        top0 += pinned_strip_h(n_pinned, scale, sidebar_w);
+    let n_pinned = pinned_run(rows, workspaces);
+    let mut y = list.y + (SESSIONS_HEADER_H * scale).round();
+    if pinned_section {
+        y += (PINNED_CAPTION_H * scale).round();
     }
-    let full_w = ((sidebar_w * scale).round() - 2.0 * pad).max(0.0);
-    let mut y = top0;
-    for (i, row) in rows.iter().enumerate() {
-        let (h, indent) = match *row {
-            SidebarRow::SectionHeader { .. } => {
-                ((section_header_h(font_scale) * scale).round(), 0.0)
-            }
-            SidebarRow::Group { ws_idx } => {
-                let indent = if workspaces.get(ws_idx).and_then(|w| w.section).is_some() {
-                    (MEMBER_INDENT * scale).round()
-                } else {
-                    0.0
-                };
-                let h = sidebar_row_h(card_rows, font_scale);
-                ((h * scale).round(), indent)
-            }
-        };
-        if i == index {
-            return LayoutRect {
-                x: pad + indent,
-                y,
-                w: (full_w - indent).max(0.0),
-                h,
-            };
+    let w = list.w.max(0.0);
+    let h = (sidebar_row_h(font_scale) * scale).round();
+    for i in 0..=rows.len() {
+        // The section gap (and its divider) sits before the first unpinned
+        // row — right under the caption when nothing is pinned. Without
+        // the section (nothing pinned, no drag) rows sit straight under
+        // the header.
+        if i == n_pinned && pinned_section {
+            y += (PINNED_SECTION_GAP * scale).round();
         }
-        y += h + gap;
+        if i == index {
+            return LayoutRect { x: list.x, y, w, h };
+        }
+        y += h;
     }
     // Out-of-range fallback: empty rect at the stack end.
-    LayoutRect { x: pad, y, w: full_w, h: 0.0 }
+    LayoutRect { x: list.x, y, w, h: 0.0 }
 }
 
 /// The delete-section button hit region at the right edge of a section-header
@@ -971,44 +1202,11 @@ pub fn section_delete_rect(header: &LayoutRect, scale: f32) -> LayoutRect {
     }
 }
 
-/// The "⌘N" hotkey hint chip at the right edge of a group row (`row` = its
-/// [`sidebar_row_rect`]). Purely decorative — nothing hit-tests against it —
-/// but it is derived from the row rect like [`section_delete_rect`] so the
-/// title clip and the chip can never disagree.
-pub fn group_hotkey_chip_rect(row: &LayoutRect, scale: f32) -> LayoutRect {
-    let w = (22.0 * scale).round();
-    let h = (16.0 * scale).round();
-    let pad = (6.0 * scale).round();
-    LayoutRect {
-        x: row.x + row.w - w - pad,
-        y: (row.y + (row.h - h) / 2.0).round(),
-        w,
-        h,
-    }
-}
-
-/// Row index that should show the active pill for `active` workspace.
-/// When the active workspace sits inside a collapsed section, that is the
-/// section header row; otherwise the visible group row.
-pub fn active_row_index(
-    rows: &[SidebarRow],
-    workspaces: &[Workspace],
-    sections: &[Section],
-    active: usize,
-) -> Option<usize> {
-    for (i, row) in rows.iter().enumerate() {
-        if let SidebarRow::Group { ws_idx } = *row {
-            if ws_idx == active {
-                return Some(i);
-            }
-        }
-    }
-    let sid = workspaces.get(active).and_then(|w| w.section)?;
-    let section_idx = sections.iter().position(|s| s.id == sid)?;
-    if !sections[section_idx].collapsed {
-        return None;
-    }
-    rows.iter().position(|r| matches!(r, SidebarRow::SectionHeader { section_idx: si } if *si == section_idx))
+/// Row index that shows the active pill for the `active` workspace, if it
+/// has a row in `rows` (pinned groups and groups hidden by the folder
+/// filter have none).
+pub fn active_row_index(rows: &[SidebarRow], active: usize) -> Option<usize> {
+    rows.iter().position(|r| r.ws_idx == active)
 }
 
 /// Parse a section rename buffer into `(emoji, name)`.
@@ -1178,92 +1376,20 @@ pub fn append_to_section(
     relocate_workspace(workspaces, from, insert_before, Some(section_id))
 }
 
-/// Drop workspace `from` onto the middle of group `target`.
-///
-/// - Target in a section → join that section, placed after the target.
-/// - Target ungrouped → create a new expanded section named "section" containing
-///   `[target, from]` and return its id.
-///
-/// Returns `(new_index_of_from, created_section_id)`.
-pub fn join_onto_group(
-    workspaces: &mut Vec<Workspace>,
-    sections: &mut Vec<Section>,
-    next_section_id: &mut u64,
-    from: usize,
-    target: usize,
-) -> (usize, Option<u64>) {
-    if from >= workspaces.len() || target >= workspaces.len() || from == target {
-        return (from, None);
+/// Move `sections[from]` so it sits before the pre-removal index
+/// `insert_before` (len = last); the folders card's drag-to-reorder. Only
+/// the card's order changes — membership is by id. Returns the final index.
+pub fn reorder_section(sections: &mut Vec<Section>, from: usize, mut insert_before: usize) -> usize {
+    if from >= sections.len() {
+        return from;
     }
-    if let Some(sid) = workspaces[target].section {
-        let new_idx = relocate_workspace(workspaces, from, target + 1, Some(sid));
-        return (new_idx, None);
+    let section = sections.remove(from);
+    if insert_before > from {
+        insert_before -= 1;
     }
-    // Create a section around [target, from].
-    let id = *next_section_id;
-    *next_section_id += 1;
-    sections.push(Section {
-        id,
-        name: "section".into(),
-        emoji: String::new(),
-        collapsed: false,
-        anchor: None,
-    });
-    // Place `from` immediately after `target`, then tag both.
-    let new_from = relocate_workspace(workspaces, from, target + 1, Some(id));
-    let new_target = if from < target { target - 1 } else { target };
-    workspaces[new_target].section = Some(id);
-    workspaces[new_from].section = Some(id);
-    (new_from, Some(id))
-}
-
-/// Move the contiguous member block of `section_id` so it starts at
-/// `dest_start` (pre-move index among current workspaces, clamped). Never
-/// splits another section — `dest_start` is adjusted out of foreign runs.
-/// Returns the block's new `[start, end)` range.
-pub fn relocate_section_block(
-    workspaces: &mut Vec<Workspace>,
-    section_id: u64,
-    mut dest_start: usize,
-) -> Option<(usize, usize)> {
-    let (start, end) = section_member_range(workspaces, section_id)?;
-    let len = end - start;
-    if len == 0 {
-        return Some((start, end));
-    }
-    // Pull the block out.
-    let block: Vec<Workspace> = workspaces.drain(start..end).collect();
-    if dest_start > start {
-        dest_start -= len;
-    }
-    dest_start = dest_start.min(workspaces.len());
-    // Do not land inside a different section's run — snap to its boundary.
-    dest_start = snap_top_level_index(workspaces, dest_start);
-    for (i, ws) in block.into_iter().enumerate() {
-        workspaces.insert(dest_start + i, ws);
-    }
-    Some((dest_start, dest_start + len))
-}
-
-/// Snap an index so it sits on a top-level boundary (not strictly inside
-/// another section's member run).
-fn snap_top_level_index(workspaces: &[Workspace], index: usize) -> usize {
-    if index == 0 || index >= workspaces.len() {
-        return index.min(workspaces.len());
-    }
-    let left = workspaces[index - 1].section;
-    let right = workspaces[index].section;
-    match (left, right) {
-        (Some(a), Some(b)) if a == b => {
-            // Inside run a — snap to end of run.
-            let mut i = index;
-            while i < workspaces.len() && workspaces[i].section == Some(a) {
-                i += 1;
-            }
-            i
-        }
-        _ => index,
-    }
+    insert_before = insert_before.min(sections.len());
+    sections.insert(insert_before, section);
+    insert_before
 }
 
 /// Delete `section_id`: ungroup its member groups — they survive as top-level
@@ -1306,35 +1432,6 @@ pub fn ensure_active_section_expanded(
     }
     false
 }
-
-/// Height of the page-dot strip pinned to the sidebar's bottom edge.
-pub const PAGE_STRIP_H: f32 = 36.0;
-/// Square hit target for one page slot in the strip.
-const PAGE_SLOT: f32 = 22.0;
-const PAGE_SLOT_GAP: f32 = 10.0;
-
-/// The page-dot strip across the bottom of the sidebar (present on every
-/// page, so the sidebar chrome is identical everywhere).
-pub fn page_strip(height: u32, scale: f32, sidebar_w: f32) -> LayoutRect {
-    let h = (PAGE_STRIP_H * scale).round();
-    LayoutRect { x: 0.0, y: height as f32 - h, w: (sidebar_w * scale).round(), h }
-}
-
-/// Slot `i` of `n` in the page strip: a horizontally centered row of squares.
-pub fn page_slot_rect(i: usize, n: usize, height: u32, scale: f32, sidebar_w: f32) -> LayoutRect {
-    let strip = page_strip(height, scale, sidebar_w);
-    let slot = (PAGE_SLOT * scale).round();
-    let gap = (PAGE_SLOT_GAP * scale).round();
-    let total = n as f32 * slot + n.saturating_sub(1) as f32 * gap;
-    let x0 = strip.x + ((strip.w - total) / 2.0).round();
-    LayoutRect {
-        x: x0 + i as f32 * (slot + gap),
-        y: strip.y + ((strip.h - slot) / 2.0).round(),
-        w: slot,
-        h: slot,
-    }
-}
-
 
 
 
@@ -1379,6 +1476,8 @@ pub struct Divider {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ResizeHover {
     Sidebar,
+    /// The band between the folders card and the sessions list.
+    Folders,
     Divider { path: Vec<u8>, dir: Dir },
 }
 
@@ -1390,6 +1489,7 @@ pub fn resize_hover_at(
     area: LayoutRect,
     scale: f32,
     sidebar_edge_x: f32,
+    folders_edge_x: Option<f32>,
     grab: f32,
     dividers_active: bool,
     px: f32,
@@ -1398,6 +1498,12 @@ pub fn resize_hover_at(
     // `sidebar_edge_x == 0.0` means collapsed: there is no edge to grab.
     if sidebar_edge_x > 0.0 && (px - sidebar_edge_x).abs() <= grab {
         return Some(ResizeHover::Sidebar);
+    }
+    if sidebar_edge_x > 0.0
+        && let Some(fx) = folders_edge_x
+        && (px - fx).abs() <= grab
+    {
+        return Some(ResizeHover::Folders);
     }
     if !dividers_active {
         return None;
@@ -2270,13 +2376,16 @@ mod tests {
     fn tab_strip_inset_only_hits_the_top_left_tile_while_collapsed() {
         let (w, h, scale) = (1600, 1000, 2.0);
         let area = terminal_area(w, h, scale, 0.0, 0.0);
-        let safe = (TRAFFIC_LIGHT_SAFE_W * scale).round();
+        let inset = (COLLAPSED_STRIP_INSET * scale).round();
 
-        // Top-left tile: strip starts right of the traffic lights, same span
-        // otherwise (right edge, y band unchanged).
+        // Top-left tile: strip starts right of the traffic lights and the
+        // floating "Show sessions" button, same span otherwise (right edge,
+        // y band unchanged).
         let top_left = LayoutRect { x: area.x, y: area.y, w: 800.0, h: 400.0 };
         let strip = tab_strip_rect(area, &top_left, scale, 0.0);
-        assert_eq!(strip.x, safe);
+        assert_eq!(strip.x, inset);
+        let btn = show_sessions_button(scale);
+        assert!(btn.x + btn.w <= strip.x);
         assert_eq!(strip.x + strip.w, top_left.x + top_left.w);
         assert_eq!((strip.y, strip.h), (top_left.y, top_left.h));
 
@@ -2318,7 +2427,7 @@ mod tests {
         // window's left edge must not read as a sidebar-resize grab.
         let node = Node::Leaf(Tile::empty(1));
         let area = terminal_area(1600, 1000, 2.0, 0.0, 0.0);
-        assert_eq!(resize_hover_at(&node, area, 2.0, 0.0, 12.0, false, 4.0, 500.0), None);
+        assert_eq!(resize_hover_at(&node, area, 2.0, 0.0, None, 12.0, false, 4.0, 500.0), None);
     }
 
     #[test]
@@ -2413,62 +2522,16 @@ mod tests {
     // --- (b) row derivation ---
 
     #[test]
-    fn rows_mixed_grouped_and_ungrouped() {
-        let workspaces = vec![
-            ws("a", None),
-            ws("b", Some(1)),
-            ws("c", Some(1)),
-            ws("d", None),
-        ];
-        let sections = vec![sec(1, false)];
-        let rows = sidebar_rows(&workspaces, &sections);
-        assert_eq!(
-            rows,
-            vec![
-                SidebarRow::Group { ws_idx: 0 },
-                SidebarRow::SectionHeader { section_idx: 0 },
-                SidebarRow::Group { ws_idx: 1 },
-                SidebarRow::Group { ws_idx: 2 },
-                SidebarRow::Group { ws_idx: 3 },
-            ]
-        );
-    }
-
-    #[test]
-    fn rows_collapsed_hides_members() {
-        let workspaces = vec![ws("a", Some(1)), ws("b", Some(1)), ws("c", None)];
-        let sections = vec![sec(1, true)];
-        let rows = sidebar_rows(&workspaces, &sections);
-        assert_eq!(
-            rows,
-            vec![
-                SidebarRow::SectionHeader { section_idx: 0 },
-                SidebarRow::Group { ws_idx: 2 },
-            ]
-        );
-    }
-
-    /// Row heights scale with the app text size, and the pure formulas are
-    /// what the rects are built from — pinned here at a non-default size,
-    /// which the ambient-default assertions elsewhere cannot reach.
-    #[test]
     fn row_heights_follow_the_app_text_size() {
         // Identity at the default size: this is what every other geometry
         // assertion in this module implicitly relies on.
-        assert_eq!(sidebar_row_h(true, 1.0), CARD_H);
-        assert_eq!(sidebar_row_h(false, 1.0), TAB_H);
-        assert_eq!(section_header_h(1.0), SECTION_HEADER_H);
-
+        assert_eq!(sidebar_row_h(1.0), CARD_H);
         // Doubling the text size doubles the row that has to hold it.
-        assert_eq!(sidebar_row_h(true, 2.0), CARD_H * 2.0);
-        assert_eq!(sidebar_row_h(false, 2.0), TAB_H * 2.0);
-        assert_eq!(section_header_h(2.0), SECTION_HEADER_H * 2.0);
-
-        // A card row stays taller than a one-line row at every size, or the
-        // preview card's avatar would no longer fit its own row.
+        assert_eq!(sidebar_row_h(2.0), CARD_H * 2.0);
+        // A two-line session row stays taller than a one-line Settings row
+        // at every size.
         for f in [0.6_f32, 1.0, 1.7, 2.7] {
-            assert!(sidebar_row_h(true, f) > sidebar_row_h(false, f));
-            assert!(sidebar_row_h(true, f) > section_header_h(f));
+            assert!(sidebar_row_h(f) > TAB_H * f);
         }
     }
 
@@ -2478,28 +2541,35 @@ mod tests {
     #[test]
     fn row_rects_carry_the_text_factor_through() {
         let scale = 2.0;
-        let rows = [SidebarRow::Group { ws_idx: 0 }, SidebarRow::Group { ws_idx: 1 }];
+        let list = sessions_list_rect(SIDEBAR_DEFAULT_W, FOLDERS_CARD_W, true, 1000, scale);
+        let rows = [SidebarRow { ws_idx: 0 }, SidebarRow { ws_idx: 1 }];
         let workspaces = [ws("a", None), ws("b", None)];
         let pitch = |f: f32| {
-            let a = sidebar_row_rect_at(&rows, 0, &workspaces, scale, f, 360.0, true);
-            let b = sidebar_row_rect_at(&rows, 1, &workspaces, scale, f, 360.0, true);
+            let a = sidebar_row_rect_at(&rows, 0, &workspaces, true, scale, f, &list);
+            let b = sidebar_row_rect_at(&rows, 1, &workspaces, true, scale, f, &list);
             (a.h, b.y - a.y)
         };
         let (h1, pitch1) = pitch(1.0);
         let (h2, pitch2) = pitch(2.0);
         assert_eq!(h1, (CARD_H * scale).round());
         assert_eq!(h2, (CARD_H * 2.0 * scale).round());
-        // Rows stay exactly one gap apart at either size.
-        let gap = (TAB_GAP * scale).round();
-        assert_eq!(pitch1, h1 + gap);
-        assert_eq!(pitch2, h2 + gap);
+        // Rows touch: the mock separates them with a hairline, not a gap.
+        assert_eq!(pitch1, h1);
+        assert_eq!(pitch2, h2);
 
-        // Same for the flat-index helper, and both ladders still share a top.
-        assert_eq!(tab_rect_at(0, scale, 1.0, 360.0).h, (TAB_H * scale).round());
-        assert_eq!(tab_rect_at(0, scale, 2.0, 360.0).h, (TAB_H * 2.0 * scale).round());
+        // Same for the Settings ladder; both start below the list header.
+        assert_eq!(tab_rect_at(0, scale, 1.0, &list).h, (TAB_H * scale).round());
+        assert_eq!(tab_rect_at(0, scale, 2.0, &list).h, (TAB_H * 2.0 * scale).round());
+        let header_bottom = list.y + (SESSIONS_HEADER_H * scale).round();
         assert_eq!(
-            tab_rect_at(0, scale, 2.0, 360.0).y,
-            sidebar_row_rect_at(&rows, 0, &workspaces, scale, 2.0, 360.0, true).y
+            tab_rect_at(0, scale, 2.0, &list).y,
+            header_bottom + 2.0 * (TAB_GAP * scale).round()
+        );
+        // Session rows start under the (always present) "Pinned" caption and
+        // its section gap.
+        assert_eq!(
+            sidebar_row_rect_at(&rows, 0, &workspaces, true, scale, 2.0, &list).y,
+            header_bottom + (PINNED_CAPTION_H * scale).round() + (PINNED_SECTION_GAP * scale).round()
         );
 
         // The live factor is capped, so a large text size can never hide more
@@ -2515,61 +2585,119 @@ mod tests {
         assert_eq!(cap_row_font_scale(40.0 / 15.0), MAX_ROW_FONT_SCALE);
     }
 
+    // --- (gantry) two-part sidebar region ---
+
+    /// The region's width is the sessions width plus the folders column
+    /// while the card is open, plus only a slim inset while it is closed;
+    /// collapsed (sessions width zero) always reports zero so
+    /// `terminal_area` keeps keying off the same zero.
     #[test]
-    fn rows_empty_section_at_end() {
-        let workspaces = vec![ws("a", None)];
-        let sections = vec![sec(9, false), sec(8, true)];
-        let rows = sidebar_rows(&workspaces, &sections);
-        assert_eq!(
-            rows,
-            vec![
-                SidebarRow::Group { ws_idx: 0 },
-                SidebarRow::SectionHeader { section_idx: 0 },
-                SidebarRow::SectionHeader { section_idx: 1 },
-            ]
-        );
+    fn sidebar_region_width_adds_the_folders_column() {
+        assert_eq!(sidebar_region_w(SIDEBAR_DEFAULT_W, FOLDERS_CARD_W, true), SIDEBAR_DEFAULT_W + 226.0);
+        assert_eq!(sidebar_region_w(SIDEBAR_DEFAULT_W, FOLDERS_CARD_W, false), SIDEBAR_DEFAULT_W + 16.0);
+        assert_eq!(sidebar_region_w(0.0, FOLDERS_CARD_W, true), 0.0);
+        assert_eq!(sidebar_region_w(0.0, FOLDERS_CARD_W, false), 0.0);
+        assert_eq!(sidebar_region_w(-1.0, FOLDERS_CARD_W, true), 0.0);
     }
 
+    /// The drag clamp bounds the sessions-list width; the GANTRY redesign
+    /// retunes the three constants, so pin them at their new values.
     #[test]
-    fn empty_section_stays_at_anchor() {
-        let mut g0 = ws("a", None);
-        g0.primary_tile = 10;
-        let mut g1 = ws("b", None);
-        g1.primary_tile = 11;
-        let workspaces = vec![g0, g1];
-        let mut s = sec(1, false);
-        s.anchor = Some(11);
-        let sections = vec![s];
-        let rows = sidebar_rows(&workspaces, &sections);
-        assert_eq!(
-            rows,
-            vec![
-                SidebarRow::Group { ws_idx: 0 },
-                SidebarRow::SectionHeader { section_idx: 0 },
-                SidebarRow::Group { ws_idx: 1 },
-            ]
-        );
+    fn sessions_width_constants_match_the_gantry_mock() {
+        assert_eq!(SIDEBAR_MIN_W, 180.0);
+        assert_eq!(SIDEBAR_DEFAULT_W, 260.0);
+        assert_eq!(SIDEBAR_MAX_W, 520.0);
     }
 
+    /// Dragging the grab band: the pointer is the region's right edge, so
+    /// the stored sessions width is that minus the folders column (open) or
+    /// the closed inset, clamped — and a round trip through
+    /// `sidebar_region_w` lands back on the pointer.
     #[test]
-    fn empty_section_anchor_none_trails() {
-        let mut g0 = ws("a", None);
-        g0.primary_tile = 10;
-        let mut g1 = ws("b", None);
-        g1.primary_tile = 11;
-        let workspaces = vec![g0, g1];
-        let mut s = sec(1, false);
-        s.anchor = None;
-        let sections = vec![s];
-        let rows = sidebar_rows(&workspaces, &sections);
+    fn resize_drag_takes_the_folders_column_back_off() {
+        let x = sidebar_region_w(300.0, FOLDERS_CARD_W, true);
+        assert_eq!(sessions_w_for_pointer(x, FOLDERS_CARD_W, true), 300.0);
+        assert_eq!(sidebar_region_w(sessions_w_for_pointer(x, FOLDERS_CARD_W, true), FOLDERS_CARD_W, true), x);
+        let x = sidebar_region_w(300.0, FOLDERS_CARD_W, false);
+        assert_eq!(sessions_w_for_pointer(x, FOLDERS_CARD_W, false), 300.0);
+        // Clamped at both ends.
+        assert_eq!(sessions_w_for_pointer(0.0, FOLDERS_CARD_W, true), SIDEBAR_MIN_W);
+        assert_eq!(sessions_w_for_pointer(5000.0, FOLDERS_CARD_W, false), SIDEBAR_MAX_W);
+    }
+
+    /// Card and list rects: the card is the left 200px column inset by the
+    /// region padding and spans the full region height; the list starts
+    /// right of card + gutter, keeps the right grab-band inset, and shares
+    /// the card's vertical inset (its header band holds the title/chips). Every coordinate is scaled and
+    /// rounded the same way painting and hit-testing will read it.
+    #[test]
+    fn gantry_card_and_list_rects_follow_the_region() {
+        let (h, s) = (1000_u32, 2.0_f32);
+        let card = folders_card_rect(h, FOLDERS_CARD_W, s);
+        assert_eq!(card.x, (REGION_PAD * s).round());
+        assert_eq!(card.y, card.x);
+        assert_eq!(card.w, (FOLDERS_CARD_W * s).round());
+        assert_eq!(card.h, h as f32 - 2.0 * card.y);
+
+        let list = sessions_list_rect(SIDEBAR_DEFAULT_W, FOLDERS_CARD_W, true, h, s);
+        assert_eq!(list.x, card.x + card.w + (REGION_GAP * s).round());
+        assert_eq!(list.y, (REGION_PAD * s).round());
+        let region_w = sidebar_region_w(SIDEBAR_DEFAULT_W, FOLDERS_CARD_W, true) * s;
+        assert_eq!(list.x + list.w, region_w - (REGION_RIGHT_PAD * s).round());
+        assert!(list.h > 0.0);
+
+        // Card closed: the list takes over the slim inset and the gutter.
+        let closed = sessions_list_rect(SIDEBAR_DEFAULT_W, FOLDERS_CARD_W, false, h, s);
+        assert_eq!(closed.x, (FOLDERS_CLOSED_INSET * s).round());
+        let closed_region = sidebar_region_w(SIDEBAR_DEFAULT_W, FOLDERS_CARD_W, false) * s;
+        assert_eq!(closed.x + closed.w, closed_region - (REGION_RIGHT_PAD * s).round());
+
+        // Collapsed (sessions width zero): no list at all.
+        assert_eq!(sessions_list_rect(0.0, FOLDERS_CARD_W, true, h, s).w, 0.0);
+
+        // Degenerate window height: the rect never goes negative.
+        assert!(sessions_list_rect(SIDEBAR_MIN_W, FOLDERS_CARD_W, true, 10, s).h >= 0.0);
+    }
+
+    /// The flat list is Group-only rows in workspace order: no section
+    /// headers, the folder's pinned groups first (the "Pinned" section), a
+    /// section filter keeps just its members, and an id nothing owns
+    /// filters to nothing.
+    #[test]
+    fn sidebar_rows_filtered_keeps_flat_group_rows() {
+        let mut pinned_a = ws("pinned", Some(7));
+        pinned_a.pinned = true;
+        let workspaces = vec![
+            ws("a", None),
+            pinned_a,
+            ws("b", Some(7)),
+            ws("c", None),
+            ws("d", Some(8)),
+        ];
+        let sections = vec![sec(7, false), sec(8, false)];
+
+        // No filter: every group, pins first, then workspace order.
+        let rows = sidebar_rows_filtered(&workspaces, &sections, None, false);
         assert_eq!(
             rows,
             vec![
-                SidebarRow::Group { ws_idx: 0 },
-                SidebarRow::Group { ws_idx: 1 },
-                SidebarRow::SectionHeader { section_idx: 0 },
+                SidebarRow { ws_idx: 1 },
+                SidebarRow { ws_idx: 0 },
+                SidebarRow { ws_idx: 2 },
+                SidebarRow { ws_idx: 3 },
+                SidebarRow { ws_idx: 4 },
             ]
         );
+        assert_eq!(pinned_run(&rows, &workspaces), 1);
+
+        // A section filter keeps only that section's members, its pin first.
+        assert_eq!(
+            sidebar_rows_filtered(&workspaces, &sections, Some(7), false),
+            vec![SidebarRow { ws_idx: 1 }, SidebarRow { ws_idx: 2 }]
+        );
+
+        // Unknown or dangling ids filter to nothing.
+        assert!(sidebar_rows_filtered(&workspaces, &sections, Some(99), false).is_empty());
     }
 
     #[test]
@@ -2587,14 +2715,6 @@ mod tests {
         workspaces.remove(0);
         normalize_section_anchors(&workspaces, &mut sections);
         assert_eq!(sections[0].anchor, Some(11));
-        let rows = sidebar_rows(&workspaces, &sections);
-        assert_eq!(
-            rows,
-            vec![
-                SidebarRow::SectionHeader { section_idx: 0 },
-                SidebarRow::Group { ws_idx: 0 },
-            ]
-        );
     }
 
     #[test]
@@ -2614,16 +2734,6 @@ mod tests {
         let mut sections = vec![e, sec(2, false)];
         normalize_section_anchors(&workspaces, &mut sections);
         assert_eq!(sections[0].anchor, Some(19));
-        let rows = sidebar_rows(&workspaces, &sections);
-        assert_eq!(
-            rows,
-            vec![
-                SidebarRow::SectionHeader { section_idx: 0 },
-                SidebarRow::SectionHeader { section_idx: 1 },
-                SidebarRow::Group { ws_idx: 0 },
-                SidebarRow::Group { ws_idx: 1 },
-            ]
-        );
     }
 
     #[test]
@@ -2639,208 +2749,115 @@ mod tests {
     }
 
     #[test]
-    fn active_in_collapsed_maps_to_header() {
-        let workspaces = vec![ws("a", Some(1)), ws("b", Some(1)), ws("c", None)];
-        let sections = vec![sec(1, true)];
-        let rows = sidebar_rows(&workspaces, &sections);
-        assert_eq!(active_row_index(&rows, &workspaces, &sections, 1), Some(0));
-        assert_eq!(active_row_index(&rows, &workspaces, &sections, 2), Some(1));
+    fn active_row_index_finds_the_group_row() {
+        let rows = [SidebarRow { ws_idx: 2 }, SidebarRow { ws_idx: 5 }];
+        assert_eq!(active_row_index(&rows, 2), Some(0));
+        assert_eq!(active_row_index(&rows, 5), Some(1));
+        // Pinned or filtered-out groups have no row to highlight.
+        assert_eq!(active_row_index(&rows, 3), None);
     }
 
     // --- (c) geometry ---
 
+    /// The "Pinned" caption always heads the list (it is the drop zone that
+    /// pins); the section gap — with the rail centred in it — sits after
+    /// the pinned run, or straight under the caption when nothing is
+    /// pinned. Rows keep their touching pitch either side of the gap.
     #[test]
-    fn geometry_headers_slimmer_members_indented() {
-        let workspaces = vec![ws("a", Some(1)), ws("b", Some(1)), ws("c", None)];
-        let sections = vec![sec(1, false)];
-        let rows = sidebar_rows(&workspaces, &sections);
-        let scale = 2.0;
-        let sw = SIDEBAR_DEFAULT_W;
-        let header = sidebar_row_rect(&rows, 0, &workspaces, scale, sw, false);
-        let member = sidebar_row_rect(&rows, 1, &workspaces, scale, sw, false);
-        let bare = sidebar_row_rect(&rows, 3, &workspaces, scale, sw, false);
-
-        // One-line group rows (TAB_H) sit under slightly taller section headers
-        // (SECTION_HEADER_H); both heights are pinned to their constants.
-        assert_eq!(header.h, (SECTION_HEADER_H * scale).round());
-        assert_eq!(member.h, (TAB_H * scale).round());
-        assert!(header.h > member.h);
-        assert!(member.x > header.x);
-        assert!((member.x + member.w - (header.x + header.w)).abs() <= 0.5);
-        assert_eq!(bare.x, header.x);
-
-        // Non-overlapping and top-to-bottom ordered.
-        let mut prev_bottom = f32::NEG_INFINITY;
-        for i in 0..rows.len() {
-            let r = sidebar_row_rect(&rows, i, &workspaces, scale, sw, false);
-            assert!(r.y >= prev_bottom);
-            prev_bottom = r.y + r.h;
-        }
-    }
-
-    #[test]
-    fn card_rows_pick_the_taller_group_height() {
-        let workspaces = vec![ws("a", Some(1)), ws("b", Some(1)), ws("c", None)];
-        let sections = vec![sec(1, false)];
-        let rows = sidebar_rows(&workspaces, &sections);
-        let scale = 2.0;
-        let sw = SIDEBAR_DEFAULT_W;
-
-        // Same rows, same index: only the flag decides the group height.
-        for i in [1usize, 2, 3] {
-            let card = sidebar_row_rect(&rows, i, &workspaces, scale, sw, true);
-            let tab = sidebar_row_rect(&rows, i, &workspaces, scale, sw, false);
-            assert_eq!(card.h, (CARD_H * scale).round());
-            assert_eq!(tab.h, (TAB_H * scale).round());
-        }
-        // Section headers are the same height either way.
-        let header_card = sidebar_row_rect(&rows, 0, &workspaces, scale, sw, true);
-        let header_tab = sidebar_row_rect(&rows, 0, &workspaces, scale, sw, false);
-        assert_eq!(header_card.h, (SECTION_HEADER_H * scale).round());
-        assert_eq!(header_card.h, header_tab.h);
-    }
-
-    #[test]
-    fn card_rows_stay_gap_separated_below_the_header() {
-        let workspaces = vec![ws("a", Some(1)), ws("b", Some(1)), ws("c", None)];
-        let sections = vec![sec(1, false)];
-        let rows = sidebar_rows(&workspaces, &sections);
-        let scale = 2.0;
-        let sw = SIDEBAR_DEFAULT_W;
-        let gap = (TAB_GAP * scale).round();
-
-        // The first row clears the titlebar and the header chip row, and
-        // starts exactly where the one-line pages' first row does — the
-        // taller cards must not creep up under the chrome.
-        let first = sidebar_row_rect(&rows, 0, &workspaces, scale, sw, true);
-        assert!(first.y >= (TITLEBAR_H * scale).round());
-        assert_eq!(first.y, tab_rect(0, scale, sw).y);
-
-        // Consecutive rows are separated by exactly one gap, so nothing
-        // overlaps even at CARD_H.
-        for i in 1..rows.len() {
-            let prev = sidebar_row_rect(&rows, i - 1, &workspaces, scale, sw, true);
-            let cur = sidebar_row_rect(&rows, i, &workspaces, scale, sw, true);
-            assert_eq!(cur.y, prev.y + prev.h + gap);
-            assert!(cur.y > prev.y + prev.h);
-        }
-    }
-
-    #[test]
-    fn card_rows_do_not_change_sidebar_rows_ordering() {
-        // Row *heights* are a paint concern; the row *list* is not, so the
-        // card pass must leave sidebar_rows' output untouched.
-        let workspaces = vec![ws("a", Some(1)), ws("b", Some(1)), ws("c", None)];
-        let sections = vec![sec(1, false)];
-        assert_eq!(
-            sidebar_rows(&workspaces, &sections),
-            vec![
-                SidebarRow::SectionHeader { section_idx: 0 },
-                SidebarRow::Group { ws_idx: 0 },
-                SidebarRow::Group { ws_idx: 1 },
-                SidebarRow::Group { ws_idx: 2 },
-            ]
-        );
-    }
-
-    /// The pinned strip collapses to nothing when empty and matches the
-    /// pad + rows×83 + gaps formula otherwise — including the wrap at the
-    /// default sidebar width where four pins become two rows (3 + 1).
-    #[test]
-    fn pinned_strip_h_zero_one_and_wrap() {
-        let sw = SIDEBAR_DEFAULT_W;
-        assert_eq!(pinned_strip_h(0, 1.0, sw), 0.0);
-        // One row: 6 + 83 + 12 = 101.
-        assert_eq!(pinned_strip_h(1, 1.0, sw), 101.0);
-        // 360 inner = 328; per_row = floor((328+14)/(84+14)) = 3, so 4 pins
-        // wrap to 2 rows: 6 + 2*83 + 8 + 12 = 192.
-        assert_eq!(pinned_per_row(sw), 3);
-        assert_eq!(pinned_strip_h(4, 1.0, sw), 192.0);
-        // Scale multiplies the whole strip.
-        assert_eq!(pinned_strip_h(1, 2.0, sw), 202.0);
-    }
-
-    /// Bubbles in a single row are equal-width, non-overlapping, and the
-    /// row is centered in the sidebar (first.x + last.x + col_w ≈ sidebar_w).
-    #[test]
-    fn pinned_bubble_rects_centered_non_overlapping() {
-        let sw = SIDEBAR_DEFAULT_W;
+    fn sidebar_row_rect_carves_out_the_pinned_section() {
+        let mut workspaces = vec![ws("a", None), ws("b", None), ws("c", None)];
         let scale = 1.0;
-        let n = 3;
-        let rects: Vec<_> = (0..n)
-            .map(|k| pinned_bubble_rect(k, n, scale, sw))
-            .collect();
-        for r in &rects {
-            assert_eq!(r.w, PINNED_COL_W * scale);
-            assert_eq!(r.h, PINNED_COL_H * scale);
-        }
-        for i in 1..n {
-            assert!(rects[i].x >= rects[i - 1].x + rects[i - 1].w);
-        }
-        // Symmetric about the sidebar midline within 1px.
-        let first = &rects[0];
-        let last = &rects[n - 1];
-        let sum = first.x + last.x + PINNED_COL_W * scale;
-        assert!((sum - sw).abs() < 1.0, "sum={sum} sw={sw}");
-    }
-
-    /// Card rows shift down by exactly the strip height when something is
-    /// pinned; one-line (`card_rows = false`) rows keep their old top.
-    #[test]
-    fn sidebar_row_rect_shifts_for_pinned_strip() {
-        let mut workspaces = vec![ws("a", None), ws("b", None)];
-        let rows = [SidebarRow::Group { ws_idx: 0 }];
-        let (scale, sw) = (1.0, 300.0);
-
-        let card_before = sidebar_row_rect(&rows, 0, &workspaces, scale, sw, true);
-        let line_before = sidebar_row_rect(&rows, 0, &workspaces, scale, sw, false);
-        workspaces[0].pinned = true;
-        let card_after = sidebar_row_rect(&rows, 0, &workspaces, scale, sw, true);
-        let line_after = sidebar_row_rect(&rows, 0, &workspaces, scale, sw, false);
-
-        assert_eq!(card_after.y, card_before.y + pinned_strip_h(1, scale, sw));
-        assert_eq!(line_after.y, line_before.y);
-        // Both ladders share the unshifted origin.
-        assert_eq!(card_before.y, line_before.y);
-    }
-
-    /// A pinned group is lifted out of the list: no row for it, whether it is
-    /// bare or a section member, while its neighbours and its section header
-    /// stay put. Unpinning restores the exact row it had.
-    #[test]
-    fn pinned_groups_leave_the_row_list() {
-        let mut workspaces = vec![ws("bare", None), ws("m1", Some(0)), ws("m2", Some(0))];
-        let sections = vec![sec(0, false)];
-        let before = sidebar_rows(&workspaces, &sections);
+        let list = sessions_list_rect(300.0, FOLDERS_CARD_W, false, 1000, scale);
+        let plain = [SidebarRow { ws_idx: 0 }, SidebarRow { ws_idx: 1 }];
+        // Nothing pinned and no drag: no section, rows start under the header.
+        let bare = sidebar_row_rect(&plain, 0, &workspaces, false, scale, &list);
+        assert_eq!(bare.y, list.y + SESSIONS_HEADER_H * scale);
+        assert_eq!(pinned_drop_zone(&plain, &workspaces, false, scale, &list).h, 0.0);
+        assert_eq!(pinned_divider_rect(&plain, &workspaces, false, scale, &list).h, 0.0);
+        assert_eq!(sidebar_rows_extent(&[], &workspaces, false, scale, &list), 0.0);
+        // With the section shown (a drag is live), the caption heads the list.
+        let r0 = sidebar_row_rect(&plain, 0, &workspaces, true, scale, &list);
+        let r1 = sidebar_row_rect(&plain, 1, &workspaces, true, scale, &list);
+        let caption = pinned_caption_rect(scale, &list);
+        assert_eq!(caption.y, list.y + SESSIONS_HEADER_H * scale);
+        assert_eq!(r0.y, caption.y + caption.h + PINNED_SECTION_GAP);
+        assert_eq!(r0.x, list.x);
+        // No pins: the drop zone is the caption plus the gap, and the rail
+        // sits in the gap.
+        let zone = pinned_drop_zone(&plain, &workspaces, true, scale, &list);
+        assert_eq!(zone.y, caption.y);
+        assert_eq!(zone.y + zone.h, r0.y);
+        let rail = pinned_divider_rect(&plain, &workspaces, true, scale, &list);
+        assert!(rail.y >= caption.y + caption.h && rail.y + rail.h <= r0.y);
         assert_eq!(
-            before,
-            vec![
-                SidebarRow::Group { ws_idx: 0 },
-                SidebarRow::SectionHeader { section_idx: 0 },
-                SidebarRow::Group { ws_idx: 1 },
-                SidebarRow::Group { ws_idx: 2 },
-            ]
+            sidebar_rows_extent(&plain, &workspaces, true, scale, &list),
+            r1.y + r1.h - (list.y + SESSIONS_HEADER_H * scale)
         );
+        assert_eq!(r0.w, list.w);
+        assert_eq!(r1.y, r0.y + r0.h);
 
-        workspaces[0].pinned = true;
-        workspaces[1].pinned = true;
-        assert_eq!(pinned_indices(&workspaces), vec![0, 1]);
-        assert_eq!(
-            sidebar_rows(&workspaces, &sections),
-            vec![SidebarRow::SectionHeader { section_idx: 0 }, SidebarRow::Group { ws_idx: 2 }]
-        );
-
-        // Every member pinned: the folder header survives with nothing under it.
         workspaces[2].pinned = true;
-        assert_eq!(
-            sidebar_rows(&workspaces, &sections),
-            vec![SidebarRow::SectionHeader { section_idx: 0 }]
-        );
+        let pinned = [SidebarRow { ws_idx: 2 }, SidebarRow { ws_idx: 0 }, SidebarRow { ws_idx: 1 }];
+        assert_eq!(pinned_run(&pinned, &workspaces), 1);
+        let caption = pinned_caption_rect(scale, &list);
+        let p0 = sidebar_row_rect(&pinned, 0, &workspaces, true, scale, &list);
+        let p1 = sidebar_row_rect(&pinned, 1, &workspaces, true, scale, &list);
+        let p2 = sidebar_row_rect(&pinned, 2, &workspaces, true, scale, &list);
+        assert_eq!(caption.y, list.y + SESSIONS_HEADER_H * scale);
+        assert_eq!(p0.y, caption.y + caption.h);
+        assert_eq!(p1.y, p0.y + p0.h + PINNED_SECTION_GAP);
+        assert_eq!(p2.y, p1.y + p1.h);
+        // With pins the caption alone is the drop zone; the rail closes the run.
+        let zone = pinned_drop_zone(&pinned, &workspaces, true, scale, &list);
+        assert_eq!(zone.h, caption.h);
+        let rail = pinned_divider_rect(&pinned, &workspaces, true, scale, &list);
+        assert!(rail.y >= p0.y + p0.h && rail.y + rail.h <= p1.y);
+        // Folding the run drops the pinned rows from the list; the gap then
+        // sits straight under the caption again.
+        let folded = sidebar_rows_filtered(&workspaces, &[], None, true);
+        assert_eq!(folded.iter().map(|r| r.ws_idx).collect::<Vec<_>>(), vec![0, 1]);
+        assert_eq!(sidebar_row_rect(&folded, 0, &workspaces, true, scale, &list).y, r0.y);
+        assert_eq!(max_scroll(100.0, 60.0), 40.0);
+        assert_eq!(max_scroll(50.0, 60.0), 0.0);
+    }
 
-        for w in &mut workspaces {
-            w.pinned = false;
-        }
-        assert_eq!(sidebar_rows(&workspaces, &sections), before);
+    #[test]
+    fn sidebar_drag_collapses_past_the_slack() {
+        let narrowest = sidebar_region_w(SIDEBAR_MIN_W, FOLDERS_CARD_W, true);
+        assert!(!sidebar_drag_collapses(narrowest, FOLDERS_CARD_W, true));
+        assert!(!sidebar_drag_collapses(narrowest - SIDEBAR_COLLAPSE_SLACK, FOLDERS_CARD_W, true));
+        assert!(sidebar_drag_collapses(narrowest - SIDEBAR_COLLAPSE_SLACK - 1.0, FOLDERS_CARD_W, true));
+        // Without the folders column the threshold moves in with the region.
+        let closed = sidebar_region_w(SIDEBAR_MIN_W, FOLDERS_CARD_W, false);
+        assert!(closed < narrowest);
+        assert!(sidebar_drag_collapses(closed - SIDEBAR_COLLAPSE_SLACK - 1.0, FOLDERS_CARD_W, false));
+        assert!(!sidebar_drag_collapses(closed, FOLDERS_CARD_W, false));
+    }
+
+    #[test]
+    fn folders_drag_collapses_past_the_slack() {
+        // The band's x at the card's minimum width.
+        let narrowest = folders_edge_x(FOLDERS_MIN_W, true).unwrap();
+        assert_eq!(folders_w_for_pointer(narrowest), FOLDERS_MIN_W);
+        assert!(!folders_drag_collapses(narrowest));
+        assert!(!folders_drag_collapses(narrowest - FOLDERS_COLLAPSE_SLACK));
+        assert!(folders_drag_collapses(narrowest - FOLDERS_COLLAPSE_SLACK - 1.0));
+    }
+
+    #[test]
+    fn reorder_section_moves_a_folder_and_returns_its_slot() {
+        let mut sections = vec![sec(1, false), sec(2, false), sec(3, false)];
+        // Drag the first folder below the last: the gap after index 2.
+        let at = reorder_section(&mut sections, 0, 3);
+        assert_eq!(at, 2);
+        assert_eq!(sections.iter().map(|s| s.id).collect::<Vec<_>>(), vec![2, 3, 1]);
+        // Dropping into its own gap is a no-op.
+        let at = reorder_section(&mut sections, 1, 1);
+        assert_eq!(at, 1);
+        assert_eq!(sections.iter().map(|s| s.id).collect::<Vec<_>>(), vec![2, 3, 1]);
+        // Folders card rows fold the tools run away.
+        assert_eq!(folder_rows(2, true, 1), vec![FolderRow::PinnedHeader, FolderRow::AllSessions, FolderRow::Section(0)]);
+        assert_eq!(folder_rows(2, false, 1).len(), 5);
     }
 
     #[test]
@@ -2855,54 +2872,144 @@ mod tests {
     #[test]
     fn terminal_area_agrees_with_the_wider_sidebar() {
         let (w, h, scale) = (1600u32, 1000u32, 2.0f32);
-        let area = terminal_area(w, h, scale, SIDEBAR_DEFAULT_W, 0.0);
-        // The split tree starts exactly at the sidebar's right edge.
-        assert_eq!(area.x, (SIDEBAR_DEFAULT_W * scale).round());
+        let region = sidebar_region_w(SIDEBAR_DEFAULT_W, FOLDERS_CARD_W, true);
+        let area = terminal_area(w, h, scale, region, 0.0);
+        // The split tree starts exactly at the region's right edge.
+        assert_eq!(area.x, (region * scale).round());
 
-        // ...and every card row stays inside the sidebar, clear of it.
+        // ...and every session row stays inside the list, clear of it.
         let workspaces = vec![ws("a", None), ws("b", None)];
-        let rows = sidebar_rows(&workspaces, &[]);
+        let rows = sidebar_rows_filtered(&workspaces, &[], None, false);
+        let list = sessions_list_rect(SIDEBAR_DEFAULT_W, FOLDERS_CARD_W, true, h, scale);
         for i in 0..rows.len() {
-            let r = sidebar_row_rect(&rows, i, &workspaces, scale, SIDEBAR_DEFAULT_W, true);
+            let r = sidebar_row_rect(&rows, i, &workspaces, true, scale, &list);
             assert!(r.x + r.w <= area.x);
+            assert!(r.x >= list.x);
         }
     }
 
+    /// The sessions-list header carries the chips: focus / ＋ / gear
+    /// right-clustered inside the header band, plus a "Show folders" chip
+    /// clear of the traffic lights only while the card is hidden.
     #[test]
-    fn header_chips_cluster_right_inside_the_titlebar() {
+    fn sessions_header_chips_cluster_right_and_show_folders_only_when_closed() {
         let scale = 2.0;
-        let sw = SIDEBAR_DEFAULT_W;
-        let plus = new_group_button(scale, sw);
-        let collapse = sidebar_collapse_button(scale, sw);
-        // Same row, both square, neither is half the strip.
-        assert_eq!(plus.y, collapse.y);
-        assert_eq!(plus.w, plus.h);
-        assert_eq!(collapse.w, collapse.h);
-        assert_eq!(plus.w, (HEADER_CHIP * scale).round());
-        assert!(plus.w < (sw * scale) / 4.0);
-
-        // Both hug the right inset as one cluster, collapse immediately left
-        // of plus, with the chip gap between them.
-        let pad = (SIDEBAR_PAD * scale).round();
+        let list = sessions_list_rect(SIDEBAR_DEFAULT_W, FOLDERS_CARD_W, true, 1000, scale);
+        let chips = sessions_header_chips(&list, true, scale);
+        assert!(chips.show_folders.is_none());
+        let side = (HEADER_CHIP * scale).round();
         let gap = (HEADER_CHIP_GAP * scale).round();
-        assert_eq!(plus.x + plus.w, (sw * scale).round() - pad);
-        assert_eq!(collapse.x + collapse.w + gap, plus.x);
+        for c in [chips.focus, chips.plus, chips.gear] {
+            assert_eq!(c.w, side);
+            assert_eq!(c.h, side);
+            assert_eq!(c.y, chips.gear.y);
+        }
+        assert_eq!(chips.gear.x + side, list.x + list.w - (HEADER_CHIP_INSET * scale).round());
+        assert_eq!(chips.plus.x + side + gap, chips.gear.x);
+        assert_eq!(chips.focus.x + side + gap, chips.plus.x);
+        assert!(chips.gear.y >= list.y);
+        assert!(chips.gear.y + side <= list.y + (SESSIONS_HEADER_H * scale).round());
 
-        // Riding inside the titlebar, not stacked under it: the whole cluster
-        // fits within TITLEBAR_H, which is what reclaimed the old chip row.
-        assert!(collapse.y > 0.0);
-        assert!(plus.y + plus.h <= (TITLEBAR_H * scale).round());
+        let closed = sessions_list_rect(SIDEBAR_DEFAULT_W, FOLDERS_CARD_W, false, 1000, scale);
+        let chips = sessions_header_chips(&closed, false, scale);
+        let show = chips.show_folders.expect("show-folders chip while the card is hidden");
+        assert_eq!(show.x, ((TRAFFIC_LIGHT_END + SHOW_FOLDERS_GAP) * scale).round());
+        assert!(show.x >= (TRAFFIC_LIGHT_END * scale).round());
+        assert_eq!(show.y, chips.gear.y);
+        assert!(show.x + show.w < chips.focus.x);
 
-        // Clear of the native traffic lights on the left of the same strip.
-        assert!(collapse.x > (TRAFFIC_LIGHT_SAFE_W * scale).round());
+        // Collapsed (no list): the chips shrink to nothing and hit nothing.
+        let none = sessions_list_rect(0.0, FOLDERS_CARD_W, true, 1000, scale);
+        let chips = sessions_header_chips(&none, true, scale);
+        assert_eq!(chips.plus.w, 0.0);
+        assert!(!chips.plus.contains(chips.plus.x, chips.plus.y));
     }
 
+    /// Folder rows: the pinned-tools caption and its tool rows come first
+    /// (only when there are tools), then "All sessions", then one row per
+    /// section in `sections` order.
     #[test]
-    fn header_chips_vanish_with_a_collapsed_sidebar() {
-        for chip in [new_group_button(2.0, 0.0), sidebar_collapse_button(2.0, 0.0)] {
-            assert_eq!(chip.w, 0.0);
-            assert!(!chip.contains(0.0, chip.y));
+    fn folder_rows_order_tools_then_all_sessions_then_folders() {
+        assert_eq!(
+            folder_rows(2, false, 1),
+            vec![
+                FolderRow::PinnedHeader,
+                FolderRow::Tool(0),
+                FolderRow::Tool(1),
+                FolderRow::AllSessions,
+                FolderRow::Section(0),
+            ]
+        );
+        assert_eq!(
+            folder_rows(0, false, 2),
+            vec![FolderRow::AllSessions, FolderRow::Section(0), FolderRow::Section(1)]
+        );
+        // No tools: nothing to separate "All sessions" from.
+        let card = folders_card_rect(1000, FOLDERS_CARD_W, 1.0);
+        assert!(folder_separator_rect(&card, &folder_rows(0, false, 2), 0.0, 1.0).is_none());
+    }
+
+    /// Folder row rects stack inside the card's body inset, start below the
+    /// header band, use the slimmer tool height, and leave the separator's
+    /// space between the tools and "All sessions".
+    #[test]
+    fn folder_row_rects_stack_inside_the_card() {
+        let scale = 2.0;
+        let card = folders_card_rect(1000, FOLDERS_CARD_W, scale);
+        let rows = folder_rows(1, false, 2);
+        let rects: Vec<_> = (0..rows.len())
+            .map(|i| folder_row_rect(&card, &rows, i, 0.0, scale))
+            .collect();
+        let pad = (FOLDER_BODY_PAD * scale).round();
+        for r in &rects {
+            assert_eq!(r.x, card.x + pad);
+            assert_eq!(r.w, card.w - 2.0 * pad);
         }
+        assert_eq!(rects[0].y, card.y + (FOLDERS_HEADER_H * scale).round());
+        assert_eq!(rects[0].h, (FOLDER_ROW_H * scale).round());
+        assert_eq!(rects[1].h, (TOOL_ROW_H * scale).round());
+        assert_eq!(rects[2].h, (FOLDER_ROW_H * scale).round());
+        let gap = (FOLDER_ROW_GAP * scale).round();
+        assert_eq!(rects[1].y, rects[0].y + rects[0].h + gap);
+        assert_eq!(
+            rects[2].y,
+            rects[1].y + rects[1].h + gap + (FOLDER_SEPARATOR_H * scale).round()
+        );
+        assert_eq!(rects[3].y, rects[2].y + rects[2].h + gap);
+        let sep = folder_separator_rect(&card, &rows, 0.0, scale).unwrap();
+        assert!(sep.y > rects[1].y + rects[1].h);
+        assert!(sep.y + sep.h <= rects[2].y);
+        assert!(sep.x > card.x && sep.x + sep.w < card.x + card.w);
+
+        // Footer hugs the card's bottom; the header chips ride the header
+        // band with "new" outermost, inset like the region.
+        let footer = folders_footer_rect(&card, scale);
+        assert_eq!(footer.y + footer.h, card.y + card.h);
+        let (hide, new) = folders_header_chips(&card, scale);
+        assert_eq!(hide.y, new.y);
+        assert!(hide.x + hide.w < new.x);
+        assert_eq!(new.x + new.w, card.x + card.w - (REGION_PAD * scale).round());
+        assert!(new.y + new.h <= card.y + (FOLDERS_HEADER_H * scale).round());
+
+        // Out of range: an empty rect at the stack's end.
+        assert_eq!(folder_row_rect(&card, &rows, 9, 0.0, scale).h, 0.0);
+    }
+
+    /// The floating "Show sessions" button sits right of the folded traffic
+    /// lights and inside the widened tab-strip inset, so the first tile's
+    /// tabs never slide under it.
+    #[test]
+    fn show_sessions_button_sits_beside_the_folded_traffic_lights() {
+        let scale = 2.0;
+        let btn = show_sessions_button(scale);
+        assert_eq!(btn.w, (SHOW_SESSIONS_BTN * scale).round());
+        assert_eq!(btn.h, btn.w);
+        assert_eq!(btn.x, ((TRAFFIC_LIGHT_END + SHOW_SESSIONS_GAP) * scale).round());
+        assert!(btn.x + btn.w <= (COLLAPSED_STRIP_INSET * scale).round());
+        // The strip keeps the same breathing room after the button as the
+        // lights keep before it.
+        assert_eq!((COLLAPSED_STRIP_INSET * scale).round() - (btn.x + btn.w), (SHOW_SESSIONS_GAP * scale).round());
+        assert!(btn.y >= (AREA_PAD * scale).round());
     }
 
     // --- (d) move / join / leave / reorder ---
@@ -2930,37 +3037,6 @@ mod tests {
         assert_eq!(workspaces[final_idx].section, Some(1));
         assert_eq!(workspaces[active].name, "d");
         let _ = sections;
-    }
-
-    #[test]
-    fn join_onto_ungrouped_creates_section() {
-        let mut workspaces = vec![ws("a", None), ws("b", None), ws("c", None)];
-        let mut sections = Vec::new();
-        let mut next_id = 1u64;
-        let (new_from, created) = join_onto_group(&mut workspaces, &mut sections, &mut next_id, 2, 0);
-        assert_eq!(created, Some(1));
-        assert_eq!(sections.len(), 1);
-        assert_eq!(sections[0].name, "section");
-        assert!(!sections[0].collapsed);
-        assert!(sections_are_contiguous(&workspaces));
-        // Order: a, c (joined), b
-        assert_eq!(workspaces[0].name, "a");
-        assert_eq!(workspaces[0].section, Some(1));
-        assert_eq!(workspaces[new_from].name, "c");
-        assert_eq!(workspaces[new_from].section, Some(1));
-        assert_eq!(new_from, 1);
-    }
-
-    #[test]
-    fn join_onto_section_member_appends_adjacent() {
-        let mut workspaces = vec![ws("a", Some(5)), ws("b", Some(5)), ws("c", None)];
-        let mut sections = vec![sec(5, false)];
-        let mut next_id = 10u64;
-        let (new_from, created) = join_onto_group(&mut workspaces, &mut sections, &mut next_id, 2, 0);
-        assert!(created.is_none());
-        assert_eq!(workspaces[new_from].section, Some(5));
-        assert!(sections_are_contiguous(&workspaces));
-        assert_eq!(section_member_range(&workspaces, 5), Some((0, 3)));
     }
 
     #[test]
@@ -2995,29 +3071,6 @@ mod tests {
     }
 
     #[test]
-    fn relocate_section_block_stays_top_level() {
-        let mut workspaces = vec![
-            ws("a", Some(1)),
-            ws("b", Some(1)),
-            ws("c", None),
-            ws("d", Some(2)),
-            ws("e", Some(2)),
-        ];
-        // Move section 2 block to the front.
-        let range = relocate_section_block(&mut workspaces, 2, 0).unwrap();
-        assert_eq!(range, (0, 2));
-        assert_eq!(workspaces[0].name, "d");
-        assert_eq!(workspaces[1].name, "e");
-        assert!(sections_are_contiguous(&workspaces));
-
-        // Attempt to drop section 1 into the middle of section 2 → snaps out.
-        let range = relocate_section_block(&mut workspaces, 1, 1).unwrap();
-        assert!(sections_are_contiguous(&workspaces));
-        let (s, e) = range;
-        assert!(workspaces[s..e].iter().all(|w| w.section == Some(1)));
-    }
-
-    #[test]
     fn ensure_active_expands_collapsed() {
         let workspaces = vec![ws("a", Some(1)), ws("b", None)];
         let mut sections = vec![sec(1, true)];
@@ -3030,9 +3083,8 @@ mod tests {
     fn empty_section_survives_until_deleted() {
         let mut workspaces = vec![ws("a", None)];
         let mut sections = vec![sec(3, false)];
-        // Empty section still renders.
-        let rows = sidebar_rows(&workspaces, &sections);
-        assert!(rows.contains(&SidebarRow::SectionHeader { section_idx: 0 }));
+        // Empty section still gets a folder row.
+        assert!(folder_rows(0, false, sections.len()).contains(&FolderRow::Section(0)));
         // Nothing auto-removes it just for being empty.
         assert!(!workspaces.iter().any(|w| w.section == Some(3)));
         // Only the explicit delete removes it.
@@ -3065,13 +3117,13 @@ mod tests {
         let dx = d.rect.x + d.rect.w / 2.0;
         let dy = d.rect.y + d.rect.h / 2.0;
         assert_eq!(
-            resize_hover_at(&node, area, scale, sidebar_edge_x, grab, true, dx, dy),
+            resize_hover_at(&node, area, scale, sidebar_edge_x, None, grab, true, dx, dy),
             Some(ResizeHover::Divider { path: vec![], dir: Dir::Row })
         );
 
         // Point at the sidebar edge → Sidebar.
         assert_eq!(
-            resize_hover_at(&node, area, scale, sidebar_edge_x, grab, true, sidebar_edge_x, 200.0),
+            resize_hover_at(&node, area, scale, sidebar_edge_x, None, grab, true, sidebar_edge_x, 200.0),
             Some(ResizeHover::Sidebar)
         );
 
@@ -3081,17 +3133,17 @@ mod tests {
         let ix = t.x + t.w / 2.0;
         let iy = t.y + t.h / 2.0;
         assert_eq!(
-            resize_hover_at(&node, area, scale, sidebar_edge_x, grab, true, ix, iy),
+            resize_hover_at(&node, area, scale, sidebar_edge_x, None, grab, true, ix, iy),
             None
         );
 
         // dividers_active=false suppresses divider hits but not the sidebar.
         assert_eq!(
-            resize_hover_at(&node, area, scale, sidebar_edge_x, grab, false, dx, dy),
+            resize_hover_at(&node, area, scale, sidebar_edge_x, None, grab, false, dx, dy),
             None
         );
         assert_eq!(
-            resize_hover_at(&node, area, scale, sidebar_edge_x, grab, false, sidebar_edge_x, 200.0),
+            resize_hover_at(&node, area, scale, sidebar_edge_x, None, grab, false, sidebar_edge_x, 200.0),
             Some(ResizeHover::Sidebar)
         );
     }
@@ -3112,7 +3164,7 @@ mod tests {
         let dx = d.rect.x + d.rect.w / 2.0;
         let dy = d.rect.y + d.rect.h / 2.0;
         assert_eq!(
-            resize_hover_at(&node, area, scale, -100.0, grab, true, dx, dy),
+            resize_hover_at(&node, area, scale, -100.0, None, grab, true, dx, dy),
             Some(ResizeHover::Divider { path: vec![], dir: Dir::Column })
         );
     }

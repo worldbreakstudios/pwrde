@@ -41,10 +41,10 @@ const PANE_PAD: f32 = 8.0;
 
 /// Corner radius of the floating tile cards and chrome panels, logical px.
 ///
-/// Matches the sidebar panel's `sidebar_ui::PANEL_RADIUS`, which is vitrine's
-/// `--radius-l`: the GANTRY mock draws its terminal tiles on the same radius as
-/// its sidebar, and a tile that rounded off tighter than the panel beside it
-/// read as two different materials.
+/// Vitrine's `--radius-l`: the GANTRY mock draws its terminal tiles on a
+/// radius close to the folders card's (`folders_ui::CARD_RADIUS`), and a tile
+/// that rounded off much tighter than the card beside it read as two
+/// different materials.
 pub(crate) const CARD_RADIUS: f32 = 18.0;
 /// Corner radius of the sidebar's rounded rows, logical px: half the 28px
 /// row height, so rows paint as fully-rounded iTerm2-style capsules. The
@@ -508,19 +508,10 @@ impl Renderer {
         let row_r = (ROW_RADIUS * self.scale).round();
         // Traffic lights are the native macOS buttons now (transparent titlebar),
         // so we no longer draw our own here.
-        match chrome.page {
-            // The Sessions empty state (centered "New group" pill + hint) is
-            // an element tree now — see `sidebar_ui::render_empty_state`.
-            Page::Sessions => {}
-            // Every other page's sidebar rows live in the element tree now
-            // (`sidebar_ui::render_sidebar`), so the canvas paints nothing
-            // for them here — only the page-dot strip below.
-            _ => {},
-        }
-
-        // ── Page-dot strip (bottom of the sidebar, every page) ─────────
-        // Painted *and* clicked by the element tree now
-        // (`sidebar_ui::page_dot_layer`); the canvas registers nothing here.
+        // The whole left region — folders card, sessions list, header chips,
+        // Settings rows and the empty state — is an element tree now
+        // (`sidebar_ui::render_sidebar`, `folders_ui`), so the canvas paints
+        // nothing for it on any page.
 
         let card_r = (CARD_RADIUS * self.scale).round();
 

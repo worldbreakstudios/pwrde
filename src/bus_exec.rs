@@ -455,6 +455,13 @@ impl App {
             "sections": sections,
             "command_palette_open": self.command.is_some(),
             "new_webview_prompt_open": self.webview_prompt.is_some(),
+            "sidebar": {
+                "collapsed": self.sidebar_collapsed,
+                "folders_open": self.folders_open,
+                "folder": self.folder_filter.map(|id| json!(id)).unwrap_or(Value::Null),
+                "sessions_w": self.sidebar_expanded_w,
+                "region_w": self.sidebar_w(),
+            },
             "flow": {
                 "enabled": crate::flow::enabled(),
                 "open": self.flow.open,
