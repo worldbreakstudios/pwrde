@@ -619,6 +619,16 @@ pub fn sidebar_drag_collapses(x: f32, folders_w: f32, folders_open: bool) -> boo
     x < sidebar_region_w(SIDEBAR_MIN_W, folders_w, folders_open) - SIDEBAR_COLLAPSE_SLACK
 }
 
+/// The folders card's twin of [`SIDEBAR_COLLAPSE_SLACK`]: how far inside
+/// the card's minimum width its resize drag folds the card away.
+pub const FOLDERS_COLLAPSE_SLACK: f32 = 50.0;
+
+/// Whether a folders-card resize drag with the pointer at logical `x`
+/// should leave the card hidden (and reopen it once dragged back out).
+pub fn folders_drag_collapses(x: f32) -> bool {
+    x < REGION_PAD + REGION_GAP / 2.0 + FOLDERS_MIN_W - FOLDERS_COLLAPSE_SLACK
+}
+
 /// Logical x of the folders-card resize band's centre (the middle of the
 /// gap between the card and the list), or `None` while the card is hidden.
 pub fn folders_edge_x(folders_w: f32, folders_open: bool) -> Option<f32> {
@@ -2822,6 +2832,16 @@ mod tests {
         assert!(closed < narrowest);
         assert!(sidebar_drag_collapses(closed - SIDEBAR_COLLAPSE_SLACK - 1.0, FOLDERS_CARD_W, false));
         assert!(!sidebar_drag_collapses(closed, FOLDERS_CARD_W, false));
+    }
+
+    #[test]
+    fn folders_drag_collapses_past_the_slack() {
+        // The band's x at the card's minimum width.
+        let narrowest = folders_edge_x(FOLDERS_MIN_W, true).unwrap();
+        assert_eq!(folders_w_for_pointer(narrowest), FOLDERS_MIN_W);
+        assert!(!folders_drag_collapses(narrowest));
+        assert!(!folders_drag_collapses(narrowest - FOLDERS_COLLAPSE_SLACK));
+        assert!(folders_drag_collapses(narrowest - FOLDERS_COLLAPSE_SLACK - 1.0));
     }
 
     #[test]

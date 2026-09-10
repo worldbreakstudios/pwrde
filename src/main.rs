@@ -4014,8 +4014,24 @@ impl App {
                 self.request_redraw();
             },
             Drag::Folders => {
-                self.folders_w = workspace::folders_w_for_pointer(px / scale);
-                self.sync_layout();
+                // Same fluid collapse as the sidebar: well inside the card's
+                // minimum width hides it (persisted like the toggle), back
+                // out reopens it.
+                let x = px / scale;
+                if workspace::folders_drag_collapses(x) {
+                    if self.folders_open {
+                        self.folders_open = false;
+                        crate::settings::set("sidebar.folders", false.into());
+                        self.sync_layout();
+                    }
+                } else {
+                    if !self.folders_open {
+                        self.folders_open = true;
+                        crate::settings::set("sidebar.folders", true.into());
+                    }
+                    self.folders_w = workspace::folders_w_for_pointer(x);
+                    self.sync_layout();
+                }
                 self.request_redraw();
             },
             Drag::Divider { path } => {
