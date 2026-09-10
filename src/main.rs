@@ -3995,10 +3995,22 @@ impl App {
             Drag::Sidebar => {
                 // The grab band rides the region's right edge; the pointer x
                 // is the region width, so take the folders column back off
-                // before it becomes the sessions-list width.
-                self.sidebar_expanded_w =
-                    workspace::sessions_w_for_pointer(px / scale, self.folders_w, self.folders_open);
-                self.sync_layout();
+                // before it becomes the sessions-list width. Dragging well
+                // past the narrowest width folds the region away, and
+                // dragging back out reopens it — the macOS sidebar feel,
+                // no button needed.
+                let x = px / scale;
+                if workspace::sidebar_drag_collapses(x, self.folders_w, self.folders_open) {
+                    if !self.sidebar_collapsed {
+                        self.sidebar_collapsed = true;
+                        self.sync_layout();
+                    }
+                } else {
+                    self.sidebar_collapsed = false;
+                    self.sidebar_expanded_w =
+                        workspace::sessions_w_for_pointer(x, self.folders_w, self.folders_open);
+                    self.sync_layout();
+                }
                 self.request_redraw();
             },
             Drag::Folders => {

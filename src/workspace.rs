@@ -607,6 +607,18 @@ pub fn folders_w_for_pointer(x: f32) -> f32 {
     (x - REGION_PAD - REGION_GAP / 2.0).clamp(FOLDERS_MIN_W, FOLDERS_MAX_W)
 }
 
+/// How far past the region's narrowest width the sidebar resize drag has
+/// to travel before the region folds away (macOS-style fluid collapse), and
+/// the point it must come back past to reopen.
+pub const SIDEBAR_COLLAPSE_SLACK: f32 = 60.0;
+
+/// Whether a sidebar resize drag with the pointer at logical `x` should
+/// leave the region collapsed: the pointer is well inside the narrowest
+/// region the folders column and the minimum list width allow.
+pub fn sidebar_drag_collapses(x: f32, folders_w: f32, folders_open: bool) -> bool {
+    x < sidebar_region_w(SIDEBAR_MIN_W, folders_w, folders_open) - SIDEBAR_COLLAPSE_SLACK
+}
+
 /// Logical x of the folders-card resize band's centre (the middle of the
 /// gap between the card and the list), or `None` while the card is hidden.
 pub fn folders_edge_x(folders_w: f32, folders_open: bool) -> Option<f32> {
@@ -2797,6 +2809,19 @@ mod tests {
         assert_eq!(sidebar_row_rect(&folded, 0, &workspaces, true, scale, &list).y, r0.y);
         assert_eq!(max_scroll(100.0, 60.0), 40.0);
         assert_eq!(max_scroll(50.0, 60.0), 0.0);
+    }
+
+    #[test]
+    fn sidebar_drag_collapses_past_the_slack() {
+        let narrowest = sidebar_region_w(SIDEBAR_MIN_W, FOLDERS_CARD_W, true);
+        assert!(!sidebar_drag_collapses(narrowest, FOLDERS_CARD_W, true));
+        assert!(!sidebar_drag_collapses(narrowest - SIDEBAR_COLLAPSE_SLACK, FOLDERS_CARD_W, true));
+        assert!(sidebar_drag_collapses(narrowest - SIDEBAR_COLLAPSE_SLACK - 1.0, FOLDERS_CARD_W, true));
+        // Without the folders column the threshold moves in with the region.
+        let closed = sidebar_region_w(SIDEBAR_MIN_W, FOLDERS_CARD_W, false);
+        assert!(closed < narrowest);
+        assert!(sidebar_drag_collapses(closed - SIDEBAR_COLLAPSE_SLACK - 1.0, FOLDERS_CARD_W, false));
+        assert!(!sidebar_drag_collapses(closed, FOLDERS_CARD_W, false));
     }
 
     #[test]
