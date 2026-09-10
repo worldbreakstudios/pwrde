@@ -670,16 +670,16 @@ impl App {
                     .w(px((cap.w - 2.0 * scaled(ROW_PAD)).max(0.0)))
                     .h(px(cap.h))
                     .flex()
-                    .items_end()
+                    .items_center()
                     .gap(px(scaled(4.0)))
-                    .pb(px(scaled(3.0)))
+                    .pt(px(scaled(5.0)))
                     .cursor_pointer()
                     .child(
                         gpui::svg()
                             .flex_none()
                             .path(chevron)
-                            .w(px(scaled(11.0)))
-                            .h(px(scaled(11.0)))
+                            .w(px(scaled(12.0)))
+                            .h(px(scaled(12.0)))
                             .text_color(ink),
                     )
                     .child(
