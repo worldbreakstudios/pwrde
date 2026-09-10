@@ -232,7 +232,7 @@ impl App {
         )
     }
 
-    /// The "Pinned tools" caption row: pin icon, label, tool count, and a
+    /// The "Tools" caption row: wrench icon, label, tool count, and a
     /// fold chevron — a click folds the tool rows away
     /// ([`App::toggle_tools_collapsed`]).
     fn pinned_header_row(&self, theme: &Theme, r: &LayoutRect, hovered: bool) -> gpui::Stateful<gpui::Div> {
@@ -246,7 +246,7 @@ impl App {
             .child(
                 gpui::svg()
                     .flex_none()
-                    .path(crate::ui::assets::ICON_PIN)
+                    .path(crate::ui::assets::ICON_WRENCH)
                     .w(px(scaled(ROW_ICON)))
                     .h(px(scaled(ROW_ICON)))
                     .text_color(theme.muted_foreground),
@@ -257,7 +257,7 @@ impl App {
                     .min_w(px(0.0))
                     .text_size(px(scaled(12.5)))
                     .text_color(theme.muted_foreground)
-                    .child("Pinned tools"),
+                    .child("Tools"),
             )
             .child(count_badge(theme, self.tools.len(), false))
             .child(

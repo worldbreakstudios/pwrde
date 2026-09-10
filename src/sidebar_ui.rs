@@ -644,10 +644,10 @@ impl App {
 
         let n_pinned = crate::workspace::pinned_run(&rows, &self.workspaces);
         let mut layer = div().absolute().left(px(0.0)).top(px(0.0)).size_full();
-        // The "Pinned" caption heads the list whether or not anything is
-        // pinned: it is the drop zone that pins a dragged group, and a
-        // click folds the run. A rail under the run marks where it ends.
-        {
+        // The "Pinned" caption heads the list while anything in the folder
+        // is pinned (or a group drag is live — the caption is the drop zone
+        // that pins); a click folds the run and a rail marks where it ends.
+        if self.pinned_section() {
             let cap = crate::workspace::pinned_caption_rect(1.0, &list);
             let n_pins = self
                 .workspaces
@@ -702,7 +702,7 @@ impl App {
                         press(entity.clone(), |this, _ev, _cx| this.toggle_pinned_collapsed()),
                     ),
             );
-            let rail = crate::workspace::pinned_divider_rect(&rows, &self.workspaces, 1.0, &list);
+            let rail = crate::workspace::pinned_divider_rect(&rows, &self.workspaces, self.pinned_section(), 1.0, &list);
             layer = layer.child(
                 div()
                     .absolute()
@@ -718,7 +718,7 @@ impl App {
             let Some(ws) = self.workspaces.get(ws_idx) else {
                 continue;
             };
-            let rect = crate::workspace::sidebar_row_rect(&rows, i, &self.workspaces, 1.0, &list);
+            let rect = crate::workspace::sidebar_row_rect(&rows, i, &self.workspaces, self.pinned_section(), 1.0, &list);
             let selected = active == Some(i);
             // No hairline under the last row, nor under the last pinned row
             // (the section gap closes that run).
@@ -733,7 +733,7 @@ impl App {
         if rows.is_empty() && self.folder_filter.is_some() {
             // A folder with no members: say so where its first
             // row would sit, so the list never reads as broken.
-            let rect = crate::workspace::sidebar_row_rect(&rows, 0, &self.workspaces, 1.0, &list);
+            let rect = crate::workspace::sidebar_row_rect(&rows, 0, &self.workspaces, self.pinned_section(), 1.0, &list);
             layer = layer.child(
                 div()
                     .absolute()

@@ -602,11 +602,28 @@ impl App {
         self.sessions_scroll.clamp(0.0, self.sessions_scroll_max())
     }
 
+    /// Whether the sessions list shows its "Pinned" section: only while
+    /// something in the current folder is pinned, or while a group drag is
+    /// live (the caption is the drop zone that pins).
+    pub(crate) fn pinned_section(&self) -> bool {
+        matches!(self.drag, Drag::Group { .. })
+            || self
+                .workspaces
+                .iter()
+                .any(|w| w.pinned && self.folder_filter.is_none_or(|f| w.section == Some(f)))
+    }
+
     fn sessions_scroll_max(&self) -> f32 {
         let scale = self.scale();
         let list = self.sessions_list(scale);
         let rows = self.sidebar_rows();
-        let extent = workspace::sidebar_rows_extent(&rows, &self.workspaces, scale, &list);
+        let extent = workspace::sidebar_rows_extent(
+            &rows,
+            &self.workspaces,
+            self.pinned_section(),
+            scale,
+            &list,
+        );
         let viewport = (list.h - (workspace::SESSIONS_HEADER_H * scale).round()).max(0.0);
         workspace::max_scroll(extent, viewport) / scale
     }
@@ -2280,6 +2297,7 @@ impl App {
                     &rows,
                     ri,
                     &self.workspaces,
+                    self.pinned_section(),
                     scale,
                     &self.sessions_rows_list(scale),
                 );
@@ -3006,6 +3024,7 @@ impl App {
                     &rows,
                     ri,
                     &self.workspaces,
+                    self.pinned_section(),
                     scale,
                     &self.sessions_rows_list(scale),
                 );
@@ -3063,6 +3082,7 @@ impl App {
         let zone = workspace::pinned_drop_zone(
             &rows,
             &self.workspaces,
+            self.pinned_section(),
             scale,
             &self.sessions_rows_list(scale),
         );
@@ -3092,6 +3112,7 @@ impl App {
                 &rows,
                 ri,
                 &self.workspaces,
+                self.pinned_section(),
                 scale,
                 &self.sessions_rows_list(scale),
             );
@@ -3128,6 +3149,7 @@ impl App {
                 &rows,
                 last,
                 &self.workspaces,
+                self.pinned_section(),
                 scale,
                 &self.sessions_rows_list(scale),
             );
@@ -3254,6 +3276,7 @@ impl App {
                             &rows,
                             ri,
                             &self.workspaces,
+                            self.pinned_section(),
                             scale,
                             &self.sessions_rows_list(scale),
                         ));
@@ -3285,6 +3308,7 @@ impl App {
                         &rows,
                         gap - 1,
                         &self.workspaces,
+                        self.pinned_section(),
                         scale,
                         &self.sessions_rows_list(scale),
                     );
@@ -3377,6 +3401,7 @@ impl App {
                 rows,
                 gap,
                 &self.workspaces,
+                self.pinned_section(),
                 scale,
                 &self.sessions_rows_list(scale),
             )
@@ -3387,6 +3412,7 @@ impl App {
                 rows,
                 last,
                 &self.workspaces,
+                self.pinned_section(),
                 scale,
                 &self.sessions_rows_list(scale),
             );
@@ -3414,6 +3440,7 @@ impl App {
                 rows,
                 ri,
                 &self.workspaces,
+                self.pinned_section(),
                 scale,
                 &self.sessions_rows_list(scale),
             );

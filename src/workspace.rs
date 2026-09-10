@@ -1048,9 +1048,13 @@ pub fn pinned_caption_rect(scale: f32, list: &LayoutRect) -> LayoutRect {
 pub fn pinned_divider_rect(
     rows: &[SidebarRow],
     workspaces: &[Workspace],
+    pinned_section: bool,
     scale: f32,
     list: &LayoutRect,
 ) -> LayoutRect {
+    if !pinned_section {
+        return LayoutRect { x: list.x, y: list.y, w: 0.0, h: 0.0 };
+    }
     let cap = pinned_caption_rect(scale, list);
     let n_pinned = pinned_run(rows, workspaces);
     let h = (sidebar_row_h(row_font_scale()) * scale).round();
@@ -1069,9 +1073,13 @@ pub fn pinned_divider_rect(
 pub fn pinned_drop_zone(
     rows: &[SidebarRow],
     workspaces: &[Workspace],
+    pinned_section: bool,
     scale: f32,
     list: &LayoutRect,
 ) -> LayoutRect {
+    if !pinned_section {
+        return LayoutRect { x: list.x, y: list.y, w: 0.0, h: 0.0 };
+    }
     let cap = pinned_caption_rect(scale, list);
     let extra = if pinned_run(rows, workspaces) == 0 {
         (PINNED_SECTION_GAP * scale).round()
@@ -1084,17 +1092,24 @@ pub fn pinned_drop_zone(
 /// Height of the sessions list's row stack (unscrolled, device px): from
 /// the header's bottom to the last row's bottom, caption and section gap
 /// included. Bounds the list's scroll ([`max_scroll`]).
-pub fn sidebar_rows_extent(rows: &[SidebarRow], workspaces: &[Workspace], scale: f32, list: &LayoutRect) -> f32 {
+pub fn sidebar_rows_extent(
+    rows: &[SidebarRow],
+    workspaces: &[Workspace],
+    pinned_section: bool,
+    scale: f32,
+    list: &LayoutRect,
+) -> f32 {
     let top = list.y + (SESSIONS_HEADER_H * scale).round();
     match rows.len().checked_sub(1) {
         Some(last) => {
-            let r = sidebar_row_rect(rows, last, workspaces, scale, list);
+            let r = sidebar_row_rect(rows, last, workspaces, pinned_section, scale, list);
             r.y + r.h - top
         },
-        None => {
-            let d = pinned_divider_rect(rows, workspaces, scale, list);
+        None if pinned_section => {
+            let d = pinned_divider_rect(rows, workspaces, true, scale, list);
             d.y + (PINNED_SECTION_GAP * scale).round() / 2.0 - top
         },
+        None => 0.0,
     }
 }
 
@@ -1108,10 +1123,11 @@ pub fn sidebar_row_rect(
     rows: &[SidebarRow],
     index: usize,
     workspaces: &[Workspace],
+    pinned_section: bool,
     scale: f32,
     list: &LayoutRect,
 ) -> LayoutRect {
-    sidebar_row_rect_at(rows, index, workspaces, scale, row_font_scale(), list)
+    sidebar_row_rect_at(rows, index, workspaces, pinned_section, scale, row_font_scale(), list)
 }
 
 /// [`sidebar_row_rect`] at an explicit text-size factor. Pure, so the tests can
@@ -1120,18 +1136,24 @@ fn sidebar_row_rect_at(
     rows: &[SidebarRow],
     index: usize,
     workspaces: &[Workspace],
+    pinned_section: bool,
     scale: f32,
     font_scale: f32,
     list: &LayoutRect,
 ) -> LayoutRect {
     let n_pinned = pinned_run(rows, workspaces);
-    let mut y = list.y + (SESSIONS_HEADER_H * scale).round() + (PINNED_CAPTION_H * scale).round();
+    let mut y = list.y + (SESSIONS_HEADER_H * scale).round();
+    if pinned_section {
+        y += (PINNED_CAPTION_H * scale).round();
+    }
     let w = list.w.max(0.0);
     let h = (sidebar_row_h(font_scale) * scale).round();
     for i in 0..=rows.len() {
         // The section gap (and its divider) sits before the first unpinned
-        // row — right under the caption when nothing is pinned.
-        if i == n_pinned {
+        // row — right under the caption when nothing is pinned. Without
+        // the section (nothing pinned, no drag) rows sit straight under
+        // the header.
+        if i == n_pinned && pinned_section {
             y += (PINNED_SECTION_GAP * scale).round();
         }
         if i == index {
@@ -2501,8 +2523,8 @@ mod tests {
         let rows = [SidebarRow { ws_idx: 0 }, SidebarRow { ws_idx: 1 }];
         let workspaces = [ws("a", None), ws("b", None)];
         let pitch = |f: f32| {
-            let a = sidebar_row_rect_at(&rows, 0, &workspaces, scale, f, &list);
-            let b = sidebar_row_rect_at(&rows, 1, &workspaces, scale, f, &list);
+            let a = sidebar_row_rect_at(&rows, 0, &workspaces, true, scale, f, &list);
+            let b = sidebar_row_rect_at(&rows, 1, &workspaces, true, scale, f, &list);
             (a.h, b.y - a.y)
         };
         let (h1, pitch1) = pitch(1.0);
@@ -2524,7 +2546,7 @@ mod tests {
         // Session rows start under the (always present) "Pinned" caption and
         // its section gap.
         assert_eq!(
-            sidebar_row_rect_at(&rows, 0, &workspaces, scale, 2.0, &list).y,
+            sidebar_row_rect_at(&rows, 0, &workspaces, true, scale, 2.0, &list).y,
             header_bottom + (PINNED_CAPTION_H * scale).round() + (PINNED_SECTION_GAP * scale).round()
         );
 
@@ -2725,21 +2747,28 @@ mod tests {
         let scale = 1.0;
         let list = sessions_list_rect(300.0, FOLDERS_CARD_W, false, 1000, scale);
         let plain = [SidebarRow { ws_idx: 0 }, SidebarRow { ws_idx: 1 }];
-        let r0 = sidebar_row_rect(&plain, 0, &workspaces, scale, &list);
-        let r1 = sidebar_row_rect(&plain, 1, &workspaces, scale, &list);
+        // Nothing pinned and no drag: no section, rows start under the header.
+        let bare = sidebar_row_rect(&plain, 0, &workspaces, false, scale, &list);
+        assert_eq!(bare.y, list.y + SESSIONS_HEADER_H * scale);
+        assert_eq!(pinned_drop_zone(&plain, &workspaces, false, scale, &list).h, 0.0);
+        assert_eq!(pinned_divider_rect(&plain, &workspaces, false, scale, &list).h, 0.0);
+        assert_eq!(sidebar_rows_extent(&[], &workspaces, false, scale, &list), 0.0);
+        // With the section shown (a drag is live), the caption heads the list.
+        let r0 = sidebar_row_rect(&plain, 0, &workspaces, true, scale, &list);
+        let r1 = sidebar_row_rect(&plain, 1, &workspaces, true, scale, &list);
         let caption = pinned_caption_rect(scale, &list);
         assert_eq!(caption.y, list.y + SESSIONS_HEADER_H * scale);
         assert_eq!(r0.y, caption.y + caption.h + PINNED_SECTION_GAP);
         assert_eq!(r0.x, list.x);
         // No pins: the drop zone is the caption plus the gap, and the rail
         // sits in the gap.
-        let zone = pinned_drop_zone(&plain, &workspaces, scale, &list);
+        let zone = pinned_drop_zone(&plain, &workspaces, true, scale, &list);
         assert_eq!(zone.y, caption.y);
         assert_eq!(zone.y + zone.h, r0.y);
-        let rail = pinned_divider_rect(&plain, &workspaces, scale, &list);
+        let rail = pinned_divider_rect(&plain, &workspaces, true, scale, &list);
         assert!(rail.y >= caption.y + caption.h && rail.y + rail.h <= r0.y);
         assert_eq!(
-            sidebar_rows_extent(&plain, &workspaces, scale, &list),
+            sidebar_rows_extent(&plain, &workspaces, true, scale, &list),
             r1.y + r1.h - (list.y + SESSIONS_HEADER_H * scale)
         );
         assert_eq!(r0.w, list.w);
@@ -2749,23 +2778,23 @@ mod tests {
         let pinned = [SidebarRow { ws_idx: 2 }, SidebarRow { ws_idx: 0 }, SidebarRow { ws_idx: 1 }];
         assert_eq!(pinned_run(&pinned, &workspaces), 1);
         let caption = pinned_caption_rect(scale, &list);
-        let p0 = sidebar_row_rect(&pinned, 0, &workspaces, scale, &list);
-        let p1 = sidebar_row_rect(&pinned, 1, &workspaces, scale, &list);
-        let p2 = sidebar_row_rect(&pinned, 2, &workspaces, scale, &list);
+        let p0 = sidebar_row_rect(&pinned, 0, &workspaces, true, scale, &list);
+        let p1 = sidebar_row_rect(&pinned, 1, &workspaces, true, scale, &list);
+        let p2 = sidebar_row_rect(&pinned, 2, &workspaces, true, scale, &list);
         assert_eq!(caption.y, list.y + SESSIONS_HEADER_H * scale);
         assert_eq!(p0.y, caption.y + caption.h);
         assert_eq!(p1.y, p0.y + p0.h + PINNED_SECTION_GAP);
         assert_eq!(p2.y, p1.y + p1.h);
         // With pins the caption alone is the drop zone; the rail closes the run.
-        let zone = pinned_drop_zone(&pinned, &workspaces, scale, &list);
+        let zone = pinned_drop_zone(&pinned, &workspaces, true, scale, &list);
         assert_eq!(zone.h, caption.h);
-        let rail = pinned_divider_rect(&pinned, &workspaces, scale, &list);
+        let rail = pinned_divider_rect(&pinned, &workspaces, true, scale, &list);
         assert!(rail.y >= p0.y + p0.h && rail.y + rail.h <= p1.y);
         // Folding the run drops the pinned rows from the list; the gap then
         // sits straight under the caption again.
         let folded = sidebar_rows_filtered(&workspaces, &[], None, true);
         assert_eq!(folded.iter().map(|r| r.ws_idx).collect::<Vec<_>>(), vec![0, 1]);
-        assert_eq!(sidebar_row_rect(&folded, 0, &workspaces, scale, &list).y, r0.y);
+        assert_eq!(sidebar_row_rect(&folded, 0, &workspaces, true, scale, &list).y, r0.y);
         assert_eq!(max_scroll(100.0, 60.0), 40.0);
         assert_eq!(max_scroll(50.0, 60.0), 0.0);
     }
@@ -2808,7 +2837,7 @@ mod tests {
         let rows = sidebar_rows_filtered(&workspaces, &[], None, false);
         let list = sessions_list_rect(SIDEBAR_DEFAULT_W, FOLDERS_CARD_W, true, h, scale);
         for i in 0..rows.len() {
-            let r = sidebar_row_rect(&rows, i, &workspaces, scale, &list);
+            let r = sidebar_row_rect(&rows, i, &workspaces, true, scale, &list);
             assert!(r.x + r.w <= area.x);
             assert!(r.x >= list.x);
         }

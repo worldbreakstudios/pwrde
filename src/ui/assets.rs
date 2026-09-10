@@ -243,6 +243,11 @@ const ICONS: &[(&str, &[u8])] = &[
     ),
     // Fold chevrons for the "Pinned" / "Pinned tools" captions (lucide
     // chevron-down / chevron-right).
+    // lucide wrench — the folders card's "Tools" caption.
+    (
+        "icons/wrench.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>"##,
+    ),
     (
         "icons/chevron-down.svg",
         br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>"##,
@@ -298,6 +303,7 @@ pub const ICON_MAXIMIZE: &str = "icons/maximize.svg";
 pub const ICON_MINIMIZE: &str = "icons/minimize.svg";
 pub const ICON_SETTINGS: &str = "icons/settings.svg";
 pub const ICON_PLUS: &str = "icons/plus.svg";
+pub const ICON_WRENCH: &str = "icons/wrench.svg";
 pub const ICON_CHEVRON_DOWN: &str = "icons/chevron-down.svg";
 pub const ICON_CHEVRON_RIGHT: &str = "icons/chevron-right.svg";
 
