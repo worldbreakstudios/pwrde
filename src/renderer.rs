@@ -136,20 +136,6 @@ pub struct LabelSpec {
     pub size: Option<f32>,
 }
 
-/// A pane's collapse caret: a chevron that rotates from pointing down
-/// (expanded) to pointing right (collapsed). Quads can't rotate, so `main.rs`
-/// paints it as a small filled gpui path. Position in physical px, angle in
-/// radians.
-#[derive(Clone, Copy)]
-pub struct CaretSpec {
-    pub cx: f32,
-    pub cy: f32,
-    /// Half-width of the chevron.
-    pub size: f32,
-    /// 0.0 points down; `-FRAC_PI_2` points right.
-    pub angle: f32,
-    pub color: Hsla,
-}
 
 /// Per-frame page/navigation state the renderer needs beyond the workspaces:
 /// which page is up plus the overlay facts the canvas paints around.
@@ -191,8 +177,6 @@ pub struct Frame {
     pub flyover_fg_quads: Vec<Quad>,
     /// Flyover tab-strip labels.
     pub flyover_labels: Vec<LabelSpec>,
-    /// Collapse carets, painted as rotated chevron paths over the chrome.
-    pub carets: Vec<CaretSpec>,
     /// Every interactive rect drawn this frame, in draw order (topmost last).
     /// Used by main.rs to compute ui_hover by reverse-iterating. Resize handles
     /// are excluded — they have their own hover/cursor logic. When a modal
@@ -460,7 +444,7 @@ impl Renderer {
         let term_palette = crate::term_theme::build(scheme, th.term_bg);
         // `pane_bg` is deliberately dropped: the ground is painted in that
         // colour already (`term_scheme_bg`), so no pane fills itself.
-        let (_, pane_ink, pane_ink_dim, pane_divider, pane_pill) = match scheme {
+        let (_, _pane_ink, _pane_ink_dim, pane_divider, pane_pill) = match scheme {
             Some(t) => (t.bg, (t.fg, 1.0), (t.fg, 0.55), (t.fg, 0.15), (t.fg, 0.12)),
             None => (
                 th.term_bg,
@@ -490,7 +474,6 @@ impl Renderer {
         let mut fg_quads: Vec<Quad> = Vec::new();
         let mut labels: Vec<LabelSpec> = Vec::new();
         let mut panes: Vec<PaneText> = Vec::new();
-        let mut carets: Vec<CaretSpec> = Vec::new();
         let mut hot: Vec<LayoutRect> = Vec::new();
         // Overlays are modal: while one is up only its elements hover or
         // register as hot; the chrome underneath goes inert (mirroring the
@@ -585,43 +568,6 @@ impl Renderer {
                 let has_caret = axis.is_some();
                 let collapsing = has_caret && (tile.collapsed || tile.collapse_anim > 0.0);
                 let side_strip = axis == Some(workspace::Dir::Row) && collapsing;
-                // The caret chevron, rotating down (expanded) → right
-                // (collapsed) with the pane's animation progress.
-                if has_caret {
-                    let cr = workspace::tile_caret_rect(rect, self.scale);
-                    // Hovered caret brightens to full ink; a side strip is one
-                    // whole-card target, so the caret isn't hot on its own.
-                    let caret_hov = !side_strip && hover(cur, &cr);
-                    carets.push(CaretSpec {
-                        cx: cr.x + cr.w / 2.0,
-                        cy: cr.y + cr.h / 2.0,
-                        size: (4.5 * self.scale).round(),
-                        angle: -std::f32::consts::FRAC_PI_2
-                            * tile.collapse_anim.clamp(0.0, 1.0),
-                        color: if caret_hov {
-                            color(pane_ink.0, pane_ink.1)
-                        } else {
-                            color(pane_ink_dim.0, pane_ink_dim.1)
-                        },
-                    });
-                    if !side_strip {
-                        hot.push(cr);
-                    }
-                    // While collapsed, any tab's unread dot bubbles up to a
-                    // badge on the chevron so hidden panes can still call
-                    // for attention.
-                    if tile.collapsed && tile.tabs.iter().any(|t| t.unread) {
-                        let ds = (6.0 * self.scale).round();
-                        let pad = (3.0 * self.scale).round();
-                        let dot = LayoutRect {
-                            x: cr.x + cr.w - ds - pad,
-                            y: cr.y + pad,
-                            w: ds,
-                            h: ds,
-                        };
-                        fg_quads.push(self.px_rect(&dot, th.accent, 1.0, ds / 2.0));
-                    }
-                }
                 // Collapsed (or mid-animation) panes paint no terminal
                 // content — the card is just its tab strip.
                 let content = workspace::tile_content(rect, self.scale);
@@ -713,7 +659,6 @@ impl Renderer {
             flyover_panes: Vec::new(),
             flyover_fg_quads: Vec::new(),
             flyover_labels: Vec::new(),
-            carets,
             hot,
         }
     }

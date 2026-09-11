@@ -204,6 +204,25 @@ const ICONS: &[(&str, &[u8])] = &[
         "icons/circle-check.svg",
         br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/></svg>"##,
     ),
+    // Webview toolbar icons (lucide drawings shared across libraries for
+    // now, like the status icons above): reload, https lock, plain-http
+    // info, and the vertical ⋮ overflow. `currentColor` so `svg()` tints.
+    (
+        "icons/refresh.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></svg>"##,
+    ),
+    (
+        "icons/lock.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="11" x="3" y="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>"##,
+    ),
+    (
+        "icons/info.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg>"##,
+    ),
+    (
+        "icons/ellipsis-vertical.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="1"/><circle cx="12" cy="19" r="1"/><circle cx="12" cy="5" r="1"/></svg>"##,
+    ),
     // ── Sidebar chrome icons (Lucide, ISC) ───────────────────────────
     // The folders card and the sessions-list header: folder rows, the pin
     // caption, the new-folder / hide-folders / show-folders / focus chips
@@ -293,6 +312,12 @@ pub const ICON_CIRCLE_ALERT: &str = "icons/circle-alert.svg";
 pub const ICON_LOADER: &str = "icons/loader.svg";
 pub const ICON_ELLIPSIS: &str = "icons/ellipsis.svg";
 pub const ICON_CIRCLE_CHECK: &str = "icons/circle-check.svg";
+
+/// Webview toolbar icons (see the table above).
+pub const ICON_REFRESH: &str = "icons/refresh.svg";
+pub const ICON_LOCK: &str = "icons/lock.svg";
+pub const ICON_INFO: &str = "icons/info.svg";
+pub const ICON_ELLIPSIS_VERTICAL: &str = "icons/ellipsis-vertical.svg";
 
 /// Sidebar chrome icons (see the table above).
 pub const ICON_FOLDER: &str = "icons/folder.svg";

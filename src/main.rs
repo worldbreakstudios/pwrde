@@ -6190,27 +6190,6 @@ impl App {
                 paint_quad(window, origin, inv, q, shadow_rgb);
             }
 
-            // 3.5) collapse carets. Quads can't rotate, so each chevron is a
-            // small filled gpui path: a V polyline thickened vertically, its
-            // points rotated around the caret center by the animated angle.
-            for c in &frame.carets {
-                let (sin, cos) = c.angle.sin_cos();
-                let pt = |x: f32, y: f32| Point::new(
-                    origin.x + px((c.cx + x * cos - y * sin) * inv),
-                    origin.y + px((c.cy + x * sin + y * cos) * inv),
-                );
-                let w = c.size;
-                let d = w * 0.55;
-                let t = w * 0.75;
-                let mut path = gpui::Path::new(pt(-w, -d));
-                path.line_to(pt(0.0, d));
-                path.line_to(pt(w, -d));
-                path.line_to(pt(w, -d + t));
-                path.line_to(pt(0.0, d + t));
-                path.line_to(pt(-w, -d + t));
-                window.paint_path(path, c.color);
-            }
-
             // 4) labels (tab titles, sidebar text, etc.).
             for label in &frame.labels {
                 let runs = [TextRun {

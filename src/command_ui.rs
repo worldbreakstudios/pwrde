@@ -200,7 +200,13 @@ impl App {
             .py(px(12.0))
             .border_b_1()
             .border_color(hairline)
-            .child(div().flex_none().text_size(px(13.0)).text_color(theme.muted_foreground).child("›"));
+            .child(
+                div().flex_none().text_color(theme.muted_foreground).child(
+                    gpui::svg()
+                        .path(theme.icons.chevron_right())
+                        .size(px(13.0)),
+                ),
+            );
         for tok in pal.tokens() {
             let (bg, fg, kind, label) = match tok {
                 Token::Command(label) => (theme.foreground.opacity(0.9), theme.background, None, label.to_string()),
@@ -279,7 +285,16 @@ impl App {
                                 .child(label),
                         )
                         .when(i + 1 < n, |d| {
-                            d.child(div().mx(px(10.0)).text_size(px(11.0)).text_color(theme.muted_foreground.opacity(0.6)).child("›"))
+                            d.child(
+                                div()
+                                    .mx(px(10.0))
+                                    .text_color(theme.muted_foreground.opacity(0.6))
+                                    .child(
+                                        gpui::svg()
+                                            .path(theme.icons.chevron_right())
+                                            .size(px(11.0)),
+                                    ),
+                            )
                         }),
                 );
             }

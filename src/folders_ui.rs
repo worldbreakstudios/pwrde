@@ -366,10 +366,14 @@ impl App {
                     .items_center()
                     .justify_center()
                     .rounded(px(4.0))
-                    .text_size(px(11.0))
                     .text_color(ink)
                     .when(del_hovered, |c| c.bg(ink.opacity(0.18)))
-                    .child("✕")
+                    .child(
+                        gpui::svg()
+                            .path(theme.icons.x())
+                            .size(px(11.0))
+                            .text_color(ink),
+                    )
                     .on_mouse_down(
                         MouseButton::Left,
                         press(entity, move |this, ev, _cx| {

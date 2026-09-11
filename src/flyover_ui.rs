@@ -84,7 +84,16 @@ impl App {
                 });
             }
         });
-        let mut strip_el = tab_strip(&bar, inv, &tabs, self.flyover_active, &hov, &style, on_press);
+        let mut strip_el = tab_strip(
+            &bar,
+            inv,
+            &tabs,
+            self.flyover_active,
+            &hov,
+            &style,
+            &cx.global::<Theme>().icons.x(),
+            on_press,
+        );
 
         // Minimize / maximize buttons at the bar's right edge — not while a
         // modal owns the frame, so a picker never floats over decoy

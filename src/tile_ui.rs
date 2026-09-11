@@ -13,10 +13,11 @@
 //! z-order (under the sidebar and the modals) instead of in the canvas's
 //! hand-kept paint order.
 //!
-//! Still canvas-painted, deliberately: the collapse caret (a rotating
-//! chevron the canvas draws as line segments), the card divider, the
-//! side-strip hover fill, and the drag-and-drop hints — all of which sit
-//! *around* the strip rather than in it.
+//! Still canvas-painted, deliberately: the card divider, the side-strip
+//! hover fill, and the drag-and-drop hints — all of which sit *around* the
+//! strip rather than in it. The collapse caret was the last hand-painted
+//! glyph here; it is a standard `svg` chevron now (the animated rotation
+//! became the same icon swap `select` uses).
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -115,6 +116,7 @@ pub(crate) fn tab_strip(
     active: usize,
     hov: &dyn Fn(&LayoutRect) -> bool,
     style: &StripStyle,
+    close_icon: &str,
     on_press: PressHandler,
 ) -> gpui::Div {
     let mut strip_el = div()
@@ -244,8 +246,13 @@ pub(crate) fn tab_strip(
                         .flex()
                         .items_center()
                         .justify_center()
-                        .text_color(if close_hov { style.ink } else { style.ink_dim })
-                        .child("×"),
+                        .child(
+                            gpui::svg()
+                                .path(close_icon)
+                                .size(px(12.0 * inv))
+                                .flex_shrink_0()
+                                .text_color(if close_hov { style.ink } else { style.ink_dim }),
+                        ),
                 ),
         );
 
@@ -315,7 +322,22 @@ impl App {
             // whole bare card is one press target that expands it.
             if axis == Some(workspace::Dir::Row) && collapsing {
                 if tile.collapsed {
+                    let cr = workspace::tile_caret_rect(rect, scale);
                     let entity = entity.clone();
+                    let badge = tile
+                        .tabs
+                        .iter()
+                        .any(|t| t.unread)
+                        .then(|| {
+                            div()
+                                .absolute()
+                                .top(px(3.0))
+                                .right(px(3.0))
+                                .size(px(6.0))
+                                .rounded_full()
+                                .bg(accent)
+                                .into_any_element()
+                        });
                     layer = layer.child(
                         div()
                             .absolute()
@@ -323,6 +345,25 @@ impl App {
                             .top(px(rect.y * inv))
                             .w(px(rect.w * inv))
                             .h(px(rect.h * inv))
+                            .child(
+                                div()
+                                    .absolute()
+                                    .left(px((cr.x - rect.x) * inv))
+                                    .top(px((cr.y - rect.y) * inv))
+                                    .w(px(cr.w * inv))
+                                    .h(px(cr.h * inv))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(
+                                        gpui::svg()
+                                            .path(cx.global::<Theme>().icons.chevron_right())
+                                            .size(px(14.0 * inv))
+                                            .flex_shrink_0()
+                                            .text_color(base.ink_dim),
+                                    )
+                                    .children(badge),
+                            )
                             .on_mouse_down(MouseButton::Left, move |ev: &MouseDownEvent, _win: &mut Window, app: &mut GpuiApp| {
                                 app.stop_propagation();
                                 if let Some(entity) = entity.upgrade() {
@@ -364,19 +405,58 @@ impl App {
                     });
                 }
             });
-            let mut strip_el = tab_strip(&bar, inv, &tabs, tile.active, &hov, &style, on_press);
-            // The collapse caret: canvas-painted (a rotating chevron), but its
-            // press is an element target at the same square.
+            let mut strip_el = tab_strip(
+                &bar,
+                inv,
+                &tabs,
+                tile.active,
+                &hov,
+                &style,
+                &cx.global::<Theme>().icons.x(),
+                on_press,
+            );
+            // The collapse caret: a standard svg chevron now (was canvas-
+            // painted). The press target stays the same square, hover keeps
+            // brightening the glyph, expanded/collapsed swap icons the way
+            // `select` does, and an unread tab still badges it while
+            // collapsed.
             if has_caret {
                 let cr = workspace::tile_caret_rect(rect, scale);
                 let entity = entity.clone();
+                let badge = (tile.collapsed && tile.tabs.iter().any(|t| t.unread)).then(
+                    || {
+                        div()
+                            .absolute()
+                            .top(px(3.0))
+                            .right(px(3.0))
+                            .size(px(6.0))
+                            .rounded_full()
+                            .bg(accent)
+                            .into_any_element()
+                    },
+                );
                 strip_el = strip_el.child(
                     div()
                         .absolute()
+                        .flex()
+                        .items_center()
+                        .justify_center()
                         .left(px((cr.x - bar.x) * inv))
                         .top(px((cr.y - bar.y) * inv))
                         .w(px(cr.w * inv))
                         .h(px(cr.h * inv))
+                        .child(
+                            gpui::svg()
+                                .path(if tile.collapsed {
+                                    cx.global::<Theme>().icons.chevron_right()
+                                } else {
+                                    cx.global::<Theme>().icons.chevron_down()
+                                })
+                                .size(px(14.0 * inv))
+                                .flex_shrink_0()
+                                .text_color(if hov(&cr) { style.ink } else { style.ink_dim }),
+                        )
+                        .children(badge)
                         .on_mouse_down(MouseButton::Left, move |ev: &MouseDownEvent, _win: &mut Window, app: &mut GpuiApp| {
                             app.stop_propagation();
                             if let Some(entity) = entity.upgrade() {
