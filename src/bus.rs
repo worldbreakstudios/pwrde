@@ -32,6 +32,11 @@ pub enum Command {
         #[serde(default)]
         group: Option<String>,
     },
+    NewWebviewCommand {
+        command: String,
+        #[serde(default)]
+        group: Option<String>,
+    },
     SendText {
         text: String,
         #[serde(default)]
@@ -148,6 +153,12 @@ pub fn command_specs() -> Vec<CommandSpec> {
             name: "send_text",
             args: "<text> [--group <name>]",
             help: "Send raw keystrokes to the focused (or named) group's pane (--enter appends \\r)",
+            read_only: false,
+        },
+        CommandSpec {
+            name: "new_webview_command",
+            args: "<command> [--group <name>]",
+            help: "Open a webview tab whose URL is the first line printed by a shell command",
             read_only: false,
         },
         CommandSpec {
@@ -437,6 +448,7 @@ fn command_tag(cmd: &Command) -> &'static str {
         Command::Action { .. } => "action",
         Command::NewSession { .. } => "new_session",
         Command::NewWebview { .. } => "new_webview",
+        Command::NewWebviewCommand { .. } => "new_webview_command",
         Command::SendText { .. } => "send_text",
         Command::Key { .. } => "key",
         Command::FocusGroup { .. } => "focus_group",
@@ -478,6 +490,10 @@ mod tests {
             },
             Command::NewWebview {
                 url: "https://example.com/docs".into(),
+                group: Some("g1".into()),
+            },
+            Command::NewWebviewCommand {
+                command: "printf 'https://example.com/docs/cmd'".into(),
                 group: Some("g1".into()),
             },
             Command::SendText {
@@ -621,6 +637,10 @@ mod tests {
             },
             Command::NewWebview {
                 url: "https://example.com".into(),
+                group: None,
+            },
+            Command::NewWebviewCommand {
+                command: "printf 'https://example.com/cmd'".into(),
                 group: None,
             },
             Command::SendText {

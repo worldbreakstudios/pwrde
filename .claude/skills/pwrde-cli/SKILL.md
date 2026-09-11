@@ -49,6 +49,7 @@ pwrde-cli read panes [query]                     # read-only: one line per pane 
 pwrde-cli read pane <id> [--lines N|--all] [--json]   # read-only: a pane's text (screen, or scrollback tail/all) by session id; --json adds title/size/cursor/group/foreground. Never moves focus/scroll
 pwrde-cli commands                               # every bus command + every rebindable Action with its current key binding
 pwrde-cli new-session ~/src/pwrde                # open a group at a dir; --layout <profile> applies a .pwrspace profile; --base <ref|default> forks a worktree via drop
+pwrde-cli new-webview-command 'echo google.com'  # webview tab whose URL is the first line the command prints (run via $SHELL -lc); --group <name|index>
 pwrde-cli send-text 'cargo test' --enter         # raw keystrokes into the focused pane; --enter appends \r; --group <name|index>; text `-` reads stdin
 pwrde-cli send-text $'\x03'                      # control bytes pass through (^C, escape sequences)
 pwrde-cli key cmd-p escape                       # press chords through the app's key handler (tests bindings/overlays; gpui syntax: cmd-shift-t, ctrl-c, enter)

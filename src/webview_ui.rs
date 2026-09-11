@@ -725,7 +725,10 @@ impl App {
             .child(
                 div()
                     .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .child("New webview"),
+                    .child(match prompt.mode {
+                        crate::WebviewPromptMode::Url => "New webview",
+                        crate::WebviewPromptMode::Command => "New webview from command",
+                    }),
             )
             .child(
                 div()

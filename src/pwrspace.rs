@@ -1,8 +1,11 @@
 //! Workspace profiles: saved group layouts stored in `.pwrspace.json` files.
 //!
 //! A profile captures a split tree with ratios, per-tile tab strips, and
-//! per-tab terminal commands or webview URLs. Profiles are offered when
-//! creating a new group so the user can restore a familiar layout instantly.
+//! per-tab terminal commands or webview URLs. A webview tab may also carry a
+//! `url_command`: a shell command run at launch whose first non-empty stdout
+//! line becomes the URL the tab loads — see [`url_from_command_output`].
+//! Profiles are offered when creating a new group so the user can restore a
+//! familiar layout instantly.
 //!
 //! The file format mirrors `persist::LayoutNode`'s serde-untagged convention:
 //! leaves and splits are disambiguated by the presence of `"split"`.
@@ -49,6 +52,13 @@ pub struct ProfileTab {
     /// URL loaded by a webview tab.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    /// Shell command run at launch in the group's cwd whose first non-empty
+    /// stdout line is the URL a `kind: "webview"` tab loads. `url` is the
+    /// fallback — and the page shown while the command runs — when the command
+    /// fails, prints nothing, or prints something that is not a resolvable
+    /// http(s) URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url_command: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,6 +73,17 @@ impl ProfileTabKind {
     fn is_terminal(&self) -> bool {
         *self == Self::Terminal
     }
+}
+
+/// URL parsed from a `url_command`'s stdout: the first non-empty trimmed
+/// line, passed through [`crate::webview::normalize_input`] so bare
+/// hostnames like `google.com` resolve to `https://google.com` and absolute
+/// http(s) URLs pass through unchanged. Returns `None` when the output has
+/// no usable line or that line is not a resolvable http(s) URL — later
+/// lines are never considered.
+pub fn url_from_command_output(stdout: &str) -> Option<String> {
+    let line = stdout.lines().map(str::trim).find(|line| !line.is_empty())?;
+    crate::webview::normalize_input(line).ok()
 }
 
 /// A node in the profile layout tree — either a leaf tile or a binary split.
@@ -303,6 +324,7 @@ mod tests {
             kind: ProfileTabKind::Webview,
             command: None,
             url: Some("https://example.com/docs".into()),
+            url_command: None,
         };
         let json = serde_json::to_string(&tab).unwrap();
         assert_eq!(json, r#"{"kind":"webview","url":"https://example.com/docs"}"#);
@@ -312,6 +334,47 @@ mod tests {
 
         let bare = serde_json::to_string(&ProfileTab::default()).unwrap();
         assert_eq!(bare, "{}");
+
+        // A command-only webview tab round-trips; no `url` key is emitted.
+        let json = r#"{"kind":"webview","url_command":"echo google.com"}"#;
+        let tab: ProfileTab = serde_json::from_str(json).unwrap();
+        assert_eq!(tab.kind, ProfileTabKind::Webview);
+        assert_eq!(tab.url_command.as_deref(), Some("echo google.com"));
+        assert!(tab.url.is_none());
+        let out = serde_json::to_string(&tab).unwrap();
+        assert_eq!(out, r#"{"kind":"webview","url_command":"echo google.com"}"#);
+    }
+
+    #[test]
+    fn terminal_tab_json_omits_url_command_when_none() {
+        let tab = ProfileTab {
+            command: Some("nvim".into()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&tab).unwrap();
+        assert_eq!(json, r#"{"command":"nvim"}"#);
+        assert!(!json.contains("url_command"));
+    }
+
+    #[test]
+    fn url_command_resolves_first_non_empty_line() {
+        assert_eq!(
+            url_from_command_output("google.com\n"),
+            Some("https://google.com".into()),
+            "bare hostname normalizes to https"
+        );
+        assert_eq!(
+            url_from_command_output("https://x.dev/a\n"),
+            Some("https://x.dev/a".into()),
+            "absolute https URL passes through unchanged"
+        );
+        assert_eq!(url_from_command_output(""), None);
+        assert_eq!(url_from_command_output("   \n\t\n"), None, "whitespace-only output");
+        assert_eq!(
+            url_from_command_output("not a url\nhttps://later.example\n"),
+            None,
+            "garbage first non-empty line: later lines are never considered"
+        );
     }
 
     // -----------------------------------------------------------------------

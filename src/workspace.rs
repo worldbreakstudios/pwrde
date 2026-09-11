@@ -44,6 +44,10 @@ pub struct WebviewTab {
     /// Runtime-only identity retained when a tab is moved or reordered.
     pub id: u64,
     pub url: String,
+    /// Runtime-only launch command from the tab's workspace profile: a shell
+    /// command whose first non-empty stdout line becomes this tab's URL once
+    /// it resolves. Never persisted; `None` for ordinary webviews.
+    pub url_command: Option<String>,
     /// The page's document title as last reported by the native view; empty
     /// or absent while a document is loading, so `Tab::title` falls back to
     /// the URL-derived label. Runtime-only: it arrives again on every load.
@@ -82,8 +86,14 @@ impl Tab {
     }
 
     pub fn webview(id: u64, url: String) -> Self {
+        Self::webview_with_command(id, url, None)
+    }
+
+    /// Like [`Tab::webview`], but records the profile `url_command` the tab was
+    /// materialized from. Runtime-only metadata: see [`WebviewTab::url_command`].
+    pub fn webview_with_command(id: u64, url: String, url_command: Option<String>) -> Self {
         Self {
-            content: TabContent::Webview(WebviewTab { id, url, title: None }),
+            content: TabContent::Webview(WebviewTab { id, url, url_command, title: None }),
             cols: 0,
             rows: 0,
             unread: false,
@@ -133,6 +143,15 @@ impl Tab {
         }
         webview.url = url;
         true
+    }
+
+    /// The profile `url_command` this webview tab was launched from, if any.
+    /// Runtime-only; see [`WebviewTab::url_command`].
+    pub fn url_command(&self) -> Option<&str> {
+        match &self.content {
+            TabContent::Terminal(_) => None,
+            TabContent::Webview(webview) => webview.url_command.as_deref(),
+        }
     }
 
     /// Record the document title the native view reported. An empty title
@@ -2207,6 +2226,28 @@ mod tests {
         assert!(tab.set_webview_url("https://example.com/docs".into()));
         assert_eq!(tab.url(), Some("https://example.com/docs"));
         assert!(!tab.set_webview_url("https://example.com/docs".into()));
+    }
+
+    #[test]
+    fn webview_url_command_metadata_stays_runtime_only() {
+        // Plain constructor: url_command defaults to None.
+        let tab = Tab::webview(1, "https://example.com".into());
+        assert_eq!(tab.url_command(), None);
+        // Command-aware constructor records the command; mutating the URL
+        // leaves the runtime-only command untouched.
+        let mut tab = Tab::webview_with_command(
+            2,
+            "about:blank".into(),
+            Some("echo example.com".into()),
+        );
+        assert_eq!(tab.url_command(), Some("echo example.com"));
+        assert!(tab.set_webview_url("https://example.com/loaded".into()));
+        assert_eq!(tab.url_command(), Some("echo example.com"));
+        // None is accepted as well, and terminal tabs never carry a command.
+        let tab = Tab::webview_with_command(3, "https://example.com".into(), None);
+        assert_eq!(tab.url_command(), None);
+        let tab = Tab::new(crate::term::Session::placeholder());
+        assert_eq!(tab.url_command(), None);
     }
 
     #[test]
