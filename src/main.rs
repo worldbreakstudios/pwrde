@@ -908,10 +908,6 @@ impl App {
         Ok(id)
     }
 
-    /// Create a webview tab whose URL is resolved by running `command` in a
-    /// login shell from the group's working directory. The tab starts on a
-    /// blank page and navigates once the background thread reports the
-    /// command's first line of output.
     /// Whether any group still holds the webview tab with this id.
     fn webview_tab_exists(&self, id: u64) -> bool {
         self.workspaces.iter().any(|ws| {
@@ -922,6 +918,10 @@ impl App {
         })
     }
 
+    /// Create a webview tab whose URL is resolved by running `command` in a
+    /// login shell from the group's working directory. The tab starts on a
+    /// blank page and navigates once the background thread reports the
+    /// command's first line of output.
     pub(crate) fn add_webview_command_tab_to_group(
         &mut self,
         group_idx: usize,
