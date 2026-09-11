@@ -175,8 +175,6 @@ pub struct Frame {
     pub flyover_panes: Vec<PaneText>,
     /// Flyover foreground fills (cursor, selection).
     pub flyover_fg_quads: Vec<Quad>,
-    /// Flyover tab-strip labels.
-    pub flyover_labels: Vec<LabelSpec>,
     /// Every interactive rect drawn this frame, in draw order (topmost last).
     /// Used by main.rs to compute ui_hover by reverse-iterating. Resize handles
     /// are excluded — they have their own hover/cursor logic. When a modal
@@ -658,7 +656,6 @@ impl Renderer {
             flyover_quads: Vec::new(),
             flyover_panes: Vec::new(),
             flyover_fg_quads: Vec::new(),
-            flyover_labels: Vec::new(),
             hot,
         }
     }
@@ -692,10 +689,9 @@ impl Renderer {
         draw_cursor: bool,
         show_window_buttons: bool,
         maximized: bool,
-        cursor: Option<(f32, f32)>,
-        paint_strip: bool,
+        _cursor: Option<(f32, f32)>,
         hot: &mut Vec<LayoutRect>,
-    ) -> (Vec<Quad>, Vec<PaneText>, Vec<Quad>, Vec<LabelSpec>) {
+    ) -> (Vec<Quad>, Vec<PaneText>, Vec<Quad>) {
         let th = self.theme();
         let scale = self.scale;
         // Resolve the terminal scheme exactly as `build_frame` does for tile
@@ -703,14 +699,13 @@ impl Renderer {
         // scheme bg/fg drive the card and tab chrome when one is selected.
         let scheme = crate::term_theme::selected(crate::theme::dark_active());
         let term_palette = crate::term_theme::build(scheme, th.term_bg);
-        let (pane_bg, pane_ink, pane_ink_dim, pane_divider, pane_pill) = match scheme {
-            Some(t) => (t.bg, (t.fg, 1.0), (t.fg, 0.55), (t.fg, 0.15), (t.fg, 0.12)),
+        let (pane_bg, _pane_ink, _pane_ink_dim, pane_divider) = match scheme {
+            Some(t) => (t.bg, (t.fg, 1.0), (t.fg, 0.55), (t.fg, 0.15)),
             None => (
                 th.term_bg,
                 (th.text_bright, 1.0),
                 (th.text_dim, 1.0),
                 (th.card_divider, 1.0),
-                ((255u8, 255u8, 255u8), 0.09f32),
             ),
         };
 
@@ -721,7 +716,6 @@ impl Renderer {
         let mut quads: Vec<Quad> = Vec::new();
         let mut fg_quads: Vec<Quad> = Vec::new();
         let mut panes: Vec<PaneText> = Vec::new();
-        let mut labels: Vec<LabelSpec> = Vec::new();
 
         // Card background + border.
         let card_r = (8.0 * scale).round();
@@ -735,149 +729,28 @@ impl Renderer {
         };
         quads.push(self.px_rect(&border, pane_divider.0, pane_divider.1 * 0.5, 0.0));
 
-        // Tab strip: highlight pill for the active tab, inset like the tile
-        // strips' pill so the bar shows around it. `paint_strip` is false in
-        // the main window, where `flyover_ui` paints the strip's pixels and
-        // the canvas only registers its hot rects.
-        if paint_strip && n > 0 {
-            let tr = crate::workspace::flyover_tab_rect(panel_rect, active, n, scale, maximized);
-            let m = (4.0 * scale).round();
-            let pill = crate::workspace::LayoutRect {
-                x: tr.x + m,
-                y: tr.y + m,
-                w: (tr.w - 2.0 * m).max(0.0),
-                h: (tr.h - 2.0 * m).max(0.0),
-            };
-            quads.push(self.px_rect(&pill, pane_pill.0, pane_pill.1, (7.0 * scale).round()));
-        }
-
-        // Tab labels + per-tab × close button (mirrors the tile tab strip).
-        let tab_text_pad = (8.0 * scale).round();
-        for (i, tab) in tabs.iter().enumerate() {
+        // Tab hit rects: the strip's pixels (pills, titles, × buttons, unread
+        // dots) are element-tree tabs from `flyover_ui` now, so the canvas
+        // emits only the rects the mouse path still resolves clicks on —
+        // same `workspace::flyover_tab_rect` / `flyover_tab_close_rect`
+        // geometry the element tree renders at.
+        for (i, _tab) in tabs.iter().enumerate() {
             let tr = crate::workspace::flyover_tab_rect(panel_rect, i, n, scale, maximized);
             let close = crate::workspace::flyover_tab_close_rect(panel_rect, i, n, scale, maximized);
-            let close_hov = hover(cursor, &close);
-            // Same hover language as the tile strips: dim pill on an inactive
-            // tab, rounded chip + brightened glyph on the ×.
-            if paint_strip && i != active && hover(cursor, &tr) && !close_hov {
-                let m = (4.0 * scale).round();
-                let pill = crate::workspace::LayoutRect {
-                    x: tr.x + m,
-                    y: tr.y + m,
-                    w: (tr.w - 2.0 * m).max(0.0),
-                    h: (tr.h - 2.0 * m).max(0.0),
-                };
-                quads.push(self.px_rect(&pill, pane_pill.0, pane_pill.1 * 0.55, (7.0 * scale).round()));
-            }
-            if paint_strip && close_hov {
-                let inset = (3.0 * scale).round();
-                let chip = crate::workspace::LayoutRect {
-                    x: close.x + inset,
-                    y: close.y + inset,
-                    w: (close.w - 2.0 * inset).max(0.0),
-                    h: (close.h - 2.0 * inset).max(0.0),
-                };
-                quads.push(self.px_rect(
-                    &chip,
-                    pane_pill.0,
-                    (pane_pill.1 * 2.0).min(1.0),
-                    (4.0 * scale).round(),
-                ));
-            }
             // Close after its tab so reverse iteration (topmost wins)
             // resolves × over the tab it sits in.
             hot.push(tr);
             hot.push(close);
-            if !paint_strip {
-                continue;
-            }
-            let title = tab.title();
-            let text = if title.is_empty() { "shell".to_string() } else { title };
-            let mut text_left = tr.x + tab_text_pad;
-            // Unread dot.
-            if tab.unread {
-                let ds = (6.0 * scale).round();
-                let dot = crate::workspace::LayoutRect {
-                    x: text_left,
-                    y: (tr.y + (tr.h - ds) / 2.0).round(),
-                    w: ds,
-                    h: ds,
-                };
-                fg_quads.push(self.px_rect(&dot, th.accent, 1.0, ds / 2.0));
-                text_left += ds + (5.0 * scale).round();
-            }
-            labels.push(LabelSpec {
-                text,
-                color: if i == active {
-                    color(pane_ink.0, pane_ink.1)
-                } else {
-                    color(pane_ink_dim.0, pane_ink_dim.1)
-                },
-                left: text_left,
-                top: (tr.y + (tr.h - self.chrome_cell_height) / 2.0).round(),
-                clip: crate::workspace::LayoutRect {
-                    w: (close.x - tr.x - tab_text_pad).max(0.0),
-                    ..tr
-                },
-                size: None,
-            });
-            labels.push(LabelSpec {
-                text: "×".to_string(),
-                color: if close_hov {
-                    color(pane_ink.0, pane_ink.1)
-                } else {
-                    color(pane_ink_dim.0, pane_ink_dim.1)
-                },
-                left: close.x + ((close.w - self.chrome_cell_width) / 2.0).round(),
-                top: (tr.y + (tr.h - self.chrome_cell_height) / 2.0).round(),
-                clip: tr,
-                size: None,
-            });
         }
 
-        // Minimize / maximize buttons at the bar's right edge. `draw_cursor`
-        // is the interactivity gate (false while a modal overlay owns the
-        // frame), so the inert controls must not paint there — otherwise a
-        // picker would float over decoy window buttons.
+        // Minimize / maximize hit rects at the bar's right edge. Their
+        // buttons are element-tree svgs in `flyover_ui`; the canvas keeps
+        // only the rects. `draw_cursor` is the interactivity gate (false
+        // while a modal overlay owns the frame), so inert controls must not
+        // register as clickable above the overlay.
         if show_window_buttons && draw_cursor {
-            let bar_h = tab_bar.h;
-            for (rect, glyph) in [
-                (crate::workspace::flyover_minimize_rect(panel_rect, scale), "–"),
-                (crate::workspace::flyover_maximize_rect(panel_rect, scale), "□"),
-            ] {
-                let hov = hover(cursor, &rect);
-                if paint_strip && hov {
-                    let inset = (3.0 * scale).round();
-                    let chip = crate::workspace::LayoutRect {
-                        x: rect.x + inset,
-                        y: rect.y + inset,
-                        w: (rect.w - 2.0 * inset).max(0.0),
-                        h: (rect.h - 2.0 * inset).max(0.0),
-                    };
-                    quads.push(self.px_rect(
-                        &chip,
-                        pane_pill.0,
-                        (pane_pill.1 * 2.0).min(1.0),
-                        (4.0 * scale).round(),
-                    ));
-                }
-                hot.push(rect);
-                if !paint_strip {
-                    continue;
-                }
-                labels.push(LabelSpec {
-                    text: glyph.to_string(),
-                    color: if hov {
-                        color(pane_ink.0, pane_ink.1)
-                    } else {
-                        color(pane_ink_dim.0, pane_ink_dim.1)
-                    },
-                    left: rect.x + ((rect.w - self.chrome_cell_width) / 2.0).round(),
-                    top: (rect.y + (bar_h - self.chrome_cell_height) / 2.0).round(),
-                    clip: rect,
-                    size: None,
-                });
-            }
+            hot.push(crate::workspace::flyover_minimize_rect(panel_rect, scale));
+            hot.push(crate::workspace::flyover_maximize_rect(panel_rect, scale));
         }
 
         // Tab-bar bottom divider line.
@@ -905,7 +778,7 @@ impl Renderer {
             self.selection_rects(session, origin, &mut fg_quads);
         }
 
-        (quads, panes, fg_quads, labels)
+        (quads, panes, fg_quads)
     }
 
     /// Build a CLI tool page: one card filling `area`, styled like the
@@ -1184,25 +1057,41 @@ mod tests {
         let close = crate::workspace::flyover_tab_close_rect(&panel, 0, 1, scale, false);
         let cursor = Some((close.x + close.w / 2.0, close.y + close.h / 2.0));
 
-        let mut hot_painted = Vec::new();
-        let (painted_quads, _, _, painted_labels) = renderer
-            .flyover_overlay(&tabs, 0, &panel, true, true, true, false, cursor, true, &mut hot_painted);
-        let mut hot_bare = Vec::new();
-        let (bare_quads, _, _, bare_labels) = renderer
-            .flyover_overlay(&tabs, 0, &panel, true, true, true, false, cursor, false, &mut hot_bare);
+        let mut hot = Vec::new();
+        let (quads, _, _) = renderer
+            .flyover_overlay(&tabs, 0, &panel, true, true, true, false, cursor, &mut hot);
 
-        assert_eq!(hot_bare.len(), hot_painted.len(), "hit-testing survives without strip pixels");
-        assert_eq!(hot_bare.len(), 4, "tab + close + minimize + maximize stay hot");
-        assert!(!painted_labels.is_empty() && bare_labels.is_empty(), "no strip labels on the canvas");
-        assert!(bare_quads.len() < painted_quads.len(), "no pills or chips on the canvas");
+        assert_eq!(hot.len(), 4, "tab + close + minimize + maximize stay hot");
+        assert!(hot.iter().any(|r| r.x == close.x && r.y == close.y));
+
+        // The strip's pixels ride the element tree now: the canvas paints
+        // only the card, top border, tab-bar divider and terminal content,
+        // so nothing may sit inside the tab bar above its divider.
+        assert!(quads.len() >= 3, "card, border and divider still paint");
+        let tab_bar = crate::workspace::flyover_tab_bar(&panel, scale);
+        let divider_y = tab_bar.y + tab_bar.h - (1.0_f32 * scale).round().max(1.0);
+        // The card background and top border span the full panel width and
+        // are retained chrome; per-tab pills, chips and unread dots were
+        // always narrower than the bar. So a strip pixel is a quad fully
+        // inside the bar above its divider that is NOT one of those
+        // full-width layers.
+        let strip_pixels = quads.iter().any(|q| {
+            q.w < tab_bar.w
+                && q.x >= tab_bar.x
+                && q.x + q.w <= tab_bar.x + tab_bar.w
+                && q.y >= tab_bar.y
+                && q.y + q.h <= divider_y
+        });
+        assert!(!strip_pixels, "no strip pixels inside the tab bar");
     }
 
-    /// Hovering a flyover tab's × registers it hot and paints the chip; with
-    /// no cursor the strip stays in its resting style. While a modal overlay
-    /// owns the frame (`draw_cursor == false`) the inert window buttons must
-    /// drop out of the hot list entirely.
+    /// Flyover hit-testing is interactivity-only now: the × hover, chip and
+    /// label pixels live in the element tree, so canvas output is identical
+    /// with or without a cursor and only the hot rects matter. While a modal
+    /// overlay owns the frame (`draw_cursor == false`) the inert window
+    /// buttons must drop out of the hot list entirely.
     #[test]
-    fn flyover_close_hover_paints_chip_and_registers_hot() {
+    fn flyover_hot_rects_track_interactivity() {
         let scale = 2.0;
         let renderer = Renderer::new(scale, 18.0, 1600, 1000);
         let panel = crate::workspace::flyover_rect(1600, 1000, scale, 1.0, 0.35, false);
@@ -1210,27 +1099,25 @@ mod tests {
         let close = crate::workspace::flyover_tab_close_rect(&panel, 0, 1, scale, false);
 
         let mut hot = Vec::new();
-        let (resting_quads, ..) = renderer
-            .flyover_overlay(&tabs, 0, &panel, true, true, true, false, None, true, &mut hot);
+        renderer
+            .flyover_overlay(&tabs, 0, &panel, true, true, true, false, None, &mut hot);
         // Tab, its ×, and the two window buttons are all interactive.
         assert_eq!(hot.len(), 4, "tab + close + minimize + maximize are hot");
         assert!(hot.iter().any(|r| r.x == close.x && r.y == close.y));
 
+        // A cursor changes pixels only (element-tree hover); the hot list
+        // — and therefore the canvas output — is identical.
         let cursor = Some((close.x + close.w / 2.0, close.y + close.h / 2.0));
         let mut hot2 = Vec::new();
-        let (hovered_quads, ..) = renderer
-            .flyover_overlay(&tabs, 0, &panel, true, true, true, false, cursor, true, &mut hot2);
-        assert_eq!(
-            hovered_quads.len(),
-            resting_quads.len() + 1,
-            "hovering the × adds exactly the chip quad"
-        );
+        renderer
+            .flyover_overlay(&tabs, 0, &panel, true, true, true, false, cursor, &mut hot2);
+        assert_eq!(hot2, hot, "hot rects do not depend on the cursor");
 
         // A modal overlay owns the frame: minimize/maximize become inert and
         // must not register as clickable above the overlay.
         let mut hot3 = Vec::new();
         renderer
-            .flyover_overlay(&tabs, 0, &panel, true, false, true, false, None, true, &mut hot3);
+            .flyover_overlay(&tabs, 0, &panel, true, false, true, false, None, &mut hot3);
         assert_eq!(
             hot3.len(),
             2,
