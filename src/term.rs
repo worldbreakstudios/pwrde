@@ -52,6 +52,14 @@ pub enum TermEvent {
     /// A Wry top-level navigation committed; folded into the owning tab on
     /// the main thread so its address, title, and persisted URL stay current.
     WebviewNavigated { id: u64, url: String },
+    /// A webview tab's profile `url_command` finished on a background thread
+    /// and its first non-empty stdout line resolved to `url`; folded into the
+    /// owning tab on the main thread exactly like [`TermEvent::WebviewNavigated`].
+    WebviewUrlResolved { id: u64, url: String },
+    /// The `url_command` failed, could not spawn, or printed nothing usable;
+    /// the tab stays on its fallback page and `message` is shown as a
+    /// dismissable status note if the tab is still open.
+    WebviewUrlFailed { id: u64, message: String },
     /// The native view's document title changed (empty while a new document
     /// loads); folded into the owning tab so its strip label tracks `<title>`.
     WebviewTitleChanged { id: u64, title: String },

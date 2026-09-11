@@ -183,7 +183,16 @@ enum ConfirmAction {
     ClearWebviewData { id: u64 },
 }
 
+/// Which kind of input the new-webview prompt is collecting: a URL to open
+/// directly, or a shell command whose first line of output becomes the URL.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WebviewPromptMode {
+    Url,
+    Command,
+}
+
 struct WebviewPrompt {
+    mode: WebviewPromptMode,
     query: String,
     error: Option<String>,
 }
@@ -833,6 +842,41 @@ impl App {
         Tab::webview(id, url)
     }
 
+    /// Run a profile webview tab's `url_command` on a background thread and
+    /// report the resolved URL back over the event channel. The UI never
+    /// waits on the command: the tab shows its fallback `url` (or a blank
+    /// page) until the thread sends `TermEvent::WebviewUrlResolved`.
+    fn spawn_webview_url_command(&self, id: u64, cmd: &str, cwd: Option<&std::path::Path>) {
+        let events_tx = self.events_tx.clone();
+        let cmd = cmd.to_string();
+        let cwd = cwd.map(std::path::Path::to_path_buf);
+        std::thread::spawn(move || {
+            // Login shell so PATH resolves like a pane's own `$SHELL -lc`.
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+            let mut command = std::process::Command::new(shell);
+            command.args(["-lc", &cmd]);
+            if let Some(cwd) = cwd {
+                command.current_dir(cwd);
+            }
+            let resolved = match command.output() {
+                Ok(output) if output.status.success() => {
+                    pwrspace::url_from_command_output(&String::from_utf8_lossy(&output.stdout))
+                        .ok_or_else(|| format!("`{cmd}` printed no resolvable URL"))
+                },
+                Ok(output) => Err(format!("`{cmd}` failed with {}", output.status)),
+                Err(err) => Err(format!("`{cmd}` failed to spawn: {err}")),
+            };
+            let event = match resolved {
+                Ok(url) => TermEvent::WebviewUrlResolved { id, url },
+                Err(message) => {
+                    eprintln!("webview url command {message}");
+                    TermEvent::WebviewUrlFailed { id, message }
+                },
+            };
+            let _ = events_tx.send(event);
+        });
+    }
+
     pub(crate) fn add_webview_tab_to_group(
         &mut self,
         group_idx: usize,
@@ -854,6 +898,58 @@ impl App {
             &mut self.sections,
             self.active,
         );
+        if self.page != Page::Sessions {
+            self.set_page(Page::Sessions);
+        } else {
+            self.sync_layout();
+            self.request_redraw();
+        }
+        self.persist_snapshot();
+        Ok(id)
+    }
+
+    /// Whether any group still holds the webview tab with this id.
+    fn webview_tab_exists(&self, id: u64) -> bool {
+        self.workspaces.iter().any(|ws| {
+            ws.root
+                .tiles()
+                .iter()
+                .any(|tile| tile.tabs.iter().any(|tab| tab.webview_id() == Some(id)))
+        })
+    }
+
+    /// Create a webview tab whose URL is resolved by running `command` in a
+    /// login shell from the group's working directory. The tab starts on a
+    /// blank page and navigates once the background thread reports the
+    /// command's first line of output.
+    pub(crate) fn add_webview_command_tab_to_group(
+        &mut self,
+        group_idx: usize,
+        command: String,
+    ) -> Result<u64, String> {
+        let command = command.trim().to_string();
+        if command.is_empty() {
+            return Err("url command is empty".into());
+        }
+        if group_idx >= self.workspaces.len() || self.workspaces[group_idx].focused().is_none() {
+            return Err("the target group has no focused pane".into());
+        }
+        let cwd = self.workspaces.get(group_idx).and_then(|ws| ws.cwd.clone());
+        let id = self.next_webview_id;
+        self.next_webview_id += 1;
+        let tab = Tab::webview_with_command(id, "about:blank".to_string(), Some(command.clone()));
+        let tile = self.workspaces[group_idx]
+            .focused_mut()
+            .expect("focused pane checked before tab allocation");
+        tile.tabs.push(tab);
+        tile.active = tile.tabs.len() - 1;
+        self.active = group_idx;
+        workspace::ensure_active_section_expanded(
+            &self.workspaces,
+            &mut self.sections,
+            self.active,
+        );
+        self.spawn_webview_url_command(id, &command, cwd.as_deref());
         if self.page != Page::Sessions {
             self.set_page(Page::Sessions);
         } else {
@@ -886,11 +982,21 @@ impl App {
         false
     }
 
-    fn open_new_webview_prompt(&mut self) {
+    fn open_new_webview_prompt(&mut self, mode: WebviewPromptMode) {
         self.command = None;
         self.webview_panel = None;
-        self.webview_prompt = Some(WebviewPrompt { query: String::new(), error: None });
-        self.modal_search_reset = Some("Enter a URL or hostname…".into());
+        self.webview_prompt = Some(WebviewPrompt {
+            mode,
+            query: String::new(),
+            error: None,
+        });
+        self.modal_search_reset = Some(
+            match mode {
+                WebviewPromptMode::Url => "Enter a URL or hostname…",
+                WebviewPromptMode::Command => "Enter a shell command that prints a URL…",
+            }
+            .into(),
+        );
         self.request_redraw();
     }
 
@@ -900,6 +1006,23 @@ impl App {
             .as_ref()
             .map(|prompt| prompt.query.clone())
             .unwrap_or_default();
+        let mode = self
+            .webview_prompt
+            .as_ref()
+            .map(|prompt| prompt.mode)
+            .unwrap_or(WebviewPromptMode::Url);
+        if mode == WebviewPromptMode::Command {
+            match self.add_webview_command_tab_to_group(self.active, raw) {
+                Ok(_) => self.webview_prompt = None,
+                Err(error) => {
+                    if let Some(prompt) = self.webview_prompt.as_mut() {
+                        prompt.error = Some(error);
+                    }
+                },
+            }
+            self.request_redraw();
+            return;
+        }
         let url = match webview::normalize_input(&raw) {
             Ok(url) => url,
             Err(error) => {
@@ -2860,13 +2983,39 @@ impl App {
                 let tabs: &[pwrspace::ProfileTab] =
                     if leaf.tabs.is_empty() { &bare } else { &leaf.tabs };
                 for profile_tab in tabs {
-                    if profile_tab.kind == pwrspace::ProfileTabKind::Webview
-                        && let Some(url) = profile_tab
+                    // A webview tab loads its `url` while it waits, falling
+                    // back to a blank page when only a `url_command` is set;
+                    // with neither it degrades to a terminal tab like today.
+                    let validated_url = if profile_tab.kind == pwrspace::ProfileTabKind::Webview {
+                        profile_tab
                             .url
                             .as_deref()
                             .and_then(|url| bus::validate_webview_url(url).ok())
-                    {
-                        tile.tabs.push(self.new_webview_tab(url));
+                            .or_else(|| {
+                                profile_tab
+                                    .url_command
+                                    .as_deref()
+                                    .map(str::trim)
+                                    .filter(|cmd| !cmd.is_empty())
+                                    .map(|_| "about:blank".to_string())
+                            })
+                    } else {
+                        None
+                    };
+                    if let Some(url) = validated_url {
+                        let url_command = profile_tab
+                            .url_command
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|cmd| !cmd.is_empty())
+                            .map(str::to_string);
+                        let id = self.next_webview_id;
+                        self.next_webview_id += 1;
+                        let tab = Tab::webview_with_command(id, url, url_command.clone());
+                        if let Some(cmd) = url_command.as_deref() {
+                            self.spawn_webview_url_command(id, cmd, cwd);
+                        }
+                        tile.tabs.push(tab);
                     } else {
                         let session = self.spawn_session_in(cwd);
                         if let Some(cmd) = profile_tab
@@ -4734,8 +4883,13 @@ impl App {
         // Empty state: terminal actions need a group, but a webview can fill
         // the placeholder tile directly because it does not require a cwd.
         if self.is_empty_state() {
-            if action == Action::NewWebview {
-                self.open_new_webview_prompt();
+            if matches!(action, Action::NewWebview | Action::NewWebviewFromCommand) {
+                let mode = if action == Action::NewWebviewFromCommand {
+                    WebviewPromptMode::Command
+                } else {
+                    WebviewPromptMode::Url
+                };
+                self.open_new_webview_prompt(mode);
                 return true;
             }
             if matches!(action, Action::NewTab | Action::NewGroup) {
@@ -4748,7 +4902,8 @@ impl App {
             Action::SplitRight => self.split(Dir::Row),
             Action::SplitDown => self.split(Dir::Column),
             Action::NewTab => self.new_tab(),
-            Action::NewWebview => self.open_new_webview_prompt(),
+            Action::NewWebview => self.open_new_webview_prompt(WebviewPromptMode::Url),
+            Action::NewWebviewFromCommand => self.open_new_webview_prompt(WebviewPromptMode::Command),
             Action::NewGroup => self.open_picker(),
             Action::Copy => self.copy(),
             Action::Paste => self.paste(),
@@ -5052,6 +5207,25 @@ impl App {
                         && self.set_webview_url(id, url)
                     {
                         self.persist_snapshot();
+                        redraw = true;
+                    }
+                },
+                TermEvent::WebviewUrlResolved { id, url } => {
+                    // The native view may not exist yet: sync builds it from
+                    // the model URL on the next frame, so a missing-view error
+                    // here is fine as long as the model URL is updated. A tab
+                    // closed before the command returned is a no-op.
+                    let _ = self.webviews.navigate(id, &url);
+                    if self.set_webview_url(id, url) {
+                        self.persist_snapshot();
+                        redraw = true;
+                    }
+                },
+                TermEvent::WebviewUrlFailed { id, message } => {
+                    // Only worth a note while the tab is still around to sit on
+                    // its fallback page.
+                    if self.webview_tab_exists(id) {
+                        self.message = Some((format!("Webview URL command {message}"), true));
                         redraw = true;
                     }
                 },
@@ -5402,7 +5576,10 @@ fn capture_profile_node(node: &Node) -> pwrspace::ProfileNode {
                     Some(url) => pwrspace::ProfileTab {
                         kind: pwrspace::ProfileTabKind::Webview,
                         command: None,
-                        url: Some(url.to_string()),
+                        // A still-resolving command tab has no page worth
+                        // saving as its fallback.
+                        url: (url != "about:blank").then(|| url.to_string()),
+                        url_command: tab.url_command().map(str::to_string),
                     },
                     None => pwrspace::ProfileTab {
                         command: tab_command(tab),
@@ -7591,6 +7768,32 @@ mod capture_profile_tests {
         assert!(json.contains(r#""split":"row""#), "split dir serialized: {json}");
         let back: pwrspace::ProfileNode = serde_json::from_str(&json).unwrap();
         assert!(matches!(back, pwrspace::ProfileNode::Split(_)));
+    }
+
+    /// A live webview tab carrying a `url_command` captures the command plus
+    /// the current URL (the terminal command stays None) and the JSON
+    /// round-trips so Save-as-workspace preserves the command.
+    #[test]
+    fn capture_preserves_webview_url_command() {
+        let mut tile = Tile::empty(1);
+        tile.tabs.push(Tab::webview_with_command(
+            7,
+            "https://fallback.example".to_string(),
+            Some("echo example.com".to_string()),
+        ));
+        let captured = capture_profile_node(&Node::Leaf(tile));
+        let pwrspace::ProfileNode::Leaf(leaf) = &captured else { panic!("expected leaf") };
+        let [tab] = leaf.tabs.as_slice() else { panic!("expected one tab") };
+        assert_eq!(tab.kind, pwrspace::ProfileTabKind::Webview);
+        assert_eq!(tab.url_command.as_deref(), Some("echo example.com"));
+        assert_eq!(tab.url.as_deref(), Some("https://fallback.example"));
+        assert!(tab.command.is_none(), "webview tabs never capture a terminal command");
+
+        let json = serde_json::to_string(&captured).unwrap();
+        assert!(json.contains("url_command"), "serialized: {json}");
+        let back: pwrspace::ProfileNode = serde_json::from_str(&json).unwrap();
+        let pwrspace::ProfileNode::Leaf(back) = &back else { panic!("expected leaf") };
+        assert_eq!(back.tabs[0].url_command.as_deref(), Some("echo example.com"));
     }
 }
 

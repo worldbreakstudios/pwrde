@@ -695,6 +695,7 @@ pub fn action_group(action: Action) -> &'static str {
         | Action::SplitDown
         | Action::NewTab
         | Action::NewWebview
+        | Action::NewWebviewFromCommand
         | Action::CloseTab
         | Action::ToggleCollapse
         | Action::ToggleFocusOthers => "Tiles",
@@ -740,6 +741,7 @@ pub fn action_glyph(action: Action) -> &'static str {
         Action::SplitDown => "⬒",
         Action::NewTab => "＋",
         Action::NewWebview => "◎",
+        Action::NewWebviewFromCommand => "◎",
         Action::CloseTab => "⌦",
         Action::ToggleCollapse => "⌃",
         Action::ToggleFocusOthers => "◎",
@@ -875,8 +877,24 @@ mod tests {
     fn new_webview_is_a_searchable_one_shot_action() {
         let mut palette = CommandPalette::root();
         palette.set_query("webview");
-        assert_eq!(action_rows(&palette.root_rows), vec![Action::NewWebview]);
+        assert_eq!(
+            action_rows(&palette.root_rows),
+            vec![Action::NewWebview, Action::NewWebviewFromCommand]
+        );
         assert_eq!(palette.enter(), Outcome::Run(Action::NewWebview));
+    }
+
+    #[test]
+    fn new_webview_from_command_is_searchable_by_command() {
+        let mut palette = CommandPalette::root();
+        palette.set_query("command");
+        let rows = action_rows(&palette.root_rows);
+        let position = rows
+            .iter()
+            .position(|row| *row == Action::NewWebviewFromCommand)
+            .expect("new webview from command is listed");
+        palette.select(position);
+        assert_eq!(palette.enter(), Outcome::Run(Action::NewWebviewFromCommand));
     }
 
     #[test]

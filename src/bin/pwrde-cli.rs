@@ -180,6 +180,39 @@ fn parse_command(sub: &str, args: &[String]) -> Result<Command, CliError> {
             let url = bus::validate_webview_url(&url).map_err(CliError::Usage)?;
             Ok(Command::NewWebview { url, group })
         }
+        "new-webview-command" => {
+            let mut command: Option<String> = None;
+            let mut group: Option<String> = None;
+            let mut i = 0;
+            while i < args.len() {
+                let a = &args[i];
+                if a == "--group" {
+                    i += 1;
+                    group = Some(
+                        args.get(i)
+                            .ok_or_else(|| CliError::Usage("--group requires a value".into()))?
+                            .clone(),
+                    );
+                } else if let Some(value) = a.strip_prefix("--group=") {
+                    group = Some(value.to_string());
+                } else if a.starts_with('-') {
+                    return Err(CliError::Usage(format!("unknown flag: {a}")));
+                } else if command.is_none() {
+                    command = Some(a.clone());
+                } else {
+                    return Err(CliError::Usage(format!("unexpected argument: {a}")));
+                }
+                i += 1;
+            }
+            let command = command
+                .ok_or_else(|| CliError::Usage("new-webview-command requires <command>".into()))?;
+            if command.trim().is_empty() {
+                return Err(CliError::Usage(
+                    "new-webview-command requires a non-blank <command>".into(),
+                ));
+            }
+            Ok(Command::NewWebviewCommand { command, group })
+        }
         "send-text" => {
             let mut text: Option<String> = None;
             let mut group: Option<String> = None;
@@ -456,6 +489,7 @@ fn usage() -> String {
         ("action", "action"),
         ("new_session", "new-session"),
         ("new_webview", "new-webview"),
+        ("new_webview_command", "new-webview-command"),
         ("send_text", "send-text"),
         ("flow_send", "flow-send"),
         ("key", "key"),
@@ -572,6 +606,35 @@ mod tests {
                 group: Some("work".into()),
             }
         );
+    }
+
+    #[test]
+    fn parses_new_webview_command_with_optional_group() {
+        let command = parse_command(
+            "new-webview-command",
+            &args(&["cargo meta open", "--group", "work"]),
+        )
+        .unwrap();
+        assert_eq!(
+            command,
+            Command::NewWebviewCommand {
+                command: "cargo meta open".into(),
+                group: Some("work".into()),
+            }
+        );
+        assert_eq!(
+            parse_command("new-webview-command", &args(&["printf 'https://x'"])).unwrap(),
+            Command::NewWebviewCommand {
+                command: "printf 'https://x'".into(),
+                group: None,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_blank_new_webview_command() {
+        assert!(parse_command("new-webview-command", &args(&[])).is_err());
+        assert!(parse_command("new-webview-command", &args(&["   "])).is_err());
     }
 
     #[test]
