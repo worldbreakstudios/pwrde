@@ -46,6 +46,9 @@ pub enum TermEvent {
     OpenDir { cwd: std::path::PathBuf },
     /// `drop` failed; show `message` in the picker overlay.
     GroupFailed { message: String },
+    /// An `http(s)` URL handed to the app from outside (the app is registered
+    /// as a browser, or `open -a Pwrde https://…`): open it as a webview tab.
+    OpenUrl { url: String },
     /// A Wry top-level navigation committed; folded into the owning tab on
     /// the main thread so its address, title, and persisted URL stay current.
     WebviewNavigated { id: u64, url: String },

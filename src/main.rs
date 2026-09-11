@@ -5120,6 +5120,19 @@ impl App {
                     self.message = Some((format!("drop failed: {message}"), true));
                     redraw = true;
                 },
+                // A web page handed to us as a browser: a webview tab in the
+                // active group. The launch placeholder has no pane to hold a
+                // tab, so it is first replaced by a real group named for the
+                // site, exactly as `add_group` does for a directory.
+                TermEvent::OpenUrl { url } => {
+                    if self.is_empty_state() {
+                        self.add_group(workspace::webview_title(&url), None);
+                    }
+                    if let Err(error) = self.add_webview_tab_to_group(self.active, url) {
+                        self.message = Some((format!("open URL failed: {error}"), true));
+                    }
+                    redraw = true;
+                },
                 // A directory opened from outside the app (Finder, `open -a`, a
                 // `pwrde://` deep link, or argv). macOS brings the app forward
                 // on its own for these, so we just add the group.
@@ -7067,6 +7080,8 @@ fn main() {
             for url in urls {
                 if let Some(cwd) = parse_open_dir(&url) {
                     let _ = tx.send(TermEvent::OpenDir { cwd });
+                } else if let Ok(url) = crate::bus::validate_webview_url(&url) {
+                    let _ = tx.send(TermEvent::OpenUrl { url });
                 }
             }
         }

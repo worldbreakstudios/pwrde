@@ -14,7 +14,7 @@ The top-level pages (see `pages.rs`) are **Sessions** (the terminal workspace), 
 - `pwrde-cli <subcommand>` — drive a running app over the command bus (`pwrde-cli --help`). **Use the `/pwrde-cli` project skill (`.claude/skills/pwrde-cli/SKILL.md`) to verify changes against the real app** — dev-build launch, socket resolution, the command cheat-sheet, and the screenshot + `state` verification loop.
 - `cargo test` — run all tests. Tests are inline `#[cfg(test)]` modules in `src/*.rs`; there is no `tests/` directory.
 - `cargo test <name>` — run a single test or filter by substring.
-- `scripts/make-app.sh` — assemble `target/release/Pwrde.app` (requires `cargo build --release` first).
+- `scripts/make-app.sh` — assemble `target/release/Pwrde.app` (requires `cargo build --release` first). Ad-hoc signed by default; with `PWRDE_SIGN_IDENTITY` + `PWRDE_TEAM_ID` + `PWRDE_PROVISION_PROFILE` it produces a Developer ID build signed with `scripts/pwrde.entitlements.in`, whose restricted `web-browser.public-key-credential` entitlement (Apple grants it per team) is what lets webview tabs use passkeys. The bundle also registers `http`/`https` (Alternate rank), and URLs handed to the app open as webview tabs (`TermEvent::OpenUrl`).
 - `scripts/deploy.sh` — pull main, build, bundle, install to `/Applications`, and install `pwrde-cli` onto PATH (`$PWRDE_CLI_DIR`, else `~/.cargo/bin`, else `/usr/local/bin`). Refuses to run off the `main` branch.
 
 Builds compile through **sccache** (`.cargo/config.toml` sets `rustc-wrapper`), so a fresh worktree's first build pulls the gpui dependency tree from cache instead of recompiling it. sccache must be installed (`brew install sccache`) or cargo fails with "could not execute process `sccache`".
