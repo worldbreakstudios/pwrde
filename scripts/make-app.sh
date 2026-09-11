@@ -3,6 +3,21 @@
 #
 # Usage: scripts/make-app.sh
 # Produces: target/release/Pwrde.app  (double-clickable macOS app bundle)
+#
+# Signing. By default the bundle is ad-hoc signed, which launches locally but
+# carries no entitlements. To produce a Developer ID build whose embedded
+# WKWebView can use passkeys (Touch ID / iCloud Keychain), set all three:
+#
+#   PWRDE_SIGN_IDENTITY     "Developer ID Application: Name (TEAMID)" — see
+#                           `security find-identity -v -p codesigning`
+#   PWRDE_TEAM_ID           the 10-character team id from that identity
+#   PWRDE_PROVISION_PROFILE path to a .provisionprofile for ${BUNDLE_ID} that
+#                           carries com.apple.developer.web-browser.public-key-credential
+#
+# The entitlement is restricted: Apple grants it per team (Account Holder
+# request at https://developer.apple.com/contact/request/macos-browsers-passkeys/),
+# after which the profile is downloadable from the developer portal. Do not
+# add it to an ad-hoc build — macOS kills the process at launch.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -96,6 +111,23 @@ cat > "${APP_DIR}/Contents/Info.plist" <<PLIST
 				<string>pwrde</string>
 			</array>
 		</dict>
+		<dict>
+			<!-- Web pages open as webview tabs; declaring the schemes is one of
+			     Apple's criteria for the passkey entitlement above and lets
+			     the app be chosen as a browser. Alternate rank keeps it from
+			     claiming links by default. -->
+			<key>CFBundleURLName</key>
+			<string>Web page</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>http</string>
+				<string>https</string>
+			</array>
+		</dict>
 	</array>
 </dict>
 </plist>
@@ -103,9 +135,37 @@ PLIST
 
 echo "APPL????" > "${APP_DIR}/Contents/PkgInfo"
 
-# Ad-hoc codesign so macOS will launch it locally (Gatekeeper still warns on
-# first open since it's unsigned by a Developer ID / unnotarized).
-codesign --force --deep --sign - "${APP_DIR}" >/dev/null 2>&1 || \
-  echo "warning: codesign failed (ad-hoc); app may need a right-click > Open" >&2
+SIGN_IDENTITY="${PWRDE_SIGN_IDENTITY:-}"
+TEAM_ID="${PWRDE_TEAM_ID:-}"
+PROFILE="${PWRDE_PROVISION_PROFILE:-}"
+
+if [[ -n "${SIGN_IDENTITY}" || -n "${TEAM_ID}" || -n "${PROFILE}" ]]; then
+  if [[ -z "${SIGN_IDENTITY}" || -z "${TEAM_ID}" || -z "${PROFILE}" ]]; then
+    echo "error: PWRDE_SIGN_IDENTITY, PWRDE_TEAM_ID and PWRDE_PROVISION_PROFILE must all be set for a Developer ID build" >&2
+    exit 1
+  fi
+  if [[ ! -f "${PROFILE}" ]]; then
+    echo "error: provisioning profile not found: ${PROFILE}" >&2
+    exit 1
+  fi
+  # Developer ID build: the embedded profile authorizes the restricted
+  # passkey entitlement, and the entitlements' identifiers must match it.
+  cp "${PROFILE}" "${APP_DIR}/Contents/embedded.provisionprofile"
+  ENT_DIR="$(mktemp -d)"
+  trap 'rm -rf "${ENT_DIR}"' EXIT
+  ENTITLEMENTS="${ENT_DIR}/pwrde.entitlements"
+  sed -e "s/@TEAM_ID@/${TEAM_ID}/g" -e "s/@BUNDLE_ID@/${BUNDLE_ID}/g" \
+    scripts/pwrde.entitlements.in > "${ENTITLEMENTS}"
+  codesign --force --deep --options runtime --timestamp \
+    --sign "${SIGN_IDENTITY}" --entitlements "${ENTITLEMENTS}" "${APP_DIR}"
+  codesign --verify --deep --strict "${APP_DIR}"
+  echo "signed ${APP_DIR} with ${SIGN_IDENTITY} (passkey entitlement embedded)"
+else
+  # Ad-hoc codesign so macOS will launch it locally (Gatekeeper still warns on
+  # first open since it's unsigned by a Developer ID / unnotarized). No
+  # entitlements here on purpose — see the header.
+  codesign --force --deep --sign - "${APP_DIR}" >/dev/null 2>&1 || \
+    echo "warning: codesign failed (ad-hoc); app may need a right-click > Open" >&2
+fi
 
 echo "built ${APP_DIR} (v${VERSION})"

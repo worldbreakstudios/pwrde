@@ -94,6 +94,15 @@ pub fn primary_command() -> String {
     get_str("session.primary_command").unwrap_or_else(|| "claude".into())
 }
 
+/// Whether terminal sessions persist across app restarts (`terminal.persist`):
+/// shells run inside shpool and the group layout is snapshotted to SQLite.
+/// Defaults to **on** — losing every session on a restart is far worse than
+/// an unexpected shpool dependency, which [`crate::term::Session::new`]
+/// degrades gracefully around when the binary is missing.
+pub fn persist_sessions() -> bool {
+    get_bool("terminal.persist", true)
+}
+
 pub fn get_bool(key: &str, default: bool) -> bool {
     store()
         .read()
@@ -171,6 +180,13 @@ mod tests {
         // The global store is empty in tests (no init/set), so the unset key
         // must fall back to the default.
         assert_eq!(primary_command(), "claude");
+    }
+
+    #[test]
+    fn persist_sessions_defaults_to_on() {
+        // Losing every session on restart was the failure mode of an off
+        // default; an unset key must read as persisted.
+        assert!(persist_sessions());
     }
 
     #[test]

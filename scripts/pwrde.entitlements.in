@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Entitlements template for a Developer ID build of Pwrde.app. make-app.sh
+  substitutes @TEAM_ID@ / @BUNDLE_ID@ and signs with the result only when
+  PWRDE_SIGN_IDENTITY and PWRDE_PROVISION_PROFILE are set; ad-hoc builds
+  get no entitlements at all, because macOS SIGKILLs an ad-hoc binary that
+  claims the restricted web-browser entitlement below.
+-->
+<plist version="1.0">
+<dict>
+	<!-- Both identifiers must match the embedded provisioning profile. -->
+	<key>com.apple.application-identifier</key>
+	<string>@TEAM_ID@.@BUNDLE_ID@</string>
+	<key>com.apple.developer.team-identifier</key>
+	<string>@TEAM_ID@</string>
+	<!--
+	  Lets the embedded WKWebView use the platform authenticator (Touch ID /
+	  iCloud Keychain passkeys) for WebAuthn on any site. Granted by Apple per
+	  team through https://developer.apple.com/contact/request/macos-browsers-passkeys/
+	  (macOS 13.3+) and delivered as a managed capability in the profile.
+	-->
+	<key>com.apple.developer.web-browser.public-key-credential</key>
+	<true/>
+</dict>
+</plist>

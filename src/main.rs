@@ -971,6 +971,17 @@ impl App {
         false
     }
 
+    fn set_webview_title(&mut self, id: u64, title: String) -> bool {
+        for workspace in &mut self.workspaces {
+            for tile in workspace.root.tiles_mut() {
+                if let Some(tab) = tile.tabs.iter_mut().find(|tab| tab.webview_id() == Some(id)) {
+                    return tab.set_webview_title(title);
+                }
+            }
+        }
+        false
+    }
+
     fn open_new_webview_prompt(&mut self, mode: WebviewPromptMode) {
         self.command = None;
         self.webview_panel = None;
@@ -1086,7 +1097,7 @@ impl App {
     /// With persistence on, the shell runs inside a freshly named shpool
     /// session so it survives app restarts.
     fn spawn_session_in(&mut self, cwd: Option<&std::path::Path>) -> Session {
-        let shpool_session = if settings::get_bool("terminal.persist", false) {
+        let shpool_session = if settings::persist_sessions() {
             use std::time::{SystemTime, UNIX_EPOCH};
             let nanos = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -1130,7 +1141,7 @@ impl App {
     }
 
     fn persist_snapshot(&self) {
-        if !settings::get_bool("terminal.persist", false) {
+        if !settings::persist_sessions() {
             return;
         }
         let saved = persist::workspaces_to_saved(&self.workspaces);
@@ -5218,6 +5229,11 @@ impl App {
                         redraw = true;
                     }
                 },
+                TermEvent::WebviewTitleChanged { id, title } => {
+                    if self.set_webview_title(id, title) {
+                        redraw = true;
+                    }
+                },
                 TermEvent::WebviewFocused { id } => {
                     let tile = self.workspaces[self.active].root.tiles().iter().find_map(|tile| {
                         tile.active_tab()
@@ -5276,6 +5292,19 @@ impl App {
                     self.pending_group_profile = None;
                     self.pending_group_section = None;
                     self.message = Some((format!("drop failed: {message}"), true));
+                    redraw = true;
+                },
+                // A web page handed to us as a browser: a webview tab in the
+                // active group. The launch placeholder has no pane to hold a
+                // tab, so it is first replaced by a real group named for the
+                // site, exactly as `add_group` does for a directory.
+                TermEvent::OpenUrl { url } => {
+                    if self.is_empty_state() {
+                        self.add_group(workspace::webview_title(&url), None);
+                    }
+                    if let Err(error) = self.add_webview_tab_to_group(self.active, url) {
+                        self.message = Some((format!("open URL failed: {error}"), true));
+                    }
                     redraw = true;
                 },
                 // A directory opened from outside the app (Finder, `open -a`, a
@@ -7228,6 +7257,8 @@ fn main() {
             for url in urls {
                 if let Some(cwd) = parse_open_dir(&url) {
                     let _ = tx.send(TermEvent::OpenDir { cwd });
+                } else if let Ok(url) = crate::bus::validate_webview_url(&url) {
+                    let _ = tx.send(TermEvent::OpenUrl { url });
                 }
             }
         }
@@ -7521,7 +7552,7 @@ fn main() {
                     // With persistence on, reattach to the previous session's
                     // groups; otherwise launch into the empty state — no shell
                     // is spawned until the user starts a group (CTA or ⇧⌘T).
-                    if !(settings::get_bool("terminal.persist", false)
+                    if !(settings::persist_sessions()
                         && app.restore_workspaces())
                     {
                         app.workspaces.push(Workspace::placeholder());
