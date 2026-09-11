@@ -15,12 +15,14 @@ pub const TOOLBAR_H: f32 = 42.0;
 pub const SITE_PANEL_H: f32 = 116.0;
 pub const TOOLS_PANEL_H: f32 = 250.0;
 
-/// Chromium-style user agent for the native child views. WKWebView's default
-/// carries no `Version/`, `Safari/` or `Chrome/` product token, so sites like
-/// Google treat it as an unknown legacy browser and serve their fallback
-/// layouts; advertising a current Chrome on macOS gets the modern ones.
+/// Safari's own user agent for the native child views. WKWebView's default
+/// carries no `Version/` or `Safari/` product token, so sites like Google
+/// treat it as an unknown legacy browser and serve their fallback layouts.
+/// It must stay a *Safari* string rather than a Chrome one: the engine really
+/// is WebKit, and Google's sign-in refuses ("This browser or app may not be
+/// secure") when the advertised browser and the engine's fingerprint disagree.
 pub const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
-AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36";
+AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15";
 
 pub fn normalize_input(value: &str) -> Result<String, String> {
     let value = value.trim();
@@ -336,6 +338,16 @@ mod tests {
         let tiny = child_bounds(content, 2.0, 10_000.0);
         assert_eq!(tiny.y, 419.0);
         assert_eq!(tiny.h, 1.0);
+    }
+
+    #[test]
+    fn user_agent_is_safari_not_chrome() {
+        // Google's sign-in refuses a Chrome UA on a WebKit engine, while the
+        // WKWebView default (no Version/ or Safari/ token) gets legacy layouts.
+        assert!(USER_AGENT.contains(" Version/"));
+        assert!(USER_AGENT.contains(" Safari/"));
+        assert!(USER_AGENT.contains("AppleWebKit/605"));
+        assert!(!USER_AGENT.contains("Chrome/"));
     }
 
     #[test]
