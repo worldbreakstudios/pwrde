@@ -101,6 +101,9 @@ impl App {
             },
             Command::NewSession { cwd, base, layout } => self.bus_new_session(cwd, base, layout),
             Command::NewWebview { url, group } => self.bus_new_webview(url, group),
+        Command::NewWebviewCommand { command, group } => {
+            self.bus_new_webview_command(command, group)
+        }
             Command::SendText { text, group } => {
                 let idx = match group {
                     Some(g) => match self.find_group(&g) {
@@ -349,6 +352,28 @@ impl App {
         }))
     }
 
+    fn bus_new_webview_command(&mut self, command: String, group: Option<String>) -> Reply {
+        let command = command.trim().to_string();
+        let group_idx = match group {
+            Some(group) => match self.find_group(&group) {
+                Some(index) => index,
+                None => return Reply::err(format!("no group matches {group:?}")),
+            },
+            None => self.active,
+        };
+        let tab_id = match self.add_webview_command_tab_to_group(group_idx, command.clone()) {
+            Ok(id) => id,
+            Err(error) => return Reply::err(error),
+        };
+        Reply::success(json!({
+            "group": group_idx,
+            "tab": tab_id,
+            "kind": "webview",
+            "url": "about:blank",
+            "url_command": command,
+        }))
+    }
+
     /// Resolve a group by exact name, case-insensitive name, sidebar title,
     /// or 0-based index.
     fn find_group(&self, key: &str) -> Option<usize> {
@@ -423,6 +448,7 @@ impl App {
                                         "kind": "webview",
                                         "tab": tab.webview_id(),
                                         "url": tab.url(),
+                                        "url_command": tab.url_command(),
                                         "title": tab.title(),
                                         "active": ti == t.active,
                                     }),

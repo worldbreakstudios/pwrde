@@ -120,6 +120,7 @@ pub enum Action {
     SplitDown,
     NewTab,
     NewWebview,
+    NewWebviewFromCommand,
     NewGroup,
     Copy,
     Paste,
@@ -161,11 +162,12 @@ pub enum Action {
 
 impl Action {
     /// Keyboard-page row order.
-    pub const ALL: [Action; 41] = [
+    pub const ALL: [Action; 42] = [
         Action::SplitRight,
         Action::SplitDown,
         Action::NewTab,
         Action::NewWebview,
+        Action::NewWebviewFromCommand,
         Action::NewGroup,
         Action::Copy,
         Action::Paste,
@@ -212,6 +214,7 @@ impl Action {
             Action::SplitDown => "split_down",
             Action::NewTab => "new_tab",
             Action::NewWebview => "new_webview",
+            Action::NewWebviewFromCommand => "new_webview_from_command",
             Action::NewGroup => "new_group",
             Action::Copy => "copy",
             Action::Paste => "paste",
@@ -258,6 +261,7 @@ impl Action {
             Action::SplitDown => "Split stacked",
             Action::NewTab => "New tab",
             Action::NewWebview => "New webview…",
+            Action::NewWebviewFromCommand => "New webview from command…",
             Action::NewGroup => "New session…",
             Action::Copy => "Copy selection",
             Action::Paste => "Paste",
@@ -311,6 +315,8 @@ impl Action {
             Action::NewTab => (false, false, false, "t"),
             // Deliberately uncommon: the command palette is the primary entry.
             Action::NewWebview => (false, true, false, "b"),
+            // Deliberately uncommon: the command palette is the primary entry.
+            Action::NewWebviewFromCommand => (true, true, false, "b"),
             Action::NewGroup => (true, false, false, "t"),
             Action::Copy => (false, false, false, "c"),
             Action::Paste => (false, false, false, "v"),
