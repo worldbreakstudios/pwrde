@@ -38,6 +38,9 @@ impl App {
         if let Some((text, dismissable)) = self.message.as_ref() {
             return self.render_message(text, *dismissable, cx);
         }
+        if let Some((text, _)) = self.toast_note.as_ref() {
+            return self.render_toast_note(text, cx);
+        }
         div().into_any_element()
     }
 
@@ -153,6 +156,19 @@ impl App {
             .scrim(crate::renderer::color(chrome.scrim, 0.30))
             .on_backdrop_click(move |_ev, _win, app| backdrop_dismiss(app))
             .child(line)
+            .into_any_element()
+    }
+
+    /// Ephemeral informational toast (screenshot copied/saved): a standard
+    /// rcn `Toast` in a full-window `ToastViewport`. It is purely visual —
+    /// the viewport paints no scrim and intercepts no input (the toast is
+    /// excluded from `modal_overlay_open`, so keys and mouse pass through),
+    /// and `App::drain_events` expires it after `TOAST_NOTE_SECS`.
+    fn render_toast_note(&self, text: &str, cx: &mut Context<Self>) -> AnyElement {
+        cx.set_global(Theme::from_chrome(crate::theme::current()));
+
+        crate::ui::ToastViewport::new()
+            .child(crate::ui::Toast::new("toast-note", text.to_string()))
             .into_any_element()
     }
 }

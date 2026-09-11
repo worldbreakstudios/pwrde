@@ -431,6 +431,10 @@ struct App {
     /// A centered one-line message. `bool` is `dismissable`: false while `drop`
     /// provisions (input swallowed), true for a failure note the user can close.
     message: Option<(String, bool)>,
+    /// An ephemeral informational toast (screenshot copied/saved): rendered
+    /// as a standard rcn `Toast`, passing keys and clicks through, expiring
+    /// on its own timer instead of lingering until replaced.
+    toast_note: Option<(String, std::time::Instant)>,
     /// The open close-primary-pane confirmation dialog, or `None`.
     confirm: Option<ConfirmClose>,
     /// Primary-pane sessions awaiting their auto-run command, keyed by session
@@ -5171,6 +5175,12 @@ impl App {
     /// redraw is needed.
     fn drain_events(&mut self) -> bool {
         let mut redraw = false;
+        // Expire an ephemeral toast note on its own timer. The drain runs on
+        // the foreground executor every ~16ms, so the toast disappears within
+        // a frame of its deadline; redraw only flips on the expiry frame.
+        if self.toast_note_due() {
+            redraw = true;
+        }
         while let Ok(event) = self.events_rx.try_recv() {
             match event {
                 TermEvent::Wakeup(id) => {
@@ -7363,6 +7373,7 @@ fn main() {
                         pending_group_section: None,
                         save_ws: None,
                         message: None,
+                        toast_note: None,
                         confirm: None,
                         pending_primary_cmd: std::collections::HashMap::new(),
                         command_input: {

@@ -49,6 +49,7 @@ pub use kbd::Kbd;
 pub use label::Label;
 pub use switch::Switch;
 pub use table::{Table, TableBody, TableCell, TableRow};
+pub use toast::{Toast, ToastViewport};
 
 pub mod alert_dialog;
 pub mod assets;
@@ -69,3 +70,4 @@ pub mod separator;
 pub mod switch;
 pub mod table;
 pub mod theme;
+pub mod toast;
