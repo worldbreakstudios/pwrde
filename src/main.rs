@@ -431,6 +431,10 @@ struct App {
     /// A centered one-line message. `bool` is `dismissable`: false while `drop`
     /// provisions (input swallowed), true for a failure note the user can close.
     message: Option<(String, bool)>,
+    /// An ephemeral informational toast (screenshot copied/saved): rendered
+    /// as a standard rcn `Toast`, passing keys and clicks through, expiring
+    /// on its own timer instead of lingering until replaced.
+    toast_note: Option<(String, std::time::Instant)>,
     /// The open close-primary-pane confirmation dialog, or `None`.
     confirm: Option<ConfirmClose>,
     /// Primary-pane sessions awaiting their auto-run command, keyed by session
@@ -5171,6 +5175,12 @@ impl App {
     /// redraw is needed.
     fn drain_events(&mut self) -> bool {
         let mut redraw = false;
+        // Expire an ephemeral toast note on its own timer. The drain runs on
+        // the foreground executor every ~16ms, so the toast disappears within
+        // a frame of its deadline; redraw only flips on the expiry frame.
+        if self.toast_note_due() {
+            redraw = true;
+        }
         while let Ok(event) = self.events_rx.try_recv() {
             match event {
                 TermEvent::Wakeup(id) => {
@@ -6208,7 +6218,7 @@ impl App {
                 Some((self.cursor.0 as f32, self.cursor.1 as f32))
             };
             let mut flyover_hot = Vec::new();
-            let (quads, panes, fg_quads, labels) = self.renderer.flyover_overlay(
+            let (quads, panes, fg_quads) = self.renderer.flyover_overlay(
                 &self.flyover_tabs,
                 self.flyover_active,
                 &panel,
@@ -6217,14 +6227,13 @@ impl App {
                 true,
                 self.flyover_maximized,
                 flyover_cursor,
-                // The strip's pixels are an element tree (`flyover_ui`).
-                false,
+                // The strip's pixels are an element tree (`flyover_ui`); the
+                // canvas emits only the hot rects the mouse path resolves.
                 &mut flyover_hot,
             );
             frame.flyover_quads = quads;
             frame.flyover_panes = panes;
             frame.flyover_fg_quads = fg_quads;
-            frame.flyover_labels = labels;
             // The panel paints above the chrome, so its controls append last
             // (topmost) — but never over a modal overlay, which owns the frame.
             if !overlay_open {
@@ -6367,27 +6376,6 @@ impl App {
                 paint_quad(window, origin, inv, q, shadow_rgb);
             }
 
-            // 3.5) collapse carets. Quads can't rotate, so each chevron is a
-            // small filled gpui path: a V polyline thickened vertically, its
-            // points rotated around the caret center by the animated angle.
-            for c in &frame.carets {
-                let (sin, cos) = c.angle.sin_cos();
-                let pt = |x: f32, y: f32| Point::new(
-                    origin.x + px((c.cx + x * cos - y * sin) * inv),
-                    origin.y + px((c.cy + x * sin + y * cos) * inv),
-                );
-                let w = c.size;
-                let d = w * 0.55;
-                let t = w * 0.75;
-                let mut path = gpui::Path::new(pt(-w, -d));
-                path.line_to(pt(0.0, d));
-                path.line_to(pt(w, -d));
-                path.line_to(pt(w, -d + t));
-                path.line_to(pt(0.0, d + t));
-                path.line_to(pt(-w, -d + t));
-                window.paint_path(path, c.color);
-            }
-
             // 4) labels (tab titles, sidebar text, etc.).
             for label in &frame.labels {
                 let runs = [TextRun {
@@ -6423,8 +6411,6 @@ impl App {
                 font_size,
                 line_height,
                 cell_height,
-                chrome_font_size,
-                chrome_line_height,
                 shadow_rgb,
             };
             paint_flyover_layer(
@@ -6434,7 +6420,6 @@ impl App {
                 &frame.flyover_quads,
                 &frame.flyover_panes,
                 &frame.flyover_fg_quads,
-                &frame.flyover_labels,
             );
 
             // 5) The modal overlays (pickers, palette, save, confirm, message)
@@ -6607,15 +6592,13 @@ struct FlyoverPaintMetrics {
     font_size: Pixels,
     line_height: Pixels,
     cell_height: f32,
-    /// Chrome text metrics (flyover tab-strip labels).
-    chrome_font_size: Pixels,
-    chrome_line_height: Pixels,
     shadow_rgb: (u8, u8, u8),
 }
 
 /// Paint one flyover layer (card + tab-strip quads, terminal text, geometry
-/// quads, clipped labels). Shared by `paint_terminal`'s 4.5 step and the
-/// popout window's paint.
+/// quads). The strip's pixels ride the element tree, so this is canvas
+/// quads + terminal text only. Shared by `paint_terminal`'s 4.5 step and
+/// the popout window's paint.
 fn paint_flyover_layer(
     window: &mut Window,
     cx: &mut GpuiApp,
@@ -6623,7 +6606,6 @@ fn paint_flyover_layer(
     quads: &[renderer::Quad],
     panes: &[renderer::PaneText],
     fg_quads: &[renderer::Quad],
-    labels: &[renderer::LabelSpec],
 ) {
     for q in quads {
         paint_quad(window, m.origin, m.inv, q, m.shadow_rgb);
@@ -6658,32 +6640,6 @@ fn paint_flyover_layer(
     }
     for q in fg_quads {
         paint_quad(window, m.origin, m.inv, q, m.shadow_rgb);
-    }
-    for label in labels {
-        let runs = [TextRun {
-            len: label.text.len(),
-            font: m.font.clone(),
-            color: label.color,
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-        }];
-        let size = label.size.map_or(m.chrome_font_size, |s| px(s * m.inv));
-        let shaped = window.text_system().shape_line(label.text.clone().into(), size, &runs, None);
-        let p = Point::new(
-            m.origin.x + px(label.left * m.inv),
-            m.origin.y + px(label.top * m.inv),
-        );
-        let clip_bounds = Bounds {
-            origin: Point::new(
-                m.origin.x + px(label.clip.x * m.inv),
-                m.origin.y + px(label.clip.y * m.inv),
-            ),
-            size: Size::new(px(label.clip.w * m.inv), px(label.clip.h * m.inv)),
-        };
-        window.with_content_mask(Some(gpui::ContentMask { bounds: clip_bounds }), |window| {
-            let _ = shaped.paint(p, m.chrome_line_height, TextAlign::Left, None, window, cx);
-        });
     }
 }
 
@@ -6941,7 +6897,7 @@ impl FlyoverPopout {
             Some((self.cursor.0 as f32, self.cursor.1 as f32))
         };
         let mut hot = Vec::new();
-        let (quads, panes, fg_quads, labels) = self.app.update(cx, |app, _| {
+        let (quads, panes, fg_quads) = self.app.update(cx, |app, _| {
             // The popout owns these grids while windowed: keep the PTYs sized
             // to this window, not the main panel.
             for tab in &mut app.flyover_tabs {
@@ -6962,8 +6918,8 @@ impl FlyoverPopout {
                 false,
                 false,
                 popout_cursor,
-                // The popout paints its own strip on the canvas.
-                true,
+                // Strip pixels ride the element tree now; the canvas path
+                // only emits hot rects.
                 &mut hot,
             )
         });
@@ -6990,21 +6946,26 @@ impl FlyoverPopout {
             font_size: px(self.renderer.font_size() * inv),
             line_height: px(self.renderer.cell_height * inv),
             cell_height: self.renderer.cell_height,
-            chrome_font_size: px(self.renderer.chrome_font_size() * inv),
-            chrome_line_height: px(self.renderer.chrome_cell_height * inv),
             shadow_rgb: th.shadow,
         };
         let term_bg = self.renderer.term_scheme_bg();
         window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
             window.paint_quad(gpui::fill(bounds, renderer::color(term_bg, 1.0)));
-            paint_flyover_layer(window, cx, &metrics, &quads, &panes, &fg_quads, &labels);
+            paint_flyover_layer(window, cx, &metrics, &quads, &panes, &fg_quads);
         });
     }
 }
 
 impl Render for FlyoverPopout {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity();
+        let scale = window.scale_factor();
+        let panel = self.panel_rect();
+        let popout_cursor = if self.selecting {
+            None
+        } else {
+            Some((self.cursor.0 as f32, self.cursor.1 as f32))
+        };
         div()
             .size_full()
             .track_focus(&self.focus_handle)
@@ -7095,6 +7056,14 @@ impl Render for FlyoverPopout {
                     },
                 )
                 .size_full(),
+            )
+            // Flyover tab strip: pixels on the element tree, painted over the
+            // canvas (which fills the window with the terminal background);
+            // clicks and drags still resolve on the canvas rects underneath.
+            .child(
+                self.app.update(cx, |app, cx| {
+                    app.render_flyover_chrome_popout(panel, scale, popout_cursor, cx)
+                }),
             )
     }
 }
@@ -7404,6 +7373,7 @@ fn main() {
                         pending_group_section: None,
                         save_ws: None,
                         message: None,
+                        toast_note: None,
                         confirm: None,
                         pending_primary_cmd: std::collections::HashMap::new(),
                         command_input: {

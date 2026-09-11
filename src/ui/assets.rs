@@ -204,6 +204,25 @@ const ICONS: &[(&str, &[u8])] = &[
         "icons/circle-check.svg",
         br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/></svg>"##,
     ),
+    // Webview toolbar icons (lucide drawings shared across libraries for
+    // now, like the status icons above): reload, https lock, plain-http
+    // info, and the vertical ⋮ overflow. `currentColor` so `svg()` tints.
+    (
+        "icons/refresh.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></svg>"##,
+    ),
+    (
+        "icons/lock.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="11" x="3" y="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>"##,
+    ),
+    (
+        "icons/info.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg>"##,
+    ),
+    (
+        "icons/ellipsis-vertical.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="1"/><circle cx="12" cy="19" r="1"/><circle cx="12" cy="5" r="1"/></svg>"##,
+    ),
     // ── Sidebar chrome icons (Lucide, ISC) ───────────────────────────
     // The folders card and the sessions-list header: folder rows, the pin
     // caption, the new-folder / hide-folders / show-folders / focus chips
@@ -281,6 +300,164 @@ const ICONS: &[(&str, &[u8])] = &[
         "icons/git/pr-merged.svg",
         br##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><circle cx="4" cy="3.5" r="1.7"/><circle cx="4" cy="12.5" r="1.7"/><circle cx="12" cy="8" r="1.7"/><path d="M4 5.2v5.6"/><path d="M4 5.5c.4 2.3 2.6 2.5 6.1 2.5"/></svg>"##,
     ),
+    // ── Command palette / new-session flow icons (Lucide, ISC) ────────
+    // The palette's fork/worktree/branch stage tiles and summary: the
+    // fork glyph, the repo-root house, the worktree branch, the local
+    // terminal, the remote push arrow and the plain top-level dash.
+    // `currentColor` so `svg()` tints them.
+    (
+        "icons/git-fork.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><circle cx="18" cy="6" r="3"/><path d="M18 9v2c0 .6-.4 1-1 1H7c-.6 0-1-.4-1-1V9"/><path d="M12 12v3"/></svg>"##,
+    ),
+    (
+        "icons/house.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 21v-8a1 1 0 0 0-1-1h-4a1 1 0 0 0-1 1v8"/><path d="M3 10a2 2 0 0 1 .709-1.528l7-5.999a2 2 0 0 1 2.582 0l7 5.999A2 2 0 0 1 21 10v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>"##,
+    ),
+    (
+        "icons/git-branch.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="6" x2="6" y1="3" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg>"##,
+    ),
+    (
+        "icons/terminal.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" x2="20" y1="19" y2="19"/></svg>"##,
+    ),
+    (
+        "icons/arrow-up.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m5 12 7-7 7 7"/><path d="M12 19V5"/></svg>"##,
+    ),
+    (
+        "icons/minus.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/></svg>"##,
+    ),
+    // Command palette action icons (lucide, currentColor so `svg()` tints them).
+    (
+        "icons/x.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>"##,
+    ),
+    (
+        "icons/save.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15.2 3a2 2 0 0 1 1.4.6l3.8 3.8a2 2 0 0 1 .6 1.4V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z"/><path d="M17 21v-7a1 1 0 0 0-1-1H8a1 1 0 0 0-1 1v7"/><path d="M7 3v4a1 1 0 0 0 1 1h7"/></svg>"##,
+    ),
+    (
+        "icons/columns-2.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M12 3v18"/></svg>"##,
+    ),
+    (
+        "icons/rows-2.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M3 12h18"/></svg>"##,
+    ),
+    (
+        "icons/square-plus.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M8 12h8"/><path d="M12 8v8"/></svg>"##,
+    ),
+    (
+        "icons/globe.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/></svg>"##,
+    ),
+    (
+        "icons/square-terminal.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m7 11 2-2-2-2"/><path d="M11 13h4"/><rect width="18" height="18" x="3" y="3" rx="2"/></svg>"##,
+    ),
+    (
+        "icons/square-x.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="m15 9-6 6"/><path d="m9 9 6 6"/></svg>"##,
+    ),
+    (
+        "icons/chevron-up.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m18 15-6-6-6 6"/></svg>"##,
+    ),
+    (
+        "icons/chevron-left.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg>"##,
+    ),
+    (
+        "icons/circle-dot.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="1"/></svg>"##,
+    ),
+    (
+        "icons/arrow-left.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 19-7-7 7-7"/><path d="M19 12H5"/></svg>"##,
+    ),
+    (
+        "icons/arrow-down.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14"/><path d="m19 12-7 7-7-7"/></svg>"##,
+    ),
+    (
+        "icons/arrow-right.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>"##,
+    ),
+    (
+        "icons/chevrons-up.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m17 11-5-5-5 5"/><path d="m17 18-5-5-5 5"/></svg>"##,
+    ),
+    (
+        "icons/chevrons-down.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m7 6 5 5 5-5"/><path d="m7 13 5 5 5-5"/></svg>"##,
+    ),
+    (
+        "icons/folder-open.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2"/></svg>"##,
+    ),
+    (
+        "icons/arrow-down-to-line.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17V3"/><path d="m6 11 6 6 6-6"/><path d="M19 21H5"/></svg>"##,
+    ),
+    (
+        "icons/picture-in-picture-2.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 9V6a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h4"/><rect width="10" height="7" x="12" y="13" rx="2"/></svg>"##,
+    ),
+    (
+        "icons/command.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 6v12a3 3 0 1 0 3-3H6a3 3 0 1 0 3 3V6a3 3 0 1 0-3 3h12a3 3 0 1 0-3-3"/></svg>"##,
+    ),
+    (
+        "icons/power.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v10"/><path d="M18.4 6.6a9 9 0 1 1-12.77.04"/></svg>"##,
+    ),
+    (
+        "icons/copy.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>"##,
+    ),
+    (
+        "icons/clipboard.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="8" height="4" x="8" y="2" rx="1" ry="1"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/></svg>"##,
+    ),
+    (
+        "icons/arrow-up-right.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 7h10v10"/><path d="M7 17 17 7"/></svg>"##,
+    ),
+    (
+        "icons/asterisk.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 6v12"/><path d="M17.196 9 6.804 15"/><path d="m6.804 9 10.392 6"/></svg>"##,
+    ),
+    (
+        "icons/zoom-in.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/><path d="M11 8v6"/><path d="M8 11h8"/></svg>"##,
+    ),
+    (
+        "icons/zoom-out.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/><path d="M8 11h8"/></svg>"##,
+    ),
+    (
+        "icons/camera.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z"/><circle cx="12" cy="13" r="3"/></svg>"##,
+    ),
+    (
+        "icons/download.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/><path d="M12 15V3"/></svg>"##,
+    ),
+    (
+        "icons/history.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/></svg>"##,
+    ),
+    (
+        "icons/arrow-left-to-line.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 19V5"/><path d="m13 6-6 6 6 6"/><path d="M17 12H7"/></svg>"##,
+    ),
+    (
+        "icons/arrow-right-to-line.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 19V5"/><path d="m11 6 6 6-6 6"/><path d="M7 12h10"/></svg>"##,
+    ),
 ];
 
 /// Sidebar PR-state icons (see the table above).
@@ -294,6 +471,12 @@ pub const ICON_LOADER: &str = "icons/loader.svg";
 pub const ICON_ELLIPSIS: &str = "icons/ellipsis.svg";
 pub const ICON_CIRCLE_CHECK: &str = "icons/circle-check.svg";
 
+/// Webview toolbar icons (see the table above).
+pub const ICON_REFRESH: &str = "icons/refresh.svg";
+pub const ICON_LOCK: &str = "icons/lock.svg";
+pub const ICON_INFO: &str = "icons/info.svg";
+pub const ICON_ELLIPSIS_VERTICAL: &str = "icons/ellipsis-vertical.svg";
+
 /// Sidebar chrome icons (see the table above).
 pub const ICON_FOLDER: &str = "icons/folder.svg";
 pub const ICON_FOLDER_PLUS: &str = "icons/folder-plus.svg";
@@ -306,6 +489,48 @@ pub const ICON_PLUS: &str = "icons/plus.svg";
 pub const ICON_WRENCH: &str = "icons/wrench.svg";
 pub const ICON_CHEVRON_DOWN: &str = "icons/chevron-down.svg";
 pub const ICON_CHEVRON_RIGHT: &str = "icons/chevron-right.svg";
+
+/// Command palette / new-session flow icons (see the table above).
+pub const ICON_GIT_FORK: &str = "icons/git-fork.svg";
+pub const ICON_HOUSE: &str = "icons/house.svg";
+pub const ICON_GIT_BRANCH: &str = "icons/git-branch.svg";
+pub const ICON_TERMINAL: &str = "icons/terminal.svg";
+pub const ICON_ARROW_UP: &str = "icons/arrow-up.svg";
+pub const ICON_MINUS: &str = "icons/minus.svg";
+
+/// Command palette action icons (see the table above).
+pub const ICON_X: &str = "icons/x.svg";
+pub const ICON_SAVE: &str = "icons/save.svg";
+pub const ICON_COLUMNS_2: &str = "icons/columns-2.svg";
+pub const ICON_ROWS_2: &str = "icons/rows-2.svg";
+pub const ICON_SQUARE_PLUS: &str = "icons/square-plus.svg";
+pub const ICON_GLOBE: &str = "icons/globe.svg";
+pub const ICON_SQUARE_TERMINAL: &str = "icons/square-terminal.svg";
+pub const ICON_SQUARE_X: &str = "icons/square-x.svg";
+pub const ICON_CHEVRON_UP: &str = "icons/chevron-up.svg";
+pub const ICON_CHEVRON_LEFT: &str = "icons/chevron-left.svg";
+pub const ICON_CIRCLE_DOT: &str = "icons/circle-dot.svg";
+pub const ICON_ARROW_LEFT: &str = "icons/arrow-left.svg";
+pub const ICON_ARROW_DOWN: &str = "icons/arrow-down.svg";
+pub const ICON_ARROW_RIGHT: &str = "icons/arrow-right.svg";
+pub const ICON_CHEVRONS_UP: &str = "icons/chevrons-up.svg";
+pub const ICON_CHEVRONS_DOWN: &str = "icons/chevrons-down.svg";
+pub const ICON_FOLDER_OPEN: &str = "icons/folder-open.svg";
+pub const ICON_ARROW_DOWN_TO_LINE: &str = "icons/arrow-down-to-line.svg";
+pub const ICON_PICTURE_IN_PICTURE_2: &str = "icons/picture-in-picture-2.svg";
+pub const ICON_COMMAND: &str = "icons/command.svg";
+pub const ICON_POWER: &str = "icons/power.svg";
+pub const ICON_COPY: &str = "icons/copy.svg";
+pub const ICON_CLIPBOARD: &str = "icons/clipboard.svg";
+pub const ICON_ARROW_UP_RIGHT: &str = "icons/arrow-up-right.svg";
+pub const ICON_ASTERISK: &str = "icons/asterisk.svg";
+pub const ICON_ZOOM_IN: &str = "icons/zoom-in.svg";
+pub const ICON_ZOOM_OUT: &str = "icons/zoom-out.svg";
+pub const ICON_CAMERA: &str = "icons/camera.svg";
+pub const ICON_DOWNLOAD: &str = "icons/download.svg";
+pub const ICON_HISTORY: &str = "icons/history.svg";
+pub const ICON_ARROW_LEFT_TO_LINE: &str = "icons/arrow-left-to-line.svg";
+pub const ICON_ARROW_RIGHT_TO_LINE: &str = "icons/arrow-right-to-line.svg";
 
 pub struct Assets;
 

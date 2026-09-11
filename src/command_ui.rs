@@ -26,9 +26,13 @@ use gpui::{
 };
 
 use crate::App;
-use crate::command::{RootRow, Stage, StepState, Token};
+use crate::command::{action_icon, RootRow, Stage, StepState, Token};
 use crate::picker::{FolderKind, ForkScope, PickerRow};
 use crate::pwrspace::ProfileNode;
+use crate::ui::assets::{
+    ICON_ARROW_UP, ICON_CHEVRON_RIGHT, ICON_GIT_BRANCH, ICON_GIT_FORK, ICON_HOUSE, ICON_MINUS,
+    ICON_PIN, ICON_PLUS,
+};
 use crate::ui::theme::Theme;
 use crate::ui::{Badge, Button, ButtonSize, ButtonVariant, Kbd};
 
@@ -48,6 +52,20 @@ const LIST_MAX_H: f32 = 350.0;
 const LAYER_PRIORITY: usize = 4;
 
 /// A rounded tile for a glyph, the mock's 24px command glyph well.
+fn icon_tile(size: f32, radius: f32, bg: Hsla, fg: Hsla, icon: &str) -> gpui::Div {
+    div()
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(px(size))
+        .h(px(size))
+        .rounded(px(radius))
+        .bg(bg)
+        .text_color(fg)
+        .child(gpui::svg().path(icon).size(px(size * 0.5)))
+}
+
 fn glyph_tile(theme: &Theme, size: f32, radius: f32, bg: Hsla, fg: Hsla, glyph: impl Into<SharedString>) -> gpui::Div {
     let _ = theme;
     div()
@@ -200,7 +218,13 @@ impl App {
             .py(px(12.0))
             .border_b_1()
             .border_color(hairline)
-            .child(div().flex_none().text_size(px(13.0)).text_color(theme.muted_foreground).child("›"));
+            .child(
+                div().flex_none().text_color(theme.muted_foreground).child(
+                    gpui::svg()
+                        .path(theme.icons.chevron_right())
+                        .size(px(13.0)),
+                ),
+            );
         for tok in pal.tokens() {
             let (bg, fg, kind, label) = match tok {
                 Token::Command(label) => (theme.foreground.opacity(0.9), theme.background, None, label.to_string()),
@@ -247,10 +271,10 @@ impl App {
             let steps = pal.steps();
             let n = steps.len();
             for (i, (label, state)) in steps.into_iter().enumerate() {
-                let (dot_bg, dot_fg, mark, label_color) = match state {
-                    StepState::Done => (theme.primary, theme.primary_foreground, "✓".to_string(), theme.primary),
-                    StepState::Active => (theme.foreground, theme.background, (i + 1).to_string(), theme.foreground),
-                    StepState::Pending => (theme.foreground.opacity(0.12), theme.muted_foreground, (i + 1).to_string(), theme.muted_foreground),
+                let (dot_bg, dot_fg, done, label_color) = match state {
+                    StepState::Done => (theme.primary, theme.primary_foreground, true, theme.primary),
+                    StepState::Active => (theme.foreground, theme.background, false, theme.foreground),
+                    StepState::Pending => (theme.foreground.opacity(0.12), theme.muted_foreground, false, theme.muted_foreground),
                 };
                 rail = rail.child(
                     div()
@@ -269,7 +293,8 @@ impl App {
                                 .text_size(px(9.5))
                                 .font_weight(gpui::FontWeight::BOLD)
                                 .text_color(dot_fg)
-                                .child(mark),
+                                .when(done, |d| d.child(gpui::svg().path(theme.icons.check()).size(px(9.5))))
+                                .when(!done, |d| d.child((i + 1).to_string())),
                         )
                         .child(
                             div()
@@ -279,7 +304,16 @@ impl App {
                                 .child(label),
                         )
                         .when(i + 1 < n, |d| {
-                            d.child(div().mx(px(10.0)).text_size(px(11.0)).text_color(theme.muted_foreground.opacity(0.6)).child("›"))
+                            d.child(
+                                div()
+                                    .mx(px(10.0))
+                                    .text_color(theme.muted_foreground.opacity(0.6))
+                                    .child(
+                                        gpui::svg()
+                                            .path(theme.icons.chevron_right())
+                                            .size(px(11.0)),
+                                    ),
+                            )
                         }),
                 );
             }
@@ -333,7 +367,7 @@ impl App {
                         RootRow::Action(action) => {
                             let multi = crate::command::is_multi_step(*action);
                             row_shell(&theme, i, i == selected, on_pick.clone())
-                                .child(glyph_tile(&theme, 24.0, 6.0, chip_bg, theme.muted_foreground, crate::command::action_glyph(*action)))
+                                .child(icon_tile(24.0, 6.0, chip_bg, theme.muted_foreground, action_icon(*action)))
                                 .child(
                                     div()
                                         .text_size(px(13.0))
@@ -402,8 +436,8 @@ impl App {
                                     )
                                     .child(div().flex_1())
                                     .child({
-                                        // The pin toggle: a gold ★ on favorites, a faint
-                                        // ☆ otherwise; its press never selects the row.
+                                        // The pin toggle: a gold pin icon on favorites, a
+                                        // faint one otherwise; its press never selects the row.
                                         let star_entity = entity.clone();
                                         let path = entry.path.clone();
                                         div()
@@ -414,9 +448,8 @@ impl App {
                                             .items_center()
                                             .justify_center()
                                             .cursor_pointer()
-                                            .text_size(px(12.0))
                                             .text_color(if pinned { gpui::hsla(0.12, 0.85, 0.52, 1.0) } else { theme.muted_foreground.opacity(0.35) })
-                                            .child(if pinned { "★" } else { "☆" })
+                                            .child(gpui::svg().path(ICON_PIN).size(px(12.0)))
                                             .on_click(move |_ev: &ClickEvent, _win: &mut Window, app: &mut GpuiApp| {
                                                 app.stop_propagation();
                                                 if let Some(entity) = star_entity.upgrade() {
@@ -436,7 +469,14 @@ impl App {
                                                 .font_family(crate::renderer::FONT_FAMILY)
                                                 .text_size(px(11.0))
                                                 .text_color(theme.muted_foreground)
-                                                .child("\u{e0a0} git"),
+                                                .child(
+                                                    div()
+                                                        .flex()
+                                                        .items_center()
+                                                        .gap(px(3.0))
+                                                        .child(gpui::svg().path(ICON_GIT_BRANCH).size(px(11.0)))
+                                                        .child("git"),
+                                                ),
                                         )
                                     })
                                     .into_any_element()
@@ -449,12 +489,12 @@ impl App {
                 if let Some(base) = pal.base.as_ref() {
                     let mut last_group: Option<&'static str> = None;
                     for (i, entry) in base.rows.iter().enumerate() {
-                        let (group, glyph, meta) = match entry.scope {
-                            ForkScope::Default => ("Start fresh", "⑂", entry.from.clone().unwrap_or_else(|| "default branch".into())),
-                            ForkScope::RepoRoot => ("Start fresh", "⌂", "no worktree".into()),
-                            ForkScope::Worktree => ("Existing worktrees", "⎇", entry.path.as_ref().map(|p| p.to_string_lossy().to_string()).unwrap_or_default()),
-                            ForkScope::Local => ("Local branches", "⌥", "local".into()),
-                            ForkScope::Remote => ("Remote branches", "⇡", "remote".into()),
+                        let (group, icon, meta) = match entry.scope {
+                            ForkScope::Default => ("Start fresh", ICON_GIT_FORK, entry.from.clone().unwrap_or_else(|| "default branch".into())),
+                            ForkScope::RepoRoot => ("Start fresh", ICON_HOUSE, "no worktree".into()),
+                            ForkScope::Worktree => ("Existing worktrees", ICON_GIT_BRANCH, entry.path.as_ref().map(|p| p.to_string_lossy().to_string()).unwrap_or_default()),
+                            ForkScope::Local => ("Local branches", ICON_MINUS, "local".into()),
+                            ForkScope::Remote => ("Remote branches", ICON_ARROW_UP, "remote".into()),
                         };
                         if last_group != Some(group) {
                             list = list.child(caption(&theme, group));
@@ -462,7 +502,7 @@ impl App {
                         }
                         list = list.child(
                             row_shell(&theme, i, i == selected, on_pick.clone())
-                                .child(glyph_tile(&theme, 26.0, 7.0, chip_bg, theme.muted_foreground, glyph))
+                                .child(icon_tile(26.0, 7.0, chip_bg, theme.muted_foreground, icon))
                                 .child(
                                     div()
                                         .font_family(crate::renderer::FONT_FAMILY)
@@ -553,14 +593,14 @@ impl App {
                 if let Some(folder) = pal.folder.as_ref() {
                     let mut last_group: Option<&'static str> = None;
                     for (i, entry) in folder.rows.iter().enumerate() {
-                        let (group, glyph, tinted) = match &entry.kind {
-                            FolderKind::TopLevel => ("Session folder", "—".to_string(), false),
+                        let (group, icon, tinted) = match &entry.kind {
+                            FolderKind::TopLevel => ("Session folder", Some(ICON_MINUS), false),
                             FolderKind::Existing { .. } => (
                                 "Existing folders",
-                                if entry.emoji.is_empty() { "▸".to_string() } else { entry.emoji.clone() },
+                                if entry.emoji.is_empty() { Some(ICON_CHEVRON_RIGHT) } else { None },
                                 true,
                             ),
-                            FolderKind::New { .. } => ("Existing folders", "＋".to_string(), false),
+                            FolderKind::New { .. } => ("Existing folders", Some(ICON_PLUS), false),
                         };
                         if last_group != Some(group) {
                             list = list.child(caption(&theme, group));
@@ -573,7 +613,10 @@ impl App {
                         };
                         list = list.child(
                             row_shell(&theme, i, i == selected, on_pick.clone())
-                                .child(glyph_tile(&theme, 26.0, 7.0, tile_bg, tile_fg, glyph))
+                                .child(match icon {
+                                    Some(icon) => icon_tile(26.0, 7.0, tile_bg, tile_fg, icon),
+                                    None => glyph_tile(&theme, 26.0, 7.0, tile_bg, tile_fg, entry.emoji.clone()),
+                                })
                                 .child(
                                     div()
                                         .text_size(px(12.0))
@@ -614,7 +657,7 @@ impl App {
                                 .bg(theme.primary.opacity(0.07))
                                 .border_1()
                                 .border_color(theme.primary.opacity(0.2))
-                                .child(glyph_tile(&theme, 38.0, 19.0, theme.primary, theme.primary_foreground, "⑂"))
+                                .child(icon_tile(38.0, 19.0, theme.primary, theme.primary_foreground, ICON_GIT_FORK))
                                 .child(
                                     div()
                                         .flex_1()
