@@ -974,7 +974,7 @@ impl App {
     /// With persistence on, the shell runs inside a freshly named shpool
     /// session so it survives app restarts.
     fn spawn_session_in(&mut self, cwd: Option<&std::path::Path>) -> Session {
-        let shpool_session = if settings::get_bool("terminal.persist", false) {
+        let shpool_session = if settings::persist_sessions() {
             use std::time::{SystemTime, UNIX_EPOCH};
             let nanos = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -1018,7 +1018,7 @@ impl App {
     }
 
     fn persist_snapshot(&self) {
-        if !settings::get_bool("terminal.persist", false) {
+        if !settings::persist_sessions() {
             return;
         }
         let saved = persist::workspaces_to_saved(&self.workspaces);
@@ -7375,7 +7375,7 @@ fn main() {
                     // With persistence on, reattach to the previous session's
                     // groups; otherwise launch into the empty state — no shell
                     // is spawned until the user starts a group (CTA or ⇧⌘T).
-                    if !(settings::get_bool("terminal.persist", false)
+                    if !(settings::persist_sessions()
                         && app.restore_workspaces())
                     {
                         app.workspaces.push(Workspace::placeholder());

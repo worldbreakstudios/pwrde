@@ -522,7 +522,7 @@ fn render_tools(app: &App, theme: &Theme, entity: gpui::WeakEntity<App>) -> AnyE
 // ── Terminal ────────────────────────────────────────────────────────────
 
 fn render_terminal(theme: &Theme, entity: gpui::WeakEntity<App>) -> AnyElement {
-    let persist = settings::get_bool("terminal.persist", false);
+    let persist = settings::persist_sessions();
     let switch_entity = entity.clone();
     let toggle = Switch::new("terminal-persist")
         .checked(persist)
