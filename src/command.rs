@@ -732,53 +732,58 @@ pub fn action_group(action: Action) -> &'static str {
     }
 }
 
-/// A short glyph for each action (the root list's leading column).
-pub fn action_glyph(action: Action) -> &'static str {
+/// The standard rcn SVG asset (see [`crate::ui::assets`]) drawn for each
+/// action — the root list's leading column, replacing the hand-drawn glyphs
+/// this list previously supplied. Kept 1:1 with [`Action::ALL`]; a new
+/// variant without an arm here fails the palette test suite.
+pub fn action_icon(action: Action) -> &'static str {
+    use crate::ui::assets::*;
+
     match action {
-        Action::NewGroup => "✎",
-        Action::CloseGroup => "⨯",
-        Action::TogglePin => "⚑",
-        Action::SaveWorkspace => "⎙",
-        Action::SplitRight => "◫",
-        Action::SplitDown => "⬒",
-        Action::NewTab => "＋",
-        Action::NewWebview => "◎",
-        Action::NewWebviewFromCommand => "◎",
-        Action::CloseTab => "⌦",
-        Action::TogglePinTab => "⚑",
-        Action::ToggleWebviewToolbar => "▭",
-        Action::ToggleCollapse => "⌃",
-        Action::ToggleFocusOthers => "◎",
-        Action::PrevTile => "⊙",
-        Action::NextTile => "⊙",
-        Action::PrevTab => "‹",
-        Action::NextTab => "›",
-        Action::FocusLeft => "←",
-        Action::FocusDown => "↓",
-        Action::FocusUp => "↑",
-        Action::FocusRight => "→",
-        Action::PrevSidebarTab => "⇤",
-        Action::NextSidebarTab => "⇥",
-        Action::PrevPage => "⇈",
-        Action::NextPage => "⇊",
-        Action::ToggleSidebar => "⌷",
-        Action::ToggleFolders => "◱",
-        Action::ToggleFlyover => "⤓",
-        Action::FlyoverPopout => "⇱",
-        Action::OpenPrInGithub => "↗",
-        Action::ToggleFlow => "✳",
-        Action::IncreaseFontSize => "␣",
-        Action::DecreaseFontSize => "␡",
-        Action::OpenSettings => "⚙",
-        Action::Copy => "⧉",
-        Action::Paste => "⎘",
-        Action::Quit => "⏻",
-        Action::CommandPalette => "⌘",
-        Action::ScreenshotToClipboard => "◫",
-        Action::ScreenshotToFile => "⎙",
-        Action::NewSection => "▤",
-        Action::GoToSessions => "▣",
-        Action::GoToTool => ">_",
+        Action::NewGroup => ICON_PLUS,
+        Action::CloseGroup => ICON_X,
+        Action::TogglePin => ICON_PIN,
+        Action::SaveWorkspace => ICON_SAVE,
+        Action::SplitRight => ICON_COLUMNS_2,
+        Action::SplitDown => ICON_ROWS_2,
+        Action::NewTab => ICON_SQUARE_PLUS,
+        Action::NewWebview => ICON_GLOBE,
+        Action::NewWebviewFromCommand => ICON_SQUARE_TERMINAL,
+        Action::CloseTab => ICON_SQUARE_X,
+        Action::TogglePinTab => ICON_PIN,
+        Action::ToggleWebviewToolbar => ICON_PANEL_TOP,
+        Action::ToggleCollapse => ICON_CHEVRON_UP,
+        Action::ToggleFocusOthers => ICON_CIRCLE_DOT,
+        Action::PrevTile => ICON_CHEVRON_LEFT,
+        Action::NextTile => ICON_CHEVRON_RIGHT,
+        Action::PrevTab => ICON_ARROW_LEFT_TO_LINE,
+        Action::NextTab => ICON_ARROW_RIGHT_TO_LINE,
+        Action::FocusLeft => ICON_ARROW_LEFT,
+        Action::FocusDown => ICON_ARROW_DOWN,
+        Action::FocusUp => ICON_ARROW_UP,
+        Action::FocusRight => ICON_ARROW_RIGHT,
+        Action::PrevPage => ICON_CHEVRONS_UP,
+        Action::NextPage => ICON_CHEVRONS_DOWN,
+        Action::ToggleSidebar => ICON_PANEL_LEFT,
+        Action::ToggleFolders => ICON_FOLDER_OPEN,
+        Action::ToggleFlyover => ICON_ARROW_DOWN_TO_LINE,
+        Action::FlyoverPopout => ICON_PICTURE_IN_PICTURE_2,
+        Action::OpenSettings => ICON_SETTINGS,
+        Action::CommandPalette => ICON_COMMAND,
+        Action::Quit => ICON_POWER,
+        Action::PrevSidebarTab => ICON_CHEVRON_LEFT,
+        Action::NextSidebarTab => ICON_CHEVRON_RIGHT,
+        Action::Copy => ICON_COPY,
+        Action::Paste => ICON_CLIPBOARD,
+        Action::OpenPrInGithub => ICON_ARROW_UP_RIGHT,
+        Action::ToggleFlow => ICON_ASTERISK,
+        Action::IncreaseFontSize => ICON_ZOOM_IN,
+        Action::DecreaseFontSize => ICON_ZOOM_OUT,
+        Action::ScreenshotToClipboard => ICON_CAMERA,
+        Action::ScreenshotToFile => ICON_DOWNLOAD,
+        Action::NewSection => ICON_FOLDER_PLUS,
+        Action::GoToSessions => ICON_HISTORY,
+        Action::GoToTool => ICON_SQUARE_TERMINAL,
     }
 }
 
@@ -1232,5 +1237,27 @@ mod tests {
             launched.folder.map(|f| f.kind),
             Some(crate::picker::FolderKind::New { name: "infra".into() })
         );
+    }
+
+    #[test]
+    fn every_action_maps_to_a_registered_svg_asset() {
+        use gpui::AssetSource;
+
+        let assets = crate::ui::assets::Assets;
+        for action in Action::ALL {
+            let path = action_icon(action);
+            assert!(path.starts_with("icons/") && path.ends_with(".svg"), "{path}");
+            let bytes = assets
+                .load(path)
+                .expect("asset loading must not error")
+                .unwrap_or_else(|| panic!("{path} is not registered in Assets"));
+            assert!(!bytes.is_empty(), "{path} is empty");
+            assert!(
+                std::str::from_utf8(&bytes)
+                    .expect("asset is utf8")
+                    .contains("<svg"),
+                "{path} is not an svg document"
+            );
+        }
     }
 }
