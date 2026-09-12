@@ -71,6 +71,7 @@ impl App {
             .map(|(i, tab)| StripTab {
                 title: tab.title(),
                 unread: tab.unread,
+                pinned: tab.pinned,
                 tab: workspace::flyover_tab_rect(&panel, i, n, scale, maximized),
                 close: workspace::flyover_tab_close_rect(&panel, i, n, scale, maximized),
             })
@@ -213,6 +214,7 @@ impl App {
             .map(|(i, tab)| StripTab {
                 title: tab.title(),
                 unread: tab.unread,
+                pinned: tab.pinned,
                 tab: workspace::flyover_tab_rect(&panel, i, n, scale, false),
                 close: workspace::flyover_tab_close_rect(&panel, i, n, scale, false),
             })

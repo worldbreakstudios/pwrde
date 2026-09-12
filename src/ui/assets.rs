@@ -248,6 +248,12 @@ const ICONS: &[(&str, &[u8])] = &[
         "icons/panel-left.svg",
         br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/></svg>"##,
     ),
+    // Lucide panel-top: the "Show / hide title bar" palette icon (the webview
+    // toolbar sits along the tile's top edge the way this frame's bar does).
+    (
+        "icons/panel-top.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18"/></svg>"##,
+    ),
     (
         "icons/maximize.svg",
         br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M21 8V5a2 2 0 0 0-2-2h-3"/><path d="M3 16v3a2 2 0 0 0 2 2h3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/></svg>"##,
@@ -482,6 +488,7 @@ pub const ICON_FOLDER: &str = "icons/folder.svg";
 pub const ICON_FOLDER_PLUS: &str = "icons/folder-plus.svg";
 pub const ICON_PIN: &str = "icons/pin.svg";
 pub const ICON_PANEL_LEFT: &str = "icons/panel-left.svg";
+pub const ICON_PANEL_TOP: &str = "icons/panel-top.svg";
 pub const ICON_MAXIMIZE: &str = "icons/maximize.svg";
 pub const ICON_MINIMIZE: &str = "icons/minimize.svg";
 pub const ICON_SETTINGS: &str = "icons/settings.svg";

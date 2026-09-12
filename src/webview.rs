@@ -35,9 +35,11 @@ pub fn normalize_input(value: &str) -> Result<String, String> {
 }
 
 /// Convert the tile content rect (physical pixels) into the child-view rect,
-/// reserving logical pixels for the always-visible toolbar and optional panel.
-pub fn child_bounds(content: LayoutRect, scale: f32, panel_h: f32) -> LayoutRect {
-    let reserve = ((TOOLBAR_H + panel_h.max(0.0)) * scale).min((content.h - 1.0).max(0.0));
+/// reserving logical pixels for the browser toolbar (`0.0` when the tab hides
+/// its title bar) and optional panel.
+pub fn child_bounds(content: LayoutRect, scale: f32, toolbar_h: f32, panel_h: f32) -> LayoutRect {
+    let reserve =
+        ((toolbar_h.max(0.0) + panel_h.max(0.0)) * scale).min((content.h - 1.0).max(0.0));
     LayoutRect {
         x: content.x,
         y: content.y + reserve,
@@ -327,7 +329,7 @@ mod tests {
             h: 400.0,
         };
         assert_eq!(
-            child_bounds(content, 2.0, SITE_PANEL_H),
+            child_bounds(content, 2.0, TOOLBAR_H, SITE_PANEL_H),
             LayoutRect {
                 x: 10.0,
                 y: 336.0,
@@ -335,9 +337,53 @@ mod tests {
                 h: 84.0
             }
         );
-        let tiny = child_bounds(content, 2.0, 10_000.0);
+        let tiny = child_bounds(content, 2.0, TOOLBAR_H, 10_000.0);
         assert_eq!(tiny.y, 419.0);
         assert_eq!(tiny.h, 1.0);
+    }
+
+    #[test]
+    fn child_bounds_hidden_toolbar_fills_content_at_any_scale() {
+        let content = LayoutRect {
+            x: 4.0,
+            y: 6.0,
+            w: 300.0,
+            h: 200.0,
+        };
+        for scale in [0.5, 1.0, 2.0, 3.5] {
+            let bounds = child_bounds(content, scale, 0.0, 0.0);
+            // Independent invariant: a hidden toolbar reserves nothing, so the
+            // child view covers the content rect exactly.
+            assert_eq!(bounds.x, content.x);
+            assert_eq!(bounds.y, content.y);
+            assert_eq!(bounds.w, content.w);
+            assert_eq!(bounds.h, content.h);
+        }
+    }
+
+    #[test]
+    fn child_bounds_toolbar_never_eats_the_whole_tile() {
+        let content = LayoutRect {
+            x: 0.0,
+            y: 0.0,
+            w: 100.0,
+            h: 300.0,
+        };
+        // At scale 1 the toolbar reserves exactly its logical height.
+        let bounds = child_bounds(content, 1.0, TOOLBAR_H, 0.0);
+        assert_eq!(bounds.y, TOOLBAR_H);
+        assert_eq!(bounds.h, content.h - TOOLBAR_H);
+        // With a panel too, the reserve is clamped so the child keeps 1px and
+        // the child view always ends at the content's bottom edge.
+        let short = LayoutRect {
+            x: 0.0,
+            y: 0.0,
+            w: 100.0,
+            h: 30.0,
+        };
+        let clamped = child_bounds(short, 1.0, TOOLBAR_H, 10_000.0);
+        assert_eq!(clamped.y, short.y + short.h - 1.0);
+        assert_eq!(clamped.h, 1.0);
     }
 
     #[test]

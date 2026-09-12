@@ -697,6 +697,8 @@ pub fn action_group(action: Action) -> &'static str {
         | Action::NewWebview
         | Action::NewWebviewFromCommand
         | Action::CloseTab
+        | Action::TogglePinTab
+        | Action::ToggleWebviewToolbar
         | Action::ToggleCollapse
         | Action::ToggleFocusOthers => "Tiles",
         Action::PrevTile
@@ -748,6 +750,8 @@ pub fn action_icon(action: Action) -> &'static str {
         Action::NewWebview => ICON_GLOBE,
         Action::NewWebviewFromCommand => ICON_SQUARE_TERMINAL,
         Action::CloseTab => ICON_SQUARE_X,
+        Action::TogglePinTab => ICON_PIN,
+        Action::ToggleWebviewToolbar => ICON_PANEL_TOP,
         Action::ToggleCollapse => ICON_CHEVRON_UP,
         Action::ToggleFocusOthers => ICON_CIRCLE_DOT,
         Action::PrevTile => ICON_CHEVRON_LEFT,

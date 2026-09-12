@@ -52,6 +52,9 @@ pub struct WebviewTab {
     /// or absent while a document is loading, so `Tab::title` falls back to
     /// the URL-derived label. Runtime-only: it arrives again on every load.
     pub title: Option<String>,
+    /// Whether the tab's own back/forward/reload/URL toolbar is collapsed so
+    /// the page fills the tile. Persisted; terminals have no toolbar.
+    pub toolbar_hidden: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,9 +75,33 @@ pub struct Tab {
     /// and by an on-screen pane's attention signal, which stamps without
     /// dotting — so a stamp does not imply the tab is currently unread.
     pub unread_at: Option<std::time::SystemTime>,
+    /// Browser-style pin: pinned tabs sort to the FRONT of their tile's tab
+    /// strip, keep their full title, and cannot be closed. Persisted.
+    pub pinned: bool,
 }
 
 impl Tab {
+    /// Whether this tab draws its back/forward/reload/URL toolbar. Only
+    /// webview tabs have one; terminals always report `false`.
+    pub fn toolbar_hidden(&self) -> bool {
+        match &self.content {
+            TabContent::Terminal(_) => false,
+            TabContent::Webview(webview) => webview.toolbar_hidden,
+        }
+    }
+
+    /// Collapse (`hidden = true`) or restore the tab's webview toolbar.
+    /// Returns whether the state changed; terminal tabs have no toolbar and
+    /// always report `false`.
+    pub fn set_toolbar_hidden(&mut self, hidden: bool) -> bool {
+        let TabContent::Webview(webview) = &mut self.content else { return false };
+        if webview.toolbar_hidden == hidden {
+            return false;
+        }
+        webview.toolbar_hidden = hidden;
+        true
+    }
+
     pub fn new(session: Session) -> Self {
         Self {
             content: TabContent::Terminal(session),
@@ -82,6 +109,7 @@ impl Tab {
             rows: 0,
             unread: false,
             unread_at: None,
+            pinned: false,
         }
     }
 
@@ -93,11 +121,18 @@ impl Tab {
     /// materialized from. Runtime-only metadata: see [`WebviewTab::url_command`].
     pub fn webview_with_command(id: u64, url: String, url_command: Option<String>) -> Self {
         Self {
-            content: TabContent::Webview(WebviewTab { id, url, url_command, title: None }),
+            content: TabContent::Webview(WebviewTab {
+                id,
+                url,
+                url_command,
+                title: None,
+                toolbar_hidden: false,
+            }),
             cols: 0,
             rows: 0,
             unread: false,
             unread_at: None,
+            pinned: false,
         }
     }
 
@@ -217,6 +252,63 @@ impl Tile {
 
     pub fn active_tab_mut(&mut self) -> Option<&mut Tab> {
         self.tabs.get_mut(self.active)
+    }
+
+    /// Number of pinned tabs: tabs are kept ordered pinned-first, so this is
+    /// the leading run of `pinned` tabs.
+    pub fn pinned_count(&self) -> usize {
+        self.tabs.iter().take_while(|tab| tab.pinned).count()
+    }
+
+    /// Insert `tab` as close to `index` as the pinned-first order allows: a
+    /// pinned tab never lands after an unpinned one and an unpinned tab never
+    /// lands inside the pinned run. Returns where it landed. This is the one
+    /// entry for drops and moves, so the invariant survives every path.
+    pub fn insert_tab(&mut self, index: usize, tab: Tab) -> usize {
+        let run = self.pinned_count();
+        let index = if tab.pinned { index.min(run) } else { index.clamp(run, self.tabs.len()) };
+        self.tabs.insert(index, tab);
+        index
+    }
+
+    /// Pin or unpin the tab at `i`, keeping the tile's tabs ordered
+    /// pinned-first: pinning moves the tab to the END of the pinned run,
+    /// unpinning to the START of the unpinned run. The tile's `active` index
+    /// follows the moved tab; other tabs keep their relative order. Returns
+    /// the tab's new index — the old one unchanged when the flag already
+    /// matches — or `None` for an out-of-range index.
+    pub fn set_tab_pinned(&mut self, i: usize, pinned: bool) -> Option<usize> {
+        if i >= self.tabs.len() {
+            return None;
+        }
+        if self.tabs[i].pinned == pinned {
+            return Some(i);
+        }
+        let run = self.pinned_count();
+        let tab = self.tabs.remove(i);
+        let was_active = self.active == i;
+        // After the removal the surviving pinned run is `0..run`, where `run`
+        // counts the pinned tabs BEFORE the flip (the moved tab is excluded:
+        // it sat below the run when pinning, inside it when unpinning), so
+        // the insertion point lands exactly on the run's boundary.
+        let j = if pinned { run } else { run - 1 };
+        self.tabs.insert(j, tab);
+        self.tabs[j].pinned = pinned;
+        if was_active {
+            self.active = j;
+        } else {
+            // Compensate `active` for the remove-then-insert shifting the
+            // tabs between the old and new positions.
+            let mut a = self.active;
+            if i < a {
+                a -= 1;
+            }
+            if j <= a {
+                a += 1;
+            }
+            self.active = a;
+        }
+        Some(j)
     }
 }
 
@@ -2203,6 +2295,150 @@ fn collect_collapse_axis(node: &Node, parent_dir: Option<Dir>, out: &mut Vec<(u6
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn term_tile(tabs: usize) -> Tile {
+        let mut tile = Tile::empty(1);
+        for _ in 0..tabs {
+            tile.tabs.push(Tab::new(Session::placeholder()));
+        }
+        tile
+    }
+
+    fn labels(tile: &Tile) -> Vec<bool> {
+        tile.tabs.iter().map(|tab| tab.pinned).collect()
+    }
+
+    #[test]
+    fn set_tab_pinned_moves_tab_to_partition_boundary() {
+        // Pinning the middle tab of an all-unpinned strip puts it at the end
+        // of the (newly created) pinned run, i.e. the front of the strip.
+        let mut tile = term_tile(3);
+        assert_eq!(tile.pinned_count(), 0);
+        assert_eq!(tile.set_tab_pinned(1, true), Some(0));
+        assert_eq!(labels(&tile), vec![true, false, false]);
+        assert_eq!(tile.pinned_count(), 1);
+        // Pinning another tab appends it after the existing pinned run.
+        assert_eq!(tile.set_tab_pinned(2, true), Some(1));
+        assert_eq!(labels(&tile), vec![true, true, false]);
+        // Unpinning the second pinned tab moves it to the START of the
+        // unpinned run, directly after the remaining pinned one.
+        assert_eq!(tile.set_tab_pinned(1, false), Some(1));
+        assert_eq!(labels(&tile), vec![true, false, false]);
+        // Unpinning the last pinned tab drops the run to zero; the tab
+        // stays at the front of the (now fully unpinned) strip.
+        assert_eq!(tile.set_tab_pinned(0, false), Some(0));
+        assert_eq!(labels(&tile), vec![false, false, false]);
+        assert_eq!(tile.pinned_count(), 0);
+    }
+
+    #[test]
+    fn insert_tab_clamps_into_the_matching_run() {
+        // Strip: [pinned, pinned, unpinned].
+        let mut tile = term_tile(3);
+        tile.set_tab_pinned(0, true);
+        tile.set_tab_pinned(1, true);
+        // An unpinned drop aimed at the front lands right after the pins.
+        let unpinned = Tab::new(Session::placeholder());
+        assert_eq!(tile.insert_tab(0, unpinned), 2);
+        assert_eq!(labels(&tile), vec![true, true, false, false]);
+        // A pinned drop aimed at the end lands at the end of the pinned run.
+        let mut pinned = Tab::new(Session::placeholder());
+        pinned.pinned = true;
+        assert_eq!(tile.insert_tab(99, pinned), 2);
+        assert_eq!(labels(&tile), vec![true, true, true, false, false]);
+        // Inside the right run the requested index is honoured.
+        let mut pinned = Tab::new(Session::placeholder());
+        pinned.pinned = true;
+        assert_eq!(tile.insert_tab(1, pinned), 1);
+        let unpinned = Tab::new(Session::placeholder());
+        assert_eq!(tile.insert_tab(5, unpinned), 5);
+        assert_eq!(tile.pinned_count(), 4);
+    }
+
+    #[test]
+    fn set_tab_pinned_no_ops_and_rejects_invalid_indexes() {
+        let mut tile = term_tile(2);
+        // Already in the requested state: index unchanged, tab not moved.
+        assert_eq!(tile.set_tab_pinned(0, false), Some(0));
+        assert_eq!(labels(&tile), vec![false, false]);
+        // Pinning the trailing tab moves it to the FRONT (end of the empty
+        // pinned run); pinning it again at its new index is a no-op.
+        assert_eq!(tile.set_tab_pinned(1, true), Some(0));
+        assert_eq!(labels(&tile), vec![true, false]);
+        assert_eq!(tile.set_tab_pinned(1, true), Some(1));
+        assert_eq!(labels(&tile), vec![true, true]);
+        // Out-of-range indexes (and the empty tile) report failure.
+        assert_eq!(tile.set_tab_pinned(2, true), None);
+        assert_eq!(Tile::empty(9).set_tab_pinned(0, true), None);
+    }
+
+    #[test]
+    fn set_tab_pinned_active_follows_the_moved_tab() {
+        // Active ON the moved tab: pinning drags the selection with it.
+        let mut tile = term_tile(3);
+        tile.active = 1;
+        assert_eq!(tile.set_tab_pinned(1, true), Some(0));
+        assert_eq!(tile.active, 0);
+        assert!(tile.active_tab().unwrap().pinned);
+        // Unpinning it again keeps it at the front of the strip with the
+        // selection still on it.
+        assert_eq!(tile.set_tab_pinned(0, false), Some(0));
+        assert_eq!(tile.active, 0);
+
+        // Active AFTER the moved tab: shift compensation keeps it on the
+        // same tab across the remove-then-insert.
+        let mut tile = term_tile(3);
+        tile.active = 2;
+        assert_eq!(tile.set_tab_pinned(0, true), Some(0));
+        assert_eq!(labels(&tile), vec![true, false, false]);
+        assert_eq!(tile.active, 2);
+
+        // Active BETWEEN old and new positions while unpinning a pinned tab.
+        let mut tile = term_tile(3);
+        tile.tabs[0].pinned = true;
+        tile.tabs[1].pinned = true;
+        tile.active = 2;
+        assert_eq!(tile.set_tab_pinned(1, false), Some(1));
+        assert_eq!(labels(&tile), vec![true, false, false]);
+        assert_eq!(tile.active, 2);
+    }
+
+    #[test]
+    fn set_tab_pinned_keeps_other_tabs_around_active_stable() {
+        // Moving a tab on either side of the active one must not change
+        // which tab the tile considers active.
+        let mut tile = term_tile(4);
+        tile.active = 2;
+        // A LATER tab is pinned past the active one: the selection shifts
+        // right with the strip but still names the same tab.
+        assert_eq!(tile.set_tab_pinned(3, true), Some(0));
+        assert_eq!(tile.active, 3);
+        // An EARLIER unpinned tab joins the run in front of the active one.
+        assert_eq!(tile.set_tab_pinned(1, true), Some(1));
+        assert_eq!(tile.active, 3);
+        assert_eq!(labels(&tile), vec![true, true, false, false]);
+    }
+
+    #[test]
+    fn toolbar_hidden_is_terminal_safe() {
+        let mut terminal = Tab::new(Session::placeholder());
+        assert!(!terminal.toolbar_hidden());
+        // Terminals have no toolbar: the setter is a no-op reporting no
+        // change, and the getter stays false.
+        assert!(!terminal.set_toolbar_hidden(true));
+        assert!(!terminal.toolbar_hidden());
+
+        let mut webview = Tab::webview(3, "https://example.com".into());
+        assert!(!webview.toolbar_hidden());
+        assert!(webview.set_toolbar_hidden(true));
+        assert!(webview.toolbar_hidden());
+        // Setting the same state again reports no change.
+        assert!(!webview.set_toolbar_hidden(true));
+        assert!(webview.set_toolbar_hidden(false));
+        assert!(!webview.toolbar_hidden());
+        assert!(!webview.set_toolbar_hidden(false));
+    }
+
 
     #[test]
     fn placeholder_is_empty() {

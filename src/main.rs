@@ -23,6 +23,7 @@ mod claude_hooks;
 mod cli_tools;
 mod command;
 mod command_ui;
+mod context_menu;
 mod features;
 mod flow;
 mod flow_ui;
@@ -112,6 +113,17 @@ fn proc_title_due(
     since_renew: std::time::Duration,
 ) -> Option<bool> {
     (since_poll >= PROC_TITLE_POLL).then_some(since_renew >= PROC_TITLE_REFRESH)
+}
+
+/// What a right-click landed on, resolved before its native context menu
+/// opens (`App::on_right_mouse_down`) and re-validated when the pick lands
+/// (`App::apply_context_menu`), since the menu blocks in AppKit meanwhile.
+#[derive(Clone, Copy, Debug)]
+enum MenuTarget {
+    /// Tab `tab` of tile `tile` in workspace `ws`.
+    Tab { ws: usize, tile: u64, tab: usize },
+    /// The sidebar session row of workspace `ws`.
+    Group { ws: usize },
 }
 
 /// A drop landing zone resolved from the pointer during a tab drag.
@@ -1082,7 +1094,8 @@ impl App {
                     continue;
                 }
                 let panel_h = webview_ui::panel_height(self.webview_panel.as_ref(), id);
-                let bounds = webview::child_bounds(content, self.scale(), panel_h);
+                let toolbar_h = if tab.toolbar_hidden() { 0.0 } else { webview::TOOLBAR_H };
+                let bounds = webview::child_bounds(content, self.scale(), toolbar_h, panel_h);
                 placements.push(webview::Placement { id, url: url.to_string(), bounds });
                 if tile_id == ws.focused_tile {
                     focus = Some(id);
@@ -1225,8 +1238,8 @@ impl App {
                     tabs.iter().filter(|t| t.tile_id == *tile).collect();
                 saved.sort_by_key(|t| t.tab_index);
                 let mut restored = Tile::empty(tile_id);
-                restored.active = saved.iter().position(|st| st.active).unwrap_or(0);
-                for st in &saved {
+                let active_saved = saved.iter().position(|st| st.active).unwrap_or(0);
+                for (saved_i, st) in saved.iter().enumerate() {
                     let mut tab = match st.kind {
                         persist::SavedTabKind::Webview => {
                             match st
@@ -1249,7 +1262,17 @@ impl App {
                     };
                     tab.unread = st.unread;
                     tab.unread_at = persist::from_epoch_secs(st.unread_at);
+                    tab.set_toolbar_hidden(st.toolbar_hidden);
                     restored.tabs.push(tab);
+                    // The saved selection is set as its tab lands; pinning
+                    // (below, for this or a later tab) keeps `active` on the
+                    // same tab as the pinned run reorders the strip.
+                    if saved_i == active_saved {
+                        restored.active = restored.tabs.len() - 1;
+                    }
+                    if st.pinned {
+                        restored.set_tab_pinned(restored.tabs.len() - 1, true);
+                    }
                 }
                 restored.collapsed = *collapsed;
                 restored.collapse_anim = if *collapsed { 1.0 } else { 0.0 };
@@ -1671,6 +1694,8 @@ impl App {
         tile.active = ti;
         ws.focused_tile = id;
         if close && n > 0 {
+            // Pinned tabs render no × chip, so a refusal (the `false` return)
+            // cannot happen from here; the bus/⌘W path reports it instead.
             self.close_active_tab();
             return;
         }
@@ -1785,13 +1810,19 @@ impl App {
         self.cursor = (f64::from(position.x) * s, f64::from(position.y) * s);
     }
 
-    fn close_active_tab(&mut self) {
+    /// Returns false when nothing could close: no tab, or a pinned one.
+    fn close_active_tab(&mut self) -> bool {
         let ws = &mut self.workspaces[self.active];
         let focused = ws.focused_tile;
         let primary = ws.primary_tile;
-        let Some(tile) = ws.root.find_tile_mut(focused) else { return };
+        let Some(tile) = ws.root.find_tile_mut(focused) else { return false };
         if tile.tabs.is_empty() {
-            return;
+            return false;
+        }
+        // A pinned tab is "keep this open": ⌘W, the × and bus closes all
+        // stop here until it is unpinned.
+        if tile.tabs[tile.active].pinned {
+            return false;
         }
         // Closing the primary pane closes the whole group — confirm first.
         if focused == primary && tile.tabs.len() == 1 {
@@ -1800,7 +1831,7 @@ impl App {
                 action: ConfirmAction::CloseGroup { primary_tile: primary },
             });
             self.request_redraw();
-            return;
+            return true;
         }
         let tab_idx = tile.active;
         let tab = tile.tabs.remove(tab_idx);
@@ -1834,6 +1865,7 @@ impl App {
         self.sync_layout();
         self.request_redraw();
         self.persist_snapshot();
+        true
     }
 
     /// ⌘⇧W: close the active group from any focused pane, through the same
@@ -2406,11 +2438,13 @@ impl App {
         }
     }
 
-    /// Right-click marks things unread again — the "come back to this later"
-    /// gesture. A sidebar group card re-dots its primary pane's active tab
-    /// (the same tab the card's dot mirrors); a tile tab re-dots that tab.
-    /// Never changes focus.
-    fn on_right_mouse_down(&mut self) {
+    /// Right-click opens a native context menu on what is under the cursor.
+    /// A sidebar session row offers "Mark as unread" (re-dots its primary
+    /// pane's active tab, the one the row's dot mirrors) and pin / unpin
+    /// group; a tile tab offers "Mark as unread", pin / unpin tab, and — for
+    /// a webview — hide / show its title bar. Never changes focus. The hit is
+    /// resolved here; the menu itself is shown by [`App::show_context_menu`].
+    fn on_right_mouse_down(&mut self, window: &Window, cx: &mut Context<Self>) {
         // A mouse-tracking TUI under the cursor gets the right-click as a
         // report (before any sidebar context handling below).
         if self.try_forward_secondary_press(MouseBtn::Right) {
@@ -2424,8 +2458,10 @@ impl App {
         {
             return;
         }
+        let Some(view) = context_menu::ns_view(window) else { return };
         let scale = self.scale();
         let (px, py) = (self.cursor.0 as f32, self.cursor.1 as f32);
+        let at = (px / scale, py / scale);
         let (_, h) = self.renderer.surface_size();
 
         if workspace::sidebar(h, scale, self.sidebar_w()).contains(px, py) {
@@ -2443,16 +2479,25 @@ impl App {
                     continue;
                 }
                 let workspace::SidebarRow { ws_idx } = *row;
-                let ws = &mut self.workspaces[ws_idx];
-                let primary = ws.primary_tile;
-                if let Some(tab) = ws.root.find_tile_mut(primary).and_then(|t| t.active_tab_mut())
-                    && !tab.unread
-                {
-                    tab.unread = true;
-                    tab.unread_at = Some(SystemTime::now());
-                    self.persist_snapshot();
-                    self.request_redraw();
-                }
+                let ws = &self.workspaces[ws_idx];
+                let unread = ws
+                    .root
+                    .find_tile(ws.primary_tile)
+                    .and_then(|t| t.active_tab())
+                    .is_some_and(|tab| tab.unread);
+                let items = vec![
+                    context_menu::MenuItem {
+                        title: "Mark as unread".into(),
+                        enabled: !unread,
+                        separator_after: true,
+                    },
+                    context_menu::MenuItem {
+                        title: if ws.pinned { "Unpin group" } else { "Pin group" }.into(),
+                        enabled: true,
+                        separator_after: false,
+                    },
+                ];
+                self.show_context_menu(view, at, MenuTarget::Group { ws: ws_idx }, items, window, cx);
                 return;
             }
             return;
@@ -2470,24 +2515,122 @@ impl App {
                 continue;
             }
             let has_caret = axes.iter().any(|(tid, a)| tid == id && a.is_some());
-            if let Some(tile) = self.workspaces[self.active].root.find_tile_mut(*id) {
+            if let Some(tile) = ws.root.find_tile(*id) {
                 let n = tile.tabs.len();
                 if n == 0 {
                     return;
                 }
                 let t0 = workspace::tile_tab_rect(&strip, 0, n, scale, has_caret);
                 let ti = ((((px - t0.x).max(0.0)) / t0.w).floor() as usize).min(n - 1);
-                if let Some(tab) = tile.tabs.get_mut(ti)
-                    && !tab.unread
-                {
-                    tab.unread = true;
-                    tab.unread_at = Some(SystemTime::now());
-                    self.persist_snapshot();
-                    self.request_redraw();
+                let tab = &tile.tabs[ti];
+                let mut items = vec![
+                    context_menu::MenuItem {
+                        title: "Mark as unread".into(),
+                        enabled: !tab.unread,
+                        separator_after: true,
+                    },
+                    context_menu::MenuItem {
+                        title: if tab.pinned { "Unpin tab" } else { "Pin tab" }.into(),
+                        enabled: true,
+                        separator_after: false,
+                    },
+                ];
+                if tab.kind() == workspace::TabKind::Webview {
+                    items.push(context_menu::MenuItem {
+                        title: if tab.toolbar_hidden() { "Show title bar" } else { "Hide title bar" }
+                            .into(),
+                        enabled: true,
+                        separator_after: false,
+                    });
                 }
+                let target = MenuTarget::Tab { ws: self.active, tile: *id, tab: ti };
+                self.show_context_menu(view, at, target, items, window, cx);
             }
             return;
         }
+    }
+
+    /// Pop the native menu for `target` outside gpui's borrow (see
+    /// `context_menu`'s header): the future runs `pop_up` between polls, then
+    /// re-enters the app to apply the pick.
+    fn show_context_menu(
+        &mut self,
+        view: context_menu::NsView,
+        at: (f32, f32),
+        target: MenuTarget,
+        items: Vec<context_menu::MenuItem>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn_in(window, async move |this, cx| {
+            let choice = context_menu::pop_up(view, at, &items);
+            let Some(choice) = choice else { return };
+            let _ = this.update_in(cx, |app, _window, cx| {
+                app.apply_context_menu(target, choice);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Apply item `choice` of the menu shown for `target`. Indices follow
+    /// the item order built in `on_right_mouse_down`. The target is
+    /// re-validated: the workspace or tab may have gone while the menu was
+    /// up.
+    fn apply_context_menu(&mut self, target: MenuTarget, choice: usize) {
+        let now = SystemTime::now();
+        match target {
+            MenuTarget::Group { ws } => {
+                let Some(w) = self.workspaces.get_mut(ws) else { return };
+                match choice {
+                    0 => {
+                        let primary = w.primary_tile;
+                        if let Some(tab) =
+                            w.root.find_tile_mut(primary).and_then(|t| t.active_tab_mut())
+                            && !tab.unread
+                        {
+                            tab.unread = true;
+                            tab.unread_at = Some(now);
+                        }
+                    },
+                    1 => w.pinned = !w.pinned,
+                    _ => return,
+                }
+            },
+            MenuTarget::Tab { ws, tile, tab } => {
+                let Some(t) = self.workspaces.get_mut(ws).and_then(|w| w.root.find_tile_mut(tile))
+                else {
+                    return;
+                };
+                if tab >= t.tabs.len() {
+                    return;
+                }
+                match choice {
+                    0 => {
+                        let tab = &mut t.tabs[tab];
+                        if !tab.unread {
+                            tab.unread = true;
+                            tab.unread_at = Some(now);
+                        }
+                    },
+                    1 => {
+                        let pinned = !t.tabs[tab].pinned;
+                        t.set_tab_pinned(tab, pinned);
+                    },
+                    2 => {
+                        let hidden = !t.tabs[tab].toolbar_hidden();
+                        // Terminal tabs never got this item; the child view's
+                        // bounds re-sync before the next paint.
+                        if !t.tabs[tab].set_toolbar_hidden(hidden) {
+                            return;
+                        }
+                    },
+                    _ => return,
+                }
+            },
+        }
+        self.persist_snapshot();
+        self.request_redraw();
     }
 
     // ── cwd picker ──────────────────────────────────────────────────────
@@ -3643,16 +3786,14 @@ impl App {
                     // Same-tile reorder: the source tab is already removed, so
                     // gaps past it shift down one to land where the line showed.
                     let index = if tile == src_tile && index > src_tab { index - 1 } else { index };
-                    let index = index.min(t.tabs.len());
-                    t.tabs.insert(index, tab);
-                    t.active = index;
+                    // `insert_tab` keeps pinned tabs in the leading run.
+                    t.active = t.insert_tab(index, tab);
                     self.workspaces[self.active].focused_tile = tile;
                 }
             },
             DropTarget::Center { tile } => {
                 if let Some(t) = self.workspaces[self.active].root.find_tile_mut(tile) {
-                    t.tabs.push(tab);
-                    t.active = t.tabs.len() - 1;
+                    t.active = t.insert_tab(t.tabs.len(), tab);
                     self.workspaces[self.active].focused_tile = tile;
                 }
             },
@@ -3670,8 +3811,7 @@ impl App {
             DropTarget::Group { ws } => {
                 if let Some(w) = self.workspaces.get_mut(ws) {
                     if let Some(t) = w.focused_mut() {
-                        t.tabs.push(tab);
-                        t.active = t.tabs.len() - 1;
+                        t.active = t.insert_tab(t.tabs.len(), tab);
                     }
                 }
             },
@@ -4911,7 +5051,11 @@ impl App {
             Action::NewGroup => self.open_picker(),
             Action::Copy => self.copy(),
             Action::Paste => self.paste(),
-            Action::CloseTab => self.close_active_tab(),
+            Action::CloseTab => {
+                if !self.close_active_tab() {
+                    return false;
+                }
+            },
             Action::CloseGroup => self.close_focused_group(),
             Action::TogglePin => {
                 if self.page == Page::Sessions {
@@ -4922,6 +5066,29 @@ impl App {
                     }
                 }
             }
+            Action::TogglePinTab => {
+                let Some(tile) = self.workspaces[self.active].focused_mut() else { return false };
+                let ti = tile.active;
+                let Some(pinned) = tile.tabs.get(ti).map(|tab| !tab.pinned) else { return false };
+                // `set_tab_pinned` keeps `active` on the moved tab.
+                tile.set_tab_pinned(ti, pinned);
+                self.persist_snapshot();
+                self.request_redraw();
+            },
+            Action::ToggleWebviewToolbar => {
+                let Some(tile) = self.workspaces[self.active].focused_mut() else { return false };
+                let ti = tile.active;
+                let Some(hidden) = tile.tabs.get(ti).map(|tab| !tab.toolbar_hidden()) else {
+                    return false;
+                };
+                // A terminal tab has no title bar: report the no-op. The child
+                // view's bounds re-sync before the next paint.
+                if !tile.tabs[ti].set_toolbar_hidden(hidden) {
+                    return false;
+                }
+                self.persist_snapshot();
+                self.request_redraw();
+            },
             Action::PrevTile => self.cycle_tile(-1),
             Action::NextTile => self.cycle_tile(1),
             Action::PrevTab => self.cycle_tab(-1),
@@ -5892,11 +6059,11 @@ impl Render for App {
             )
             .on_mouse_down(
                 MouseButton::Right,
-                cx.listener(|app, ev: &MouseDownEvent, _window, cx| {
+                cx.listener(|app, ev: &MouseDownEvent, window, cx| {
                     let s = app.scale() as f64;
                     app.cursor = (f64::from(ev.position.x) * s, f64::from(ev.position.y) * s);
                     app.modifiers = ev.modifiers;
-                    app.on_right_mouse_down();
+                    app.on_right_mouse_down(window, cx);
                     cx.notify();
                 }),
             )

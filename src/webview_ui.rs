@@ -51,6 +51,7 @@ struct ChromePlacement {
     can_go_back: bool,
     can_go_forward: bool,
     zoom_percent: u16,
+    toolbar_hidden: bool,
 }
 
 fn host(url: &str) -> String {
@@ -153,9 +154,9 @@ impl App {
     pub(crate) fn sync_webview_input_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let placements = self.chrome_placements();
         let address_visible = self.webview_address_for.is_some_and(|id| {
-            placements
-                .iter()
-                .any(|placement| placement.id == id && placement.focused)
+            placements.iter().any(|placement| {
+                placement.id == id && placement.focused && !placement.toolbar_hidden
+            })
         });
         let find_visible = self.webview_find_for.is_some_and(|id| {
             placements.iter().any(|placement| placement.id == id)
@@ -261,6 +262,7 @@ impl App {
                 let tab = tile.active_tab()?;
                 let id = tab.webview_id()?;
                 let url = tab.url()?.to_string();
+                let toolbar_hidden = tab.toolbar_hidden();
                 let state = self.webviews.state(id);
                 Some(ChromePlacement {
                     id,
@@ -270,6 +272,7 @@ impl App {
                     can_go_back: state.as_ref().is_some_and(|state| state.can_go_back),
                     can_go_forward: state.as_ref().is_some_and(|state| state.can_go_forward),
                     zoom_percent: state.map_or(100, |state| state.zoom_percent),
+                    toolbar_hidden,
                 })
             })
             .collect()
@@ -296,13 +299,18 @@ impl App {
             let y = placement.rect.y / scale;
             let width = placement.rect.w / scale;
             let height = placement.rect.h / scale;
-            let toolbar_height = crate::webview::TOOLBAR_H.min(height.max(0.0));
+            let toolbar_height = if placement.toolbar_hidden {
+                0.0
+            } else {
+                crate::webview::TOOLBAR_H.min(height.max(0.0))
+            };
             let address_focused = self
                 .webview_address
                 .read(cx)
                 .focus_handle(cx)
                 .is_focused(window);
             if placement.focused
+                && !placement.toolbar_hidden
                 && (self.webview_address_for != Some(id)
                     || (!address_focused && self.webview_address.read(cx).text() != placement.url))
             {
@@ -411,43 +419,45 @@ impl App {
                         .into_any_element()
                 });
 
-            let toolbar_entity = entity.clone();
-            let toolbar = div()
-                .absolute()
-                .occlude()
-                .left(px(x))
-                .top(px(y))
-                .w(px(width))
-                .h(px(toolbar_height))
-                .overflow_hidden()
-                .px(px(5.0))
-                .flex()
-                .items_center()
-                .gap(px(2.0))
-                .bg(theme.card)
-                .border_b_1()
-                .border_color(theme.border)
-                .font_family(crate::renderer::FONT_FAMILY)
-                .on_mouse_down(
-                    gpui::MouseButton::Left,
-                    move |_event, _window, app: &mut GpuiApp| {
-                        if let Some(entity) = toolbar_entity.upgrade() {
-                            entity.update(app, |this, _cx| this.focus_webview_tab(id));
-                        }
-                    },
-                )
-                .child(back)
-                .child(forward)
-                .child(reload)
-                .child(site)
-                .child(address)
-                .child(tools);
-            layer = layer.child(toolbar);
+            if !placement.toolbar_hidden {
+                let toolbar_entity = entity.clone();
+                let toolbar = div()
+                    .absolute()
+                    .occlude()
+                    .left(px(x))
+                    .top(px(y))
+                    .w(px(width))
+                    .h(px(toolbar_height))
+                    .overflow_hidden()
+                    .px(px(5.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(2.0))
+                    .bg(theme.card)
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .font_family(crate::renderer::FONT_FAMILY)
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        move |_event, _window, app: &mut GpuiApp| {
+                            if let Some(entity) = toolbar_entity.upgrade() {
+                                entity.update(app, |this, _cx| this.focus_webview_tab(id));
+                            }
+                        },
+                    )
+                    .child(back)
+                    .child(forward)
+                    .child(reload)
+                    .child(site)
+                    .child(address)
+                    .child(tools);
+                layer = layer.child(toolbar);
+            }
 
             if let Some(panel) = self.webview_panel.clone().filter(|panel| panel.id() == id) {
                 let panel_height = panel
                     .height()
-                    .min((height - crate::webview::TOOLBAR_H - 1.0 / scale).max(0.0));
+                    .min((height - toolbar_height - 1.0 / scale).max(0.0));
                 let panel_el = match panel {
                     Panel::Site { cookies, .. } => {
                         let secure = placement.url.starts_with("https://");
@@ -507,7 +517,7 @@ impl App {
                         .absolute()
                         .occlude()
                         .left(px(x))
-                        .top(px(y + crate::webview::TOOLBAR_H))
+                        .top(px(y + toolbar_height))
                         .w(px(width))
                         .h(px(panel_height))
                         .overflow_hidden()

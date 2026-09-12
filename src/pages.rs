@@ -127,6 +127,8 @@ pub enum Action {
     CloseTab,
     CloseGroup,
     TogglePin,
+    TogglePinTab,
+    ToggleWebviewToolbar,
     Quit,
     PrevTile,
     NextTile,
@@ -162,7 +164,7 @@ pub enum Action {
 
 impl Action {
     /// Keyboard-page row order.
-    pub const ALL: [Action; 42] = [
+    pub const ALL: [Action; 44] = [
         Action::SplitRight,
         Action::SplitDown,
         Action::NewTab,
@@ -174,6 +176,8 @@ impl Action {
         Action::CloseTab,
         Action::CloseGroup,
         Action::TogglePin,
+    Action::TogglePinTab,
+    Action::ToggleWebviewToolbar,
         Action::Quit,
         Action::PrevTile,
         Action::NextTile,
@@ -221,6 +225,8 @@ impl Action {
             Action::CloseTab => "close_tab",
             Action::CloseGroup => "close_group",
             Action::TogglePin => "toggle_pin",
+            Action::TogglePinTab => "toggle_pin_tab",
+            Action::ToggleWebviewToolbar => "toggle_title_bar",
             Action::Quit => "quit",
             Action::PrevTile => "prev_tile",
             Action::NextTile => "next_tile",
@@ -268,6 +274,8 @@ impl Action {
             Action::CloseTab => "Close tab",
             Action::CloseGroup => "Close group",
             Action::TogglePin => "Pin/unpin group",
+            Action::TogglePinTab => "Pin / unpin tab",
+            Action::ToggleWebviewToolbar => "Show / hide title bar",
             Action::Quit => "Quit",
             Action::PrevTile => "Focus previous tile",
             Action::NextTile => "Focus next tile",
@@ -323,6 +331,9 @@ impl Action {
             Action::CloseTab => (false, false, false, "w"),
             Action::CloseGroup => (true, false, false, "w"),
             Action::TogglePin => (true, false, false, "p"),
+            // ⌥⌘P / ⌥⌘T; the tab's right-click menu is the primary entry.
+            Action::TogglePinTab => (false, true, false, "p"),
+            Action::ToggleWebviewToolbar => (false, true, false, "t"),
             Action::Quit => (false, false, false, "q"),
             Action::PrevTile => (false, false, false, "["),
             Action::NextTile => (false, false, false, "]"),

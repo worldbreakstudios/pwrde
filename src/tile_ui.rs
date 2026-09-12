@@ -100,6 +100,9 @@ pub(crate) type PressHandler = Rc<dyn Fn(usize, bool, &MouseDownEvent, &mut Gpui
 pub(crate) struct StripTab {
     pub title: String,
     pub unread: bool,
+    /// Pinned tabs keep their full title but draw a pin ring before it and
+    /// no × — they can't be closed until unpinned.
+    pub pinned: bool,
     pub tab: LayoutRect,
     pub close: LayoutRect,
 }
@@ -129,7 +132,9 @@ pub(crate) fn tab_strip(
 
     for (ti, tab) in tabs.iter().enumerate() {
         let is_active = ti == active;
-        let close_hov = hov(&tab.close);
+        // Pinned tabs render no ×, so their close rect must not eat the
+        // pill hover either — a press there selects the tab.
+        let close_hov = !tab.pinned && hov(&tab.close);
         let tab_hov = hov(&tab.tab) && !close_hov;
         // Rects relative to the strip box, in logical px.
         let rel = |r: &LayoutRect| ((r.x - bar.x) * inv, (r.y - bar.y) * inv, r.w * inv, r.h * inv);
@@ -183,6 +188,22 @@ pub(crate) fn tab_strip(
             _ => style.ink_dim,
         };
         let mut text_left = TEXT_PAD;
+        // Pin ring: a hollow dot in the dim ink so it reads apart from the
+        // filled accent unread dot that may follow it.
+        if tab.pinned {
+            tab_el = tab_el.child(
+                div()
+                    .absolute()
+                    .left(px(text_left))
+                    .top(px(((tth - DOT) / 2.0).round()))
+                    .w(px(DOT))
+                    .h(px(DOT))
+                    .rounded(px(DOT / 2.0))
+                    .border_1()
+                    .border_color(text_color),
+            );
+            text_left += DOT + DOT_GAP;
+        }
         if tab.unread {
             tab_el = tab_el.child(
                 div()
@@ -202,7 +223,12 @@ pub(crate) fn tab_strip(
                 .left(px(text_left))
                 .top(px(0.0))
                 .h(px(tth))
-                .w(px((cx_ - tx - text_left).max(0.0)))
+                .w(px(if tab.pinned {
+                    // No × to clip short of: the title runs to the pill's edge.
+                    (tw - text_left - TEXT_PAD).max(0.0)
+                } else {
+                    (cx_ - tx - text_left).max(0.0)
+                }))
                 .overflow_hidden()
                 .whitespace_nowrap()
                 .flex()
@@ -210,6 +236,14 @@ pub(crate) fn tab_strip(
                 .text_color(text_color)
                 .child(text),
         );
+
+        // A pinned tab has no ×: its close rect stays in the canvas hit list
+        // but presses there fall through to the tab (`close_active_tab`
+        // refuses pinned tabs regardless).
+        if tab.pinned {
+            strip_el = strip_el.child(tab_el);
+            continue;
+        }
 
         // × and its hover chip. Its press wins over the tab's: the inner
         // listener runs first and stops propagation.
@@ -389,6 +423,7 @@ impl App {
                 .map(|(ti, tab)| StripTab {
                     title: tab.title(),
                     unread: tab.unread,
+                    pinned: tab.pinned,
                     tab: workspace::tile_tab_rect(&strip, ti, n, scale, has_caret),
                     close: workspace::tile_tab_close_rect(&strip, ti, n, scale, has_caret),
                 })
