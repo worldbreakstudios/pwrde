@@ -441,6 +441,7 @@ impl App {
                                         "title": tab.title(),
                                         "active": ti == t.active,
                                         "unread": tab.unread,
+                                        "pinned": tab.pinned,
                                         "cols": tab.cols,
                                         "rows": tab.rows,
                                     }),
@@ -451,6 +452,9 @@ impl App {
                                         "url_command": tab.url_command(),
                                         "title": tab.title(),
                                         "active": ti == t.active,
+                                        "unread": tab.unread,
+                                        "pinned": tab.pinned,
+                                        "toolbar_hidden": tab.toolbar_hidden(),
                                     }),
                                 })
                                 .collect();
@@ -573,6 +577,7 @@ impl App {
                         "active": active,
                         "focused": gi == self.active && w.focused_tile == t.id && active,
                         "unread": tab.unread,
+                        "pinned": tab.pinned,
                         "cols": tab.cols,
                         "rows": tab.rows,
                         "foreground": foreground,

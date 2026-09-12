@@ -697,6 +697,8 @@ pub fn action_group(action: Action) -> &'static str {
         | Action::NewWebview
         | Action::NewWebviewFromCommand
         | Action::CloseTab
+        | Action::TogglePinTab
+        | Action::ToggleWebviewToolbar
         | Action::ToggleCollapse
         | Action::ToggleFocusOthers => "Tiles",
         Action::PrevTile
@@ -743,6 +745,8 @@ pub fn action_glyph(action: Action) -> &'static str {
         Action::NewWebview => "◎",
         Action::NewWebviewFromCommand => "◎",
         Action::CloseTab => "⌦",
+        Action::TogglePinTab => "⚑",
+        Action::ToggleWebviewToolbar => "▭",
         Action::ToggleCollapse => "⌃",
         Action::ToggleFocusOthers => "◎",
         Action::PrevTile => "⊙",

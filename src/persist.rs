@@ -66,6 +66,10 @@ pub struct SavedTab {
     pub cwd: Option<String>,
     pub unread: bool,
     pub unread_at: Option<i64>,
+    /// Pinned tabs sort to the front of their tile's tab strip.
+    pub pinned: bool,
+    /// Webview tabs only: collapse the GPUI-drawn navigation toolbar.
+    pub toolbar_hidden: bool,
     pub kind: SavedTabKind,
     pub url: Option<String>,
 }
@@ -140,6 +144,10 @@ fn open_db(path: &Path) -> SqlResult<Connection> {
     let _ = conn.execute("ALTER TABLE tabs ADD COLUMN unread INTEGER", []);
     // Migrate pre-attention DBs; duplicate-column errors are intentionally ignored.
     let _ = conn.execute("ALTER TABLE tabs ADD COLUMN unread_at INTEGER", []);
+    // Migrate pre-pinned / pre-toolbar-hidden DBs; duplicate-column errors are
+    // intentionally ignored — NULL decodes as false on load.
+    let _ = conn.execute("ALTER TABLE tabs ADD COLUMN pinned INTEGER", []);
+    let _ = conn.execute("ALTER TABLE tabs ADD COLUMN toolbar_hidden INTEGER", []);
     let _ = conn.execute(
         "ALTER TABLE tabs ADD COLUMN content_kind TEXT NOT NULL DEFAULT 'terminal'",
         [],
@@ -215,8 +223,8 @@ pub fn save_snapshot(
 
         for tab in &group.tabs {
             tx.execute(
-                "INSERT INTO tabs (group_id, tile_id, tab_index, active, shpool_session, cwd, unread, unread_at, content_kind, url)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                "INSERT INTO tabs (group_id, tile_id, tab_index, active, shpool_session, cwd, unread, unread_at, pinned, toolbar_hidden, content_kind, url)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 (
                     group_id,
                     tab.tile_id,
@@ -226,6 +234,8 @@ pub fn save_snapshot(
                     &tab.cwd,
                     if tab.unread { 1 } else { 0 },
                     tab.unread_at,
+                    if tab.pinned { 1 } else { 0 },
+                    if tab.toolbar_hidden { 1 } else { 0 },
                     match tab.kind {
                         SavedTabKind::Terminal => "terminal",
                         SavedTabKind::Webview => "webview",
@@ -346,7 +356,7 @@ fn load_groups(conn: &Connection) -> Vec<SavedGroup> {
         };
 
         let mut tab_stmt = match conn.prepare(
-            "SELECT tile_id, tab_index, active, shpool_session, cwd, unread, unread_at, content_kind, url
+            "SELECT tile_id, tab_index, active, shpool_session, cwd, unread, unread_at, pinned, toolbar_hidden, content_kind, url
              FROM tabs WHERE group_id = ?1 ORDER BY tile_id, tab_index",
         ) {
             Ok(s) => s,
@@ -365,11 +375,15 @@ fn load_groups(conn: &Connection) -> Vec<SavedGroup> {
                 cwd: row.get(4)?,
                 unread: row.get::<_, Option<i64>>(5)?.map(|v| v != 0).unwrap_or(false),
                 unread_at: row.get::<_, Option<i64>>(6)?,
-                kind: match row.get::<_, Option<String>>(7)?.as_deref() {
+                // NULL (pre-pin rows) and 0 both mean unpinned.
+                pinned: row.get::<_, Option<i64>>(7)?.map(|v| v != 0).unwrap_or(false),
+                // NULL (pre-toolbar rows) and 0 both mean shown.
+                toolbar_hidden: row.get::<_, Option<i64>>(8)?.map(|v| v != 0).unwrap_or(false),
+                kind: match row.get::<_, Option<String>>(9)?.as_deref() {
                     Some("webview") => SavedTabKind::Webview,
                     _ => SavedTabKind::Terminal,
                 },
-                url: row.get(8)?,
+                url: row.get(10)?,
             })
         }) {
             Ok(r) => r,
@@ -485,6 +499,8 @@ fn node_to_layout_rec(node: &crate::workspace::Node, tabs: &mut Vec<SavedTab>) -
                     cwd: None, // cwd is not tracked on Session; shpool will preserve it
                     unread: tab.unread,
                     unread_at: to_epoch_secs(tab.unread_at),
+                    pinned: tab.pinned,
+                    toolbar_hidden: tab.toolbar_hidden(),
                     kind: match tab.kind() {
                         crate::workspace::TabKind::Terminal => SavedTabKind::Terminal,
                         crate::workspace::TabKind::Webview => SavedTabKind::Webview,
@@ -563,6 +579,8 @@ mod tests {
                 cwd: Some("/home/user".into()),
                 unread: false,
                 unread_at: None,
+                pinned: false,
+                toolbar_hidden: false,
                 kind: SavedTabKind::Terminal,
                 url: None,
             }],
@@ -621,6 +639,8 @@ mod tests {
                         cwd: Some("/home/user".into()),
                         unread: false,
                         unread_at: None,
+                        pinned: false,
+                        toolbar_hidden: false,
                         kind: SavedTabKind::Terminal,
                         url: None,
                     },
@@ -632,6 +652,8 @@ mod tests {
                         cwd: Some("/tmp".into()),
                         unread: false,
                         unread_at: None,
+                        pinned: false,
+                        toolbar_hidden: false,
                         kind: SavedTabKind::Terminal,
                         url: None,
                     },
@@ -643,6 +665,8 @@ mod tests {
                         cwd: None,
                         unread: false,
                         unread_at: None,
+                        pinned: false,
+                        toolbar_hidden: false,
                         kind: SavedTabKind::Terminal,
                         url: None,
                     },
@@ -664,6 +688,8 @@ mod tests {
                     cwd: Some("/var/log".into()),
                     unread: false,
                     unread_at: None,
+                    pinned: false,
+                    toolbar_hidden: false,
                     kind: SavedTabKind::Terminal,
                     url: None,
                 }],
@@ -931,6 +957,8 @@ mod tests {
                     cwd: None,
                     unread: true,
                     unread_at: Some(1_700_000_000),
+                    pinned: false,
+                    toolbar_hidden: false,
                     kind: SavedTabKind::Terminal,
                     url: None,
                 },
@@ -942,6 +970,8 @@ mod tests {
                     cwd: None,
                     unread: false,
                     unread_at: None,
+                    pinned: false,
+                    toolbar_hidden: false,
                     kind: SavedTabKind::Terminal,
                     url: None,
                 },
@@ -986,6 +1016,8 @@ mod tests {
             cwd: None,
             unread: false,
             unread_at: None,
+            pinned: false,
+            toolbar_hidden: false,
             kind: SavedTabKind::Webview,
             url: Some("https://example.com/docs".into()),
         });
@@ -1059,7 +1091,52 @@ mod tests {
             groups[0].tabs[0].unread_at, None,
             "pre-migration rows have no attention stamp"
         );
+        assert!(!groups[0].tabs[0].pinned, "pre-migration rows load unpinned");
+        assert!(
+            !groups[0].tabs[0].toolbar_hidden,
+            "pre-migration rows load with toolbar shown"
+        );
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
+
+    #[test]
+    fn roundtrip_pinned_and_hidden_toolbar_flags() {
+        // A pinned tab and a toolbar-hidden webview tab keep both flags
+        // through save/load; the other tab keeps its defaults.
+        let path = temp_db("pin-toolbar");
+        let mut group = sample_group(0, "flags", None);
+        group.tabs[0].pinned = true;
+        group.tabs[0].active = false;
+        group.tabs.push(SavedTab {
+            tile_id: 1,
+            tab_index: 1,
+            active: true,
+            shpool_session: None,
+            cwd: None,
+            unread: false,
+            unread_at: None,
+            pinned: false,
+            toolbar_hidden: true,
+            kind: SavedTabKind::Webview,
+            url: Some("https://example.com".into()),
+        });
+        let groups = vec![group];
+        save_snapshot(&groups, &[], &path).unwrap();
+        let (loaded, _) = load_snapshot(&path);
+        assert_eq!(loaded[0].tabs.len(), 2);
+        assert!(loaded[0].tabs[0].pinned, "pinned flag survives the roundtrip");
+        assert!(
+            !loaded[0].tabs[0].toolbar_hidden,
+            "terminal tabs never carry a hidden toolbar"
+        );
+        assert!(
+            loaded[0].tabs[1].toolbar_hidden,
+            "hidden toolbar survives the roundtrip"
+        );
+        assert!(!loaded[0].tabs[1].pinned);
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
 }

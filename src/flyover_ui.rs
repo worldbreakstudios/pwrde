@@ -69,6 +69,8 @@ impl App {
             .map(|(i, tab)| StripTab {
                 title: tab.title(),
                 unread: tab.unread,
+                // Flyover tabs have no context menu, so nothing pins them.
+                pinned: false,
                 tab: workspace::flyover_tab_rect(&panel, i, n, scale, maximized),
                 close: workspace::flyover_tab_close_rect(&panel, i, n, scale, maximized),
             })
