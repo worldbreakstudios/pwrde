@@ -1694,6 +1694,8 @@ impl App {
         tile.active = ti;
         ws.focused_tile = id;
         if close && n > 0 {
+            // Pinned tabs render no × chip, so a refusal (the `false` return)
+            // cannot happen from here; the bus/⌘W path reports it instead.
             self.close_active_tab();
             return;
         }

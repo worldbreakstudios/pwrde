@@ -132,7 +132,9 @@ pub(crate) fn tab_strip(
 
     for (ti, tab) in tabs.iter().enumerate() {
         let is_active = ti == active;
-        let close_hov = hov(&tab.close);
+        // Pinned tabs render no ×, so their close rect must not eat the
+        // pill hover either — a press there selects the tab.
+        let close_hov = !tab.pinned && hov(&tab.close);
         let tab_hov = hov(&tab.tab) && !close_hov;
         // Rects relative to the strip box, in logical px.
         let rel = |r: &LayoutRect| ((r.x - bar.x) * inv, (r.y - bar.y) * inv, r.w * inv, r.h * inv);

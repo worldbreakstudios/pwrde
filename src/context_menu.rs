@@ -4,8 +4,8 @@
 //! at a logical window-space point via `popUpMenuPositioningItem:` (which runs
 //! its own synchronous tracking loop), and returns the index of the item the
 //! user chose, or `None` when the menu is dismissed. The chosen item is
-//! recorded through a tiny Objective-C target class registered once with
-//! `std::sync::Once`; each menu item carries its index in its `tag` and calls
+//! recorded through a tiny Objective-C target class registered once through
+//! a `std::sync::OnceLock`; each menu item carries its index in its `tag` and calls
 //! `menuItemChosen:`, which stashes the tag into an `AtomicIsize`.
 //!
 //! Because the tracking loop is nested, `pop_up` must NOT run inside a gpui
@@ -66,7 +66,11 @@ unsafe fn ns_string(s: &str) -> *mut objc::runtime::Object {
 /// The window's content `NSView`, captured while a `Window` is at hand so
 /// the menu can be popped later from outside gpui's borrow. Held as an
 /// address (not a pointer) so the value is plain data for a spawned future;
-/// the view outlives every menu shown over it.
+/// the view outlives every menu shown over it. (If the window were torn
+/// down before the spawned future first polled, the initial `msg_send!`
+/// would touch a freed view; the menu is requested from a live click and
+/// polled on the next foreground turn, so that window is not reachable in
+/// practice.)
 #[derive(Clone, Copy, Debug)]
 pub struct NsView(usize);
 
