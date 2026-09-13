@@ -536,13 +536,17 @@ impl App {
                 let idle = !chat.busy && !chat.unseen;
                 let dim = |c: gpui::Hsla| if idle { c.opacity(0.65) } else { c };
                 let avatar = if chat.busy {
-                    div().bg(theme.primary).text_color(theme.primary_foreground).child("✳")
+                    div().bg(theme.primary).text_color(theme.primary_foreground).child(
+                        gpui::svg().path(crate::ui::assets::ICON_ASTERISK).size(px(10.0)),
+                    )
                 } else if chat.unseen {
                     div().bg(theme.muted).text_color(ok_color).child(
                         gpui::svg().path(theme.icons.check()).size(px(10.0)),
                     )
                 } else {
-                    div().bg(dim(theme.muted)).text_color(dim(theme.muted_foreground)).child("✳")
+                    div().bg(dim(theme.muted)).text_color(dim(theme.muted_foreground)).child(
+                        gpui::svg().path(crate::ui::assets::ICON_ASTERISK).size(px(10.0)),
+                    )
                 };
                 let preview = match chat.messages.last() {
                     Some(FlowMsg::User(t)) | Some(FlowMsg::Assistant(t)) => t.clone(),
