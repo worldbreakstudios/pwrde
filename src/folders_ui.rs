@@ -20,6 +20,7 @@ use gpui::{
 
 use crate::App;
 use crate::sidebar_ui::{icon_chip, press, scaled, separator};
+use crate::ui::icon;
 use crate::ui::theme::Theme;
 use crate::workspace::{FolderRow, LayoutRect};
 
@@ -243,14 +244,11 @@ impl App {
         };
         row_shell(r, false, hovered, theme)
             .id("folders-pinned")
-            .child(
-                gpui::svg()
-                    .flex_none()
-                    .path(crate::ui::assets::ICON_WRENCH)
-                    .w(px(scaled(ROW_ICON)))
-                    .h(px(scaled(ROW_ICON)))
-                    .text_color(theme.muted_foreground),
-            )
+            .child(icon(
+                crate::ui::assets::ICON_WRENCH,
+                px(scaled(ROW_ICON)),
+                theme.muted_foreground,
+            ))
             .child(
                 div()
                     .flex_1()
@@ -260,14 +258,7 @@ impl App {
                     .child("Tools"),
             )
             .child(count_badge(theme, self.tools.len(), false))
-            .child(
-                gpui::svg()
-                    .flex_none()
-                    .path(chevron)
-                    .w(px(scaled(ROW_ICON)))
-                    .h(px(scaled(ROW_ICON)))
-                    .text_color(theme.muted_foreground),
-            )
+            .child(icon(chevron, px(scaled(ROW_ICON)), theme.muted_foreground))
     }
 
     /// One pinned CLI-tool row: green dot + the tool's command in monospace.
@@ -368,12 +359,7 @@ impl App {
                     .rounded(px(4.0))
                     .text_color(ink)
                     .when(del_hovered, |c| c.bg(ink.opacity(0.18)))
-                    .child(
-                        gpui::svg()
-                            .path(theme.icons.x())
-                            .size(px(11.0))
-                            .text_color(ink),
-                    )
+                    .child(icon(theme.icons.x(), px(11.0), ink))
                     .on_mouse_down(
                         MouseButton::Left,
                         press(entity, move |this, ev, _cx| {
@@ -443,14 +429,11 @@ fn folder_row(
                     .text_color(ink)
                     .child(e),
             ),
-            None => d.child(
-                gpui::svg()
-                    .flex_none()
-                    .path(crate::ui::assets::ICON_FOLDER)
-                    .w(px(scaled(ROW_ICON)))
-                    .h(px(scaled(ROW_ICON)))
-                    .text_color(icon_ink),
-            ),
+            None => d.child(icon(
+                crate::ui::assets::ICON_FOLDER,
+                px(scaled(ROW_ICON)),
+                icon_ink,
+            )),
         })
         .child(
             div()

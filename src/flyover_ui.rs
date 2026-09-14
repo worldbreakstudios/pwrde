@@ -17,11 +17,12 @@ use std::rc::Rc;
 
 use gpui::{
     AnyElement, App as GpuiApp, Context, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, ParentElement, Styled, Window, div, px, prelude::FluentBuilder as _, svg,
+    MouseDownEvent, ParentElement, Styled, Window, div, px, prelude::FluentBuilder as _,
 };
 
 use crate::App;
 use crate::ui::assets::{ICON_MAXIMIZE, ICON_MINIMIZE};
+use crate::ui::icon;
 use crate::renderer::color;
 use crate::tile_ui::{PressHandler, StripStyle, StripTab, tab_strip};
 use crate::ui::theme::Theme;
@@ -102,7 +103,7 @@ impl App {
         // modal owns the frame, so a picker never floats over decoy
         // controls (the canvas gated them the same way).
         if !modal {
-            for (rect, icon, maximize) in [
+            for (rect, path, maximize) in [
                 (
                     workspace::flyover_minimize_rect(&panel, scale),
                     ICON_MINIMIZE,
@@ -159,8 +160,11 @@ impl App {
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .text_color(if h { style.ink } else { style.ink_dim })
-                                .child(svg().path(icon).size(px(12.0))),
+                                .child(icon(
+                                    path,
+                                    px(12.0),
+                                    if h { style.ink } else { style.ink_dim },
+                                )),
                         ),
                 );
             }

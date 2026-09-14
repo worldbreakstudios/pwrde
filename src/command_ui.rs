@@ -25,6 +25,7 @@ use gpui::{
     Styled, Window, deferred, anchored, div, point, px, prelude::FluentBuilder as _,
 };
 
+use crate::ui::icon;
 use crate::App;
 use crate::command::{action_icon, RootRow, Stage, StepState, Token};
 use crate::picker::{FolderKind, ForkScope, PickerRow};
@@ -52,7 +53,7 @@ const LIST_MAX_H: f32 = 350.0;
 const LAYER_PRIORITY: usize = 4;
 
 /// A rounded tile for a glyph, the mock's 24px command glyph well.
-fn icon_tile(size: f32, radius: f32, bg: Hsla, fg: Hsla, icon: &str) -> gpui::Div {
+fn icon_tile(size: f32, radius: f32, bg: Hsla, fg: Hsla, path: &str) -> gpui::Div {
     div()
         .flex_none()
         .flex()
@@ -63,7 +64,7 @@ fn icon_tile(size: f32, radius: f32, bg: Hsla, fg: Hsla, icon: &str) -> gpui::Di
         .rounded(px(radius))
         .bg(bg)
         .text_color(fg)
-        .child(gpui::svg().path(icon).size(px(size * 0.5)))
+        .child(icon(path, px(size * 0.5), fg))
 }
 
 fn glyph_tile(theme: &Theme, size: f32, radius: f32, bg: Hsla, fg: Hsla, glyph: impl Into<SharedString>) -> gpui::Div {
@@ -219,11 +220,11 @@ impl App {
             .border_b_1()
             .border_color(hairline)
             .child(
-                div().flex_none().text_color(theme.muted_foreground).child(
-                    gpui::svg()
-                        .path(theme.icons.chevron_right())
-                        .size(px(13.0)),
-                ),
+                div().flex_none().child(icon(
+                    theme.icons.chevron_right(),
+                    px(13.0),
+                    theme.muted_foreground,
+                )),
             );
         for tok in pal.tokens() {
             let (bg, fg, kind, label) = match tok {
@@ -293,7 +294,7 @@ impl App {
                                 .text_size(px(9.5))
                                 .font_weight(gpui::FontWeight::BOLD)
                                 .text_color(dot_fg)
-                                .when(done, |d| d.child(gpui::svg().path(theme.icons.check()).size(px(9.5))))
+                                .when(done, |d| d.child(icon(theme.icons.check(), px(9.5), dot_fg)))
                                 .when(!done, |d| d.child((i + 1).to_string())),
                         )
                         .child(
@@ -308,11 +309,11 @@ impl App {
                                 div()
                                     .mx(px(10.0))
                                     .text_color(theme.muted_foreground.opacity(0.6))
-                                    .child(
-                                        gpui::svg()
-                                            .path(theme.icons.chevron_right())
-                                            .size(px(11.0)),
-                                    ),
+                                    .child(icon(
+                                        theme.icons.chevron_right(),
+                                        px(11.0),
+                                        theme.muted_foreground.opacity(0.6),
+                                    )),
                             )
                         }),
                 );
@@ -448,8 +449,11 @@ impl App {
                                             .items_center()
                                             .justify_center()
                                             .cursor_pointer()
-                                            .text_color(if pinned { gpui::hsla(0.12, 0.85, 0.52, 1.0) } else { theme.muted_foreground.opacity(0.35) })
-                                            .child(gpui::svg().path(ICON_PIN).size(px(12.0)))
+                                            .child(icon(
+                                                ICON_PIN,
+                                                px(12.0),
+                                                if pinned { gpui::hsla(0.12, 0.85, 0.52, 1.0) } else { theme.muted_foreground.opacity(0.35) },
+                                            ))
                                             .on_click(move |_ev: &ClickEvent, _win: &mut Window, app: &mut GpuiApp| {
                                                 app.stop_propagation();
                                                 if let Some(entity) = star_entity.upgrade() {
@@ -474,7 +478,7 @@ impl App {
                                                         .flex()
                                                         .items_center()
                                                         .gap(px(3.0))
-                                                        .child(gpui::svg().path(ICON_GIT_BRANCH).size(px(11.0)))
+                                                        .child(icon(ICON_GIT_BRANCH, px(11.0), theme.muted_foreground))
                                                         .child("git"),
                                                 ),
                                         )

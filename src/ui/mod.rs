@@ -22,11 +22,15 @@
 //! and [`alert_dialog`] (`AlertDialog::scrim` for the chrome's own scrim
 //! color, `AlertDialog::on_backdrop_click` for clicks on the scrim outside
 //! the panel, `AlertDialog::top` to pin the panel below the viewport's top
-//! edge, and the panel width yielding to `Styled` refinements).
+//! edge, and the panel width yielding to `Styled` refinements), and
+//! [`assets::icon`] (local: builds an svg icon whose own text color is set —
+//! gpui only paints an svg carrying its own `text_color`, which does not
+//! cascade from a parent div).
 //!
 //! Keep the `pub use` re-exports ABOVE the `pub mod` lines: `rcn add`
 //! regenerates everything after the first `pub mod` and would drop them.
 
+pub use assets::icon;
 pub use badge::{Badge, BadgeVariant};
 pub use alert_dialog::{AlertDialog, AlertDialogFooter};
 #[allow(unused_imports)] // vendored rcn surface: kept exported while no caller uses it
@@ -48,6 +52,7 @@ pub use kbd::Kbd;
 #[allow(unused_imports)] // vendored rcn surface: kept exported while no caller uses it
 pub use label::Label;
 pub use switch::Switch;
+
 pub use table::{Table, TableBody, TableCell, TableRow};
 pub use toast::{Toast, ToastViewport};
 
