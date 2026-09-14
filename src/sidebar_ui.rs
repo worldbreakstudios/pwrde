@@ -37,6 +37,7 @@ use crate::git_context::{PrRollup, derive_rollup};
 use crate::sidebar_card::{
     CardAvatar, avatar_for, diffstat_line, relative_time,
 };
+use crate::ui::icon;
 use crate::ui::theme::Theme;
 
 /// Horizontal padding inside a session row (mock: `10px 12px`).
@@ -674,14 +675,7 @@ impl App {
                     .gap(px(scaled(4.0)))
                     .pt(px(scaled(5.0)))
                     .cursor_pointer()
-                    .child(
-                        gpui::svg()
-                            .flex_none()
-                            .path(chevron)
-                            .w(px(scaled(12.0)))
-                            .h(px(scaled(12.0)))
-                            .text_color(ink),
-                    )
+                    .child(icon(chevron, px(scaled(12.0)), ink))
                     .child(
                         div()
                             .text_size(px(scaled(10.5)))
@@ -965,13 +959,7 @@ impl App {
                                             .bg(soft),
                                     )
                                 } else {
-                                    d.child(
-                                        gpui::svg()
-                                            .path(avatar_icon(kind))
-                                            .w(px(scaled(STATUS_ICON)))
-                                            .h(px(scaled(STATUS_ICON)))
-                                            .text_color(tint),
-                                    )
+                                    d.child(icon(avatar_icon(kind), px(scaled(STATUS_ICON)), tint))
                                 }
                             }),
                     ),
@@ -1171,7 +1159,7 @@ pub(crate) fn icon_chip(
     rect: &crate::workspace::LayoutRect,
     hovered: bool,
     active: bool,
-    icon: &'static str,
+    path: &'static str,
 ) -> gpui::Div {
     let ink = if active {
         theme.primary_foreground
@@ -1194,13 +1182,7 @@ pub(crate) fn icon_chip(
         .when(!active && hovered, |c| {
             c.bg(theme.muted.opacity(if theme.dark { 0.5 } else { 0.7 }))
         })
-        .child(
-            gpui::svg()
-                .path(icon)
-                .w(px(HEADER_ICON))
-                .h(px(HEADER_ICON))
-                .text_color(ink),
-        )
+        .child(icon(path, px(HEADER_ICON), ink))
 }
 
 /// The logical-pixel cursor the panel hovers against, or `None` when nothing

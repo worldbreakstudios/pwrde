@@ -30,6 +30,7 @@ use crate::flow::{ActionStatus, FlowMsg, FlowView};
 use crate::pages::Action;
 use crate::ui::Glass;
 use crate::ui::assets::ICON_PLUS;
+use crate::ui::icon;
 use crate::ui::theme::Theme;
 use crate::App;
 
@@ -337,7 +338,7 @@ impl App {
                     e.update(app, |this, cx| this.flow_submit_composer(window, cx));
                 }
             })
-            .child(gpui::svg().path(theme.icons.chevron_up()).size(px(14.0)));
+            .child(icon(theme.icons.chevron_up(), px(14.0), theme.primary_foreground));
         let focus_editor = editor.clone();
         let chip = || {
             div()
@@ -539,7 +540,7 @@ impl App {
                     div().bg(theme.primary).text_color(theme.primary_foreground).child("✳")
                 } else if chat.unseen {
                     div().bg(theme.muted).text_color(ok_color).child(
-                        gpui::svg().path(theme.icons.check()).size(px(10.0)),
+                        icon(theme.icons.check(), px(10.0), ok_color),
                     )
                 } else {
                     div().bg(dim(theme.muted)).text_color(dim(theme.muted_foreground)).child("✳")
@@ -707,7 +708,7 @@ impl App {
                                 });
                             }
                         })
-                        .child(gpui::svg().path(ICON_PLUS).size(px(14.0))),
+                        .child(icon(ICON_PLUS, px(14.0), theme.primary)),
                 )
                 .child(
                     div()
@@ -725,7 +726,7 @@ impl App {
                                 });
                             }
                         })
-                        .child(gpui::svg().path(theme.icons.chevron_down()).size(px(12.0))),
+                        .child(icon(theme.icons.chevron_down(), px(12.0), theme.muted_foreground)),
                 );
 
             let chat = self.flow.active_chat();
@@ -834,11 +835,11 @@ impl App {
                                 .into_any_element(),
                             ActionStatus::Done => div()
                                 .text_color(ok_color)
-                                .child(gpui::svg().path(theme.icons.check()).size(px(11.0)))
+                                .child(icon(theme.icons.check(), px(11.0), ok_color))
                                 .into_any_element(),
                             ActionStatus::Failed => div()
                                 .text_color(theme.destructive)
-                                .child(gpui::svg().path(theme.icons.x()).size(px(11.0)))
+                                .child(icon(theme.icons.x(), px(11.0), theme.destructive))
                                 .into_any_element(),
                         };
                         div()

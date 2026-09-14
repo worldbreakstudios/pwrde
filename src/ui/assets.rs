@@ -2,6 +2,11 @@
 //! each supported icon library's own drawing style (mirroring shadcn's icon
 //! library choice). All four sets are permissively licensed (Lucide ISC,
 //! Tabler MIT, Phosphor MIT, Remix Apache-2.0).
+//!
+//! Local addition: [`icon`] — an svg() builder that always sets the svg's own
+//! text color, because gpui's Svg::paint only draws when the svg element's
+//! computed `style.text.color` is `Some` (text_color does NOT cascade from a
+//! parent div to a child svg).
 
 use std::borrow::Cow;
 
@@ -541,6 +546,30 @@ pub const ICON_ARROW_RIGHT_TO_LINE: &str = "icons/arrow-right-to-line.svg";
 
 pub struct Assets;
 
+/// Build an svg icon that is guaranteed to paint.
+///
+/// gpui's `Svg::paint` gates on the svg element's OWN computed
+/// `style.text.color`: `self.path.as_ref().zip(style.text.color)`
+/// (crates/gpui/src/elements/svg.rs, pinned rev). `.text_color(..)` on a
+/// parent `div()` does NOT cascade to a child svg, so a bare `svg()` inside a
+/// colored wrapper renders blank. This helper always chains
+/// `.text_color(color)` directly on the svg element, plus `flex_shrink_0()`
+/// so the icon keeps its size in flex rows.
+///
+/// Local addition (not in upstream rcn).
+pub fn icon(
+    path: impl Into<SharedString>,
+    size: gpui::Pixels,
+    color: impl Into<gpui::Hsla>,
+) -> gpui::Svg {
+    use gpui::{Styled as _, svg};
+    svg()
+        .path(path)
+        .size(size)
+        .text_color(color)
+        .flex_shrink_0()
+}
+
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
         Ok(ICONS
@@ -555,5 +584,69 @@ impl AssetSource for Assets {
             .filter(|(name, _)| name.starts_with(path))
             .map(|(name, _)| SharedString::from(*name))
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::icon;
+
+    /// Files outside src/ui/ must not build bare `svg()` elements: gpui only
+    /// paints an svg whose own text color is set, so every icon outside the
+    /// vendored components goes through [`icon`] (or chains `.text_color`
+    /// directly on the svg). The detector below is proven on a constructed
+    /// bare-svg source in `detects_bare_svg`.
+    const NO_BARE_SVG: [&str; 7] = [
+        "../command_ui.rs",
+        "../flyover_ui.rs",
+        "../flow_ui.rs",
+        "../sidebar_ui.rs",
+        "../webview_ui.rs",
+        "../folders_ui.rs",
+        "../tile_ui.rs",
+    ];
+
+    fn bare_svg_lines(source: &str) -> Vec<String> {
+        source
+            .lines()
+            .filter(|line| {
+                let t = line.trim_start();
+                t.starts_with("svg()") || t.starts_with("gpui::svg()")
+            })
+            .map(|line| line.trim().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn no_bare_svg_calls_outside_ui() {
+        for path in NO_BARE_SVG {
+            let src = match path {
+                "../command_ui.rs" => include_str!("../command_ui.rs"),
+                "../flyover_ui.rs" => include_str!("../flyover_ui.rs"),
+                "../flow_ui.rs" => include_str!("../flow_ui.rs"),
+                "../sidebar_ui.rs" => include_str!("../sidebar_ui.rs"),
+                "../webview_ui.rs" => include_str!("../webview_ui.rs"),
+                "../folders_ui.rs" => include_str!("../folders_ui.rs"),
+                "../tile_ui.rs" => include_str!("../tile_ui.rs"),
+                _ => unreachable!(),
+            };
+            assert!(
+                bare_svg_lines(src).is_empty(),
+                "{path} contains a bare svg() call; use ui::icon(path, size, color) \
+                 or chain .text_color(..) on the svg so gpui paints it"
+            );
+        }
+    }
+
+    #[test]
+    fn detects_bare_svg() {
+        let bare = "div().child(\n    svg().path(\"x\").size(px(8.)),\n    gpui::svg().path(\"y\"),\n    icon(\"z\", px(8.), fg),\n)";
+        assert_eq!(bare_svg_lines(bare).len(), 2);
+    }
+
+    #[test]
+    fn icon_helper_compiles() {
+        // Type-level smoke: returns a gpui::Svg with path/size/color set.
+        let _svg: gpui::Svg = icon("icons/x.svg", gpui::px(12.), gpui::black());
     }
 }

@@ -8,6 +8,7 @@ use gpui::{
 use crate::App;
 use crate::ui::theme::Theme;
 use crate::ui::assets::{ICON_ELLIPSIS_VERTICAL, ICON_INFO, ICON_LOCK, ICON_REFRESH};
+use crate::ui::icon;
 use crate::ui::{AlertDialog, AlertDialogFooter, Button, ButtonSize, ButtonVariant};
 
 #[derive(Clone, Debug)]
@@ -327,11 +328,7 @@ impl App {
                 .variant(ButtonVariant::Ghost)
                 .size(ButtonSize::IconSm)
                 .disabled(!placement.can_go_back)
-                .child(
-                    gpui::svg()
-                        .path(theme.icons.chevron_left())
-                        .size(px(14.0)),
-                )
+                .child(icon(theme.icons.chevron_left(), px(14.0), theme.foreground))
                 .on_click(move |_event, _window, app| {
                     if let Some(entity) = back_entity.upgrade() {
                         entity.update(app, |this, _cx| {
@@ -345,11 +342,7 @@ impl App {
                 .variant(ButtonVariant::Ghost)
                 .size(ButtonSize::IconSm)
                 .disabled(!placement.can_go_forward)
-                .child(
-                    gpui::svg()
-                        .path(theme.icons.chevron_right())
-                        .size(px(14.0)),
-                )
+                .child(icon(theme.icons.chevron_right(), px(14.0), theme.foreground))
                 .on_click(move |_event, _window, app| {
                     if let Some(entity) = forward_entity.upgrade() {
                         entity.update(app, |this, _cx| {
@@ -362,7 +355,7 @@ impl App {
             let reload = Button::new(format!("webview-reload-{id}"))
                 .variant(ButtonVariant::Ghost)
                 .size(ButtonSize::IconSm)
-                .child(gpui::svg().path(ICON_REFRESH).size(px(14.0)))
+                .child(icon(ICON_REFRESH, px(14.0), theme.foreground))
                 .on_click(move |_event, _window, app| {
                     if let Some(entity) = reload_entity.upgrade() {
                         entity.update(app, |this, _cx| {
@@ -376,9 +369,9 @@ impl App {
                 .variant(ButtonVariant::Ghost)
                 .size(ButtonSize::IconSm)
                 .child(if placement.url.starts_with("https://") {
-                    gpui::svg().path(ICON_LOCK).size(px(14.0))
+                    icon(ICON_LOCK, px(14.0), theme.foreground)
                 } else {
-                    gpui::svg().path(ICON_INFO).size(px(14.0))
+                    icon(ICON_INFO, px(14.0), theme.foreground)
                 })
                 .on_click(move |_event, _window, app| {
                     if let Some(entity) = site_entity.upgrade() {
@@ -389,7 +382,7 @@ impl App {
             let tools = Button::new(format!("webview-tools-{id}"))
                 .variant(ButtonVariant::Ghost)
                 .size(ButtonSize::IconSm)
-                .child(gpui::svg().path(ICON_ELLIPSIS_VERTICAL).size(px(14.0)))
+                .child(icon(ICON_ELLIPSIS_VERTICAL, px(14.0), theme.foreground))
                 .on_click(move |_event, _window, app| {
                     if let Some(entity) = tools_entity.upgrade() {
                         entity.update(app, |this, _cx| this.toggle_webview_tools_panel(id));

@@ -29,6 +29,7 @@ use gpui::{
 
 use crate::App;
 use crate::renderer::color;
+use crate::ui::icon;
 use crate::ui::theme::Theme;
 use crate::workspace::{self, LayoutRect};
 
@@ -280,13 +281,11 @@ pub(crate) fn tab_strip(
                         .flex()
                         .items_center()
                         .justify_center()
-                        .child(
-                            gpui::svg()
-                                .path(close_icon)
-                                .size(px(12.0 * inv))
-                                .flex_shrink_0()
-                                .text_color(if close_hov { style.ink } else { style.ink_dim }),
-                        ),
+                        .child(icon(
+                            close_icon,
+                            px(12.0 * inv),
+                            if close_hov { style.ink } else { style.ink_dim },
+                        )),
                 ),
         );
 
@@ -389,13 +388,11 @@ impl App {
                                     .flex()
                                     .items_center()
                                     .justify_center()
-                                    .child(
-                                        gpui::svg()
-                                            .path(cx.global::<Theme>().icons.chevron_right())
-                                            .size(px(14.0 * inv))
-                                            .flex_shrink_0()
-                                            .text_color(base.ink_dim),
-                                    )
+                                    .child(icon(
+                                        cx.global::<Theme>().icons.chevron_right(),
+                                        px(14.0 * inv),
+                                        base.ink_dim,
+                                    ))
                                     .children(badge),
                             )
                             .on_mouse_down(MouseButton::Left, move |ev: &MouseDownEvent, _win: &mut Window, app: &mut GpuiApp| {
@@ -480,17 +477,15 @@ impl App {
                         .top(px((cr.y - bar.y) * inv))
                         .w(px(cr.w * inv))
                         .h(px(cr.h * inv))
-                        .child(
-                            gpui::svg()
-                                .path(if tile.collapsed {
-                                    cx.global::<Theme>().icons.chevron_right()
-                                } else {
-                                    cx.global::<Theme>().icons.chevron_down()
-                                })
-                                .size(px(14.0 * inv))
-                                .flex_shrink_0()
-                                .text_color(if hov(&cr) { style.ink } else { style.ink_dim }),
-                        )
+                        .child(icon(
+                            if tile.collapsed {
+                                cx.global::<Theme>().icons.chevron_right()
+                            } else {
+                                cx.global::<Theme>().icons.chevron_down()
+                            },
+                            px(14.0 * inv),
+                            if hov(&cr) { style.ink } else { style.ink_dim },
+                        ))
                         .children(badge)
                         .on_mouse_down(MouseButton::Left, move |ev: &MouseDownEvent, _win: &mut Window, app: &mut GpuiApp| {
                             app.stop_propagation();
