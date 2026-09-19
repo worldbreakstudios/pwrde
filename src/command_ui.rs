@@ -31,8 +31,8 @@ use crate::command::{action_icon, RootRow, Stage, StepState, Token};
 use crate::picker::{FolderKind, ForkScope, PickerRow};
 use crate::pwrspace::ProfileNode;
 use crate::ui::assets::{
-    ICON_ARROW_UP, ICON_CHEVRON_RIGHT, ICON_GIT_BRANCH, ICON_GIT_FORK, ICON_HOUSE, ICON_MINUS,
-    ICON_PIN, ICON_PLUS,
+    ICON_ARROW_UP, ICON_CHEVRON_RIGHT, ICON_GIT_BRANCH, ICON_GIT_FORK, ICON_HISTORY, ICON_HOUSE,
+    ICON_MINUS, ICON_PIN, ICON_PLUS,
 };
 use crate::ui::theme::Theme;
 use crate::ui::{Badge, Button, ButtonSize, ButtonVariant, Kbd};
@@ -486,6 +486,59 @@ impl App {
                                     .into_any_element()
                             }
                         });
+                    }
+                }
+            }
+            Stage::ClaudeSession => {
+                if let Some(picker) = pal.claude_sessions.as_ref() {
+                    for (i, row) in picker.rows.iter().enumerate() {
+                        match row {
+                            crate::picker::SessionRow::Note(note) => {
+                                list = list.child(caption(&theme, note.clone()));
+                            }
+                            crate::picker::SessionRow::Entry(session) => {
+                                list = list.child(
+                                    row_shell(&theme, i, i == selected, on_pick.clone())
+                                        .child(icon_tile(
+                                            26.0,
+                                            7.0,
+                                            chip_bg,
+                                            theme.muted_foreground,
+                                            ICON_HISTORY,
+                                        ))
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .flex_col()
+                                                .overflow_hidden()
+                                                .child(
+                                                    div()
+                                                        .font_family(crate::renderer::FONT_FAMILY)
+                                                        .text_size(px(13.0))
+                                                        .font_weight(gpui::FontWeight::MEDIUM)
+                                                        .text_color(theme.foreground)
+                                                        .child(session.title.clone()),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .font_family(crate::renderer::FONT_FAMILY)
+                                                        .text_size(px(11.0))
+                                                        .text_color(theme.muted_foreground)
+                                                        .overflow_hidden()
+                                                        .whitespace_nowrap()
+                                                        .text_ellipsis()
+                                                        .child(
+                                                            session
+                                                                .cwd
+                                                                .to_string_lossy()
+                                                                .to_string(),
+                                                        ),
+                                                ),
+                                        )
+                                        .child(div().flex_1()),
+                                );
+                            }
+                        }
                     }
                 }
             }

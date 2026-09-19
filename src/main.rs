@@ -20,6 +20,7 @@ mod backdrop;
 mod bus;
 mod bus_exec;
 mod claude_hooks;
+mod claude_sessions;
 mod cli_tools;
 mod command;
 mod command_ui;
@@ -2650,6 +2651,19 @@ impl App {
         {
             pal.provide_repo(picker::Picker::new());
         }
+        // The `Resume Claude session…` route loads its list here too, right
+        // after the pick, so the stage switch renders a populated picker. It
+        // is the same best-effort scan the repo picker already performs.
+        if self
+            .command
+            .as_ref()
+            .is_some_and(|p| p.needs_claude_sessions())
+        {
+            let recent = claude_sessions::load_recent();
+            if let Some(pal) = self.command.as_mut() {
+                pal.provide_claude_sessions(picker::ClaudeSessionPicker::new(recent));
+            }
+        }
         self.command_scroll_to = self.command.as_ref().map(|c| c.selected());
         self.modal_search_reset = Some(self.command_placeholder().to_string());
     }
@@ -2802,7 +2816,43 @@ impl App {
 
     /// Create the group (or flyover tab) the New-session flow described.
     fn launch_new_session(&mut self, session: command::NewSession) {
-        let command::NewSession { name, repo, base, layout, folder, for_flyover } = session;
+        let command::NewSession { name, repo, base, layout, folder, for_flyover, claude } = session;
+        // The `Resume Claude session…` route: one ordinary single-pane group in
+        // the session's exact recorded cwd, whose shell is handed the resume
+        // command as argv (`claude --resume <session-id>`) — the id is never
+        // interpolated into shell syntax, and nothing else from the transcript
+        // is used. Base and Layout are skipped, as the route intends.
+        // The selection arrives on the payload: `command_enter` clears the
+        // palette before calling this, so the choice cannot be read back off
+        // `self.command` here.
+        if let Some(claude) = claude {
+            self.add_group(name, Some(claude.cwd.clone()));
+            let founded = self
+                .workspaces
+                .get(self.active)
+                .and_then(|ws| {
+                    ws.root
+                        .tiles()
+                        .first()
+                        .and_then(|tile| tile.tabs.first())
+                        .and_then(workspace::Tab::session)
+                })
+                .map(|session| session.id);
+            if let Some(id) = founded {
+                // Typed into the pane's shell: the id must arrive as one
+                // inert word, so this is the single-quoted command line —
+                // never `resume_argv().join(" ")`, which would splice a
+                // planted id's metacharacters into shell syntax.
+                let line = claude.typed_command_line();
+                // Queued for the pane's first wakeup, exactly like the other
+                // primary commands (`add_group`, profiles): the wakeup drain
+                // types it once the shell has printed its prompt. Queuing only
+                // is what keeps this to a single send — an immediate write on
+                // top would deliver the same line twice.
+                self.pending_primary_cmd.insert(id, line);
+            }
+            return;
+        }
         if for_flyover {
             let cwd = base.and_then(|b| b.path).or(Some(repo.path));
             self.spawn_flyover_tab(cwd);
@@ -5356,7 +5406,9 @@ impl App {
                     if let Some(cmd) = self.pending_primary_cmd.remove(&id)
                         && let Some(session) = self.find_session(id)
                     {
-                        session.write(format!("{cmd}\r"));
+                        // Carriage return, not line feed: that is what the
+                        // pane's Enter sends, so the shell runs the queued line.
+                        session.write(primary_command_bytes(&cmd));
                     }
                     if self.is_visible(id) {
                         let ws = &self.workspaces[self.active];
@@ -5891,6 +5943,16 @@ fn scroll_steps(accum: &mut f64, notches: f64) -> isize {
     let steps = accum.trunc() as isize;
     *accum -= steps as f64;
     steps
+}
+
+/// The bytes a queued primary command (`pending_primary_cmd`) is typed into
+/// its pane with: the line followed by a carriage return — the byte an Enter
+/// keypress sends — so the shell submits it. Only the first wakeup writes
+/// this, which is what makes a queued command exactly one send.
+fn primary_command_bytes(cmd: &str) -> Vec<u8> {
+    let mut bytes = cmd.as_bytes().to_vec();
+    bytes.push(b'\r');
+    bytes
 }
 
 /// Map a gpui keystroke to the bytes a terminal expects, or `None` when the
@@ -8033,6 +8095,32 @@ mod proc_title_tests {
             Some(false)
         );
         assert_eq!(proc_title_due(PROC_TITLE_POLL, PROC_TITLE_REFRESH), Some(true));
+    }
+}
+
+#[cfg(test)]
+mod primary_command_queue_tests {
+    use super::*;
+
+    /// The queued-line encoding ends in exactly one Enter: the carriage
+    /// return a real keypress sends (never a line feed).
+    #[test]
+    fn primary_command_is_typed_with_a_single_carriage_return() {
+        let bytes = primary_command_bytes("claude --resume abc-123");
+        assert_eq!(bytes, b"claude --resume abc-123\r");
+        assert_eq!(bytes.iter().filter(|b| **b == b'\r' || **b == b'\n').count(), 1);
+        assert!(!bytes.contains(&b'\n'));
+    }
+
+    /// Removing the queued command consumes it: the map holds exactly one
+    /// entry per pane, so the drain's `remove` can never send a second time.
+    #[test]
+    fn draining_removes_the_queue_entry_so_nothing_is_sent_twice() {
+        let mut pending: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
+        pending.insert(7, "claude --resume abc-123".to_string());
+        assert_eq!(pending.remove(&7).as_deref(), Some("claude --resume abc-123"));
+        assert!(pending.remove(&7).is_none());
+        assert!(pending.is_empty());
     }
 }
 

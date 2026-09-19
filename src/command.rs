@@ -32,6 +32,10 @@ pub enum Stage {
     Layout,
     /// Step 4: which sidebar folder (section) the group files under.
     Folder,
+    /// The `Resume Claude session…` route's own step: pick a recent Claude Code
+    /// session; choosing one jumps straight to the launch (no Base, no Layout)
+    /// in that session's recorded cwd.
+    ClaudeSession,
     /// The flow is complete: the summary card is showing.
     Done,
 }
@@ -81,6 +85,11 @@ pub struct NewSession {
     pub folder: Option<FolderEntry>,
     /// Whether the group opens in the flyover terminal.
     pub for_flyover: bool,
+    /// The picked Claude session, or `None` for the ordinary flow. This is
+    /// the launch handoff: the app closes the palette before it calls
+    /// `launch_new_session`, so the choice must ride on the payload and
+    /// cannot be read back off the palette afterwards.
+    pub claude: Option<crate::claude_sessions::ClaudeSession>,
 }
 
 /// What confirming (↩) or popping (⌫ on an empty query) did.
@@ -129,6 +138,13 @@ pub struct CommandPalette {
     pub layout: Option<ProfilePicker>,
     /// Step 4's model, once the layout is chosen.
     pub folder: Option<FolderPicker>,
+    /// The `Resume Claude session…` route's model, once that row is taken.
+    pub claude_sessions: Option<crate::picker::ClaudeSessionPicker>,
+    /// The Repo-step row when it turned out to be the resume route. The flow
+    /// then runs on its own step instead of Base → Layout.
+    pub claude_route: Option<PickerEntry>,
+    /// The picked Claude session: the launch payload for the route.
+    pub claude_choice: Option<crate::claude_sessions::ClaudeSession>,
     /// The group name (derived from the repo path).
     pub name: String,
     /// The picked repo, once chosen.
@@ -156,6 +172,9 @@ impl CommandPalette {
             base: None,
             layout: None,
             folder: None,
+            claude_sessions: None,
+            claude_route: None,
+            claude_choice: None,
             name: String::new(),
             repo_choice: None,
             base_choice: None,
@@ -181,6 +200,9 @@ impl CommandPalette {
             base: None,
             layout: None,
             folder: None,
+            claude_sessions: None,
+            claude_route: None,
+            claude_choice: None,
             name: String::new(),
             repo_choice: None,
             base_choice: None,
@@ -205,7 +227,13 @@ impl CommandPalette {
     /// Hand the Repo step its directory list. The model never scans the
     /// filesystem itself; the app provides the picker whenever the flow
     /// lands on this step (`App::ensure_command_repo`), tests inject fixtures.
-    pub fn provide_repo(&mut self, repo: Picker) {
+    pub fn provide_repo(&mut self, mut repo: Picker) {
+        // The flyover flow must never offer the `Resume Claude session…`
+        // route: that route creates a full workspace group, ignoring the
+        // flyover pick entirely. Normal New session keeps it.
+        if self.for_flyover {
+            repo.set_claude_route(false);
+        }
         self.repo = Some(repo);
     }
 
@@ -223,6 +251,9 @@ impl CommandPalette {
         self.base = None;
         self.layout = None;
         self.folder = None;
+        self.claude_sessions = None;
+        self.claude_route = None;
+        self.claude_choice = None;
         self.name = String::new();
         self.repo_choice = None;
         self.base_choice = None;
@@ -268,9 +299,21 @@ impl CommandPalette {
         }
     }
 
+    /// True when the flow's Repo step landed on the `Resume Claude session…`
+    /// row and still needs its recent list (the app then calls
+    /// [`CommandPalette::provide_claude_sessions`]).
+    pub fn needs_claude_sessions(&self) -> bool {
+        !self.for_flyover && self.claude_route.is_some() && self.claude_sessions.is_none()
+    }
+
     /// The current stage's query (`""` on Done).
     pub fn query(&self) -> &str {
         match self.stage {
+            Stage::ClaudeSession => self
+                .claude_sessions
+                .as_ref()
+                .map(|p| p.query.as_str())
+                .unwrap_or(""),
             Stage::Root => &self.root_query,
             Stage::Repo => self.repo.as_ref().map(|p| p.query.as_str()).unwrap_or(""),
             Stage::Base => self.base.as_ref().map(|p| p.query.as_str()).unwrap_or(""),
@@ -283,6 +326,11 @@ impl CommandPalette {
     /// Replaces the current stage's query and refilters.
     pub fn set_query(&mut self, q: &str) {
         match self.stage {
+            Stage::ClaudeSession => {
+                if let Some(picker) = self.claude_sessions.as_mut() {
+                    picker.set_query(q);
+                }
+            }
             Stage::Root => self.rebuild_root(q),
             Stage::Repo => {
                 if let Some(picker) = self.repo.as_mut() {
@@ -311,6 +359,11 @@ impl CommandPalette {
     /// The current stage's highlight.
     pub fn selected(&self) -> usize {
         match self.stage {
+            Stage::ClaudeSession => self
+                .claude_sessions
+                .as_ref()
+                .map(|p| p.selected)
+                .unwrap_or(0),
             Stage::Root => self.root_selected,
             Stage::Repo => self.repo.as_ref().map(|p| p.selected).unwrap_or(0),
             Stage::Base => self.base.as_ref().map(|p| p.selected).unwrap_or(0),
@@ -325,6 +378,11 @@ impl CommandPalette {
     /// profile pickers have no headers).
     pub fn move_selection(&mut self, delta: isize) {
         match self.stage {
+            Stage::ClaudeSession => {
+                if let Some(picker) = self.claude_sessions.as_mut() {
+                    picker.move_selection(delta);
+                }
+            }
             Stage::Root => {
                 // Each unit of `delta` is one Action row in that direction;
                 // headers are skipped and the ends clamp.
@@ -377,6 +435,11 @@ impl CommandPalette {
     /// Highlights row `index` of the current stage (clamped to the list).
     pub fn select(&mut self, index: usize) {
         match self.stage {
+            Stage::ClaudeSession => {
+                if let Some(picker) = self.claude_sessions.as_mut() {
+                    picker.select(index);
+                }
+            }
             Stage::Root => {
                 if !self.root_rows.is_empty() {
                     let index = index.min(self.root_rows.len() - 1);
@@ -429,6 +492,12 @@ impl CommandPalette {
         if let Some(folder) = &self.folder_choice {
             tokens.push(Token::Arg { kind: "folder", label: folder.label.clone() });
         }
+        if let Some(session) = &self.claude_choice {
+            tokens.push(Token::Arg {
+                kind: "claude",
+                label: session.title.clone(),
+            });
+        }
         tokens
     }
 
@@ -461,12 +530,16 @@ impl CommandPalette {
 
     /// Whether the flow (and so the step rail) is showing.
     pub fn in_flow(&self) -> bool {
-        matches!(self.stage, Stage::Repo | Stage::Base | Stage::Layout | Stage::Folder)
+        matches!(
+            self.stage,
+            Stage::Repo | Stage::Base | Stage::Layout | Stage::Folder | Stage::ClaudeSession
+        )
     }
 
     /// The search field's placeholder for the current stage.
     pub fn placeholder(&self) -> &'static str {
         match self.stage {
+            Stage::ClaudeSession => "Search Claude sessions…",
             Stage::Root => "Run a command…",
             Stage::Repo => "Search repos…",
             Stage::Base => "Filter branches & worktrees…",
@@ -479,6 +552,7 @@ impl CommandPalette {
     /// The status line under the search field.
     pub fn footer(&self) -> String {
         match self.stage {
+            Stage::ClaudeSession => "Resume Claude session · single pane".into(),
             Stage::Root => {
                 let commands = self.root_rows.iter().filter(|r| matches!(r, RootRow::Action(_))).count();
                 format!("root · {commands} commands")
@@ -505,6 +579,14 @@ impl CommandPalette {
         self.stage = Stage::Layout;
     }
 
+    /// Supplies the recent-Claude-session picker once the Repo step landed on
+    /// the `Resume Claude session…` row: stage moves to its own step, and the
+    /// flow launches straight from there — Base and Layout are never shown.
+    pub fn provide_claude_sessions(&mut self, picker: crate::picker::ClaudeSessionPicker) {
+        self.claude_sessions = Some(picker);
+        self.stage = Stage::ClaudeSession;
+    }
+
     /// Supplies the folder picker after [`Outcome::LayoutChosen`]: stage
     /// moves to Folder.
     pub fn provide_folder(&mut self, folder: FolderPicker) {
@@ -519,6 +601,27 @@ impl CommandPalette {
             return Outcome::Nothing;
         }
         match self.stage {
+            Stage::ClaudeSession | Stage::Done if self.claude_choice.is_some() => {
+                // Back off the resume route to the Repo step it started from,
+                // clearing the route picks so the repo list returns fresh —
+                // whether the pick is still being made (ClaudeSession) or has
+                // already settled into the review card (Done).
+                self.claude_sessions = None;
+                self.claude_route = None;
+                self.claude_choice = None;
+                self.repo_choice = None;
+                self.stage = Stage::Repo;
+                Outcome::Nothing
+            }
+            Stage::ClaudeSession => {
+                // The resume list is up but nothing is picked yet: leaving the
+                // route returns to the Repo step it started from.
+                self.claude_sessions = None;
+                self.claude_route = None;
+                self.repo_choice = None;
+                self.stage = Stage::Repo;
+                Outcome::Nothing
+            }
             Stage::Done => {
                 self.stage = Stage::Folder;
                 self.folder_choice = None;
@@ -586,9 +689,44 @@ impl CommandPalette {
                 let Some(choice) = choice else {
                     return Outcome::Nothing;
                 };
+                // The `Resume Claude session…` row is a route, not a
+                // directory: no Base, no Layout. The picker comes next and the
+                // session's own recorded cwd roots the group.
+                if crate::picker::is_claude_route(&choice) {
+                    // Belt and braces: the flyover picker withholds the row,
+                    // and a route pick that slipped through does nothing
+                    // rather than building a group the flyover cannot show.
+                    if self.for_flyover {
+                        return Outcome::Nothing;
+                    }
+                    self.name = "claude".into();
+                    self.claude_route = Some(choice.clone());
+                    self.repo_choice = Some(choice);
+                    return Outcome::Nothing;
+                }
                 self.name = group_name(&choice.path);
                 self.repo_choice = Some(choice.clone());
                 Outcome::RepoChosen(choice)
+            }
+            Stage::ClaudeSession => {
+                let choice = self
+                    .claude_sessions
+                    .as_ref()
+                    .and_then(|p| p.selected_entry())
+                    .cloned();
+                let Some(choice) = choice else {
+                    return Outcome::Nothing;
+                };
+                self.name = group_name(&choice.cwd);
+                // The session is carried through the stage, not launched yet:
+                // the palette closes (`command_enter`) before the app reads
+                // the payload, so `Outcome::Launch` is only emitted from
+                // `Done` below, where `finish` still sees the pick.
+                self.claude_choice = Some(choice);
+                self.claude_sessions = None;
+                self.claude_route = None;
+                self.stage = Stage::Done;
+                Outcome::Nothing
             }
             Stage::Base => {
                 let choice = self.base.as_ref().and_then(ForkPicker::selected_entry).cloned();
@@ -630,23 +768,50 @@ impl CommandPalette {
         }
     }
 
-    /// Collects the flow's picks into the launch payload.
+    /// Collects the flow's picks into the launch payload. On the resume route
+    /// the session's recorded cwd stands in for the picked directory; the app
+    /// reads the session itself off `claude_choice` and launches the resume
+    /// command (argv for a direct spawn, or the session's single-quoted
+    /// `typed_command_line` when the line is typed into the pane's shell —
+    /// never argv joined with spaces, which a planted session id could turn
+    /// into shell syntax).
     fn finish(&self) -> NewSession {
         NewSession {
             name: self.name.clone(),
-            repo: self
-                .repo_choice
-                .clone()
-                .expect("launch without a repo pick"),
+            repo: match &self.claude_choice {
+                Some(session) => PickerEntry {
+                    path: session.cwd.clone(),
+                    label: session.title.clone(),
+                    is_git: false,
+                },
+                None => self
+                    .repo_choice
+                    .clone()
+                    .expect("launch without a repo pick"),
+            },
             base: self.base_choice.clone(),
             layout: self.layout_choice.clone(),
             folder: self.folder_choice.clone(),
             for_flyover: self.for_flyover,
+            claude: self.claude_choice.clone(),
         }
     }
 
     /// The Done card: `(headline, status)`.
     pub fn summary(&self) -> (String, String) {
+        // The resume route skips Base, Layout and Folder, so the ordinary card
+        // would read "⎇ main · Default" — a branch and layout nobody picked —
+        // and would name the route's NUL-sentinel repo row. Report the session
+        // itself instead: its human-facing title, the cwd it recorded (where
+        // the pane opens), and the exact resume line the app types.
+        if let Some(session) = &self.claude_choice {
+            let headline = format!("{} · {}", session.title, session.cwd.display());
+            let status = format!(
+                "Resumes {} · continues in its recorded cwd",
+                session.typed_command_line()
+            );
+            return (headline, status);
+        }
         let base_label = self
             .base_choice
             .as_ref()
@@ -925,6 +1090,18 @@ mod tests {
     }
 
     /// A repo picker with two entries, no filesystem access.
+    /// The row index of the repo list's directory entry labelled `label`.
+    fn repo_row(palette: &CommandPalette, label: &str) -> usize {
+        palette
+            .repo
+            .as_ref()
+            .expect("repo picker")
+            .rows
+            .iter()
+            .position(|r| matches!(r, PickerRow::Entry(e) if e.label == label))
+            .expect("the directory row is listed")
+    }
+
     fn repo_picker() -> Picker {
         Picker::from_entries(
             vec![
@@ -1058,9 +1235,13 @@ mod tests {
         );
         assert!(!launched.for_flyover);
 
-        // Git-repo variant: provide_base walks through Base too.
+        // Git-repo variant: provide_base walks through Base too. (The repo list
+        // seats its selection on the resume route, so the directory row is
+        // selected by label.)
         let mut palette = CommandPalette::new_session(false);
         palette.repo = Some(repo_picker());
+        let row = repo_row(&palette, "~/src/pwrde");
+        palette.select(row);
         match palette.enter() {
             Outcome::RepoChosen(_) => {}
             other => panic!("expected RepoChosen, got {other:?}"),
@@ -1098,6 +1279,8 @@ mod tests {
         let mut palette = CommandPalette::root();
         palette.enter_new_session();
         palette.repo = Some(repo_picker());
+        let row = repo_row(&palette, "~/src/pwrde");
+        palette.select(row);
         palette.enter();
         palette.provide_base(fork_picker());
         palette.select(0);
@@ -1171,7 +1354,8 @@ mod tests {
         let mut palette = CommandPalette::new_session(true);
         assert!(palette.for_flyover);
         palette.repo = Some(repo_picker());
-        palette.select(1); // the git repo
+        let row = repo_row(&palette, "~/src/pwrde");
+        palette.select(row); // the git repo
         assert!(matches!(palette.enter(), Outcome::RepoChosen(_)));
         palette.provide_base(fork_picker());
         palette.select(0);
@@ -1259,5 +1443,253 @@ mod tests {
                 "{path} is not an svg document"
             );
         }
+    }
+
+    /// A recent-Claude-session picker over `(title, cwd)` pairs, in the order
+    /// the reader would hand them over (newest first).
+    fn claude_picker(entries: &[(&str, &str)]) -> crate::picker::ClaudeSessionPicker {
+        let sessions = entries
+            .iter()
+            .enumerate()
+            .map(|(i, (title, cwd))| crate::claude_sessions::ClaudeSession {
+                id: format!("session-{i}"),
+                cwd: PathBuf::from(cwd),
+                title: (*title).to_string(),
+                updated: std::time::UNIX_EPOCH + std::time::Duration::from_secs(i as u64 + 1),
+            })
+            .collect();
+        crate::picker::ClaudeSessionPicker::new(sessions)
+    }
+
+    /// The row index of the repo list's `Resume Claude session…` route.
+    fn claude_route_row(palette: &CommandPalette) -> usize {
+        palette
+            .repo
+            .as_ref()
+            .expect("repo picker")
+            .rows
+            .iter()
+            .position(|r| matches!(r, PickerRow::Entry(e) if crate::picker::is_claude_route(e)))
+            .expect("the resume route is offered at the Repo step")
+    }
+
+    #[test]
+    fn repo_step_offers_the_resume_route_and_waits_for_its_list() {
+        let mut palette = CommandPalette::new_session(false);
+        palette.repo = Some(repo_picker());
+        let row = claude_route_row(&palette);
+        palette.select(row);
+        assert_eq!(
+            palette.enter(),
+            Outcome::Nothing,
+            "the route needs its recent list before it can move on"
+        );
+        assert!(palette.needs_claude_sessions());
+        assert_eq!(palette.stage, Stage::Repo);
+        // The app supplies the list; only then does the stage move.
+        palette.provide_claude_sessions(claude_picker(&[("b2", "/tmp"), ("b1", "/tmp")]));
+        assert_eq!(palette.stage, Stage::ClaudeSession);
+        assert_eq!(palette.placeholder(), "Search Claude sessions…");
+        assert_eq!(palette.query(), "");
+        assert!(!palette.needs_claude_sessions());
+        // ⌫ returns predictably to the Repo step with the route pick cleared.
+        assert_eq!(palette.pop(), Outcome::Nothing);
+        assert_eq!(palette.stage, Stage::Repo);
+        assert!(palette.repo_choice.is_none());
+        assert!(!palette.needs_claude_sessions());
+        assert_eq!(palette.placeholder(), "Search repos…");
+    }
+
+    /// The flyover New-session palette creates a flyover terminal, not a
+    /// workspace group: it must not offer the resume route at all.
+    #[test]
+    fn flyover_repo_step_withholds_the_resume_route() {
+        let mut palette = CommandPalette::new_session(true);
+        assert!(palette.for_flyover);
+        assert!(palette.needs_repo());
+        palette.provide_repo(repo_picker());
+        assert!(
+            palette
+                .repo
+                .as_ref()
+                .expect("repo picker")
+                .rows
+                .iter()
+                .all(|r| !matches!(r, PickerRow::Entry(e) if crate::picker::is_claude_route(e))),
+            "the flyover picker must not list the resume route"
+        );
+        // The directory rows are untouched and the flow still walks through
+        // the Base pick the flyover path ends at.
+        let row = repo_row(&palette, "~/src/pwrde");
+        palette.select(row);
+        assert!(matches!(palette.enter(), Outcome::RepoChosen(_)));
+        assert!(!palette.needs_claude_sessions());
+        assert!(palette.claude_route.is_none());
+    }
+
+    /// Normal New session still offers the route, and picking it still waits
+    /// for the recent list before switching stage.
+    #[test]
+    fn normal_repo_step_still_offers_the_resume_route() {
+        let mut palette = CommandPalette::new_session(false);
+        palette.provide_repo(repo_picker());
+        assert!(palette
+            .repo
+            .as_ref()
+            .expect("repo picker")
+            .rows
+            .iter()
+            .any(|r| matches!(r, PickerRow::Entry(e) if crate::picker::is_claude_route(e))));
+        let row = claude_route_row(&palette);
+        palette.select(row);
+        assert_eq!(palette.enter(), Outcome::Nothing);
+        assert_eq!(palette.stage, Stage::Repo);
+        assert!(palette.needs_claude_sessions());
+        palette.provide_claude_sessions(claude_picker(&[("b1", "/tmp")]));
+        assert_eq!(palette.stage, Stage::ClaudeSession);
+    }
+
+    #[test]
+    fn choosing_a_session_launches_a_single_pane_in_its_recorded_cwd() {
+        let mut palette = CommandPalette::new_session(false);
+        palette.repo = Some(repo_picker());
+        let row = claude_route_row(&palette);
+        palette.select(row);
+        assert!(matches!(palette.enter(), Outcome::Nothing));
+        palette.provide_claude_sessions(claude_picker(&[
+            ("main-notes", "/tmp/pwrde-notes"),
+            ("main", "/tmp/pwrde"),
+        ]));
+        palette.select(0);
+        // Picking a session settles the flow into the review card; launching
+        // happens only on the final confirm, so the app can close the palette
+        // in between and still find the session on the payload.
+        assert_eq!(palette.enter(), Outcome::Nothing);
+        let launched = match palette.enter() {
+            Outcome::Launch(session) => session,
+            other => panic!("expected Launch, got {other:?}"),
+        };
+        // The pick bypassed Base and Layout entirely.
+        assert!(launched.base.is_none());
+        assert!(launched.layout.is_none());
+        assert!(launched.folder.is_none());
+        assert_eq!(launched.repo.path, PathBuf::from("/tmp/pwrde-notes"));
+        assert_eq!(launched.name, "pwrde-notes");
+        assert!(!launched.repo.is_git);
+        assert_eq!(
+            palette.tokens().last(),
+            Some(&Token::Arg {
+                kind: "claude",
+                label: "main-notes".into()
+            })
+        );
+        // The session the app must resume rides along on the launch payload —
+        // the palette is cleared before the app reads it.
+        let chosen = launched.claude.as_ref().expect("the session rides along");
+        assert_eq!(chosen.id, "session-0");
+        // And the line the app types is the quoted one, not the argv join.
+        assert_eq!(chosen.typed_command_line(), chosen.resume_display());
+        assert_eq!(chosen.typed_command_line(), "claude --resume session-0");
+    }
+
+    /// After a session pick the review card must describe the session — its
+    /// human-facing title and recorded cwd — never the route's internals: the
+    /// NUL-sentinel repo path, a branch or layout that was never picked.
+    #[test]
+    fn done_summary_after_a_claude_pick_names_the_session_and_its_cwd() {
+        let mut palette = CommandPalette::new_session(false);
+        palette.repo = Some(repo_picker());
+        let row = claude_route_row(&palette);
+        palette.select(row);
+        assert!(matches!(palette.enter(), Outcome::Nothing));
+        palette.provide_claude_sessions(claude_picker(&[
+            ("pwrde notes", "/tmp/pwrde-notes"),
+            ("other", "/tmp/other"),
+        ]));
+        palette.select(0);
+        assert_eq!(palette.enter(), Outcome::Nothing);
+        assert_eq!(palette.stage, Stage::Done);
+
+        let (headline, status) = palette.summary();
+        let card = format!("{headline}\n{status}");
+        assert!(card.contains("pwrde notes"), "the session's title: {card}");
+        assert!(
+            card.contains("/tmp/pwrde-notes"),
+            "the session's recorded cwd: {card}"
+        );
+        assert!(
+            card.contains("claude --resume session-0"),
+            "the resume context: {card}"
+        );
+        assert!(
+            !card.contains("pwrde/claude-sessions"),
+            "the route's sentinel path must not leak: {card}"
+        );
+        assert!(!card.contains('\u{0}'), "nor its NUL: {card}");
+        assert!(!card.contains('⎇'), "no fake branch on the resume card: {card}");
+        assert!(!card.contains("main"), "no fake branch/main: {card}");
+        assert!(!card.contains("Default"), "no default layout: {card}");
+
+        // The launch payload is unchanged by the summary fix.
+        let launched = match palette.enter() {
+            Outcome::Launch(session) => session,
+            other => panic!("expected Launch, got {other:?}"),
+        };
+        assert_eq!(launched.repo.path, PathBuf::from("/tmp/pwrde-notes"));
+        assert!(launched.base.is_none() && launched.layout.is_none());
+        assert_eq!(
+            launched.claude.as_ref().expect("the session rides along").id,
+            "session-0"
+        );
+    }
+
+    /// ⌫ on the Claude review card backs off the resume route to the Repo step
+    /// it started from, clearing the pick so no stale session can launch.
+    #[test]
+    fn backing_off_the_claude_done_card_returns_to_the_repo_step() {
+        let mut palette = CommandPalette::new_session(false);
+        palette.repo = Some(repo_picker());
+        let row = claude_route_row(&palette);
+        palette.select(row);
+        assert!(matches!(palette.enter(), Outcome::Nothing));
+        palette.provide_claude_sessions(claude_picker(&[("pwrde notes", "/tmp/pwrde-notes")]));
+        palette.select(0);
+        assert_eq!(palette.enter(), Outcome::Nothing);
+        assert_eq!(palette.stage, Stage::Done);
+
+        assert_eq!(palette.pop(), Outcome::Nothing);
+        assert_eq!(palette.stage, Stage::Repo);
+        assert!(palette.claude_choice.is_none(), "the pick is cleared");
+        assert!(palette.claude_route.is_none());
+        assert!(palette.claude_sessions.is_none());
+        assert!(palette.repo_choice.is_none());
+    }
+
+    #[test]
+    fn an_empty_history_is_a_note_that_cannot_be_launched() {
+        let mut picker = crate::picker::ClaudeSessionPicker::new(Vec::new());
+        assert!(picker.is_empty());
+        assert!(matches!(
+            picker.rows.as_slice(),
+            [crate::picker::SessionRow::Note(_)]
+        ));
+        picker.move_selection(1);
+        picker.select(0);
+        assert!(
+            picker.selected_entry().is_none(),
+            "the empty state is not selectable"
+        );
+
+        let mut palette = CommandPalette::new_session(false);
+        palette.repo = Some(repo_picker());
+        let row = claude_route_row(&palette);
+        palette.select(row);
+        assert!(matches!(palette.enter(), Outcome::Nothing));
+        palette.provide_claude_sessions(crate::picker::ClaudeSessionPicker::new(Vec::new()));
+        assert_eq!(palette.enter(), Outcome::Nothing, "nothing to resume");
+        assert_eq!(palette.stage, Stage::ClaudeSession);
+        // And the repo route is still reachable from there.
+        assert_eq!(palette.pop(), Outcome::Nothing);
+        assert_eq!(palette.stage, Stage::Repo);
     }
 }
