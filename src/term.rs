@@ -487,6 +487,44 @@ pub fn shpool_foreground_command(session_name: &str) -> Option<String> {
     deepest_descendant(&clean, root)
 }
 
+/// Widest emulator grid pwrde allocates for a pane, in cells. The primary
+/// screen's grid is always this wide (see [`grid_cols_for`]); this bounds the
+/// memory a pane can claim.
+pub const H_COLS_MAX: usize = 2048;
+
+/// Grid columns for the *primary* screen of a pane whose visible width is
+/// `viewport_cols` cells.
+///
+/// pwrde does not wrap long lines at the pane edge: the emulator grid is wider
+/// than the viewport, so a long line stays one row and the pane shows a
+/// horizontally scrollable window over the cells to the right. There is no way
+/// to have both an unwrapped grid and a viewport-width PTY — the grid *is* what
+/// the emulator tells the application it has — so the PTY reports these wider
+/// columns and programs that lay output out to `COLUMNS` lay it out wide (the
+/// user scrolls to it).
+///
+/// The width is a *constant* (`max(viewport, H_COLS_MAX)`), not a multiple of
+/// the viewport, for two reasons: resizing a pane then never re-wraps its
+/// scrollback, and the grid can never end up narrower than the pane itself. The
+/// alternate screen is the exception — `Session::begin_frame` gives a
+/// full-screen TUI the exact viewport width, because it asks the tty how big it
+/// is and lays out to that answer.
+pub fn grid_cols_for(viewport_cols: usize) -> usize {
+    viewport_cols.max(H_COLS_MAX)
+}
+
+/// Last size and cell metrics reported to a pane, in physical px — everything
+/// [`Session::apply_size`] needs to (re)build the PTY and the emulator grid
+/// without a new window resize.
+#[derive(Clone, Copy)]
+struct PaneSize {
+    cols: usize,
+    rows: usize,
+    cell_w: u16,
+    cell_h: u16,
+    dpi: u32,
+}
+
 pub struct Session {
     pub id: u64,
     pub term: Arc<Mutex<Terminal>>,
@@ -495,6 +533,19 @@ pub struct Session {
     redraw_pending: Arc<AtomicBool>,
     /// Lines scrolled up from the live bottom (0 = following new output).
     scroll_offset: AtomicUsize,
+    /// Cells scrolled right from column 0. The emulator grid is wider than the
+    /// pane ([`grid_cols_for`]), so this is what "scroll right" moves. Always 0
+    /// on the alternate screen, where the grid is exactly the viewport.
+    h_scroll: AtomicUsize,
+    /// The pane's *visible* size plus cell metrics, as last reported by
+    /// [`Session::resize`]. The grid width is derived from this, so entering and
+    /// leaving the alternate screen can re-size the grid without a window resize.
+    viewport: Mutex<PaneSize>,
+    /// Whether the emulator is on the alternate screen. A full-screen TUI asks
+    /// the tty how big it is and lays out to that, so on the alternate screen the
+    /// grid is exactly the viewport; the wide no-wrap grid belongs to the primary
+    /// screen's scrollback. Updated by [`Session::begin_frame`].
+    alt_active: AtomicBool,
     /// Active mouse selection, if any (in stable-row coordinates).
     selection: Mutex<Option<Sel>>,
     /// Consecutive sweeps that failed to resolve a name for this pane. A pane
@@ -536,10 +587,11 @@ impl Session {
         events: Sender<TermEvent>,
         shpool_session: Option<String>,
     ) -> Self {
+        let grid_cols = grid_cols_for(cols);
         let pty_size = PtySize {
             rows: rows as u16,
-            cols: cols as u16,
-            pixel_width: cols as u16 * cell_width,
+            cols: grid_cols as u16,
+            pixel_width: (grid_cols as u16).saturating_mul(cell_width),
             pixel_height: rows as u16 * cell_height,
         };
         let pair = native_pty_system().openpty(pty_size).expect("openpty");
@@ -633,7 +685,7 @@ impl Session {
 
         let term_size = TerminalSize {
             rows,
-            cols,
+            cols: grid_cols,
             pixel_width: pty_size.pixel_width as usize,
             pixel_height: pty_size.pixel_height as usize,
             dpi,
@@ -701,6 +753,15 @@ impl Session {
             master: pair.master,
             redraw_pending,
             scroll_offset: AtomicUsize::new(0),
+            h_scroll: AtomicUsize::new(0),
+            viewport: Mutex::new(PaneSize {
+                cols,
+                rows,
+                cell_w: cell_width,
+                cell_h: cell_height,
+                dpi,
+            }),
+            alt_active: AtomicBool::new(false),
             selection: Mutex::new(None),
             proc_title: Mutex::new(None),
             proc_title_misses: AtomicUsize::new(0),
@@ -713,14 +774,24 @@ impl Session {
     /// thread and no event channel — just enough structure to build a `Tab`.
     #[cfg(test)]
     pub fn placeholder() -> Self {
-        let pty_size = PtySize { rows: 24, cols: 80, pixel_width: 640, pixel_height: 384 };
+        let pty_size = PtySize {
+            rows: 24,
+            cols: grid_cols_for(80) as u16,
+            pixel_width: grid_cols_for(80) as u16 * 8,
+            pixel_height: 384,
+        };
         let pair = native_pty_system().openpty(pty_size).expect("openpty");
         let _child = pair.slave.spawn_command(CommandBuilder::new("/bin/cat")).expect("spawn cat");
         drop(pair.slave);
         let writer =
             PtyWriter(Arc::new(Mutex::new(pair.master.take_writer().expect("pty writer"))));
-        let term_size =
-            TerminalSize { rows: 24, cols: 80, pixel_width: 640, pixel_height: 384, dpi: 96 };
+        let term_size = TerminalSize {
+            rows: 24,
+            cols: grid_cols_for(80),
+            pixel_width: grid_cols_for(80) * 8,
+            pixel_height: 384,
+            dpi: 96,
+        };
         let term =
             Terminal::new(term_size, Arc::new(TermConfig), "pwrde-test", "0", Box::new(writer.clone()));
         Self {
@@ -730,6 +801,9 @@ impl Session {
             master: pair.master,
             redraw_pending: Arc::new(AtomicBool::new(false)),
             scroll_offset: AtomicUsize::new(0),
+            h_scroll: AtomicUsize::new(0),
+            viewport: Mutex::new(PaneSize { cols: 80, rows: 24, cell_w: 8, cell_h: 16, dpi: 96 }),
+            alt_active: AtomicBool::new(false),
             selection: Mutex::new(None),
             proc_title: Mutex::new(None),
             proc_title_misses: AtomicUsize::new(0),
@@ -747,8 +821,59 @@ impl Session {
 
     /// Mark the pending redraw as consumed; the next PTY chunk after this
     /// will emit a fresh wakeup. Call at the start of every frame.
+    ///
+    /// Also where the grid snaps between screens. An application moving onto (or
+    /// off) the alternate screen changes what width the pane's grid should be:
+    /// the true viewport for a full-screen TUI, the wide no-wrap grid for the
+    /// primary screen's scrollback. Nothing hands us an event for that escape
+    /// sequence, so the frame boundary is where it is noticed — the grid is one
+    /// frame behind at worst, and the pane is re-sized right away, which raises
+    /// SIGWINCH so the app re-lays out to the width it now really has.
     pub fn begin_frame(&self) {
         self.redraw_pending.store(false, Ordering::Release);
+        let alt = self.term.lock().unwrap().is_alt_screen_active();
+        if alt != self.alt_active.swap(alt, Ordering::Relaxed) {
+            self.reset_h_scroll();
+            let size = *self.viewport.lock().unwrap();
+            self.apply_size(size);
+        }
+    }
+
+    /// Grid width for the screen that is active now: the wide, never-wrapped-at-
+    /// the-pane-edge scrollback grid on the primary screen, the exact viewport on
+    /// the alternate screen.
+    fn grid_width(&self, viewport_cols: usize) -> usize {
+        if self.alt_active.load(Ordering::Relaxed) {
+            viewport_cols
+        } else {
+            grid_cols_for(viewport_cols)
+        }
+    }
+
+    /// (Re)size the emulator grid and the PTY for `size` under the screen that is
+    /// active now. The PTY is told the same width as the grid, because the grid
+    /// *is* what the emulator advertises to the application.
+    fn apply_size(&self, size: PaneSize) {
+        if size.cols == 0 || size.rows == 0 {
+            return;
+        }
+        let grid = self.grid_width(size.cols);
+        let _ = self.master.resize(PtySize {
+            rows: size.rows as u16,
+            cols: grid as u16,
+            pixel_width: (grid as u16).saturating_mul(size.cell_w),
+            pixel_height: size.rows as u16 * size.cell_h,
+        });
+        self.term.lock().unwrap().resize(TerminalSize {
+            rows: size.rows,
+            cols: grid,
+            pixel_width: grid.saturating_mul(size.cell_w as usize),
+            pixel_height: size.rows * size.cell_h as usize,
+            dpi: size.dpi,
+        });
+        // Entering the alternate screen narrows the grid to the viewport, so the
+        // horizontal view has to be re-clamped (it lands on 0 there).
+        self.scroll_h_by(0);
     }
 
     /// Current window title exactly as set by escape sequences — no fallback.
@@ -838,7 +963,7 @@ impl Session {
         let screen = term.screen();
         let cursor = term.cursor_pos();
         (
-            screen.physical_cols,
+            self.viewport_cols(),
             screen.physical_rows,
             screen.scrollback_rows(),
             (cursor.x, cursor.y as usize),
@@ -878,6 +1003,39 @@ impl Session {
     /// Snap back to the live bottom (called on keystroke, like every terminal).
     pub fn scroll_to_bottom(&self) {
         self.scroll_offset.store(0, Ordering::Relaxed);
+    }
+
+    // ── Horizontal viewport ─────────────────────────────────────────────
+
+    /// Visible width of the pane in cells. On the primary screen the emulator
+    /// grid is wider ([`grid_cols_for`]), so this is what the pane itself shows;
+    /// on the alternate screen the grid is exactly this wide.
+    pub fn viewport_cols(&self) -> usize {
+        self.viewport.lock().unwrap().cols
+    }
+
+    /// Cells the view is scrolled right from column 0 (0 = leftmost).
+    pub fn h_scroll(&self) -> usize {
+        self.h_scroll.load(Ordering::Relaxed)
+    }
+
+    /// Scroll the viewport horizontally by `cells` (positive = right), clamped
+    /// so the grid's right edge can never come left of the pane's right edge.
+    pub fn scroll_h_by(&self, cells: isize) {
+        let viewport = self.viewport_cols().max(1);
+        let max = {
+            let term = self.term.lock().unwrap();
+            let screen = term.screen();
+            screen.physical_cols.saturating_sub(viewport)
+        };
+        let cur = self.h_scroll.load(Ordering::Relaxed) as isize;
+        let next = (cur + cells).clamp(0, max as isize);
+        self.h_scroll.store(next as usize, Ordering::Relaxed);
+    }
+
+    /// Snap the view back to column 0 (keystroke, resize, alt-screen entry).
+    pub fn reset_h_scroll(&self) {
+        self.h_scroll.store(0, Ordering::Relaxed);
     }
 
     /// True when wheel events belong to the *app*, not our scrollback: either
@@ -1029,24 +1187,19 @@ impl Session {
             .map(|h| h.url)
     }
 
-    /// Propagate a window resize to both the grid and the PTY (SIGWINCH).
+    /// Propagate a window resize to the pane. `cols`/`rows` are the pane's
+    /// *visible* size; the grid and the PTY get [`grid_cols_for`] columns on the
+    /// primary screen (so long lines are not wrapped at the pane edge) and exactly
+    /// `cols` on the alternate screen (so a TUI's layout matches the pane). The
+    /// primary grid width does not depend on the viewport, so a pane resize never
+    /// re-wraps the scrollback.
     pub fn resize(&self, cols: usize, rows: usize, cell_width: u16, cell_height: u16, dpi: u32) {
         if cols == 0 || rows == 0 {
             return;
         }
-        let _ = self.master.resize(PtySize {
-            rows: rows as u16,
-            cols: cols as u16,
-            pixel_width: cols as u16 * cell_width,
-            pixel_height: rows as u16 * cell_height,
-        });
-        self.term.lock().unwrap().resize(TerminalSize {
-            rows,
-            cols,
-            pixel_width: cols * cell_width as usize,
-            pixel_height: rows * cell_height as usize,
-            dpi,
-        });
+        let size = PaneSize { cols, rows, cell_w: cell_width, cell_h: cell_height, dpi };
+        *self.viewport.lock().unwrap() = size;
+        self.apply_size(size);
     }
 }
 
@@ -1058,6 +1211,130 @@ mod tests {
         let size =
             TerminalSize { rows, cols, pixel_width: cols * 8, pixel_height: rows * 16, dpi: 96 };
         Terminal::new(size, Arc::new(TermConfig), "pwrde-test", "0", Box::new(std::io::sink()))
+    }
+
+    /// The pane viewport is narrower than the emulator grid (see
+    /// [`grid_cols_for`]): a long line must stay on one row instead of wrapping
+    /// at the pane edge, so there is something to the right to scroll to.
+    #[test]
+    fn a_long_line_stays_on_one_row_in_the_widened_grid() {
+        let mut term = make_term(grid_cols_for(10), 4);
+        let long = "x".repeat(30);
+        term.advance_bytes(format!("{long}\r\n").as_bytes());
+
+        let screen = term.screen();
+        let lines = screen.lines_in_phys_range(screen.scrollback_or_visible_range(&(0..4)));
+        assert_eq!(lines[0].as_str().trim_end(), long);
+        assert!(!lines[0].last_cell_was_wrapped(), "the grid must not soft-wrap it");
+    }
+
+    /// Contrast case, and the reason the grid cannot stay viewport-width: in a
+    /// grid as narrow as the pane the very same line soft-wraps across rows.
+    /// Only an explicit line break starts a new line in the widened grid.
+    #[test]
+    fn a_viewport_width_grid_soft_wraps_the_same_line() {
+        let mut term = make_term(10, 4);
+        let long = "x".repeat(30);
+        term.advance_bytes(format!("{long}\r\n").as_bytes());
+
+        let screen = term.screen();
+        let lines = screen.lines_in_phys_range(screen.scrollback_or_visible_range(&(0..4)));
+        assert!(lines[0].last_cell_was_wrapped(), "10 cols must soft-wrap 30 chars");
+        let joined: String =
+            lines.iter().take(3).map(|l| l.as_str().trim_end().to_string()).collect();
+        assert_eq!(joined, long, "the text is all there, just wrapped");
+    }
+
+    /// The primary grid is a constant wide width: at least [`H_COLS_MAX`], and
+    /// never narrower than the pane itself (a viewport past the bound gets its own
+    /// width back — the old viewport-multiple rule could return *fewer* columns
+    /// than the pane above the bound). Constant, so a pane resize never re-wraps
+    /// scrollback.
+    #[test]
+    fn grid_cols_are_wide_and_never_narrower_than_the_viewport() {
+        assert_eq!(grid_cols_for(1), H_COLS_MAX);
+        assert_eq!(grid_cols_for(10), H_COLS_MAX);
+        assert_eq!(grid_cols_for(80), H_COLS_MAX);
+        assert_eq!(grid_cols_for(H_COLS_MAX), H_COLS_MAX);
+        assert_eq!(grid_cols_for(H_COLS_MAX * 2), H_COLS_MAX * 2);
+        assert!(grid_cols_for(3000) >= 3000, "a wide pane keeps at least its own width");
+        assert_eq!(grid_cols_for(40), grid_cols_for(120), "the width is viewport-independent");
+    }
+
+    /// The "no wrap at the pane edge" promise does not stop at some smaller
+    /// bound: a line well past the former 4x/1024 grid stays on one row.
+    #[test]
+    fn a_line_past_the_former_bound_does_not_wrap() {
+        let mut term = make_term(grid_cols_for(10), 4);
+        let long = "y".repeat(1500);
+        term.advance_bytes(format!("{long}\r\n").as_bytes());
+
+        let screen = term.screen();
+        let lines = screen.lines_in_phys_range(screen.scrollback_or_visible_range(&(0..4)));
+        assert_eq!(lines[0].as_str().trim_end(), long);
+        assert!(!lines[0].last_cell_was_wrapped(), "1500 chars must fit the wide grid");
+    }
+
+    /// Explicit line breaks are the *only* thing that starts a new row: a `CRLF`
+    /// breaks the row even though the grid has room for both lines.
+    #[test]
+    fn only_line_breaks_start_new_rows() {
+        let mut term = make_term(grid_cols_for(10), 4);
+        term.advance_bytes(b"one\r\ntwo\r\n");
+
+        let screen = term.screen();
+        let lines = screen.lines_in_phys_range(screen.scrollback_or_visible_range(&(0..4)));
+        assert_eq!(lines[0].as_str().trim_end(), "one");
+        assert_eq!(lines[1].as_str().trim_end(), "two");
+        assert!(!lines[0].last_cell_was_wrapped() && !lines[1].last_cell_was_wrapped());
+    }
+
+    /// A pane wider than [`H_COLS_MAX`] (a 4K display in a narrow font is close)
+    /// still gets a grid at least its own width, so nothing wraps at the edge.
+    #[test]
+    fn a_viewport_past_the_bound_still_does_not_wrap() {
+        let mut term = make_term(grid_cols_for(3000), 4);
+        assert_eq!(term.screen().physical_cols, 3000);
+        let long = "z".repeat(2500);
+        term.advance_bytes(format!("{long}\r\n").as_bytes());
+
+        let screen = term.screen();
+        let lines = screen.lines_in_phys_range(screen.scrollback_or_visible_range(&(0..4)));
+        assert_eq!(lines[0].as_str().trim_end(), long);
+        assert!(!lines[0].last_cell_was_wrapped());
+    }
+
+    /// The alternate screen is exempt from the wide grid: a full-screen TUI asks
+    /// the tty how big it is and lays out to that answer, and there is nothing to
+    /// scroll horizontally to in a TUI. `begin_frame` switches the grid as the app
+    /// enters and leaves DECSET 1049, and re-sizes the PTY (SIGWINCH) with it.
+    #[test]
+    fn alternate_screen_keeps_the_true_viewport_width() {
+        let session = Session::placeholder();
+        session.resize(80, 24, 8, 16, 96);
+        assert_eq!(session.viewport_cols(), 80);
+        assert_eq!(session.term.lock().unwrap().screen().physical_cols, grid_cols_for(80));
+        session.scroll_h_by(1_000_000);
+        assert_eq!(session.h_scroll(), grid_cols_for(80) - 80, "the wide grid can scroll right");
+
+        session.term.lock().unwrap().advance_bytes(b"\x1b[?1049h");
+        session.begin_frame();
+        assert!(session.term.lock().unwrap().is_alt_screen_active());
+        assert_eq!(
+            session.term.lock().unwrap().screen().physical_cols,
+            80,
+            "the TUI is told the true pane width"
+        );
+        assert_eq!(session.h_scroll(), 0, "nothing to scroll horizontally on the alt screen");
+
+        session.term.lock().unwrap().advance_bytes(b"\x1b[?1049l");
+        session.begin_frame();
+        assert!(!session.term.lock().unwrap().is_alt_screen_active());
+        assert_eq!(
+            session.term.lock().unwrap().screen().physical_cols,
+            grid_cols_for(80),
+            "back on the primary screen the grid is wide again"
+        );
     }
 
     /// The scrollback viewport must never slide off the top of the buffer and
