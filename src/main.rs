@@ -2042,12 +2042,22 @@ impl App {
     /// mouse-tracking app owns the wheel — there we forward it to the app
     /// (which scrolls its own content), since the alternate screen has no
     /// scrollback of ours to move.
-    fn on_scroll(&mut self, delta: gpui::ScrollDelta, cell_height: f32) {
+    fn on_scroll(
+        &mut self,
+        delta: gpui::ScrollDelta,
+        cell_height: f32,
+        modifiers: gpui::Modifiers,
+    ) {
         if self.confirm.is_some()
             || self.message.is_some()
             || self.webview_prompt.is_some()
             || self.command.is_some()
         {
+            return;
+        }
+        // Shift+wheel pans the pane sideways; with no terminal under the
+        // cursor it falls through to the ordinary vertical handling below.
+        if modifiers.shift && self.on_h_scroll(delta) {
             return;
         }
         // Flyover panel scroll: intercept first when panel is open and cursor is inside.
@@ -2072,7 +2082,7 @@ impl App {
                         let up = steps > 0;
                         if session.app_consumes_wheel() {
                             let (col, row) =
-                                self.renderer.cell_at(&content, px, py).unwrap_or((0, 0));
+                                self.cell_at_in(session, &content, px, py).unwrap_or((0, 0));
                             for _ in 0..steps.unsigned_abs() {
                                 session.forward_wheel(up, col, row);
                             }
@@ -2114,7 +2124,7 @@ impl App {
                     let content = workspace::tile_content(&self.tool_area(), scale);
                     let up = steps > 0;
                     if session.app_consumes_wheel() {
-                        let (col, row) = self.renderer.cell_at(&content, px, py).unwrap_or((0, 0));
+                        let (col, row) = self.cell_at_in(session, &content, px, py).unwrap_or((0, 0));
                         for _ in 0..steps.unsigned_abs() {
                             session.forward_wheel(up, col, row);
                         }
@@ -2162,7 +2172,7 @@ impl App {
             // Hand the wheel to the app (mouse report, or alternate-scroll arrow
             // keys on the alternate screen) — once per accumulated step.
             let content = workspace::tile_content(rect, scale);
-            let (col, row) = self.renderer.cell_at(&content, px, py).unwrap_or((0, 0));
+            let (col, row) = self.cell_at_in(session, &content, px, py).unwrap_or((0, 0));
             for _ in 0..steps.unsigned_abs() {
                 session.forward_wheel(up, col, row);
             }
@@ -2175,6 +2185,69 @@ impl App {
 
     fn request_redraw(&mut self) {
         self.dirty = true;
+    }
+
+    /// Cell under a pointer in `content`, accounting for the pane's horizontal
+    /// scroll. The primary grid is wider than the pane (see
+    /// `term::grid_cols_for`) and the pane's text is painted `h_scroll` cells to
+    /// the left, so the hit test adds that offset back — subtracting it would
+    /// land short by twice the offset on a panned pane.
+    fn cell_at_in(
+        &self,
+        session: &Session,
+        content: &workspace::LayoutRect,
+        px: f32,
+        py: f32,
+    ) -> Option<(usize, usize)> {
+        self.renderer.cell_at_scrolled(content, px, py, session.h_scroll())
+    }
+
+    /// Shift+wheel: pan the terminal under the cursor sideways through its
+    /// unwrapped grid (a pane with a long line has more to the right of its
+    /// right edge). Returns whether it consumed the event — with no pane under
+    /// the cursor the wheel falls through to the ordinary vertical path (the
+    /// sidebar's scroll containers). The app never sees these: a TUI's own
+    /// layout is fixed at the viewport, so there is nothing for it to pan.
+    fn on_h_scroll(&mut self, delta: gpui::ScrollDelta) -> bool {
+        let scale = self.scale();
+        let (px, py) = (self.cursor.0 as f32, self.cursor.1 as f32);
+        // Same precedence as the vertical path: flyover panel, then tool page,
+        // then the session tile under the pointer.
+        let loc = if self.flyover_open
+            && !self.flyover_tabs.is_empty()
+            && self.flyover_rect_now().contains(px, py)
+        {
+            Some(MouseLoc::Flyover)
+        } else if let Page::Tool(_) = self.page {
+            let content = workspace::tile_content(&self.tool_area(), scale);
+            content.contains(px, py).then_some(MouseLoc::Tool)
+        } else if self.page == Page::Sessions {
+            let ws = &self.workspaces[self.active];
+            let (tiles, _) = workspace::layout_tiles(&ws.root, self.area(), scale);
+            tiles
+                .iter()
+                .find(|(_, r)| workspace::tile_content(r, scale).contains(px, py))
+                .map(|(id, _)| MouseLoc::Tile(*id))
+        } else {
+            None
+        };
+        let Some(loc) = loc else { return false };
+        // One wheel notch (or ~3 cell-widths of trackpad travel) is 3 cells.
+        let cell_w = self.renderer.cell_width as f64;
+        let notches = match delta {
+            gpui::ScrollDelta::Lines(p) => p.x as f64 + p.y as f64,
+            gpui::ScrollDelta::Pixels(p) => {
+                (f32::from(p.x) + f32::from(p.y)) as f64 / (cell_w * 3.0)
+            },
+        };
+        let steps = scroll_steps(&mut self.scroll_accum, notches);
+        if steps == 0 {
+            return true;
+        }
+        let Some(session) = self.loc_session(loc) else { return false };
+        session.scroll_h_by(steps * 3);
+        self.request_redraw();
+        true
     }
 
     /// ⌘V: clipboard → focused terminal (bracketed-paste aware).
@@ -3867,9 +3940,10 @@ impl App {
             if !content.contains(px, py) {
                 continue;
             }
-            if let Some((col, row)) = self.renderer.cell_at(&content, px, py)
-                && let Some(tab) = ws.root.find_tile(*id).and_then(|t| t.active_tab())
-                && let Some(url) = tab.session().and_then(|session| session.link_at(col, row))
+            if let Some(tab) = ws.root.find_tile(*id).and_then(|t| t.active_tab())
+                && let Some(session) = tab.session()
+                && let Some((col, row)) = self.cell_at_in(session, &content, px, py)
+                && let Some(url) = session.link_at(col, row)
             {
                 open_in_browser(&url);
                 return true;
@@ -3923,9 +3997,9 @@ impl App {
                 None => return,
             },
         };
-        let (col, row) = self.renderer.cell_at(&content, px, py).unwrap_or((0, 0));
         let m = self.modifiers;
         if let Some(session) = self.loc_session(loc) {
+            let (col, row) = self.cell_at_in(session, &content, px, py).unwrap_or((0, 0));
             session.forward_mouse(phase, btn, col, row, m.shift, m.alt, m.control);
         }
         self.request_redraw();
@@ -4112,14 +4186,13 @@ impl App {
                         return;
                     }
                     let content = workspace::flyover_content(&panel, scale);
-                    if let Some((col, row)) = self.renderer.cell_at(&content, px, py) {
-                        if let Some(session) = self
-                            .flyover_tabs
-                            .get(self.flyover_active)
-                            .and_then(Tab::session)
-                        {
-                            session.begin_selection(col, row);
-                        }
+                    if let Some(session) = self
+                        .flyover_tabs
+                        .get(self.flyover_active)
+                        .and_then(Tab::session)
+                        && let Some((col, row)) = self.cell_at_in(session, &content, px, py)
+                    {
+                        session.begin_selection(col, row);
                         self.drag = Drag::FlyoverSelect;
                     }
                 }
@@ -4197,9 +4270,9 @@ impl App {
                 self.request_redraw();
                 return;
             }
-            if let Some((col, row)) = self.renderer.cell_at(&content, px, py)
-                && let Some(ts) = self.active_tool_session()
+            if let Some(ts) = self.active_tool_session()
                 && let Some(session) = ts.tab.session()
+                && let Some((col, row)) = self.cell_at_in(session, &content, px, py)
             {
                 session.begin_selection(col, row);
                 self.drag = Drag::ToolSelect;
@@ -4263,14 +4336,13 @@ impl App {
                     return;
                 }
                 let content = workspace::tile_content(rect, scale);
-                if let Some((col, row)) = self.renderer.cell_at(&content, px, py) {
-                    if let Some(tab) =
-                        self.workspaces[self.active].root.find_tile(*id).and_then(|t| t.active_tab())
-                        && let Some(session) = tab.session()
-                    {
-                        session.begin_selection(col, row);
-                        self.drag = Drag::Select { tile: *id };
-                    }
+                if let Some(tab) =
+                    self.workspaces[self.active].root.find_tile(*id).and_then(|t| t.active_tab())
+                    && let Some(session) = tab.session()
+                    && let Some((col, row)) = self.cell_at_in(session, &content, px, py)
+                {
+                    session.begin_selection(col, row);
+                    self.drag = Drag::Select { tile: *id };
                 }
                 self.mark_visible_read();
                 self.request_redraw();
@@ -4392,24 +4464,23 @@ impl App {
                 let (px, py) = (self.cursor.0 as f32, self.cursor.1 as f32);
                 let panel = self.flyover_rect_now();
                 let content = workspace::flyover_content(&panel, scale);
-                if let Some((col, row)) = self.renderer.cell_at(&content, px, py) {
-                    if let Some(session) = self
-                        .flyover_tabs
-                        .get(self.flyover_active)
-                        .and_then(Tab::session)
-                    {
-                        session.update_selection(col, row);
-                        self.request_redraw();
-                    }
+                if let Some(session) = self
+                    .flyover_tabs
+                    .get(self.flyover_active)
+                    .and_then(Tab::session)
+                    && let Some((col, row)) = self.cell_at_in(session, &content, px, py)
+                {
+                    session.update_selection(col, row);
+                    self.request_redraw();
                 }
             },
             Drag::ToolSelect => {
                 let scale = self.renderer.scale;
                 let (px, py) = (self.cursor.0 as f32, self.cursor.1 as f32);
                 let content = workspace::tile_content(&self.tool_area(), scale);
-                if let Some((col, row)) = self.renderer.cell_at(&content, px, py)
-                    && let Some(ts) = self.active_tool_session()
+                if let Some(ts) = self.active_tool_session()
                     && let Some(session) = ts.tab.session()
+                    && let Some((col, row)) = self.cell_at_in(session, &content, px, py)
                 {
                     session.update_selection(col, row);
                     self.request_redraw();
@@ -4421,12 +4492,12 @@ impl App {
                 let scale = self.renderer.scale;
                 if let Some(rect) = self.tile_rect(tile) {
                     let content = workspace::tile_content(&rect, scale);
-                    if let Some((col, row)) = self.renderer.cell_at(&content, px, py)
-                        && let Some(tab) = self.workspaces[self.active]
-                            .root
-                            .find_tile(tile)
-                            .and_then(|t| t.active_tab())
+                    if let Some(tab) = self.workspaces[self.active]
+                        .root
+                        .find_tile(tile)
+                        .and_then(|t| t.active_tab())
                         && let Some(session) = tab.session()
+                        && let Some((col, row)) = self.cell_at_in(session, &content, px, py)
                     {
                         session.update_selection(col, row);
                         self.request_redraw();
@@ -4499,10 +4570,11 @@ impl App {
                         if !content.contains(px, py) {
                             continue;
                         }
-                        if let Some((col, row)) = self.renderer.cell_at(&content, px, py)
-                            && let Some(tab) =
-                                ws.root.find_tile(*id).and_then(|t| t.active_tab())
-                            && tab.session().is_some_and(|session| session.link_at(col, row).is_some())
+                        if let Some(tab) =
+                            ws.root.find_tile(*id).and_then(|t| t.active_tab())
+                            && let Some(session) = tab.session()
+                            && let Some((col, row)) = self.cell_at_in(session, &content, px, py)
+                            && session.link_at(col, row).is_some()
                         {
                             found = Some((*id, col, row));
                         }
@@ -4678,9 +4750,11 @@ impl App {
                 .and_then(Tab::session)
             {
                 session.write(bytes);
-                // Typing snaps back to the live bottom and drops any
-                // selection, like every other terminal.
+                // Typing snaps back to the live bottom, drops any selection
+                // and un-pans a horizontally scrolled view, like every other
+                // terminal.
                 session.scroll_to_bottom();
+                session.reset_h_scroll();
                 session.clear_selection();
             }
         }
@@ -6107,7 +6181,7 @@ impl Render for App {
                 }),
             )
             .on_scroll_wheel(cx.listener(|app, ev: &gpui::ScrollWheelEvent, _win, cx| {
-                app.on_scroll(ev.delta, app.renderer.cell_height);
+                app.on_scroll(ev.delta, app.renderer.cell_height, ev.modifiers);
                 cx.notify();
             }))
             .child(
@@ -6508,34 +6582,54 @@ impl App {
                 paint_quad(window, origin, inv, q, shadow_rgb);
             }
 
-            // 2) per-pane foreground text.
+            // 2) per-pane foreground text. The pane's primary grid is wider
+            // than its rect (long lines do not wrap), so every row is painted
+            // inside the pane's own clip rect: the surplus to the right is
+            // cropped here and panned into view with Shift+wheel, instead of
+            // bleeding under the neighbouring card.
             for pane in &frame.panes {
                 let (ox, oy) = pane.origin;
-                for (ri, row) in pane.rows.iter().enumerate() {
-                    if row.is_empty() {
-                        continue;
-                    }
-                    let mut text = String::new();
-                    let mut runs: Vec<TextRun> = Vec::new();
-                    for span in row {
-                        text.push_str(&span.text);
-                        runs.push(TextRun {
-                            len: span.text.len(),
-                            font: font.clone(),
-                            color: span.color,
-                            background_color: None,
-                            underline: None,
-                            strikethrough: None,
-                        });
-                    }
-                    let shaped: ShapedLine =
-                        window.text_system().shape_line(text.into(), font_size, &runs, None);
-                    let p = Point::new(
-                        origin.x + px(ox * inv),
-                        origin.y + px((oy + ri as f32 * cell_height) * inv),
-                    );
-                    let _ = shaped.paint(p, line_height, TextAlign::Left, None, window, cx);
-                }
+                let pane_clip = Bounds {
+                    origin: Point::new(
+                        origin.x + px(pane.clip.x * inv),
+                        origin.y + px(pane.clip.y * inv),
+                    ),
+                    size: Size::new(px(pane.clip.w * inv), px(pane.clip.h * inv)),
+                };
+                window.with_content_mask(
+                    Some(gpui::ContentMask { bounds: pane_clip }),
+                    |window| {
+                        for (ri, row) in pane.rows.iter().enumerate() {
+                            if row.is_empty() {
+                                continue;
+                            }
+                            let mut text = String::new();
+                            let mut runs: Vec<TextRun> = Vec::new();
+                            for span in row {
+                                text.push_str(&span.text);
+                                runs.push(TextRun {
+                                    len: span.text.len(),
+                                    font: font.clone(),
+                                    color: span.color,
+                                    background_color: None,
+                                    underline: None,
+                                    strikethrough: None,
+                                });
+                            }
+                            let shaped: ShapedLine = window.text_system().shape_line(
+                                text.into(),
+                                font_size,
+                                &runs,
+                                None,
+                            );
+                            let p = Point::new(
+                                origin.x + px(ox * inv),
+                                origin.y + px((oy + ri as f32 * cell_height) * inv),
+                            );
+                            let _ = shaped.paint(p, line_height, TextAlign::Left, None, window, cx);
+                        }
+                    },
+                );
             }
 
             // 3) foreground quads (box-drawing / block glyphs from rect.rs).
@@ -6779,31 +6873,42 @@ fn paint_flyover_layer(
     }
     for pane in panes {
         let (ox, oy) = pane.origin;
-        for (ri, row) in pane.rows.iter().enumerate() {
-            if row.is_empty() {
-                continue;
+        // Same clip as the in-window panes: a flyover pane's grid is wider
+        // than the card, so its rows are cropped at the card's content rect.
+        let pane_clip = Bounds {
+            origin: Point::new(
+                m.origin.x + px(pane.clip.x * m.inv),
+                m.origin.y + px(pane.clip.y * m.inv),
+            ),
+            size: Size::new(px(pane.clip.w * m.inv), px(pane.clip.h * m.inv)),
+        };
+        window.with_content_mask(Some(gpui::ContentMask { bounds: pane_clip }), |window| {
+            for (ri, row) in pane.rows.iter().enumerate() {
+                if row.is_empty() {
+                    continue;
+                }
+                let mut text = String::new();
+                let mut runs: Vec<TextRun> = Vec::new();
+                for span in row {
+                    text.push_str(&span.text);
+                    runs.push(TextRun {
+                        len: span.text.len(),
+                        font: m.font.clone(),
+                        color: span.color,
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    });
+                }
+                let shaped: ShapedLine =
+                    window.text_system().shape_line(text.into(), m.font_size, &runs, None);
+                let p = Point::new(
+                    m.origin.x + px(ox * m.inv),
+                    m.origin.y + px((oy + ri as f32 * m.cell_height) * m.inv),
+                );
+                let _ = shaped.paint(p, m.line_height, TextAlign::Left, None, window, cx);
             }
-            let mut text = String::new();
-            let mut runs: Vec<TextRun> = Vec::new();
-            for span in row {
-                text.push_str(&span.text);
-                runs.push(TextRun {
-                    len: span.text.len(),
-                    font: m.font.clone(),
-                    color: span.color,
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                });
-            }
-            let shaped: ShapedLine =
-                window.text_system().shape_line(text.into(), m.font_size, &runs, None);
-            let p = Point::new(
-                m.origin.x + px(ox * m.inv),
-                m.origin.y + px((oy + ri as f32 * m.cell_height) * m.inv),
-            );
-            let _ = shaped.paint(p, m.line_height, TextAlign::Left, None, window, cx);
-        }
+        });
     }
     for q in fg_quads {
         paint_quad(window, m.origin, m.inv, q, m.shadow_rgb);
@@ -6865,7 +6970,17 @@ impl FlyoverPopout {
         let scale = self.renderer.scale;
         let content = workspace::flyover_content(&self.panel_rect(), scale);
         let (mx, my) = (self.cursor.0 as f32, self.cursor.1 as f32);
-        let (col, row) = self.renderer.cell_at(&content, mx, my).unwrap_or((0, 0));
+        let h_cells = {
+            let app = self.app.read(cx);
+            app.flyover_tabs
+                .get(app.flyover_active)
+                .and_then(Tab::session)
+                .map_or(0, Session::h_scroll)
+        };
+        let (col, row) = self
+            .renderer
+            .cell_at_scrolled(&content, mx, my, h_cells)
+            .unwrap_or((0, 0));
         let m = self.modifiers;
         self.app.update(cx, |app, _| {
             if let Some(session) = app
@@ -6909,7 +7024,14 @@ impl FlyoverPopout {
         let panel = self.panel_rect();
         let tab_bar = workspace::flyover_tab_bar(&panel, scale);
         let content = workspace::flyover_content(&panel, scale);
-        let cell = self.renderer.cell_at(&content, mx, my);
+        let h_cells = {
+            let app = self.app.read(cx);
+            app.flyover_tabs
+                .get(app.flyover_active)
+                .and_then(Tab::session)
+                .map_or(0, Session::h_scroll)
+        };
+        let cell = self.renderer.cell_at_scrolled(&content, mx, my, h_cells);
 
         let n = self.app.read(cx).flyover_tabs.len();
         if n == 0 {
@@ -6981,7 +7103,14 @@ impl FlyoverPopout {
         }
         let panel = self.panel_rect();
         let content = workspace::flyover_content(&panel, scale);
-        if let Some((col, row)) = self.renderer.cell_at(&content, mx, my) {
+        let h_cells = {
+            let app = self.app.read(cx);
+            app.flyover_tabs
+                .get(app.flyover_active)
+                .and_then(Tab::session)
+                .map_or(0, Session::h_scroll)
+        };
+        if let Some((col, row)) = self.renderer.cell_at_scrolled(&content, mx, my, h_cells) {
             self.app.update(cx, |app, _| {
                 if let Some(session) = app
                     .flyover_tabs
@@ -6996,9 +7125,41 @@ impl FlyoverPopout {
         }
     }
 
-    fn on_scroll(&mut self, delta: gpui::ScrollDelta, cx: &mut Context<Self>) {
+    fn on_scroll(
+        &mut self,
+        delta: gpui::ScrollDelta,
+        modifiers: gpui::Modifiers,
+        cx: &mut Context<Self>,
+    ) {
         let scale = self.renderer.scale;
         let panel = self.panel_rect();
+        // Shift+wheel pans the pane sideways (mirrors `App::on_scroll`): the
+        // popout's grid is wider than the window, so it has something to the
+        // right of its right edge.
+        if modifiers.shift {
+            let cell_w = f64::from(self.renderer.cell_width);
+            let notches = match delta {
+                gpui::ScrollDelta::Lines(p) => f64::from(p.x) + f64::from(p.y),
+                gpui::ScrollDelta::Pixels(p) => {
+                    (f64::from(f32::from(p.x)) + f64::from(f32::from(p.y))) / (cell_w * 3.0)
+                },
+            };
+            let steps = scroll_steps(&mut self.scroll_accum, notches);
+            if steps != 0 {
+                self.app.update(cx, |app, _| {
+                    if let Some(session) = app
+                        .flyover_tabs
+                        .get(app.flyover_active)
+                        .and_then(Tab::session)
+                    {
+                        session.scroll_h_by(steps * 3);
+                    }
+                    app.request_redraw();
+                });
+                cx.notify();
+            }
+            return;
+        }
         let content = workspace::flyover_content(&panel, scale);
         let (mx, my) = (self.cursor.0 as f32, self.cursor.1 as f32);
         let cell_h = f64::from(self.renderer.cell_height);
@@ -7010,7 +7171,14 @@ impl FlyoverPopout {
         if steps == 0 {
             return;
         }
-        let cell = self.renderer.cell_at(&content, mx, my);
+        let h_cells = {
+            let app = self.app.read(cx);
+            app.flyover_tabs
+                .get(app.flyover_active)
+                .and_then(Tab::session)
+                .map_or(0, Session::h_scroll)
+        };
+        let cell = self.renderer.cell_at_scrolled(&content, mx, my, h_cells);
         self.app.update(cx, |app, _| {
             if let Some(session) = app
                 .flyover_tabs
@@ -7211,7 +7379,7 @@ impl Render for FlyoverPopout {
                 }),
             )
             .on_scroll_wheel(cx.listener(|this, ev: &gpui::ScrollWheelEvent, _win, cx| {
-                this.on_scroll(ev.delta, cx);
+                this.on_scroll(ev.delta, ev.modifiers, cx);
             }))
             .child(
                 canvas(

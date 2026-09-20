@@ -120,6 +120,11 @@ pub struct TextSpan {
 pub struct PaneText {
     pub origin: (f32, f32),
     pub rows: Vec<Vec<TextSpan>>,
+    /// The rect the pane's text must be clipped to. The primary grid is wider
+    /// than the pane ([`crate::term::grid_cols_for`]), so a row can be longer
+    /// than the pane is wide: `main.rs` clips every row here, so it is cut off
+    /// at the pane's edge instead of bleeding under a neighbouring card.
+    pub clip: LayoutRect,
 }
 
 /// A single line of chrome/picker text, positioned in physical px. `clip` is
@@ -367,9 +372,44 @@ impl Renderer {
         ))
     }
 
+    /// The (col, row) cell under a point within a tile's content rect, for a
+    /// pane whose text is scrolled right by `h_cells` cells.
+    ///
+    /// The runs paint `h_cells` cells to the *left* of the pane's origin, so a
+    /// hit test adds that offset back to the pointer's column — it does not
+    /// subtract it. The result then clamps to the window the pane actually
+    /// shows: column `h_cells` is the leftmost visible cell and
+    /// `h_cells + visible_cols - 1` the rightmost, so a click past the right
+    /// edge lands on the last visible cell rather than on a cell that is
+    /// scrolled out of view.
+    pub fn cell_at_scrolled(
+        &self,
+        content: &LayoutRect,
+        px: f32,
+        py: f32,
+        h_cells: usize,
+    ) -> Option<(usize, usize)> {
+        let (col, row) = self.cell_at(content, px, py)?;
+        let visible_cols = self.grid_size_for(content).0;
+        Some((
+            (col + h_cells).min(h_cells + visible_cols.saturating_sub(1)),
+            row,
+        ))
+    }
+
     /// Translucent highlight quads for the session's active selection, one
     /// per visible row of the span. No-op for an empty (zero-width) selection.
-    fn selection_rects(&self, session: &Session, origin: (f32, f32), rects: &mut Vec<Quad>) {
+    /// `content` is the pane's content rect and `h_cells` the horizontal
+    /// scroll offset the pane's text runs were painted with (see
+    /// [`Renderer::snapshot_pane`]), so the highlight covers exactly the cells
+    /// that are on screen.
+    fn selection_rects(
+        &self,
+        session: &Session,
+        content: &LayoutRect,
+        h_cells: usize,
+        rects: &mut Vec<Quad>,
+    ) {
         let Some((start, end)) = session.selection_span() else { return };
         // A zero-width selection (a bare click, no drag) paints nothing —
         // mirrors `selected_text`, which returns no text for the same state.
@@ -384,6 +424,17 @@ impl Renderer {
         let phys = screen.scrollback_or_visible_range(&(-offset..rows as i32 - offset));
         let s_top = screen.phys_to_stable_row_index(phys.start);
         drop(term);
+
+        // Horizontal window — the same offset the text was painted with, so
+        // the highlight stays on its glyphs and never reaches under a
+        // neighbouring pane. `origin` shifts left by the scrolled cells.
+        let visible_cols = self.grid_size_for(content).0;
+        let h = h_cells.min(cols.saturating_sub(1));
+        let win = h..(h + visible_cols);
+        let origin = {
+            let (ox, oy) = self.content_origin(content);
+            (ox - h as f32 * self.cell_width, oy)
+        };
 
         for vrow in 0..rows {
             let r = s_top + vrow as isize;
@@ -402,7 +453,8 @@ impl Renderer {
             } else {
                 (0, cols)
             };
-            let c1 = c1.min(cols);
+            let c0 = c0.max(win.start);
+            let c1 = c1.min(cols).min(win.end);
             if c1 <= c0 {
                 continue;
             }
@@ -569,7 +621,6 @@ impl Renderer {
                 // Collapsed (or mid-animation) panes paint no terminal
                 // content — the card is just its tab strip.
                 let content = workspace::tile_content(rect, self.scale);
-                let origin = self.content_origin(&content);
                 if !collapsing
                     && let Some(session) = tile.tabs.get(tile.active).and_then(|t| t.session())
                 {
@@ -577,17 +628,23 @@ impl Renderer {
                     let tile_hover = link_hover
                         .filter(|(hid, _, _)| *hid == *id)
                         .map(|(_, col, row)| (col, row));
+                    let h_cells = session.h_scroll();
                     let rows = self.snapshot_pane(
                         session,
                         &term_palette,
-                        origin,
+                        &content,
+                        h_cells,
                         draw_cursor,
                         tile_hover,
                         &mut bg_quads,
                         &mut fg_quads,
                     );
-                    panes.push(PaneText { origin, rows });
-                    self.selection_rects(session, origin, &mut fg_quads);
+                    self.selection_rects(session, &content, h_cells, &mut fg_quads);
+                    panes.push(PaneText {
+                        origin: self.content_origin(&content),
+                        rows,
+                        clip: content,
+                    });
                 }
                 // A sideways strip has no room for the strip's labels: only
                 // the caret shows. A stacked collapse keeps its tab labels
@@ -764,18 +821,23 @@ impl Renderer {
 
         // Terminal content for the active tab.
         if let Some(session) = tabs.get(active).and_then(|tab| tab.session()) {
-            let origin = self.content_origin(&content);
+            let h_cells = session.h_scroll();
             let rows = self.snapshot_pane(
                 session,
                 &term_palette,
-                origin,
+                &content,
+                h_cells,
                 draw_cursor && focused,
                 None,
                 &mut quads,
                 &mut fg_quads,
             );
-            panes.push(PaneText { origin, rows });
-            self.selection_rects(session, origin, &mut fg_quads);
+            self.selection_rects(session, &content, h_cells, &mut fg_quads);
+            panes.push(PaneText {
+                origin: self.content_origin(&content),
+                rows,
+                clip: content,
+            });
         }
 
         (quads, panes, fg_quads)
@@ -833,36 +895,55 @@ impl Renderer {
         }
 
         let content = crate::workspace::tile_content(area, scale);
-        let origin = self.content_origin(&content);
         let Some(session) = tab.session() else {
             return (
                 quads,
-                PaneText { origin, rows: Vec::new() },
+                PaneText {
+                    origin: self.content_origin(&content),
+                    rows: Vec::new(),
+                    clip: content,
+                },
                 fg_quads,
                 labels,
             );
         };
+        let h_cells = session.h_scroll();
         let rows = self.snapshot_pane(
             session,
             &term_palette,
-            origin,
+            &content,
+            h_cells,
             draw_cursor && !exited,
             None,
             &mut quads,
             &mut fg_quads,
         );
-        self.selection_rects(session, origin, &mut fg_quads);
-        (quads, PaneText { origin, rows }, fg_quads, labels)
+        self.selection_rects(session, &content, h_cells, &mut fg_quads);
+        (
+            quads,
+            PaneText {
+                origin: self.content_origin(&content),
+                rows,
+                clip: content,
+            },
+            fg_quads,
+            labels,
+        )
     }
 
-    /// Snapshot one pane's grid into per-row text spans + geometry quads,
-    /// offset to `origin`. One `Vec<TextSpan>` per grid row (so the caller can
-    /// shape each row independently). Holds the terminal lock only for the walk.
+    /// Snapshot one pane's grid into per-row text spans + geometry quads for
+    /// `content`, whose text is scrolled right by `h_cells` cells. One
+    /// `Vec<TextSpan>` per grid row (so the caller can shape each row
+    /// independently). Only cells inside the pane's own window survive, so a
+    /// row longer than the pane is cut off here — and by the caller's content
+    /// mask — instead of bleeding under a neighbour. Holds the terminal lock
+    /// only for the walk.
     fn snapshot_pane(
         &self,
         session: &Session,
         palette: &ColorPalette,
-        origin: (f32, f32),
+        content: &LayoutRect,
+        h_cells: usize,
         draw_cursor: bool,
         hover: Option<(usize, usize)>,
         bg_rects: &mut Vec<Quad>,
@@ -883,6 +964,18 @@ impl Renderer {
             screen.scrollback_or_visible_range(&(-offset..rows as i32 - offset)),
         );
 
+        // Horizontal window: the primary grid is wider than the pane, so the
+        // visible slice starts `h_cells` cells in from column 0 and the runs
+        // paint that far to the left of the pane's own origin. Cells outside
+        // the window — and every quad derived from them — are dropped, so a
+        // long row is cut off at the pane edge rather than drawn under its
+        // neighbour.
+        let visible_cols = self.grid_size_for(content).0;
+        let h = h_cells.min(screen.physical_cols.saturating_sub(1));
+        let win = h..(h + visible_cols);
+        let origin = self.content_origin(content);
+        let origin = (origin.0 - h as f32 * self.cell_width, origin.1);
+
         // Coalesce per-cell colors into runs: one span per same-colored
         // stretch keeps the shaping input small.
         // Links get the accent color + an underline quad; ⌘-click opens.
@@ -894,13 +987,20 @@ impl Renderer {
             crate::links::hovered_url(&links, row, col).map(|s| s.to_owned())
         });
         for l in &links {
+            // Clip the underline to the visible window: a link that starts or
+            // ends off-screen must not drag its underline under a neighbour.
+            let ls = l.start_col.max(win.start);
+            let le = (l.end_col + 1).min(win.end);
+            if le <= ls {
+                continue;
+            }
             let is_hovered = hovered_url.as_deref() == Some(l.url.as_str());
-            let span = (l.end_col - l.start_col + 1) as f32;
+            let span = (le - ls) as f32;
             // Hovered links get a slightly thicker underline, still hugging
             // the cell bottom.
             let (y_off, height) = if is_hovered { (0.91, 0.09) } else { (0.92, 0.06) };
             rects.push(self.cell_rect(
-                origin, l.start_col, l.row, 0.0, y_off, span, height, th.accent, 1.0,
+                origin, ls, l.row, 0.0, y_off, span, height, th.accent, 1.0,
             ));
         }
 
@@ -909,6 +1009,9 @@ impl Renderer {
             let mut spans: Vec<TextSpan> = Vec::new();
             for cell in line.visible_cells() {
                 let col = cell.cell_index();
+                if !win.contains(&col) {
+                    continue;
+                }
                 let attrs = cell.attrs();
                 // Reverse video swaps fg/bg: the cell fills with the resolved
                 // foreground and the glyph is shaped in the resolved background,
@@ -974,7 +1077,11 @@ impl Renderer {
 
         // Cursor: a solid quad, drawn on top of the text (focused tile only).
         let cur = term.cursor_pos();
-        if draw_cursor && cur.visibility == CursorVisibility::Visible && cur.y >= 0 {
+        if draw_cursor
+            && cur.visibility == CursorVisibility::Visible
+            && cur.y >= 0
+            && win.contains(&cur.x)
+        {
             let (r, g, b, _) = palette.foreground.to_srgb_u8();
             rects.push(self.cell_rect(
                 origin,
@@ -1155,5 +1262,35 @@ mod tests {
         // Twelve fractional cells span 129.6 px, not the 132 px produced by
         // rounding each cell to 11 px before laying out the grid.
         assert!((right - origin.0 - 129.6).abs() <= 0.5);
+    }
+
+    /// Horizontal-scroll hit testing: the text runs of a scrolled pane are
+    /// painted `h_cells` cells to the left, so the pointer's column gains that
+    /// offset back (adding, not subtracting), and a click past the pane's right
+    /// edge clamps to the last visible cell instead of pointing at a cell that
+    /// is scrolled out of view.
+    #[test]
+    fn horizontal_hit_testing_adds_the_scroll_offset() {
+        let renderer = Renderer::new(1.0, 10.0, 800, 600);
+        let content = crate::workspace::LayoutRect { x: 100.0, y: 50.0, w: 200.0, h: 100.0 };
+        // PANE_PAD * scale is the cell origin inside the content rect.
+        let (ox, oy) = (108.0, 58.0);
+        assert_eq!(renderer.cell_at(&content, ox, oy), Some((0, 0)));
+        // Scrolled 7 cells right the same pixel is column 7.
+        assert_eq!(renderer.cell_at_scrolled(&content, ox, oy, 7), Some((7, 0)));
+        assert_eq!(renderer.cell_at_scrolled(&content, ox + 10.0, oy, 7), Some((8, 0)));
+        // (200 - 2*8) / 10 = 18 visible columns.
+        let visible = renderer.grid_size_for(&content).0;
+        assert_eq!(visible, 18);
+        // A pixel 18 columns in (past the last visible cell) clamps to that
+        // cell rather than reporting the grid's column 25.
+        assert_eq!(
+            renderer.cell_at_scrolled(&content, ox + 10.0 * visible as f32, oy, 7),
+            Some((7 + visible - 1, 0))
+        );
+        // Left of the pane's own origin there is no cell (the mouse path falls
+        // through) — and the unscrolled hit test is unchanged.
+        assert_eq!(renderer.cell_at_scrolled(&content, ox - 1.0, oy, 7), None);
+        assert_eq!(renderer.cell_at_scrolled(&content, ox + 100.0, oy, 0), Some((10, 0)));
     }
 }
