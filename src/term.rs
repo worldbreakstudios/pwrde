@@ -113,6 +113,14 @@ impl TerminalConfiguration for TermConfig {
     fn color_palette(&self) -> ColorPalette {
         crate::term_theme::palette(crate::theme::current())
     }
+
+    /// Inline images are always on. The emulator (wezterm-term, built with its
+    /// `use_image` feature) parses kitty graphics, iTerm2 `File=` and sixel
+    /// into cell attachments; `renderer` paints them from there. The default
+    /// is `false`, which silently drops every image escape sequence.
+    fn enable_kitty_graphics(&self) -> bool {
+        true
+    }
 }
 
 /// The PTY input handle, shared between user keystrokes and the terminal's
@@ -1587,5 +1595,37 @@ mod tests {
         };
         assert!(text.contains(&want), "expected {want:?} in grid, got {text:?}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kitty_graphics_attaches_an_image_to_the_screen() {
+        let mut term = wezterm_term::Terminal::new(
+            wezterm_term::TerminalSize {
+                rows: 4,
+                cols: 20,
+                pixel_width: 200,
+                pixel_height: 80,
+                dpi: 96,
+            },
+            Arc::new(TermConfig),
+            "pwrde",
+            "0.1.0",
+            Box::new(Vec::new()),
+        );
+        // kitty graphics: transmit-and-display a 2x2 raw RGBA image (f=32 sends
+        // the pixels base64'd, which is what `chafa`/`kitten icat` send by
+        // default for raw data).
+        term.advance_bytes(b"\x1b_Ga=T,f=32,s=2,v=2;/wAA/wD/AP8AAP////8A/w==\x1b\\");
+        let screen = term.screen();
+        let lines = screen.lines_in_phys_range(0..1);
+        let mut attached = 0;
+        for line in &lines {
+            for cell in line.visible_cells() {
+                if cell.attrs().images().is_some() {
+                    attached += 1;
+                }
+            }
+        }
+        assert!(attached > 0, "kitty graphics must attach an image to the grid");
     }
 }

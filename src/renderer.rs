@@ -17,9 +17,15 @@
 //! foreground quads (block glyph geometry, cursor, links) → labels (tab
 //! titles, picker) → picker overlay.
 
-use gpui::Hsla;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use gpui::{Hsla, RenderImage};
+use image::{Delay, Frame as ImageFrame, RgbaImage};
 use termwiz::surface::CursorVisibility;
 use wezterm_term::color::ColorPalette;
+use wezterm_term::image::{ImageCell, ImageData, ImageDataType};
 
 use crate::pages::Page;
 use crate::rect::char_rects;
@@ -120,6 +126,124 @@ pub struct TextSpan {
 pub struct PaneText {
     pub origin: (f32, f32),
     pub rows: Vec<Vec<TextSpan>>,
+    /// Inline image placements (kitty graphics / iTerm2 / sixel) attached to
+    /// cells in this pane, in physical px relative to `origin`.
+    pub images: Vec<PaneImage>,
+}
+
+/// One placement of an inline image inside a pane, resolved to physical px
+/// relative to the pane's content origin. An image spanning several cells is
+/// attached to *each* of them by the emulator, each attachment carrying the
+/// slice of the decoded image that lands on that cell — so a placement is one
+/// of these per covered cell, and they tile.
+#[derive(Clone)]
+pub struct PaneImage {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    /// Attachment z-index: negative paints under the glyphs (kitty `z=`).
+    pub z: i32,
+    /// The decoded image in the order gpui samples it (see [`render_image`]).
+    pub image: Arc<RenderImage>,
+    /// Sub-rect of the decoded image this attachment shows, in source px
+    /// (`x`, `y`, `w`, `h`).
+    pub src: (f32, f32, f32, f32),
+}
+
+/// Decode an emulator image payload to `(width, height, RGBA8 pixels)`.
+/// Encoded blobs (kitty `f=100`, iTerm2 `File=`) go through the `image` crate
+/// — the same decoder wezterm itself uses; raw (`f=32`) and animated RGBA use
+/// their first frame. Blob-leased payloads (`EncodedLease`) are not reachable
+/// here: pwrde's terminal never swaps images out to the blob store.
+fn decode_pixels(data: &ImageDataType) -> Option<(u32, u32, Vec<u8>)> {
+    match data {
+        ImageDataType::Rgba8 {
+            data,
+            width,
+            height,
+            ..
+        } => Some((*width, *height, data.clone())),
+        ImageDataType::AnimRgba8 {
+            frames,
+            width,
+            height,
+            ..
+        } => Some((*width, *height, frames.first()?.clone())),
+        ImageDataType::EncodedFile(bytes) => {
+            let decoded = image::load_from_memory(bytes).ok()?.to_rgba8();
+            Some((decoded.width(), decoded.height(), decoded.into_raw()))
+        }
+        _ => None,
+    }
+}
+
+/// Upload-ready image for gpui: gpui's `RenderImage` frames are BGRA, so the
+/// straight-alpha RGBA this decodes to is written red/blue-swapped (exactly as
+/// `backdrop::Impression::to_render_image` does for the glass backdrop).
+fn render_image(w: u32, h: u32, rgba: &[u8]) -> RenderImage {
+    let w = w.max(1);
+    let h = h.max(1);
+    let mut buf = RgbaImage::new(w, h);
+    for (i, px) in rgba.chunks_exact(4).enumerate() {
+        let (x, y) = ((i as u32) % w, (i as u32) / w);
+        if x < w && y < h {
+            buf.put_pixel(x, y, image::Rgba([px[2], px[1], px[0], px[3]]));
+        }
+    }
+    RenderImage::new(vec![ImageFrame::from_parts(
+        buf,
+        0,
+        0,
+        Delay::from_numer_denom_ms(0, 1),
+    )])
+}
+
+/// Resolve one cell attachment to a [`PaneImage`]. wezterm attaches the image
+/// to the cell it covers: the quad is that cell's rect expanded by the
+/// attachment's padding, and `top_left`/`bottom_right` select the slice of the
+/// decoded image that belongs to the cell (normalised image coords). Same
+/// maths as wezterm-gui's `populate_image_quad`, in physical px.
+///
+/// The returned `x`/`y` are pane-relative: the cell grid is `col/row * cell`
+/// and the pane origin is deliberately not a parameter — the caller adds
+/// `PaneText::origin` exactly once, at paint time, the same way it places
+/// glyph rows.
+fn pane_image(
+    attachment: &ImageCell,
+    col: usize,
+    row: usize,
+    cell_w: f32,
+    cell_h: f32,
+    image: Arc<RenderImage>,
+) -> PaneImage {
+    let (pad_left, pad_top, pad_right, pad_bottom) = attachment.padding();
+    let (left, top) = (pad_left as f32, pad_top as f32);
+    // Pane-relative (the caller adds `PaneText::origin` back, exactly once,
+    // when it converts to gpui logical px) — matching how glyph rows are
+    // placed. Subtracting a pane origin here while `paint_pane_images` added
+    // only the window origin put every quad a whole pane-origin to the left,
+    // i.e. over the sidebar.
+    let x = col as f32 * cell_w + left;
+    let y = row as f32 * cell_h + top;
+    let size = image.size(0);
+    let (img_w, img_h) = (size.width.0 as f32, size.height.0 as f32);
+    let tl = attachment.top_left();
+    let br = attachment.bottom_right();
+    PaneImage {
+        x,
+        y,
+        w: cell_w + left - pad_right as f32,
+        h: cell_h + top - pad_bottom as f32,
+        z: attachment.z_index(),
+        image,
+        src: (
+            *tl.x * img_w,
+            *tl.y * img_h,
+            (*br.x - *tl.x) * img_w,
+            (*br.y - *tl.y) * img_h,
+        ),
+    }
 }
 
 /// A single line of chrome/picker text, positioned in physical px. `clip` is
@@ -189,6 +313,10 @@ pub struct Frame {
 pub struct Renderer {
     width: u32,
     height: u32,
+
+    /// Decoded inline images, keyed by wezterm's content hash of the image
+    /// data, so a placement that is redrawn every frame decodes once.
+    image_cache: RefCell<HashMap<[u8; 32], Arc<RenderImage>>>,
 
     pub scale: f32,
     /// Terminal grid cell metrics (from the `terminal.font_size` setting).
@@ -264,6 +392,7 @@ impl Renderer {
         let mut renderer = Self {
             width: width.max(1),
             height: height.max(1),
+            image_cache: RefCell::new(HashMap::new()),
             scale,
             cell_width: 0.0,
             cell_height: 0.0,
@@ -577,7 +706,7 @@ impl Renderer {
                     let tile_hover = link_hover
                         .filter(|(hid, _, _)| *hid == *id)
                         .map(|(_, col, row)| (col, row));
-                    let rows = self.snapshot_pane(
+                    let (rows, images) = self.snapshot_pane(
                         session,
                         &term_palette,
                         origin,
@@ -586,7 +715,7 @@ impl Renderer {
                         &mut bg_quads,
                         &mut fg_quads,
                     );
-                    panes.push(PaneText { origin, rows });
+                    panes.push(PaneText { origin, rows, images });
                     self.selection_rects(session, origin, &mut fg_quads);
                 }
                 // A sideways strip has no room for the strip's labels: only
@@ -765,7 +894,7 @@ impl Renderer {
         // Terminal content for the active tab.
         if let Some(session) = tabs.get(active).and_then(|tab| tab.session()) {
             let origin = self.content_origin(&content);
-            let rows = self.snapshot_pane(
+            let (rows, images) = self.snapshot_pane(
                 session,
                 &term_palette,
                 origin,
@@ -774,7 +903,7 @@ impl Renderer {
                 &mut quads,
                 &mut fg_quads,
             );
-            panes.push(PaneText { origin, rows });
+            panes.push(PaneText { origin, rows, images });
             self.selection_rects(session, origin, &mut fg_quads);
         }
 
@@ -837,12 +966,12 @@ impl Renderer {
         let Some(session) = tab.session() else {
             return (
                 quads,
-                PaneText { origin, rows: Vec::new() },
+                PaneText { origin, rows: Vec::new(), images: Vec::new() },
                 fg_quads,
                 labels,
             );
         };
-        let rows = self.snapshot_pane(
+        let (rows, images) = self.snapshot_pane(
             session,
             &term_palette,
             origin,
@@ -852,12 +981,27 @@ impl Renderer {
             &mut fg_quads,
         );
         self.selection_rects(session, origin, &mut fg_quads);
-        (quads, PaneText { origin, rows }, fg_quads, labels)
+        (quads, PaneText { origin, rows, images }, fg_quads, labels)
     }
 
     /// Snapshot one pane's grid into per-row text spans + geometry quads,
     /// offset to `origin`. One `Vec<TextSpan>` per grid row (so the caller can
     /// shape each row independently). Holds the terminal lock only for the walk.
+    /// Decode (and cache) an emulator image payload for painting.
+    fn decoded_image(&self, data: &ImageData) -> Option<Arc<RenderImage>> {
+        let key = data.hash();
+        if let Some(cached) = self.image_cache.borrow().get(&key) {
+            return Some(Arc::clone(cached));
+        }
+        let (w, h, rgba) = {
+            let guard = data.data();
+            decode_pixels(&guard)
+        }?;
+        let image = Arc::new(render_image(w, h, &rgba));
+        self.image_cache.borrow_mut().insert(key, Arc::clone(&image));
+        Some(image)
+    }
+
     fn snapshot_pane(
         &self,
         session: &Session,
@@ -867,7 +1011,7 @@ impl Renderer {
         hover: Option<(usize, usize)>,
         bg_rects: &mut Vec<Quad>,
         rects: &mut Vec<Quad>,
-    ) -> Vec<Vec<TextSpan>> {
+    ) -> (Vec<Vec<TextSpan>>, Vec<PaneImage>) {
         let th = self.theme();
         // Box-drawing line thickness in px, and in cell-relative units.
         let thickness = (self.cell_width / 8.0).round().max(1.0);
@@ -905,11 +1049,28 @@ impl Renderer {
         }
 
         let mut rows_spans: Vec<Vec<TextSpan>> = Vec::with_capacity(lines.len());
+        let mut images: Vec<PaneImage> = Vec::new();
         for (row, line) in lines.iter().enumerate() {
             let mut spans: Vec<TextSpan> = Vec::new();
             for cell in line.visible_cells() {
                 let col = cell.cell_index();
                 let attrs = cell.attrs();
+                // Inline images hang off the cell's attributes; each covered
+                // cell carries its own slice of the decoded image.
+                if let Some(attachments) = attrs.images() {
+                    for attachment in &attachments {
+                        if let Some(image) = self.decoded_image(attachment.image_data()) {
+                            images.push(pane_image(
+                                attachment,
+                                col,
+                                row,
+                                self.cell_width,
+                                self.cell_height,
+                                image,
+                            ));
+                        }
+                    }
+                }
                 // Reverse video swaps fg/bg: the cell fills with the resolved
                 // foreground and the glyph is shaped in the resolved background,
                 // so reversed cells stay legible instead of vanishing.
@@ -989,7 +1150,7 @@ impl Renderer {
             ));
         }
 
-        rows_spans
+        (rows_spans, images)
     }
 
     /// A quad straight from layout coordinates (already physical px).
@@ -1155,5 +1316,149 @@ mod tests {
         // Twelve fractional cells span 129.6 px, not the 132 px produced by
         // rounding each cell to 11 px before laying out the grid.
         assert!((right - origin.0 - 129.6).abs() <= 0.5);
+    }
+
+    #[test]
+    fn raw_rgba_image_data_reaches_gpui_as_bgra() {
+        // 2x1 opaque red + green, the kitty `f=32` payload shape.
+        let data = ImageData::with_data(ImageDataType::new_single_frame(
+            2,
+            1,
+            vec![255, 0, 0, 255, 0, 255, 0, 255],
+        ));
+        let renderer = Renderer::new(2.0, 8.0, 100, 100);
+        let decoded = renderer.decoded_image(&data).expect("raw RGBA must decode");
+        assert_eq!(decoded.size(0).width.0, 2);
+        assert_eq!(decoded.size(0).height.0, 1);
+        let bytes = decoded.as_bytes(0).expect("frame 0 exists");
+        assert_eq!(&bytes[..4], &[0, 0, 255, 255], "red lands in the BGRA red slot");
+        assert_eq!(&bytes[4..], &[0, 255, 0, 255], "green stays green");
+    }
+
+    #[test]
+    fn encoded_image_data_decodes_through_the_image_crate() {
+        // A 1x1 PNG, as a kitty `f=100` or iTerm2 `File=` payload delivers it.
+        const PNG: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x63, 0xE0, 0x12, 0x91, 0xFB, 0x0F, 0x00, 0x01, 0xA4, 0x01, 0x3C, 0x93, 0x8B,
+            0x0E, 0xB7, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+        let data = ImageData::with_raw_data(PNG.to_vec());
+        let renderer = Renderer::new(2.0, 8.0, 100, 100);
+        let decoded = renderer
+            .decoded_image(&data)
+            .expect("a PNG payload must decode");
+        assert_eq!(decoded.size(0).width.0, 1);
+        assert_eq!(decoded.size(0).height.0, 1);
+        // Same image, second call: served from the cache, not re-decoded.
+        assert!(renderer.decoded_image(&data).is_some());
+    }
+
+    #[test]
+    fn image_attachment_maps_cell_padding_and_texture_coords() {
+        let data = Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
+            4,
+            2,
+            vec![0u8; 4 * 2 * 4],
+        )));
+        let attachment = ImageCell::with_z_index(
+            wezterm_term::image::TextureCoordinate::new_f32(0.0, 0.0),
+            wezterm_term::image::TextureCoordinate::new_f32(1.0, 0.5),
+            Arc::clone(&data),
+            1,
+            2,
+            3,
+            4,
+            5,
+            Some(7),
+            None,
+        );
+        let renderer = Renderer::new(2.0, 8.0, 100, 100);
+        let image = renderer.decoded_image(&data).expect("raw RGBA must decode");
+        let pi = pane_image(&attachment, 3, 1, 8.0, 16.0, image);
+        assert_eq!(pi.z, 1, "attachment z-index is carried through");
+        // Cell 3 of an 8px grid starts at 24px *within the pane*; padding
+        // shifts the quad. The pane origin is deliberately NOT folded in —
+        // `paint_pane_images` adds it (see
+        // `pane_image_stays_pane_relative_for_the_painter_to_offset`).
+        assert_eq!(pi.x, 24.0 + 2.0);
+        assert_eq!(pi.y, 16.0 + 3.0);
+        assert_eq!(pi.w, 8.0 + 2.0 - 4.0);
+        assert_eq!(pi.h, 16.0 + 3.0 - 5.0);
+        // top_left/bottom_right select the top half of a 4x2 image.
+        assert_eq!(pi.src, (0.0, 0.0, 4.0, 1.0));
+    }
+
+    #[test]
+    fn pane_image_stays_pane_relative_for_the_painter_to_offset() {
+        // Regression: the pane's content origin must be added exactly once, at
+        // paint time. Baking a pane origin into the quad while
+        // `paint_pane_images` added only the window origin (not the pane
+        // origin) threw every quad a whole pane origin to the left, painting
+        // the image over the sidebar. pane_image now takes no origin at all,
+        // so its coordinates are the cell grid inside the pane — the same
+        // frame `PaneText::rows` glyphs are shaped in.
+        let data = Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
+            4,
+            4,
+            vec![0u8; 4 * 4 * 4],
+        )));
+        let attachment = ImageCell::with_z_index(
+            wezterm_term::image::TextureCoordinate::new_f32(0.0, 0.0),
+            wezterm_term::image::TextureCoordinate::new_f32(1.0, 1.0),
+            Arc::clone(&data),
+            0,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+        );
+        let renderer = Renderer::new(2.0, 8.0, 100, 100);
+        let image = renderer.decoded_image(&data).expect("raw RGBA must decode");
+        let pi = pane_image(&attachment, 2, 3, 8.0, 16.0, image);
+        // Column 2 row 3 of an 8x16 grid, no window and no pane offset in it.
+        assert_eq!((pi.x, pi.y), (16.0, 48.0));
+        assert_eq!((pi.w, pi.h), (8.0, 16.0));
+        // The painter's placement is then pane origin + this, once:
+        //   gpui x = window origin + (pane_origin.0 + pi.x) / scale
+        // which is what `paint_pane_images` computes from `PaneText::origin`.
+        let pane_origin = (494.0_f32, 39.0_f32);
+        assert_eq!(pane_origin.0 + pi.x, 510.0);
+        assert_eq!(pane_origin.1 + pi.y, 87.0);
+    }
+
+    #[test]
+    fn image_quad_width_tracks_the_renderer_cell_geometry() {
+        // A placement spanning one cell must come out `cell_w x cell_h` at the
+        // renderer's own metrics — the same metrics `grid_size_for` divides the
+        // pane rect by, and the ones `Session::resize` is handed (see
+        // `App::cell_px`), so emulator-side placement and paint agree.
+        let data = Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
+            8,
+            8,
+            vec![0u8; 8 * 8 * 4],
+        )));
+        let attachment = ImageCell::with_z_index(
+            wezterm_term::image::TextureCoordinate::new_f32(0.0, 0.0),
+            wezterm_term::image::TextureCoordinate::new_f32(1.0, 1.0),
+            Arc::clone(&data),
+            0,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+        );
+        // Odd, fractional cell width, as the text system actually measures it.
+        let renderer = Renderer::new(2.0, 9.25, 100, 100);
+        let image = renderer.decoded_image(&data).expect("raw RGBA must decode");
+        let pi = pane_image(&attachment, 0, 0, 9.25, 18.5, image);
+        assert_eq!(pi.w, 9.25, "one cell wide at the renderer's cell width");
+        assert_eq!(pi.h, 18.5, "one cell tall at the renderer's cell height");
     }
 }
