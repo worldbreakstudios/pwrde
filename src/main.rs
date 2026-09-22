@@ -6513,7 +6513,7 @@ impl App {
             //    everything else paints over them.
             for pane in &frame.panes {
                 let (ox, oy) = pane.origin;
-                paint_pane_images(window, origin, inv, &pane.images, true);
+                paint_pane_images(window, origin, pane.origin, inv, &pane.images, true);
                 for (ri, row) in pane.rows.iter().enumerate() {
                     if row.is_empty() {
                         continue;
@@ -6539,7 +6539,7 @@ impl App {
                     );
                     let _ = shaped.paint(p, line_height, TextAlign::Left, None, window, cx);
                 }
-                paint_pane_images(window, origin, inv, &pane.images, false);
+                paint_pane_images(window, origin, pane.origin, inv, &pane.images, false);
             }
 
             // 3) foreground quads (box-drawing / block glyphs from rect.rs).
@@ -6715,6 +6715,7 @@ fn hide_titlebar_decoration(window: &Window) {
 fn paint_pane_images(
     window: &mut Window,
     origin: Point<Pixels>,
+    pane_origin: (f32, f32),
     inv: f32,
     images: &[renderer::PaneImage],
     under: bool,
@@ -6730,8 +6731,15 @@ fn paint_pane_images(
         let size = img.image.size(0);
         let (img_w, img_h) = (size.width.0 as f32, size.height.0 as f32);
         let scale = img.w / sw;
+        // `PaneImage` coordinates are pane-relative (the cell grid inside the
+        // pane), exactly like `PaneText::rows`. Add the pane's content origin
+        // once — omitting it drew every image a pane origin to the left, on
+        // top of the sidebar; adding it on the renderer side *and* here would
+        // double it.
+        let pane_x = origin.x + px((pane_origin.0 + img.x) * inv);
+        let pane_y = origin.y + px((pane_origin.1 + img.y) * inv);
         let bounds = Bounds {
-            origin: Point::new(origin.x + px(img.x * inv), origin.y + px(img.y * inv)),
+            origin: Point::new(pane_x, pane_y),
             size: Size::new(px(img.w * inv), px(img.h * inv)),
         };
         // `image_bounds` is where the *whole* image would land at this scale;

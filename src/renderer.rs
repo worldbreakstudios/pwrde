@@ -204,9 +204,13 @@ fn render_image(w: u32, h: u32, rgba: &[u8]) -> RenderImage {
 /// attachment's padding, and `top_left`/`bottom_right` select the slice of the
 /// decoded image that belongs to the cell (normalised image coords). Same
 /// maths as wezterm-gui's `populate_image_quad`, in physical px.
+///
+/// The returned `x`/`y` are pane-relative: the cell grid is `col/row * cell`
+/// and the pane origin is deliberately not a parameter — the caller adds
+/// `PaneText::origin` exactly once, at paint time, the same way it places
+/// glyph rows.
 fn pane_image(
     attachment: &ImageCell,
-    origin: (f32, f32),
     col: usize,
     row: usize,
     cell_w: f32,
@@ -215,15 +219,20 @@ fn pane_image(
 ) -> PaneImage {
     let (pad_left, pad_top, pad_right, pad_bottom) = attachment.padding();
     let (left, top) = (pad_left as f32, pad_top as f32);
-    let x = origin.0 + col as f32 * cell_w + left;
-    let y = origin.1 + row as f32 * cell_h + top;
+    // Pane-relative (the caller adds `PaneText::origin` back, exactly once,
+    // when it converts to gpui logical px) — matching how glyph rows are
+    // placed. Subtracting a pane origin here while `paint_pane_images` added
+    // only the window origin put every quad a whole pane-origin to the left,
+    // i.e. over the sidebar.
+    let x = col as f32 * cell_w + left;
+    let y = row as f32 * cell_h + top;
     let size = image.size(0);
     let (img_w, img_h) = (size.width.0 as f32, size.height.0 as f32);
     let tl = attachment.top_left();
     let br = attachment.bottom_right();
     PaneImage {
-        x: x - origin.0,
-        y: y - origin.1,
+        x,
+        y,
         w: cell_w + left - pad_right as f32,
         h: cell_h + top - pad_bottom as f32,
         z: attachment.z_index(),
@@ -1053,7 +1062,6 @@ impl Renderer {
                         if let Some(image) = self.decoded_image(attachment.image_data()) {
                             images.push(pane_image(
                                 attachment,
-                                origin,
                                 col,
                                 row,
                                 self.cell_width,
@@ -1369,14 +1377,88 @@ mod tests {
         );
         let renderer = Renderer::new(2.0, 8.0, 100, 100);
         let image = renderer.decoded_image(&data).expect("raw RGBA must decode");
-        let pi = pane_image(&attachment, (10.0, 20.0), 3, 1, 8.0, 16.0, image);
+        let pi = pane_image(&attachment, 3, 1, 8.0, 16.0, image);
         assert_eq!(pi.z, 1, "attachment z-index is carried through");
-        // Cell 3 of an 8px grid starts at 24px; padding shifts the quad.
+        // Cell 3 of an 8px grid starts at 24px *within the pane*; padding
+        // shifts the quad. The pane origin is deliberately NOT folded in —
+        // `paint_pane_images` adds it (see
+        // `pane_image_stays_pane_relative_for_the_painter_to_offset`).
         assert_eq!(pi.x, 24.0 + 2.0);
         assert_eq!(pi.y, 16.0 + 3.0);
         assert_eq!(pi.w, 8.0 + 2.0 - 4.0);
         assert_eq!(pi.h, 16.0 + 3.0 - 5.0);
         // top_left/bottom_right select the top half of a 4x2 image.
         assert_eq!(pi.src, (0.0, 0.0, 4.0, 1.0));
+    }
+
+    #[test]
+    fn pane_image_stays_pane_relative_for_the_painter_to_offset() {
+        // Regression: the pane's content origin must be added exactly once, at
+        // paint time. Baking a pane origin into the quad while
+        // `paint_pane_images` added only the window origin (not the pane
+        // origin) threw every quad a whole pane origin to the left, painting
+        // the image over the sidebar. pane_image now takes no origin at all,
+        // so its coordinates are the cell grid inside the pane — the same
+        // frame `PaneText::rows` glyphs are shaped in.
+        let data = Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
+            4,
+            4,
+            vec![0u8; 4 * 4 * 4],
+        )));
+        let attachment = ImageCell::with_z_index(
+            wezterm_term::image::TextureCoordinate::new_f32(0.0, 0.0),
+            wezterm_term::image::TextureCoordinate::new_f32(1.0, 1.0),
+            Arc::clone(&data),
+            0,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+        );
+        let renderer = Renderer::new(2.0, 8.0, 100, 100);
+        let image = renderer.decoded_image(&data).expect("raw RGBA must decode");
+        let pi = pane_image(&attachment, 2, 3, 8.0, 16.0, image);
+        // Column 2 row 3 of an 8x16 grid, no window and no pane offset in it.
+        assert_eq!((pi.x, pi.y), (16.0, 48.0));
+        assert_eq!((pi.w, pi.h), (8.0, 16.0));
+        // The painter's placement is then pane origin + this, once:
+        //   gpui x = window origin + (pane_origin.0 + pi.x) / scale
+        // which is what `paint_pane_images` computes from `PaneText::origin`.
+        let pane_origin = (494.0_f32, 39.0_f32);
+        assert_eq!(pane_origin.0 + pi.x, 510.0);
+        assert_eq!(pane_origin.1 + pi.y, 87.0);
+    }
+
+    #[test]
+    fn image_quad_width_tracks_the_renderer_cell_geometry() {
+        // A placement spanning one cell must come out `cell_w x cell_h` at the
+        // renderer's own metrics — the same metrics `grid_size_for` divides the
+        // pane rect by, and the ones `Session::resize` is handed (see
+        // `App::cell_px`), so emulator-side placement and paint agree.
+        let data = Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
+            8,
+            8,
+            vec![0u8; 8 * 8 * 4],
+        )));
+        let attachment = ImageCell::with_z_index(
+            wezterm_term::image::TextureCoordinate::new_f32(0.0, 0.0),
+            wezterm_term::image::TextureCoordinate::new_f32(1.0, 1.0),
+            Arc::clone(&data),
+            0,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+        );
+        // Odd, fractional cell width, as the text system actually measures it.
+        let renderer = Renderer::new(2.0, 9.25, 100, 100);
+        let image = renderer.decoded_image(&data).expect("raw RGBA must decode");
+        let pi = pane_image(&attachment, 0, 0, 9.25, 18.5, image);
+        assert_eq!(pi.w, 9.25, "one cell wide at the renderer's cell width");
+        assert_eq!(pi.h, 18.5, "one cell tall at the renderer's cell height");
     }
 }
