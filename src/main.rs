@@ -6508,9 +6508,12 @@ impl App {
                 paint_quad(window, origin, inv, q, shadow_rgb);
             }
 
-            // 2) per-pane foreground text.
+            // 2) per-pane foreground text, sandwiched around the pane's inline
+            //    images: kitty's negative z-index images sit under the glyphs,
+            //    everything else paints over them.
             for pane in &frame.panes {
                 let (ox, oy) = pane.origin;
+                paint_pane_images(window, origin, inv, &pane.images, true);
                 for (ri, row) in pane.rows.iter().enumerate() {
                     if row.is_empty() {
                         continue;
@@ -6536,6 +6539,7 @@ impl App {
                     );
                     let _ = shaped.paint(p, line_height, TextAlign::Left, None, window, cx);
                 }
+                paint_pane_images(window, origin, inv, &pane.images, false);
             }
 
             // 3) foreground quads (box-drawing / block glyphs from rect.rs).
@@ -6702,6 +6706,52 @@ fn hide_titlebar_decoration(window: &Window) {
                 }
             }
         }
+    }
+}
+
+/// Paint one pane's inline images (kitty graphics / iTerm2 `File=` / sixel) as
+/// gpui image quads. `under` selects the sub-text layer: kitty's negative
+/// z-index images belong behind the glyphs, the rest above them.
+fn paint_pane_images(
+    window: &mut Window,
+    origin: Point<Pixels>,
+    inv: f32,
+    images: &[renderer::PaneImage],
+    under: bool,
+) {
+    for img in images {
+        if (img.z < 0) != under || img.w <= 0.0 || img.h <= 0.0 {
+            continue;
+        }
+        let (sx, sy, sw, sh) = img.src;
+        if sw <= 0.0 || sh <= 0.0 {
+            continue;
+        }
+        let size = img.image.size(0);
+        let (img_w, img_h) = (size.width.0 as f32, size.height.0 as f32);
+        let scale = img.w / sw;
+        let bounds = Bounds {
+            origin: Point::new(origin.x + px(img.x * inv), origin.y + px(img.y * inv)),
+            size: Size::new(px(img.w * inv), px(img.h * inv)),
+        };
+        // `image_bounds` is where the *whole* image would land at this scale;
+        // the visible rect (bounds ∩ image_bounds == bounds) is then exactly
+        // the source slice this attachment carries.
+        let image_bounds = Bounds {
+            origin: Point::new(
+                bounds.origin.x - px(sx * scale * inv),
+                bounds.origin.y - px(sy * scale * inv),
+            ),
+            size: Size::new(px(img_w * scale * inv), px(img_h * scale * inv)),
+        };
+        let _ = window.paint_image(
+            bounds,
+            image_bounds,
+            gpui::Corners::all(px(0.0)),
+            std::sync::Arc::clone(&img.image),
+            0,
+            false,
+        );
     }
 }
 

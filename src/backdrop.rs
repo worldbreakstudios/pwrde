@@ -305,6 +305,7 @@ mod tests {
         let panes = vec![PaneText {
             origin: (0.0, 0.0),
             rows: vec![vec![crate::renderer::TextSpan { text: "ab  ".into(), color: hsla(1.0, 1.0, 1.0, 1.0) }]],
+            images: Vec::new(),
         }];
         let mut imp = Impression::solid(4, 1, [0.0; 3]);
         imp.panes(&panes, DOWNSAMPLE, DOWNSAMPLE);
