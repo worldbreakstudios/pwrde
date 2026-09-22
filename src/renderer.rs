@@ -149,6 +149,9 @@ pub struct PaneImage {
     /// Sub-rect of the decoded image this attachment shows, in source px
     /// (`x`, `y`, `w`, `h`).
     pub src: (f32, f32, f32, f32),
+    /// The emulator payload this placement was decoded from. Kept so the mouse
+    /// path can turn a click into a file macOS Preview can open.
+    pub source: Arc<ImageData>,
 }
 
 /// Decode an emulator image payload to `(width, height, RGBA8 pixels)`.
@@ -156,7 +159,7 @@ pub struct PaneImage {
 /// — the same decoder wezterm itself uses; raw (`f=32`) and animated RGBA use
 /// their first frame. Blob-leased payloads (`EncodedLease`) are not reachable
 /// here: pwrde's terminal never swaps images out to the blob store.
-fn decode_pixels(data: &ImageDataType) -> Option<(u32, u32, Vec<u8>)> {
+pub(crate) fn decode_pixels(data: &ImageDataType) -> Option<(u32, u32, Vec<u8>)> {
     match data {
         ImageDataType::Rgba8 {
             data,
@@ -216,6 +219,7 @@ fn pane_image(
     cell_w: f32,
     cell_h: f32,
     image: Arc<RenderImage>,
+    source: Arc<ImageData>,
 ) -> PaneImage {
     let (pad_left, pad_top, pad_right, pad_bottom) = attachment.padding();
     let (left, top) = (pad_left as f32, pad_top as f32);
@@ -243,7 +247,54 @@ fn pane_image(
             (*br.x - *tl.x) * img_w,
             (*br.y - *tl.y) * img_h,
         ),
+        source,
     }
+}
+
+/// An inline-image placement in *window* coordinates: one of a pane's
+/// [`PaneImage`] quads with the pane's content origin folded in. The mouse path
+/// hit-tests clicks against these instead of re-walking the terminal grid, and
+/// the payload rides along so a click can hand the picture to Preview.
+#[derive(Clone)]
+pub struct ImageHit {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    /// Attachment z-index (kitty `z=`), so overlapping placements resolve the
+    /// same way the painter stacked them.
+    pub z: i32,
+    pub source: Arc<ImageData>,
+}
+
+impl ImageHit {
+    /// Fold a pane's content origin into one of the placements it painted.
+    pub fn from_pane(origin: (f32, f32), img: &PaneImage) -> Self {
+        Self {
+            x: origin.0 + img.x,
+            y: origin.1 + img.y,
+            w: img.w,
+            h: img.h,
+            z: img.z,
+            source: Arc::clone(&img.source),
+        }
+    }
+
+    pub fn contains(&self, px: f32, py: f32) -> bool {
+        px >= self.x && px < self.x + self.w && py >= self.y && py < self.y + self.h
+    }
+}
+
+/// The image payload under a point (physical px, window coordinates), or
+/// `None` for an ordinary terminal cell. Where placements overlap, the topmost
+/// wins: highest z-index first, then the most recently attached payload. Every
+/// covered cell of one placement carries the same payload, so any hit inside it
+/// resolves to the same bytes.
+pub fn image_at(hits: &[ImageHit], px: f32, py: f32) -> Option<Arc<ImageData>> {
+    hits.iter()
+        .filter(|h| h.contains(px, py))
+        .max_by_key(|h| (h.z, h.source.hash()))
+        .map(|h| Arc::clone(&h.source))
 }
 
 /// A single line of chrome/picker text, positioned in physical px. `clip` is
@@ -1059,7 +1110,8 @@ impl Renderer {
                 // cell carries its own slice of the decoded image.
                 if let Some(attachments) = attrs.images() {
                     for attachment in &attachments {
-                        if let Some(image) = self.decoded_image(attachment.image_data()) {
+                        let data = attachment.image_data();
+                        if let Some(image) = self.decoded_image(data) {
                             images.push(pane_image(
                                 attachment,
                                 col,
@@ -1067,6 +1119,7 @@ impl Renderer {
                                 self.cell_width,
                                 self.cell_height,
                                 image,
+                                data.clone(),
                             ));
                         }
                     }
@@ -1377,7 +1430,7 @@ mod tests {
         );
         let renderer = Renderer::new(2.0, 8.0, 100, 100);
         let image = renderer.decoded_image(&data).expect("raw RGBA must decode");
-        let pi = pane_image(&attachment, 3, 1, 8.0, 16.0, image);
+        let pi = pane_image(&attachment, 3, 1, 8.0, 16.0, image, Arc::clone(&data));
         assert_eq!(pi.z, 1, "attachment z-index is carried through");
         // Cell 3 of an 8px grid starts at 24px *within the pane*; padding
         // shifts the quad. The pane origin is deliberately NOT folded in —
@@ -1419,7 +1472,7 @@ mod tests {
         );
         let renderer = Renderer::new(2.0, 8.0, 100, 100);
         let image = renderer.decoded_image(&data).expect("raw RGBA must decode");
-        let pi = pane_image(&attachment, 2, 3, 8.0, 16.0, image);
+        let pi = pane_image(&attachment, 2, 3, 8.0, 16.0, image, Arc::clone(&data));
         // Column 2 row 3 of an 8x16 grid, no window and no pane offset in it.
         assert_eq!((pi.x, pi.y), (16.0, 48.0));
         assert_eq!((pi.w, pi.h), (8.0, 16.0));
@@ -1457,8 +1510,78 @@ mod tests {
         // Odd, fractional cell width, as the text system actually measures it.
         let renderer = Renderer::new(2.0, 9.25, 100, 100);
         let image = renderer.decoded_image(&data).expect("raw RGBA must decode");
-        let pi = pane_image(&attachment, 0, 0, 9.25, 18.5, image);
+        let pi = pane_image(&attachment, 0, 0, 9.25, 18.5, image, Arc::clone(&data));
         assert_eq!(pi.w, 9.25, "one cell wide at the renderer's cell width");
         assert_eq!(pi.h, 18.5, "one cell tall at the renderer's cell height");
+    }
+
+    #[test]
+    fn image_hits_resolve_a_click_and_prefer_the_topmost_placement() {
+        // Two placements over the same cell, stacked like kitty's `z=`.
+        let bottom = Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
+            4,
+            4,
+            vec![1u8; 4 * 4 * 4],
+        )));
+        let top = Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
+            4,
+            4,
+            vec![2u8; 4 * 4 * 4],
+        )));
+        let cell = |data: &Arc<ImageData>, z: i32| {
+            ImageCell::with_z_index(
+                wezterm_term::image::TextureCoordinate::new_f32(0.0, 0.0),
+                wezterm_term::image::TextureCoordinate::new_f32(1.0, 1.0),
+                Arc::clone(data),
+                z,
+                0,
+                0,
+                0,
+                0,
+                None,
+                None,
+            )
+        };
+        let renderer = Renderer::new(2.0, 8.0, 100, 100);
+        let below = pane_image(
+            &cell(&bottom, 1),
+            2,
+            3,
+            8.0,
+            16.0,
+            renderer.decoded_image(&bottom).expect("raw RGBA must decode"),
+            Arc::clone(&bottom),
+        );
+        let above = pane_image(
+            &cell(&top, 5),
+            2,
+            3,
+            8.0,
+            16.0,
+            renderer.decoded_image(&top).expect("raw RGBA must decode"),
+            Arc::clone(&top),
+        );
+        // The pane's content origin (physical px) is folded in exactly once.
+        let hits = [
+            ImageHit::from_pane((100.0, 40.0), &below),
+            ImageHit::from_pane((100.0, 40.0), &above),
+        ];
+        assert_eq!((hits[0].x, hits[0].y), (116.0, 88.0));
+        assert_eq!((hits[0].w, hits[0].h), (8.0, 16.0));
+        // A click on a plain cell — left of column 2, past its right edge, or
+        // a row above — is no image at all.
+        assert!(image_at(&hits, 115.9, 90.0).is_none());
+        assert!(image_at(&hits, 124.1, 90.0).is_none());
+        assert!(image_at(&hits, 116.5, 87.9).is_none());
+        // Inside the cell the higher z-index placement wins, and it is the
+        // payload we hand to Preview that decides.
+        let hit = image_at(&hits, 116.5, 90.0).expect("a click inside the cell hits an image");
+        assert_eq!(hit.hash(), top.hash(), "the topmost placement wins");
+        let only_below = [ImageHit::from_pane((100.0, 40.0), &below)];
+        assert_eq!(
+            image_at(&only_below, 116.5, 90.0).unwrap().hash(),
+            bottom.hash(),
+            "dropping the top placement reveals the one under it"
+        );
     }
 }

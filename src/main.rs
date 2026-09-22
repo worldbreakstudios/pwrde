@@ -75,7 +75,7 @@ use gpui::{
 };
 
 use pages::{Action, Binding, Page, Section};
-use renderer::Renderer;
+use renderer::{ImageHit, Renderer};
 use term::{MouseBtn, MousePhase, Session, TermEvent};
 use workspace::{Dir, Node, Tab, Tile, Workspace};
 
@@ -498,6 +498,12 @@ struct App {
     /// Link currently under the pointer: (tile id, col, row).
     /// Used to brighten the hovered link and show a pointing-hand cursor.
     link_hover: Option<(u64, usize, usize)>,
+    /// Inline-image placements from the most recent frame, in window physical
+    /// px — the pictures a click can open in Preview.
+    image_hits: Vec<ImageHit>,
+    /// The inline image under the pointer, as `(payload hash, pointer)`, so
+    /// hover feedback only repaints when it changes.
+    image_hover: Option<([u8; 32], (f32, f32))>,
     /// Interactive chrome rects from the most recent frame, for hover testing.
     hot_rects: Vec<workspace::LayoutRect>,
     /// Index into hot_rects of the currently hovered element (topmost wins).
@@ -4044,6 +4050,20 @@ impl App {
         self.try_forward_secondary_press(MouseBtn::Middle);
     }
 
+    /// Hand the picture under a point (physical px, window coords) to macOS
+    /// Preview. Returns false when no inline image is there, so the caller
+    /// falls through to the ordinary click handling.
+    fn open_image_at(&mut self, px: f32, py: f32) -> bool {
+        let Some(data) = renderer::image_at(&self.image_hits, px, py) else {
+            return false;
+        };
+        if let Err(e) = open_image_in_preview(&data) {
+            eprintln!("pwrde: could not open the inline image in Preview: {e}");
+        }
+        self.request_redraw();
+        true
+    }
+
     fn on_mouse_down(&mut self, window: &mut Window, click_count: usize, cx: &mut Context<Self>) {
         let scale = self.renderer.scale;
         let (px, py) = (self.cursor.0 as f32, self.cursor.1 as f32);
@@ -4072,6 +4092,13 @@ impl App {
         // editor never lingers and silently swallows terminal keystrokes.
         if self.editing_section.is_some() {
             self.commit_section_rename();
+        }
+
+        // A click on an inline image belongs to the picture, not the terminal:
+        // it opens in Preview. Returning here keeps that click from starting a
+        // text selection or reaching a mouse-tracking TUI.
+        if self.open_image_at(px, py) {
+            return;
         }
 
         // Flyover panel hit-testing: after modal-overlay check, before sidebar/tiles.
@@ -4520,6 +4547,15 @@ impl App {
                     .map(|(i, _)| i);
                 if ui_hover != self.ui_hover {
                     self.ui_hover = ui_hover;
+                    self.request_redraw();
+                }
+                // Inline-image hover, so the pointing hand appears as the
+                // pointer crosses a picture. Resolved against the last frame's
+                // placements — no terminal lock on the move path.
+                let image_hover =
+                    renderer::image_at(&self.image_hits, px, py).map(|d| (d.hash(), (px, py)));
+                if image_hover != self.image_hover {
+                    self.image_hover = image_hover;
                     self.request_redraw();
                 }
             },
@@ -6255,6 +6291,9 @@ impl App {
         }
         self.sync_webviews(window);
         self.begin_frame();
+        // Rebuilt below from the placements this frame paints; until then the
+        // previous frame's list would hit-test against stale geometry.
+        self.image_hits.clear();
 
         // Cursor style must be set during paint (gpui asserts the phase). Sticky
         // resize_hover keeps the resize cursor for the whole drag, even when the
@@ -6364,10 +6403,18 @@ impl App {
             let title = self.tools.get(i).map(|t| t.name.as_str()).unwrap_or("");
             let (quads, pane, fg_quads, labels) =
                 self.renderer.tool_page(&ts.tab, &area, title, ts.exited, !overlay_open);
+            let tool_hits: Vec<ImageHit> = pane
+                .images
+                .iter()
+                .map(|img| ImageHit::from_pane(pane.origin, img))
+                .collect();
             frame.bg_quads.extend(quads);
             frame.panes.push(pane);
             frame.fg_quads.extend(fg_quads);
             frame.labels.extend(labels);
+            if !overlay_open {
+                self.image_hits.extend(tool_hits);
+            }
         }
         // The flyover panel lives outside the workspace tree, so its layer is
         // built here from App state and slotted into the frame's flyover
@@ -6398,9 +6445,20 @@ impl App {
                 // canvas emits only the hot rects the mouse path resolves.
                 &mut flyover_hot,
             );
+            let flyover_hits: Vec<ImageHit> = panes
+                .iter()
+                .flat_map(|pane| {
+                    pane.images
+                        .iter()
+                        .map(|img| ImageHit::from_pane(pane.origin, img))
+                })
+                .collect();
             frame.flyover_quads = quads;
             frame.flyover_panes = panes;
             frame.flyover_fg_quads = fg_quads;
+            if !overlay_open {
+                self.image_hits.extend(flyover_hits);
+            }
             // The panel paints above the chrome, so its controls append last
             // (topmost) — but never over a modal overlay, which owns the frame.
             if !overlay_open {
@@ -6442,6 +6500,16 @@ impl App {
         // trusting the value on_mouse_move derived from the previous frame)
         // so a keyboard-opened overlay or layout change can't leave a stale
         // pointing hand; on_mouse_move only change-detects to trigger redraws.
+        // Inline images are hit-testable but not chrome "hot" elements: they
+        // append after the chrome rects so they neither steal a `ui_hover` slot
+        // nor reorder hover priority, and still resolve in paint order.
+        if !overlay_open {
+            self.image_hits.extend(frame.panes.iter().flat_map(|pane| {
+                pane.images
+                    .iter()
+                    .map(|img| ImageHit::from_pane(pane.origin, img))
+            }));
+        }
         self.hot_rects = frame.hot.clone();
         self.ui_hover = if matches!(self.drag, Drag::None) {
             let (cx, cy) = (self.cursor.0 as f32, self.cursor.1 as f32);
@@ -6454,9 +6522,22 @@ impl App {
         } else {
             None
         };
+        // Inline images under the pointer get the pointing hand too: a click
+        // hands the picture to Preview. Resolved against the placements this
+        // frame is about to paint, so hover and click always agree. An open
+        // modal overlay owns the frame, so nothing hovers then.
+        self.image_hover = if matches!(self.drag, Drag::None) && !overlay_open {
+            let (cx, cy) = (self.cursor.0 as f32, self.cursor.1 as f32);
+            renderer::image_at(&self.image_hits, cx, cy).map(|data| (data.hash(), (cx, cy)))
+        } else {
+            None
+        };
         // Show pointing-hand cursor when hovering any interactive chrome
         // element (links and resize handles keep priority).
         if resize_hover.is_none() && link_hover_suppressed.is_none() && self.ui_hover.is_some() {
+            window.set_window_cursor_style(CursorStyle::PointingHand);
+        }
+        if resize_hover.is_none() && self.image_hover.is_some() {
             window.set_window_cursor_style(CursorStyle::PointingHand);
         }
 
@@ -6894,6 +6975,9 @@ struct FlyoverPopout {
     hot_rects: Vec<workspace::LayoutRect>,
     /// Index into `hot_rects` of the hovered control (topmost wins).
     ui_hover: Option<usize>,
+    /// Inline-image placements from the last paint (this window's px), so a
+    /// click on a picture opens it in Preview here too.
+    image_hits: Vec<ImageHit>,
 }
 
 impl FlyoverPopout {
@@ -6988,7 +7072,14 @@ impl FlyoverPopout {
             cx.notify();
             return;
         }
-        // Content: a mouse-tracking TUI takes the click; else select text.
+        // Content: an inline image is a click target (open in Preview); then a
+        // mouse-tracking TUI takes the click; else select text.
+        if let Some(data) = renderer::image_at(&self.image_hits, mx, my) {
+            if let Err(e) = open_image_in_preview(&data) {
+                eprintln!("pwrde: could not open the inline image in Preview: {e}");
+            }
+            return;
+        }
         if self.popout_press(MouseBtn::Left, cx) {
             return;
         }
@@ -7148,6 +7239,14 @@ impl FlyoverPopout {
                 &mut hot,
             )
         });
+        self.image_hits = panes
+            .iter()
+            .flat_map(|pane| {
+                pane.images
+                    .iter()
+                    .map(|img| ImageHit::from_pane(pane.origin, img))
+            })
+            .collect();
         self.hot_rects = hot;
         self.ui_hover = popout_cursor.and_then(|(mx, my)| {
             self.hot_rects
@@ -7157,7 +7256,9 @@ impl FlyoverPopout {
                 .find(|(_, r)| r.contains(mx, my))
                 .map(|(i, _)| i)
         });
-        if self.ui_hover.is_some() {
+        let over_image = popout_cursor
+            .is_some_and(|(mx, my)| renderer::image_at(&self.image_hits, mx, my).is_some());
+        if self.ui_hover.is_some() || over_image {
             window.set_window_cursor_style(CursorStyle::PointingHand);
         }
 
@@ -7330,6 +7431,7 @@ fn open_flyover_window(app: gpui::Entity<App>, cx: &mut GpuiApp) {
                 mouse_report_buttons: 0,
                 hot_rects: Vec::new(),
                 ui_hover: None,
+                image_hits: Vec::new(),
                 scroll_accum: 0.0,
             })
         },
@@ -7717,6 +7819,8 @@ fn main() {
                             icon: cx.new(crate::ui::Input::new),
                         },
                         link_hover: None,
+                        image_hits: Vec::new(),
+                        image_hover: None,
                         hot_rects: Vec::new(),
                         ui_hover: None,
                         flyover_tabs: Vec::new(),
@@ -8097,4 +8201,72 @@ mod proc_title_tests {
 /// Hand a URL to the default browser (macOS `open`), fire-and-forget.
 fn open_in_browser(url: &str) {
     let _ = std::process::Command::new("open").arg(url).spawn();
+}
+
+/// Hand an inline-image payload (kitty graphics / iTerm2 `File=` / sixel) to
+/// macOS Preview. An encoded payload already *is* a file's bytes, so they are
+/// written through under a matching suffix; raw RGBA (`f=32`) and animated
+/// payloads have no bytes on disk and are re-encoded as PNG. The temp path is
+/// keyed by the payload's content hash, so re-clicking one picture reuses a
+/// single file instead of littering the temp dir.
+fn open_image_in_preview(data: &wezterm_term::image::ImageData) -> std::io::Result<()> {
+    use wezterm_term::image::ImageDataType;
+
+    let guard = data.data();
+    let (ext, bytes) = match &*guard {
+        ImageDataType::EncodedFile(bytes) => (image_suffix(bytes), bytes.clone()),
+        payload => {
+            let Some((w, h, rgba)) = crate::renderer::decode_pixels(payload) else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "unsupported inline image payload",
+                ));
+            };
+            let mut png = Vec::new();
+            image::ImageEncoder::write_image(
+                image::codecs::png::PngEncoder::new(&mut png),
+                &rgba,
+                w,
+                h,
+                image::ExtendedColorType::Rgba8,
+            )
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            ("png", png)
+        },
+    };
+    let hash = data.hash();
+    drop(guard);
+
+    let mut digest = String::with_capacity(hash.len() * 2);
+    for b in hash {
+        use std::fmt::Write as _;
+        let _ = write!(digest, "{b:02x}");
+    }
+    let path = std::env::temp_dir().join(format!("pwrde-image-{digest}.{ext}"));
+    if !path.exists() {
+        std::fs::write(&path, &bytes)?;
+    }
+    std::process::Command::new("open")
+        .arg("-a")
+        .arg("Preview")
+        .arg(&path)
+        .spawn()?;
+    Ok(())
+}
+
+/// The file suffix for an encoded image payload, sniffed from its magic bytes:
+/// Preview picks its decoder off the extension, so the bytes must not land in a
+/// suffix-less temp file. Unknown payloads fall back to PNG, which is what the
+/// kitty and iTerm2 clients pwrde talks to send in practice.
+fn image_suffix(bytes: &[u8]) -> &'static str {
+    match bytes {
+        [0x89, b'P', b'N', b'G', ..] => "png",
+        [0xFF, 0xD8, ..] => "jpg",
+        [b'G', b'I', b'F', ..] => "gif",
+        [b'B', b'M', ..] => "bmp",
+        _ if bytes.len() > 12 && bytes.starts_with(b"RIFF") && bytes[8..].starts_with(b"WEBP") => {
+            "webp"
+        },
+        _ => "png",
+    }
 }
