@@ -545,7 +545,11 @@ fn render_terminal(theme: &Theme, entity: gpui::WeakEntity<App>) -> AnyElement {
             theme,
             vec![
                 settings_row()
-                    .child(row_text(theme, "Persist sessions", None))
+                    .child(row_text(
+                        theme,
+                        "Persist sessions",
+                        Some("Panes survive restarts via shpool; sessions, folders and layouts always persist."),
+                    ))
                     .child(toggle)
                     .into_any_element(),
             ],

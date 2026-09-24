@@ -560,7 +560,7 @@ impl Session {
         let (shpool_name, spawn_notice) = if command.is_some() {
             (None, None)
         } else if shpool_session.is_some() && shpool_bin.is_none() {
-            (None, Some("pwrde: shpool not found — this shell won't survive a restart. Install it (brew install shell-pool/shpool/shpool) or turn off Persist sessions in Settings.\r\n"))
+            (None, Some("pwrde: shpool not found — this pane won't survive a restart (its session and layout still will). Install it (brew install shell-pool/shpool/shpool) or turn off Persist sessions in Settings.\r\n"))
         } else {
             (shpool_session.clone(), None)
         };
