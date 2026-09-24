@@ -1005,12 +1005,15 @@ pub fn sessions_header_chips(list: &LayoutRect, folders_open: bool, scale: f32) 
 /// or dangling section id filters to nothing, which the list surfaces as its
 /// empty state. The admitted pinned groups come first, in their own order:
 /// they form the "Pinned" section at the top of the list ([`pinned_run`]) —
-/// folded away entirely while `pinned_collapsed`.
+/// folded away entirely while `pinned_collapsed` — and the snoozed ones
+/// last, under the bottom caption ([`snoozed_run`]) — likewise folded away
+/// while `snoozed_collapsed`.
 pub fn sidebar_rows_filtered(
     workspaces: &[Workspace],
     sections: &[Section],
     filter: Option<u64>,
     pinned_collapsed: bool,
+    snoozed_collapsed: bool,
 ) -> Vec<SidebarRow> {
     let admit = |ws: &Workspace| match filter {
         None => true,
@@ -1029,7 +1032,7 @@ pub fn sidebar_rows_filtered(
         // trail it (the "Snoozed" section). The two flags are mutually
         // exclusive; pinned wins the sort if hand-edited data sets both.
         .chain(admitted().filter(|(_, ws)| !ws.pinned && !ws.snoozed))
-        .chain(admitted().filter(|(_, ws)| ws.snoozed && !ws.pinned))
+        .chain(admitted().filter(|(_, ws)| ws.snoozed && !ws.pinned && !snoozed_collapsed))
         .map(|(ws_idx, _)| SidebarRow { ws_idx })
         .collect()
 }
@@ -1226,21 +1229,40 @@ pub fn pinned_caption_rect(scale: f32, list: &LayoutRect) -> LayoutRect {
     }
 }
 
+/// State of the bottom "Snoozed" section: how many admitted groups are
+/// snoozed (folded or not) and whether the run is folded away.
+///
+/// The caption band outlives the run — it is the click target that folds it
+/// and brings it back, exactly as [`pinned_caption_rect`] heads the pinned
+/// run — so the geometry cannot read the count off `rows` the way
+/// [`snoozed_run`] does: a folded run contributes no rows at all.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SnoozedSection {
+    /// Snoozed groups the current folder filter admits. Zero hides the band.
+    pub total: usize,
+    /// The run is folded (`sidebar.snoozed_collapsed`): the caption stays,
+    /// the rows leave the list.
+    pub collapsed: bool,
+}
+
 /// Device-px rect of the "Snoozed" caption — the label heading the run of
-/// snoozed groups at the bottom of the list. Zero-height when nothing is
-/// snoozed. The section gap sits *above* it, so the caption reads as the
-/// closing band of the ordinary run. `list` is the *scrolled* list rect.
+/// snoozed groups at the bottom of the list, and the toggle that folds it.
+/// Zero-height while `snoozed.total` is 0. The section gap sits *above* it,
+/// so the caption reads as the closing band of the ordinary run. `list` is
+/// the *scrolled* list rect.
 pub fn snoozed_caption_rect(
     rows: &[SidebarRow],
     workspaces: &[Workspace],
     pinned_section: bool,
+    snoozed: SnoozedSection,
     scale: f32,
     list: &LayoutRect,
 ) -> LayoutRect {
-    let n_snoozed = snoozed_run(rows, workspaces);
-    if n_snoozed == 0 {
+    if snoozed.total == 0 {
         return LayoutRect { x: list.x, y: list.y, w: 0.0, h: 0.0 };
     }
+    // Rows the list actually lays out: zero while the run is folded.
+    let n_snoozed = snoozed_run(rows, workspaces);
     let n_pinned = pinned_run(rows, workspaces);
     let n_ordinary = rows.len() - n_snoozed;
     let h = (sidebar_row_h(row_font_scale()) * scale).round();
@@ -1256,6 +1278,31 @@ pub fn snoozed_caption_rect(
     }
     y += (PINNED_SECTION_GAP * scale).round();
     LayoutRect { x: list.x, y, w: list.w.max(0.0), h: (PINNED_CAPTION_H * scale).round() }
+}
+
+/// The hairline closing the ordinary run: centred in the section gap above
+/// the "Snoozed" caption, mirroring [`pinned_divider_rect`] at the top of
+/// the list. Zero-height while nothing is snoozed. Device px; `list` is
+/// scrolled.
+pub fn snoozed_divider_rect(
+    rows: &[SidebarRow],
+    workspaces: &[Workspace],
+    pinned_section: bool,
+    snoozed: SnoozedSection,
+    scale: f32,
+    list: &LayoutRect,
+) -> LayoutRect {
+    let cap = snoozed_caption_rect(rows, workspaces, pinned_section, snoozed, scale, list);
+    if cap.h == 0.0 {
+        return LayoutRect { x: list.x, y: list.y, w: 0.0, h: 0.0 };
+    }
+    let inset = (12.0 * scale).round();
+    LayoutRect {
+        x: list.x + inset,
+        y: cap.y - ((PINNED_SECTION_GAP * scale).round() / 2.0).round(),
+        w: (list.w - 2.0 * inset).max(0.0),
+        h: scale.round().max(1.0),
+    }
 }
 
 /// The hairline closing the "Pinned" section: centred in the gap under
@@ -1312,6 +1359,7 @@ pub fn sidebar_rows_extent(
     rows: &[SidebarRow],
     workspaces: &[Workspace],
     pinned_section: bool,
+    snoozed: SnoozedSection,
     scale: f32,
     list: &LayoutRect,
 ) -> f32 {
@@ -1319,13 +1367,19 @@ pub fn sidebar_rows_extent(
     match rows.len().checked_sub(1) {
         Some(last) => {
             let r = sidebar_row_rect(rows, last, workspaces, pinned_section, scale, list);
-            r.y + r.h - top
+            // A folded snoozed run leaves its caption below the last row.
+            let cap = snoozed_caption_rect(rows, workspaces, pinned_section, snoozed, scale, list);
+            (r.y + r.h).max(cap.y + cap.h) - top
         },
         None if pinned_section => {
             let d = pinned_divider_rect(rows, workspaces, true, scale, list);
-            d.y + (PINNED_SECTION_GAP * scale).round() / 2.0 - top
+            let cap = snoozed_caption_rect(rows, workspaces, true, snoozed, scale, list);
+            (d.y + (PINNED_SECTION_GAP * scale).round() / 2.0).max(cap.y + cap.h) - top
         },
-        None => 0.0,
+        None => {
+            let cap = snoozed_caption_rect(rows, workspaces, false, snoozed, scale, list);
+            (cap.y + cap.h - top).max(0.0)
+        },
     }
 }
 
@@ -2729,6 +2783,11 @@ mod tests {
         assert!(!ws.shows_unread_dot(), "a snoozed row paints no dot");
     }
 
+    /// The open "Snoozed" section: one snoozed group, not folded.
+    fn snoozed_open() -> SnoozedSection {
+        SnoozedSection { total: 1, collapsed: false }
+    }
+
     #[test]
     fn snoozed_rows_sort_below_the_snoozed_caption() {
         let mut later = ws("later", None);
@@ -2737,7 +2796,7 @@ mod tests {
 
         // Ordering: pinned first (none here), then workspace order, then the
         // snoozed run at the bottom.
-        let rows = sidebar_rows_filtered(&workspaces, &[], None, false);
+        let rows = sidebar_rows_filtered(&workspaces, &[], None, false, false);
         assert_eq!(
             rows,
             vec![
@@ -2755,16 +2814,62 @@ mod tests {
         let a = sidebar_row_rect(&rows, 0, &workspaces, false, scale, &list);
         let b = sidebar_row_rect(&rows, 1, &workspaces, false, scale, &list);
         let s = sidebar_row_rect(&rows, 2, &workspaces, false, scale, &list);
-        let cap = snoozed_caption_rect(&rows, &workspaces, false, scale, &list);
+        let cap =
+            snoozed_caption_rect(&rows, &workspaces, false, snoozed_open(), scale, &list);
         assert_eq!(b.y, a.y + a.h);
         assert!(cap.y >= b.y + b.h, "the caption never overlaps the last row");
         assert_eq!(s.y, cap.y + cap.h);
         assert!(s.y > b.y + b.h);
 
         // Nothing snoozed: no band at all.
-        let plain = sidebar_rows_filtered(&workspaces[..1], &[], None, false);
+        let plain = sidebar_rows_filtered(&workspaces[..1], &[], None, false, false);
         assert_eq!(snoozed_run(&plain, &workspaces), 0);
-        assert_eq!(snoozed_caption_rect(&plain, &workspaces, false, scale, &list).h, 0.0);
+        assert_eq!(
+            snoozed_caption_rect(&plain, &workspaces, false, SnoozedSection::default(), scale, &list).h,
+            0.0
+        )
+    }
+
+    /// The "Snoozed" section folds on a click, exactly as the "Pinned" run
+    /// does: the rows leave the list, the caption band stays put as the
+    /// toggle, and the stack's extent still covers it.
+    #[test]
+    fn snoozed_section_folds_away_like_the_pinned_run() {
+        let mut later = ws("later", None);
+        later.snoozed = true;
+        let workspaces = vec![ws("a", None), later, ws("b", None)];
+        let list = LayoutRect { x: 0.0, y: 0.0, w: 260.0, h: 600.0 };
+        let scale = 1.0;
+        let folded = SnoozedSection { total: 1, collapsed: true };
+
+        // Folded: the snoozed row leaves the list.
+        let rows = sidebar_rows_filtered(&workspaces, &[], None, false, true);
+        assert_eq!(rows.iter().map(|r| r.ws_idx).collect::<Vec<_>>(), vec![0, 2]);
+        assert_eq!(snoozed_run(&rows, &workspaces), 0);
+
+        // The caption survives — it is the toggle — right under the last
+        // ordinary row, with the rail in the gap above it.
+        let cap = snoozed_caption_rect(&rows, &workspaces, false, folded, scale, &list);
+        let last = sidebar_row_rect(&rows, 1, &workspaces, false, scale, &list);
+        assert_eq!(cap.h, PINNED_CAPTION_H * scale);
+        assert!(cap.y >= last.y + last.h);
+        let rail = snoozed_divider_rect(&rows, &workspaces, false, folded, scale, &list);
+        assert!(rail.y < cap.y && rail.y >= last.y + last.h - PINNED_SECTION_GAP * scale);
+
+        // Extent: the row band is gone, the caption's bottom still counts.
+        let open_rows = sidebar_rows_filtered(&workspaces, &[], None, false, false);
+        let open_ext =
+            sidebar_rows_extent(&open_rows, &workspaces, false, snoozed_open(), scale, &list);
+        let folded_ext = sidebar_rows_extent(&rows, &workspaces, false, folded, scale, &list);
+        assert!(folded_ext < open_ext);
+        assert_eq!(folded_ext, cap.y + cap.h - (list.y + SESSIONS_HEADER_H * scale));
+
+        // Nothing snoozed: no band at all, folded or not.
+        let none = sidebar_rows_filtered(&workspaces[..1], &[], None, false, true);
+        assert_eq!(
+            snoozed_caption_rect(&none, &workspaces, false, SnoozedSection::default(), scale, &list).h,
+            0.0
+        )
     }
 
     #[test]
@@ -3110,7 +3215,7 @@ mod tests {
         let sections = vec![sec(7, false), sec(8, false)];
 
         // No filter: every group, pins first, then workspace order.
-        let rows = sidebar_rows_filtered(&workspaces, &sections, None, false);
+        let rows = sidebar_rows_filtered(&workspaces, &sections, None, false, false);
         assert_eq!(
             rows,
             vec![
@@ -3125,12 +3230,12 @@ mod tests {
 
         // A section filter keeps only that section's members, its pin first.
         assert_eq!(
-            sidebar_rows_filtered(&workspaces, &sections, Some(7), false),
+            sidebar_rows_filtered(&workspaces, &sections, Some(7), false, false),
             vec![SidebarRow { ws_idx: 1 }, SidebarRow { ws_idx: 2 }]
         );
 
         // Unknown or dangling ids filter to nothing.
-        assert!(sidebar_rows_filtered(&workspaces, &sections, Some(99), false).is_empty());
+        assert!(sidebar_rows_filtered(&workspaces, &sections, Some(99), false, false).is_empty());
     }
 
     #[test]
@@ -3207,7 +3312,10 @@ mod tests {
         assert_eq!(bare.y, list.y + SESSIONS_HEADER_H * scale);
         assert_eq!(pinned_drop_zone(&plain, &workspaces, false, scale, &list).h, 0.0);
         assert_eq!(pinned_divider_rect(&plain, &workspaces, false, scale, &list).h, 0.0);
-        assert_eq!(sidebar_rows_extent(&[], &workspaces, false, scale, &list), 0.0);
+        assert_eq!(
+            sidebar_rows_extent(&[], &workspaces, false, SnoozedSection::default(), scale, &list),
+            0.0
+        );
         // With the section shown (a drag is live), the caption heads the list.
         let r0 = sidebar_row_rect(&plain, 0, &workspaces, true, scale, &list);
         let r1 = sidebar_row_rect(&plain, 1, &workspaces, true, scale, &list);
@@ -3223,7 +3331,7 @@ mod tests {
         let rail = pinned_divider_rect(&plain, &workspaces, true, scale, &list);
         assert!(rail.y >= caption.y + caption.h && rail.y + rail.h <= r0.y);
         assert_eq!(
-            sidebar_rows_extent(&plain, &workspaces, true, scale, &list),
+            sidebar_rows_extent(&plain, &workspaces, true, SnoozedSection::default(), scale, &list),
             r1.y + r1.h - (list.y + SESSIONS_HEADER_H * scale)
         );
         assert_eq!(r0.w, list.w);
@@ -3247,7 +3355,7 @@ mod tests {
         assert!(rail.y >= p0.y + p0.h && rail.y + rail.h <= p1.y);
         // Folding the run drops the pinned rows from the list; the gap then
         // sits straight under the caption again.
-        let folded = sidebar_rows_filtered(&workspaces, &[], None, true);
+        let folded = sidebar_rows_filtered(&workspaces, &[], None, true, false);
         assert_eq!(folded.iter().map(|r| r.ws_idx).collect::<Vec<_>>(), vec![0, 1]);
         assert_eq!(sidebar_row_rect(&folded, 0, &workspaces, true, scale, &list).y, r0.y);
         assert_eq!(max_scroll(100.0, 60.0), 40.0);
@@ -3312,7 +3420,7 @@ mod tests {
 
         // ...and every session row stays inside the list, clear of it.
         let workspaces = vec![ws("a", None), ws("b", None)];
-        let rows = sidebar_rows_filtered(&workspaces, &[], None, false);
+        let rows = sidebar_rows_filtered(&workspaces, &[], None, false, false);
         let list = sessions_list_rect(SIDEBAR_DEFAULT_W, FOLDERS_CARD_W, true, h, scale);
         for i in 0..rows.len() {
             let r = sidebar_row_rect(&rows, i, &workspaces, true, scale, &list);

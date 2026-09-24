@@ -22,7 +22,9 @@
 //! Pinned groups keep their full row — the card's context is the point of
 //! the row — and simply sort first, under a "Pinned" caption
 //! ([`crate::workspace::pinned_caption_rect`]); dragging a row across the
-//! section boundary pins or unpins it.
+//! section boundary pins or unpins it. The bottom "Snoozed" run mirrors it
+//! ([`crate::workspace::snoozed_caption_rect`]), and either caption folds
+//! its run on a click.
 use gpui::{
     AnyElement, App as GpuiApp, BoxShadow, ClickEvent, Context, FontWeight, Hsla,
     InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, SharedString,
@@ -707,16 +709,44 @@ impl App {
                     .bg(theme.border),
             );
         }
-        // The "Snoozed" band heads the snoozed run at the bottom of the
-        // list, mirroring the "Pinned" caption at the top. A label, not a
-        // drop zone: snoozing is a context-menu action.
-        if crate::workspace::snoozed_run(&rows, &self.workspaces) > 0 {
+        // The "Snoozed" band closes the list, mirroring the "Pinned"
+        // caption at the top: a rail ends the ordinary run, a click folds
+        // the run away (or brings it back) and the count reports what is
+        // hidden. Snoozing itself stays a context-menu action, so the
+        // caption is not a drop zone.
+        let snoozed = self.snoozed_section();
+        if snoozed.total > 0 {
             let cap = crate::workspace::snoozed_caption_rect(
                 &rows,
                 &self.workspaces,
                 self.pinned_section(),
+                snoozed,
                 1.0,
                 &list,
+            );
+            let chevron = if snoozed.collapsed {
+                crate::ui::assets::ICON_CHEVRON_RIGHT
+            } else {
+                crate::ui::assets::ICON_CHEVRON_DOWN
+            };
+            let cap_hover = hover.is_some_and(|(x, y)| cap.contains(x, y));
+            let ink = if cap_hover { theme.foreground } else { theme.muted_foreground };
+            let rail = crate::workspace::snoozed_divider_rect(
+                &rows,
+                &self.workspaces,
+                self.pinned_section(),
+                snoozed,
+                1.0,
+                &list,
+            );
+            layer = layer.child(
+                div()
+                    .absolute()
+                    .left(px(rail.x))
+                    .top(px(rail.y))
+                    .w(px(rail.w.max(0.0)))
+                    .h(px(rail.h))
+                    .bg(theme.border),
             );
             layer = layer.child(
                 div()
@@ -728,12 +758,28 @@ impl App {
                     .h(px(cap.h))
                     .flex()
                     .items_center()
+                    .gap(px(scaled(4.0)))
+                    .pt(px(scaled(5.0)))
+                    .cursor_pointer()
+                    .child(icon(chevron, px(scaled(12.0)), ink))
                     .child(
                         div()
                             .text_size(px(scaled(10.5)))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.muted_foreground)
+                            .text_color(ink)
                             .child("Snoozed"),
+                    )
+                    .when(snoozed.collapsed, |d| {
+                        d.child(
+                            div()
+                                .text_size(px(scaled(10.5)))
+                                .text_color(theme.muted_foreground)
+                                .child(format!("{}", snoozed.total)),
+                        )
+                    })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        press(entity.clone(), |this, _ev, _cx| this.toggle_snoozed_collapsed()),
                     ),
             );
         }
