@@ -1207,6 +1207,7 @@ impl App {
                 primary_tile,
                 section: group.section_id,
                 pinned: group.pinned,
+                snoozed: group.snoozed,
             };
             ws.fix_focus();
             self.workspaces.push(ws);
@@ -2502,6 +2503,11 @@ impl App {
                         enabled: true,
                         separator_after: false,
                     },
+                    context_menu::MenuItem {
+                        title: if ws.snoozed { "Unsnooze group" } else { "Snooze group" }.into(),
+                        enabled: true,
+                        separator_after: false,
+                    },
                 ];
                 self.show_context_menu(view, at, MenuTarget::Group { ws: ws_idx }, items, window, cx);
                 return;
@@ -2599,7 +2605,21 @@ impl App {
                             tab.unread_at = Some(now);
                         }
                     },
-                    1 => w.pinned = !w.pinned,
+                    1 => {
+                        w.pinned = !w.pinned;
+                        // Pinned and snoozed are opposite ends of one list:
+                        // toggling one clears the other so a row can never
+                        // sit in both sections.
+                        if w.pinned {
+                            w.snoozed = false;
+                        }
+                    },
+                    2 => {
+                        w.snoozed = !w.snoozed;
+                        if w.snoozed {
+                            w.pinned = false;
+                        }
+                    },
                     _ => return,
                 }
             },
@@ -3104,6 +3124,7 @@ impl App {
             primary_tile,
             section: self.folder_filter,
             pinned: false,
+            snoozed: false,
         };
         ws.fix_focus();
         if empty {

@@ -707,6 +707,36 @@ impl App {
                     .bg(theme.border),
             );
         }
+        // The "Snoozed" band heads the snoozed run at the bottom of the
+        // list, mirroring the "Pinned" caption at the top. A label, not a
+        // drop zone: snoozing is a context-menu action.
+        if crate::workspace::snoozed_run(&rows, &self.workspaces) > 0 {
+            let cap = crate::workspace::snoozed_caption_rect(
+                &rows,
+                &self.workspaces,
+                self.pinned_section(),
+                1.0,
+                &list,
+            );
+            layer = layer.child(
+                div()
+                    .id("sessions-snoozed-caption")
+                    .absolute()
+                    .left(px(cap.x + scaled(ROW_PAD)))
+                    .top(px(cap.y))
+                    .w(px((cap.w - 2.0 * scaled(ROW_PAD)).max(0.0)))
+                    .h(px(cap.h))
+                    .flex()
+                    .items_center()
+                    .child(
+                        div()
+                            .text_size(px(scaled(10.5)))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme.muted_foreground)
+                            .child("Snoozed"),
+                    ),
+            );
+        }
         for (i, row) in rows.iter().enumerate() {
             let crate::workspace::SidebarRow { ws_idx } = *row;
             let Some(ws) = self.workspaces.get(ws_idx) else {
@@ -1009,7 +1039,9 @@ impl App {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .when(ws.any_unread(), |d| {
+                            // A snoozed group paints no dot: see
+                            // [`crate::workspace::Workspace::shows_unread_dot`].
+                            .when(ws.shows_unread_dot(), |d| {
                                 d.child(
                                     div()
                                         .w(px(scaled(UNREAD_DOT)))

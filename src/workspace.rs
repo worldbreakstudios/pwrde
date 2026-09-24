@@ -459,6 +459,13 @@ pub struct Workspace {
     /// scroll. Its section membership survives the pin so unpinning drops it
     /// straight back where it was.
     pub pinned: bool,
+    /// When true, this group is tucked into the "Snoozed" section at the
+    /// bottom of the sessions list and its row's unread dot is suppressed: the
+    /// user has said "not now", so the sidebar must stop asking for attention.
+    /// Section membership survives the snooze, exactly like a pin, so
+    /// unsnoozing drops it straight back where it was. `pinned` and `snoozed`
+    /// are mutually exclusive — toggling one clears the other.
+    pub snoozed: bool,
 }
 
 impl Workspace {
@@ -474,6 +481,7 @@ impl Workspace {
             primary_tile: focused_tile,
             section: None,
             pinned: false,
+            snoozed: false,
         }
     }
 
@@ -514,6 +522,15 @@ impl Workspace {
         self.root.tiles().iter().any(|t| t.tabs.iter().any(|tab| tab.unread))
     }
 
+    /// Whether the sessions list should paint this group's unread dot. A
+    /// snoozed group never does: snoozing is an explicit "hide it for later",
+    /// so the row stops advertising unread output until it is woken. The
+    /// underlying [`Self::any_unread`] signal survives, so unsnoozing brings
+    /// the dot straight back.
+    pub fn shows_unread_dot(&self) -> bool {
+        self.any_unread() && !self.snoozed
+    }
+
     /// Return the moment this workspace most recently asked for attention.
     ///
     /// When tabs are currently unread, this is the oldest timestamp among
@@ -552,6 +569,16 @@ impl Workspace {
 pub fn pinned_run(rows: &[SidebarRow], workspaces: &[Workspace]) -> usize {
     rows.iter()
         .take_while(|r| workspaces.get(r.ws_idx).is_some_and(|w| w.pinned))
+        .count()
+}
+
+/// How many trailing rows of `rows` are snoozed groups. [`sidebar_rows_filtered`]
+/// lists them last, under the "Snoozed" caption at the bottom of the list —
+/// the mirror of the pinned run at the top. Zero means no snoozed section.
+pub fn snoozed_run(rows: &[SidebarRow], workspaces: &[Workspace]) -> usize {
+    rows.iter()
+        .rev()
+        .take_while(|r| workspaces.get(r.ws_idx).is_some_and(|w| w.snoozed))
         .count()
 }
 
@@ -998,7 +1025,11 @@ pub fn sidebar_rows_filtered(
     let admitted = || workspaces.iter().enumerate().filter(|(_, ws)| admit(ws));
     admitted()
         .filter(|(_, ws)| ws.pinned && !pinned_collapsed)
-        .chain(admitted().filter(|(_, ws)| !ws.pinned))
+        // Pinned groups head the list (the "Pinned" section), snoozed ones
+        // trail it (the "Snoozed" section). The two flags are mutually
+        // exclusive; pinned wins the sort if hand-edited data sets both.
+        .chain(admitted().filter(|(_, ws)| !ws.pinned && !ws.snoozed))
+        .chain(admitted().filter(|(_, ws)| ws.snoozed && !ws.pinned))
         .map(|(ws_idx, _)| SidebarRow { ws_idx })
         .collect()
 }
@@ -1195,6 +1226,38 @@ pub fn pinned_caption_rect(scale: f32, list: &LayoutRect) -> LayoutRect {
     }
 }
 
+/// Device-px rect of the "Snoozed" caption — the label heading the run of
+/// snoozed groups at the bottom of the list. Zero-height when nothing is
+/// snoozed. The section gap sits *above* it, so the caption reads as the
+/// closing band of the ordinary run. `list` is the *scrolled* list rect.
+pub fn snoozed_caption_rect(
+    rows: &[SidebarRow],
+    workspaces: &[Workspace],
+    pinned_section: bool,
+    scale: f32,
+    list: &LayoutRect,
+) -> LayoutRect {
+    let n_snoozed = snoozed_run(rows, workspaces);
+    if n_snoozed == 0 {
+        return LayoutRect { x: list.x, y: list.y, w: 0.0, h: 0.0 };
+    }
+    let n_pinned = pinned_run(rows, workspaces);
+    let n_ordinary = rows.len() - n_snoozed;
+    let h = (sidebar_row_h(row_font_scale()) * scale).round();
+    let mut y = list.y + (SESSIONS_HEADER_H * scale).round();
+    if pinned_section {
+        y += (PINNED_CAPTION_H * scale).round();
+    }
+    y += n_ordinary as f32 * h;
+    // Same boundary rule [`sidebar_row_rect_at`] uses: the pinned gap is
+    // added at the first unpinned row, which lies inside the ordinary run.
+    if pinned_section && n_ordinary >= n_pinned {
+        y += (PINNED_SECTION_GAP * scale).round();
+    }
+    y += (PINNED_SECTION_GAP * scale).round();
+    LayoutRect { x: list.x, y, w: list.w.max(0.0), h: (PINNED_CAPTION_H * scale).round() }
+}
+
 /// The hairline closing the "Pinned" section: centred in the gap under
 /// the last pinned row, or straight under the caption when nothing is
 /// pinned (or the section is folded). Device px; `list` is scrolled.
@@ -1295,6 +1358,7 @@ fn sidebar_row_rect_at(
     list: &LayoutRect,
 ) -> LayoutRect {
     let n_pinned = pinned_run(rows, workspaces);
+    let n_snoozed = snoozed_run(rows, workspaces);
     let mut y = list.y + (SESSIONS_HEADER_H * scale).round();
     if pinned_section {
         y += (PINNED_CAPTION_H * scale).round();
@@ -1308,6 +1372,12 @@ fn sidebar_row_rect_at(
         // the header.
         if i == n_pinned && pinned_section {
             y += (PINNED_SECTION_GAP * scale).round();
+        }
+        // The "Snoozed" band sits between the last ordinary row and the
+        // snoozed run at the bottom of the list: a gap, the caption, then
+        // the rows.
+        if n_snoozed > 0 && i == rows.len() - n_snoozed {
+            y += (PINNED_SECTION_GAP * scale).round() + (PINNED_CAPTION_H * scale).round();
         }
         if i == index {
             return LayoutRect { x: list.x, y, w, h };
@@ -2645,6 +2715,56 @@ mod tests {
         assert_eq!(tile.active, 0);
         let ws = Workspace::new("g".into(), tile, None);
         assert!(ws.any_unread());
+    }
+
+    #[test]
+    fn snoozing_hides_the_unread_dot_but_keeps_the_signal() {
+        use crate::term::Session;
+        let mut tile = Tile::new(42, Session::placeholder());
+        tile.tabs[0].unread = true;
+        let mut ws = Workspace::new("g".into(), tile, None);
+        assert!(ws.shows_unread_dot(), "a live unread tab dots the row");
+        ws.snoozed = true;
+        assert!(ws.any_unread(), "snoozing must not clear the unread signal");
+        assert!(!ws.shows_unread_dot(), "a snoozed row paints no dot");
+    }
+
+    #[test]
+    fn snoozed_rows_sort_below_the_snoozed_caption() {
+        let mut later = ws("later", None);
+        later.snoozed = true;
+        let workspaces = vec![ws("a", None), later, ws("b", None)];
+
+        // Ordering: pinned first (none here), then workspace order, then the
+        // snoozed run at the bottom.
+        let rows = sidebar_rows_filtered(&workspaces, &[], None, false);
+        assert_eq!(
+            rows,
+            vec![
+                SidebarRow { ws_idx: 0 },
+                SidebarRow { ws_idx: 2 },
+                SidebarRow { ws_idx: 1 },
+            ]
+        );
+        assert_eq!(snoozed_run(&rows, &workspaces), 1);
+
+        // Geometry: the snoozed row hangs off the caption band, which itself
+        // sits a section gap below the last ordinary row.
+        let list = LayoutRect { x: 0.0, y: 0.0, w: 260.0, h: 600.0 };
+        let scale = 1.0;
+        let a = sidebar_row_rect(&rows, 0, &workspaces, false, scale, &list);
+        let b = sidebar_row_rect(&rows, 1, &workspaces, false, scale, &list);
+        let s = sidebar_row_rect(&rows, 2, &workspaces, false, scale, &list);
+        let cap = snoozed_caption_rect(&rows, &workspaces, false, scale, &list);
+        assert_eq!(b.y, a.y + a.h);
+        assert!(cap.y >= b.y + b.h, "the caption never overlaps the last row");
+        assert_eq!(s.y, cap.y + cap.h);
+        assert!(s.y > b.y + b.h);
+
+        // Nothing snoozed: no band at all.
+        let plain = sidebar_rows_filtered(&workspaces[..1], &[], None, false);
+        assert_eq!(snoozed_run(&plain, &workspaces), 0);
+        assert_eq!(snoozed_caption_rect(&plain, &workspaces, false, scale, &list).h, 0.0);
     }
 
     #[test]

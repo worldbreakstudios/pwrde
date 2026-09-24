@@ -43,6 +43,8 @@ pub struct SavedGroup {
     pub section_id: Option<u64>,
     /// Whether this group is pinned to the Sessions sidebar quick-access strip.
     pub pinned: bool,
+    /// Whether this group is snoozed to the bottom of the sessions list.
+    pub snoozed: bool,
 }
 
 /// A saved collapsible sidebar section.
@@ -141,6 +143,8 @@ fn open_db(path: &Path) -> SqlResult<Connection> {
     let _ = conn.execute("ALTER TABLE groups ADD COLUMN section_id INTEGER", []);
     // Migrate pre-pin DBs; duplicate-column errors are intentionally ignored.
     let _ = conn.execute("ALTER TABLE groups ADD COLUMN pinned INTEGER", []);
+    // Migrate pre-snooze DBs; duplicate-column errors are intentionally ignored.
+    let _ = conn.execute("ALTER TABLE groups ADD COLUMN snoozed INTEGER", []);
     let _ = conn.execute("ALTER TABLE tabs ADD COLUMN unread INTEGER", []);
     // Migrate pre-attention DBs; duplicate-column errors are intentionally ignored.
     let _ = conn.execute("ALTER TABLE tabs ADD COLUMN unread_at INTEGER", []);
@@ -206,8 +210,8 @@ pub fn save_snapshot(
         });
 
         tx.execute(
-            "INSERT INTO groups (position, name, cwd, focused_tile, layout, section_id, pinned)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO groups (position, name, cwd, focused_tile, layout, section_id, pinned, snoozed)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             (
                 group.position,
                 &group.name,
@@ -216,6 +220,7 @@ pub fn save_snapshot(
                 &layout_json,
                 group.section_id.map(|id| id as i64),
                 if group.pinned { 1 } else { 0 },
+                if group.snoozed { 1 } else { 0 },
             ),
         )?;
 
@@ -306,7 +311,7 @@ fn load_sections(conn: &Connection) -> Vec<SavedSection> {
 
 fn load_groups(conn: &Connection) -> Vec<SavedGroup> {
     let mut stmt = match conn.prepare(
-        "SELECT id, position, name, cwd, focused_tile, layout, section_id, pinned
+        "SELECT id, position, name, cwd, focused_tile, layout, section_id, pinned, snoozed
          FROM groups ORDER BY position",
     ) {
         Ok(s) => s,
@@ -326,6 +331,7 @@ fn load_groups(conn: &Connection) -> Vec<SavedGroup> {
             row.get::<_, String>(5)?,
             row.get::<_, Option<i64>>(6)?,
             row.get::<_, Option<i64>>(7)?,
+            row.get::<_, Option<i64>>(8)?,
         ))
     }) {
         Ok(r) => r,
@@ -338,7 +344,7 @@ fn load_groups(conn: &Connection) -> Vec<SavedGroup> {
     let mut groups = Vec::new();
 
     for row_result in rows {
-        let (group_id, position, name, cwd, focused_tile, layout_json, section_id, pinned) =
+        let (group_id, position, name, cwd, focused_tile, layout_json, section_id, pinned, snoozed) =
             match row_result {
                 Ok(r) => r,
                 Err(e) => {
@@ -411,6 +417,8 @@ fn load_groups(conn: &Connection) -> Vec<SavedGroup> {
             section_id: section_id.map(|id| id as u64),
             // NULL (pre-pin rows) and 0 both mean unpinned.
             pinned: pinned.map(|v| v != 0).unwrap_or(false),
+            // NULL (pre-snooze rows) and 0 both mean not snoozed.
+            snoozed: snoozed.map(|v| v != 0).unwrap_or(false),
         });
     }
 
@@ -445,6 +453,7 @@ pub fn workspaces_to_saved(workspaces: &[crate::workspace::Workspace]) -> Vec<Sa
                 tabs,
                 section_id: ws.section,
                 pinned: ws.pinned,
+                snoozed: ws.snoozed,
             }
         })
         .collect()
@@ -586,6 +595,7 @@ mod tests {
             }],
             section_id,
             pinned: false,
+            snoozed: false,
         }
     }
 
@@ -673,6 +683,7 @@ mod tests {
                 ],
                 section_id: None,
                 pinned: false,
+                snoozed: false,
             },
             SavedGroup {
                 position: 1,
@@ -695,6 +706,7 @@ mod tests {
                 }],
                 section_id: None,
                 pinned: false,
+                snoozed: false,
             },
         ];
 
@@ -900,6 +912,26 @@ mod tests {
     }
 
     #[test]
+    fn roundtrip_snoozed_flag() {
+        let path = temp_db("snoozed-roundtrip");
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+
+        let mut snoozed = sample_group(0, "later", None);
+        snoozed.snoozed = true;
+        let awake = sample_group(1, "now", None);
+        save_snapshot(&[snoozed, awake], &[], &path).unwrap();
+
+        let (loaded, _) = load_snapshot(&path);
+        assert_eq!(loaded.len(), 2);
+        assert!(loaded[0].snoozed, "a snoozed group must survive the roundtrip");
+        assert!(!loaded[1].snoozed, "an awake group stays awake");
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
     fn missing_db_loads_empty() {
         let (groups, sections) = load_snapshot(Path::new("/nonexistent/pwrde/state.db"));
         assert_eq!(groups.len(), 0);
@@ -978,6 +1010,7 @@ mod tests {
             ],
             section_id: None,
             pinned: false,
+            snoozed: false,
         }];
 
         save_snapshot(&groups, &[], &path).unwrap();
