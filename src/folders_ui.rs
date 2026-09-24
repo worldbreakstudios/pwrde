@@ -317,7 +317,7 @@ impl App {
         let mut unread = false;
         for w in self.workspaces.iter().filter(|w| w.section == Some(section_id)) {
             members += 1;
-            unread |= w.any_unread();
+            unread |= w.shows_unread_dot();
         }
         let editing = self
             .editing_section

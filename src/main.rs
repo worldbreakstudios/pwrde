@@ -390,6 +390,10 @@ struct App {
     tools_collapsed: bool,
     /// The sessions list's "Pinned" run is folded (`sidebar.pinned_collapsed`).
     pinned_collapsed: bool,
+    /// The sessions list's "Snoozed" run is folded
+    /// (`sidebar.snoozed_collapsed`) — the same fold as the pinned run, at
+    /// the other end of the list.
+    snoozed_collapsed: bool,
     /// The spot the native traffic lights were last positioned for
     /// (`workspace::traffic_light_spot`); `render` re-syncs on change.
     traffic_lights_for: Option<workspace::TrafficLightSpot>,
@@ -644,6 +648,25 @@ impl App {
                 .any(|w| w.pinned && self.folder_filter.is_none_or(|f| w.section == Some(f)))
     }
 
+    /// The sessions list's "Snoozed" section: how many groups in the
+    /// current folder are snoozed, and whether that run is folded
+    /// (`sidebar.snoozed_collapsed`). Unlike the pinned caption this is not a
+    /// drop zone, so no live drag keeps it up.
+    pub(crate) fn snoozed_section(&self) -> workspace::SnoozedSection {
+        workspace::SnoozedSection {
+            total: self
+                .workspaces
+                .iter()
+                .filter(|w| {
+                    w.snoozed
+                        && !w.pinned
+                        && self.folder_filter.is_none_or(|f| w.section == Some(f))
+                })
+                .count(),
+            collapsed: self.snoozed_collapsed,
+        }
+    }
+
     fn sessions_scroll_max(&self) -> f32 {
         let scale = self.scale();
         let list = self.sessions_list(scale);
@@ -652,6 +675,7 @@ impl App {
             &rows,
             &self.workspaces,
             self.pinned_section(),
+            self.snoozed_section(),
             scale,
             &list,
         );
@@ -731,6 +755,14 @@ impl App {
         self.request_redraw();
     }
 
+    /// Fold or unfold the sessions list's "Snoozed" run: the mirror of
+    /// [`App::toggle_pinned_collapsed`] at the bottom of the list.
+    pub(crate) fn toggle_snoozed_collapsed(&mut self) {
+        self.snoozed_collapsed = !self.snoozed_collapsed;
+        settings::set("sidebar.snoozed_collapsed", self.snoozed_collapsed.into());
+        self.request_redraw();
+    }
+
     /// A folder row press: select the folder now (`press_folder_row`) and
     /// arm a re-order drag that goes live past the drag threshold.
     pub(crate) fn press_folder_drag(&mut self, si: usize) {
@@ -749,6 +781,7 @@ impl App {
             &self.sections,
             self.folder_filter,
             self.pinned_collapsed,
+            self.snoozed_collapsed,
         )
     }
 
@@ -1210,6 +1243,7 @@ impl App {
                 primary_tile,
                 section: group.section_id,
                 pinned: group.pinned,
+                snoozed: group.snoozed,
             };
             ws.fix_focus();
             self.workspaces.push(ws);
@@ -2512,6 +2546,11 @@ impl App {
                         enabled: true,
                         separator_after: false,
                     },
+                    context_menu::MenuItem {
+                        title: if ws.snoozed { "Unsnooze group" } else { "Snooze group" }.into(),
+                        enabled: true,
+                        separator_after: false,
+                    },
                 ];
                 self.show_context_menu(view, at, MenuTarget::Group { ws: ws_idx }, items, window, cx);
                 return;
@@ -2609,7 +2648,21 @@ impl App {
                             tab.unread_at = Some(now);
                         }
                     },
-                    1 => w.pinned = !w.pinned,
+                    1 => {
+                        w.pinned = !w.pinned;
+                        // Pinned and snoozed are opposite ends of one list:
+                        // toggling one clears the other so a row can never
+                        // sit in both sections.
+                        if w.pinned {
+                            w.snoozed = false;
+                        }
+                    },
+                    2 => {
+                        w.snoozed = !w.snoozed;
+                        if w.snoozed {
+                            w.pinned = false;
+                        }
+                    },
                     _ => return,
                 }
             },
@@ -3114,6 +3167,7 @@ impl App {
             primary_tile,
             section: self.folder_filter,
             pinned: false,
+            snoozed: false,
         };
         ws.fix_focus();
         if empty {
@@ -7699,6 +7753,7 @@ fn main() {
                         folders_scroll: 0.0,
                         tools_collapsed: settings::get_bool("sidebar.tools_collapsed", false),
                         pinned_collapsed: settings::get_bool("sidebar.pinned_collapsed", false),
+                        snoozed_collapsed: settings::get_bool("sidebar.snoozed_collapsed", false),
                         traffic_lights_for: None,
                         modifiers: Modifiers::default(),
                         mouse_report: None,
