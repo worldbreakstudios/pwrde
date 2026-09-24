@@ -94,8 +94,14 @@ pub fn primary_command() -> String {
     get_str("session.primary_command").unwrap_or_else(|| "claude".into())
 }
 
-/// Whether terminal sessions persist across app restarts (`terminal.persist`):
-/// shells run inside shpool and the group layout is snapshotted to SQLite.
+/// Whether terminal *panes* persist across app restarts (`terminal.persist`):
+/// shells run inside shpool so they stay alive after pwrde exits.
+///
+/// This governs shpool only. The group/folder/tab snapshot in
+/// [`crate::persist`] is written and restored regardless, so turning this off
+/// never loses the sessions or the layouts they were launched with — the panes
+/// just come back as fresh plain shells instead of live ones.
+///
 /// Defaults to **on** — losing every session on a restart is far worse than
 /// an unexpected shpool dependency, which [`crate::term::Session::new`]
 /// degrades gracefully around when the binary is missing.

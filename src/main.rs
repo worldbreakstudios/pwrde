@@ -1163,10 +1163,13 @@ impl App {
         )
     }
 
+    /// Snapshot the live groups, tabs and sidebar folders to SQLite.
+    ///
+    /// This runs regardless of the shpool toggle: the folders, the sessions
+    /// and the split layouts they were launched with have to survive a restart
+    /// even when the panes themselves are not shpool-backed. That toggle only
+    /// decides whether a shell runs inside shpool (see [`Self::spawn_session_in`]).
     fn persist_snapshot(&self) {
-        if !settings::persist_sessions() {
-            return;
-        }
         let saved = persist::workspaces_to_saved(&self.workspaces);
         let sections = persist::sections_to_saved(&self.sections);
         if let Err(e) = persist::save_snapshot_default(&saved, &sections) {
@@ -1260,9 +1263,16 @@ impl App {
                         },
                         persist::SavedTabKind::Terminal => {
                             let tab_cwd = st.cwd.as_ref().map(std::path::PathBuf::from);
+                            // The saved shpool name is only reused while shpool
+                            // persistence is on; with it off the tab still comes
+                            // back in the same place in the layout, as a fresh
+                            // plain shell in the saved cwd.
                             let session = self.spawn_session_named(
                                 tab_cwd.as_deref().or(cwd),
-                                st.shpool_session.clone(),
+                                persist::reattach_shpool_name(
+                                    st.shpool_session.as_deref(),
+                                    settings::persist_sessions(),
+                                ),
                             );
                             Tab::new(session)
                         },
@@ -7869,12 +7879,13 @@ fn main() {
                         glass_backdrop_size: (0.0, 0.0),
                         _lfg_events_child: crate::lfg::spawn_event_stream(events_tx.clone()),
                     };
-                    // With persistence on, reattach to the previous session's
-                    // groups; otherwise launch into the empty state — no shell
-                    // is spawned until the user starts a group (CTA or ⇧⌘T).
-                    if !(settings::persist_sessions()
-                        && app.restore_workspaces())
-                    {
+                    // Sessions, folders and the layouts they were launched
+                    // with are restored on every launch — including with
+                    // shpool persistence off, where the panes come back as
+                    // fresh plain shells instead of live ones. Only a
+                    // missing/empty snapshot falls back to the empty state
+                    // (no shell until the user starts a group, CTA or ⇧⌘T).
+                    if !app.restore_workspaces() {
                         app.workspaces.push(Workspace::placeholder());
                     }
                     app.sync_layout();

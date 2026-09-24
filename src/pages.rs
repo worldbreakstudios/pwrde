@@ -555,7 +555,7 @@ pub fn settings_index() -> Vec<SettingsEntry> {
     out.push(SettingsEntry {
         section: Section::Terminal,
         label: "Persist sessions",
-        keywords: "persist sessions restore",
+        keywords: "persist sessions restore shpool panes survive restart layout folder",
     });
 
     // Appearance

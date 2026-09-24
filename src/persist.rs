@@ -537,6 +537,16 @@ fn node_to_layout_rec(node: &crate::workspace::Node, tabs: &mut Vec<SavedTab>) -
     }
 }
 
+/// The shpool session name a restored tab may reattach to.
+///
+/// `None` whenever `shpool_enabled` is false: with the shpool toggle off the
+/// snapshot still restores every group, folder and tab, but each tab comes
+/// back as a fresh plain shell instead of attaching to a pane that is not
+/// being kept alive.
+pub fn reattach_shpool_name(saved: Option<&str>, shpool_enabled: bool) -> Option<String> {
+    if shpool_enabled { saved.map(str::to_string) } else { None }
+}
+
 /// Public API using the default DB path.
 pub fn save_snapshot_default(
     groups: &[SavedGroup],
@@ -596,6 +606,24 @@ mod tests {
             section_id,
             pinned: false,
             snoozed: false,
+        }
+    }
+
+    /// A plain-shell tab (no shpool session) — the shape a snapshot has when
+    /// the shpool toggle is off.
+    fn plain_tab(tile: usize, tab_index: usize, active: bool) -> SavedTab {
+        SavedTab {
+            tile_id: tile,
+            tab_index,
+            active,
+            shpool_session: None,
+            cwd: Some("/srv".into()),
+            unread: false,
+            unread_at: None,
+            pinned: false,
+            toolbar_hidden: false,
+            kind: SavedTabKind::Terminal,
+            url: None,
         }
     }
 
@@ -936,6 +964,69 @@ mod tests {
         let (groups, sections) = load_snapshot(Path::new("/nonexistent/pwrde/state.db"));
         assert_eq!(groups.len(), 0);
         assert_eq!(sections.len(), 0);
+    }
+
+    #[test]
+    fn shpool_names_only_reattach_while_shpool_persistence_is_on() {
+        assert_eq!(
+            reattach_shpool_name(Some("pwrde-1-abc"), true),
+            Some("pwrde-1-abc".into())
+        );
+        assert_eq!(reattach_shpool_name(Some("pwrde-1-abc"), false), None);
+        assert_eq!(reattach_shpool_name(None, true), None);
+        assert_eq!(reattach_shpool_name(None, false), None);
+    }
+
+    #[test]
+    fn layouts_without_shpool_sessions_roundtrip_with_their_folders() {
+        // With the shpool toggle off every tab is a plain shell, but the
+        // snapshot must still carry the group name, cwd, split ratios and
+        // sidebar folder — that is what restores a session after a restart.
+        let path = temp_db("no-shpool-layout");
+        let sections = vec![SavedSection {
+            id: 4,
+            position: 0,
+            name: "work".into(),
+            emoji: "\u{1f6e0}".into(),
+            collapsed: false,
+            anchor: None,
+        }];
+        let mut group = sample_group(0, "api", Some(4));
+        group.cwd = Some("/srv/api".into());
+        group.layout = LayoutNode::Split {
+            dir: "row".into(),
+            ratio: 0.42,
+            a: Box::new(LayoutNode::Leaf { tile: 1, collapsed: false }),
+            b: Box::new(LayoutNode::Leaf { tile: 2, collapsed: false }),
+        };
+        group.tabs = vec![plain_tab(1, 0, true), plain_tab(2, 0, true)];
+
+        save_snapshot(&[group], &sections, &path).unwrap();
+        let (loaded, loaded_sections) = load_snapshot(&path);
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "api");
+        assert_eq!(loaded[0].cwd, Some("/srv/api".into()));
+        assert_eq!(loaded[0].section_id, Some(4));
+        assert_eq!(loaded_sections.len(), 1);
+        assert_eq!(loaded_sections[0].name, "work");
+        match &loaded[0].layout {
+            LayoutNode::Split { dir, ratio, a, b } => {
+                assert_eq!(dir, "row");
+                assert!((ratio - 0.42).abs() < 0.001);
+                assert_eq!(**a, LayoutNode::Leaf { tile: 1, collapsed: false });
+                assert_eq!(**b, LayoutNode::Leaf { tile: 2, collapsed: false });
+            }
+            _ => panic!("expected split layout"),
+        }
+        assert_eq!(loaded[0].tabs.len(), 2);
+        assert!(loaded[0].tabs.iter().all(|t| t.shpool_session.is_none()));
+        assert!(loaded[0]
+            .tabs
+            .iter()
+            .all(|t| reattach_shpool_name(t.shpool_session.as_deref(), false).is_none()));
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
