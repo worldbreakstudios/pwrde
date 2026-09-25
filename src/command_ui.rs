@@ -50,7 +50,6 @@ const PANEL_TOP_MIN: f32 = 40.0;
 const LIST_MAX_H: f32 = 350.0;
 /// Deferred-draw priority: above every other deferred element (Select
 /// dropdowns, the confirm dialog) so nothing paints over the palette.
-const LAYER_PRIORITY: usize = 4;
 
 /// A rounded tile for a glyph, the mock's 24px command glyph well.
 fn icon_tile(size: f32, radius: f32, bg: Hsla, fg: Hsla, path: &str) -> gpui::Div {
