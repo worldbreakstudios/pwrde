@@ -1,9 +1,15 @@
 # Overlay redesign — toasts in the sidebar, a real command-palette window, a fullscreen global terminal
 
-Status: plan landed; section 4.1 (the sidebar toast stack) is implemented —
-`src/toast_ui.rs` plus every producer/reader rewired, no `App.message` left. Scope: the plan the goal asks for **and**
-the PRs that implement it. Every file:line below was read on this branch
-(`tw-omura-fa2q4`, base `bbfb1e7`).
+Status: **shipped on this branch** — §4.1 (`src/toast_ui.rs`: the two-kind
+sidebar toast stack, every producer/reader rewired, no `App.message` left), §4.2
+(`src/palette_window.rs`: the palette as its own `cx.open_window` view),
+§4.3 (`src/global_hotkey.rs` + the `global-hotkey` dep: the system-wide ⌥⌘P
+summon) and §4.4 (always-fullscreen flyover window) are all implemented; what
+remains is the §4.4 deferred deletion of the dead in-window flyover machinery.
+Scope: the plan the goal asks for **and** the PRs that implement it. Every
+file:line below was read on this branch (`tw-omura-fa2q4`, base `bbfb1e7`);
+line numbers drift as the branch moves, so treat them as anchors, not
+offsets.
 
 ## 1. Goal (verbatim)
 
@@ -113,7 +119,8 @@ expires on its own timer.)
 pwrde already does exactly this for the flyover (`open_flyover_window`, `src/main.rs:7495-7545`,
 `FlyoverPopout` at `:7059`): a lazily created `cx.open_window` view that **reuses `App` as the
 single source of truth** and pulls `App.window` only for native operations. The palette copies
-that shape:
+that shape — **landed as `src/palette_window.rs` on this branch**, with the pump reconciling
+the window against `App.command.is_some()`:
 
 - `PaletteWindow` view in `src/palette.rs` (or a new `src/palette_window.rs`), holding the
   same `App` entity plus a `Renderer`-light context for text measurement.
@@ -132,14 +139,16 @@ that shape:
 
 ### 4.3 System-wide hotkey
 
-gpui at this pin exposes **no** global-hotkey registration (grep of the vendored crate found
-none), and `global-hotkey` is not in `Cargo.lock`. Two viable routes, in preference order:
+gpui at this pin exposes **no** global-hotkey registration, so the hotkey had to come from
+elsewhere. Two viable routes were weighed, in preference order — **route 1 is the one that
+landed** (`src/global_hotkey.rs`, `global-hotkey = "0.8"` in `Cargo.toml`):
 
 1. **`global-hotkey` crate** (tao/tauri's, macOS backend `RegisterEventHotKey`) on its own
-   thread, forwarding presses over the existing `events_tx` channel as a new
-   `TermEvent::GlobalHotkey(u32)` — the drain in `App::drain_events` (`src/main.rs:5477`) then
-   flips `palette_window_visible` on the main thread. No new unsafe glue, rebindable later via
-   `settings.rs`.
+   thread (shipped) — presses arrive on the existing `events_tx` channel as the payload-less
+   `TermEvent::GlobalPalette` (`src/term.rs`), and the drain in `App::drain_events` routes
+   them to `toggle_command_root`, so the palette opens with pwrde in the background. No new
+   unsafe glue. The binding is read from `keyboard.global_palette` (`settings.rs`) once at
+   startup, so changing it needs a restart today.
 2. **Carbon directly** through the already-present `objc 0.2` / `libc` deps
    (`InstallEventHandler` + `RegisterEventHotKey`) — no new dependency, but ~100 lines of
    unsafe AppKit/Carbon glue.
@@ -173,10 +182,11 @@ retired in-window flag and now only mirrors `flyover_window_visible`.
 canvas paint block (`main.rs:6528-6555`), the `paint_flyover_layer` call in `paint_terminal`,
 `flyover_ceiling` + the sidebar clip (`sidebar_ui.rs:112-130`, `:357`), the flyover resize band
 (`resize_ui.rs:229-240`), the flyover mouse hit-tests (`main.rs:4018`, `:4095`, `:4198-4217`,
-`:4504-4512`, `:4565`), the `flyover_anim` tick (`main.rs:5705-5712`), and `flyover_maximized`
-(`main.rs:2340-2344`). Each is unreachable while `flyover_windowed` stays true, but it is still
-code that reads like an overlay path, so the deletion is worth a scoped commit of its own
-rather than being folded into the shipping change.
+`:4504-4512`, `:4565`), the `flyover_anim` tick (`main.rs:5705-5712`), `flyover_maximized`
+(`main.rs:2340-2344`), and the retired `flyover_open` / `flyover_focused` flags (which now
+only mirror the window's visibility). Each is unreachable while `flyover_windowed` stays
+true, but it is still code that reads like an overlay path, so the deletion is worth a
+scoped commit of its own rather than being folded into the shipping change.
 
 ## 5. PR plan
 
@@ -200,3 +210,25 @@ Risks: (a) sub-window z-order — a palette window must be activated explicitly
 (b) the global hotkey needs Accessibility/Input Monitoring permission on first use (the same
 permission the input helper in repo memory already documents); (c) `message` disappearing from
 `state_json` is an API change for CLI consumers — keep `message` (the newest toast's text) for one release.
+
+## 6. Post-ship review of the landed branch
+
+The branch was put through drip's independent reviewer
+(`drip --review --base main`, exit 0, 8 units): **0 P0 · 0 P1 · 16 P2**, goal fit met.
+The P2s are recorded here honestly rather than fixed, so a follow-up knows exactly what is
+left:
+
+- The palette window's `open_window` failure path is silent and retried every frame while
+  `command` stays `Some` (every other failure path in this change reports through
+  `toast_notification`). Worth an `eprintln!` + a toast on first failure.
+- `modal_search_reset` is a claim consumed by whichever of `PaletteWindow::render` and the
+  webview-prompt path renders first; the contract is deliberate but unpinned by a test.
+- The toast mount's `.bottom(px(list.y))` leans on the sidebar's top/bottom pads being
+  symmetric; the `drain_events` → `toast_due` / `clear_status_toasts` integration is untested.
+- `command_ui.rs`'s module header still describes the palette keyboard as living in `main.rs`
+  (it moved to `PaletteWindow::on_key_down` → `App::palette_key`), and
+  `render_command_panel` still reads `self.glass_backdrop`.
+- Webview navigation failure no longer steals focus at all, so the address field keeps the
+  stale text; refocusing on failure would let the user retry in place.
+- Toasts live in the sidebar, so a persistent `Notification` is invisible while the sidebar
+  is collapsed with ⌘S — by design, but worth one sentence in user docs.
