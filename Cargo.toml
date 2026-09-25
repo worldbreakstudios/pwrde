@@ -42,6 +42,11 @@ arboard = "3.6.1"
 libc = "0.2"
 objc = "0.2"
 raw-window-handle = "0.6"
+# ⌥⌘P works with pwrde in the background (Carbon `RegisterEventHotKey` under
+# the hood, on its own thread — see `src/global_hotkey.rs`). Registered at
+# launch; the palette window is what it summons. macOS-only in this app, and
+# the module no-ops on other platforms.
+global-hotkey = "0.8"
 serde = { version = "1", features = ["derive"] }
 # Native child webviews for webview tabs (WebViewBuilder::build_as_child).
 wry = { version = "0.56.1", features = ["devtools"] }

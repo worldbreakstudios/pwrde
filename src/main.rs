@@ -32,12 +32,14 @@ mod flyover_ui;
 mod gh;
 mod git;
 mod git_context;
+mod global_hotkey;
 mod lfg;
 mod modal_ui;
 mod settings_ui;
 mod links;
 mod pages;
 mod palette;
+mod palette_window;
 mod persist;
 mod picker;
 mod pwrspace;
@@ -50,6 +52,7 @@ mod sidebar_card;
 mod sidebar_ui;
 mod term;
 mod tile_ui;
+mod toast_ui;
 mod term_theme;
 mod theme;
 // Vendored shadcn-style component copies (see ui/mod.rs). Kept faithful to
@@ -444,13 +447,15 @@ struct App {
     /// the field, sets that placeholder and focuses it (opening happens in
     /// handlers without a `Window`).
     modal_search_reset: Option<String>,
-    /// A centered one-line message. `bool` is `dismissable`: false while `drop`
-    /// provisions (input swallowed), true for a failure note the user can close.
-    message: Option<(String, bool)>,
-    /// An ephemeral informational toast (screenshot copied/saved): rendered
-    /// as a standard rcn `Toast`, passing keys and clicks through, expiring
-    /// on its own timer instead of lingering until replaced.
-    toast_note: Option<(String, std::time::Instant)>,
+    /// The sidebar toast stack, oldest first: status notes (an action just
+    /// taken) expire on their own after `toast_ui::TOAST_TTL`, notifications
+    /// (a failure, a result worth reading) stay until they are clicked. This
+    /// replaces the centered `message` overlay — see `toast_ui` for why a
+    /// webview makes an in-window overlay the wrong tool.
+    toasts: Vec<crate::toast_ui::ToastNote>,
+    /// Monotonic id for the next toast, so a row keeps its identity while the
+    /// stack shifts under the pointer.
+    next_toast_id: u64,
     /// The open close-primary-pane confirmation dialog, or `None`.
     confirm: Option<ConfirmClose>,
     /// Primary-pane sessions awaiting their auto-run command, keyed by session
@@ -539,6 +544,10 @@ struct App {
     /// The main window, so popout-initiated flows (new-tab picker, docking)
     /// can bring it forward.
     main_window: Option<gpui::AnyWindowHandle>,
+    /// The open command-palette window, when the pump has one up. The palette
+    /// model (`command`) is the source of truth for whether it should exist;
+    /// the pump reconciles the window against it every tick.
+    palette_window: Option<gpui::WindowHandle<crate::palette_window::PaletteWindow>>,
     /// Keystrokes queued by the bus `key` command, drained through the real
     /// gpui key-down handler so bindings and overlay routing are exercised.
     pending_keys: Vec<gpui::Keystroke>,
@@ -1144,8 +1153,7 @@ impl App {
         if let Some(error) =
             self.webviews.sync(window, &live, &placements, focus, &self.events_tx)
         {
-            self.message = Some((format!("Could not open webview: {error}"), true));
-            self.request_redraw();
+            self.toast_notification(format!("Could not open webview: {error}"));
         }
     }
 
@@ -2109,7 +2117,7 @@ impl App {
             },
             ConfirmAction::ClearWebviewData { id } => {
                 if let Err(error) = self.webviews.clear_browsing_data(id) {
-                    self.message = Some((error, true));
+                    self.toast_notification(error);
                 }
                 self.webview_panel = None;
             },
@@ -2124,11 +2132,9 @@ impl App {
     /// (which scrolls its own content), since the alternate screen has no
     /// scrollback of ours to move.
     fn on_scroll(&mut self, delta: gpui::ScrollDelta, cell_height: f32) {
-        if self.confirm.is_some()
-            || self.message.is_some()
-            || self.webview_prompt.is_some()
-            || self.command.is_some()
-        {
+        // The command palette is deliberately absent from this gate: it owns a
+        // separate window, so the main window keeps scrolling behind it.
+        if self.confirm.is_some() || self.webview_prompt.is_some() {
             return;
         }
         // Flyover panel scroll: intercept first when panel is open and cursor is inside.
@@ -2337,22 +2343,22 @@ impl App {
         self.request_redraw();
     }
 
-    /// Move the flyover between the in-window panel and its own popout
-    /// window. The sessions never move — only which surface renders them.
+    /// Show or hide the flyover's own window. The in-window panel is retired —
+    /// the global terminal is always a real window — so this is only the
+    /// window's visibility toggle: it never unsets `flyover_windowed` (which is
+    /// what used to blank the terminal on a docked↔popout press and could
+    /// restore the in-window paint path) and it moves `flyover_open` with
+    /// `flyover_window_visible`, so the pump's predicate stays coherent. The
+    /// sessions never move.
     fn flyover_toggle_windowed(&mut self) {
-        if self.flyover_windowed {
-            // Dock back: the pump closes the window; the panel takes over.
-            self.flyover_windowed = false;
-            self.flyover_window_visible = false;
-            self.flyover_open = true;
-            self.flyover_focused = true;
+        self.flyover_windowed = true;
+        let showing =
+            Self::flyover_window_wanted(self.flyover_windowed, self.flyover_window_visible);
+        self.flyover_window_visible = !showing;
+        self.flyover_open = !showing;
+        self.flyover_focused = !showing;
+        if !showing {
             self.flyover_mark_read();
-        } else {
-            // Pop out: the panel slides away; the pump opens the window.
-            self.flyover_windowed = true;
-            self.flyover_window_visible = true;
-            self.flyover_open = false;
-            self.flyover_focused = false;
             if self.flyover_tabs.is_empty() {
                 self.open_flyover_picker();
             }
@@ -2533,10 +2539,10 @@ impl App {
         }
         if self.page != Page::Sessions
             || self.confirm.is_some()
-            || self.message.is_some()
             || self.webview_prompt.is_some()
-            || self.command.is_some()
         {
+            // The palette is not a modal here: it is its own window, so a
+            // right-click in the main window is resolved normally.
             return;
         }
         let Some(view) = context_menu::ns_view(window) else { return };
@@ -2737,7 +2743,9 @@ impl App {
 
     /// True while the command palette owns the shared search field.
     fn search_modal_open(&self) -> bool {
-        self.command.is_some() || self.webview_prompt.is_some()
+        // The palette's search field lives in the palette's own window, so it
+        // no longer counts as a modal owning the main window's field.
+        self.webview_prompt.is_some()
     }
 
     /// Point the shared search field at the palette's current stage: clear
@@ -2846,6 +2854,7 @@ impl App {
                         self.spawn_flyover_tab(entry.path);
                     } else if self.flyover_tabs.is_empty() {
                         self.flyover_open = false;
+                        self.flyover_window_visible = false;
                     }
                 } else {
                     let root = entry.path.clone().or(repo);
@@ -2977,37 +2986,44 @@ impl App {
         self.request_redraw();
     }
 
-    /// Toggle the flyover panel open/closed. In windowed mode this shows or
-    /// hides the popout window instead (the pump reconciles the actual
-    /// window); sessions keep running either way.
+    /// The one predicate for "the global terminal's window belongs on screen":
+    /// the frame pump reconciles the real window against exactly this, and the
+    /// ⌘` / popout toggles flip it. `flyover_windowed` is pinned true at every
+    /// entry point (`flyover_open` is the retired in-window flag and just
+    /// mirrors `flyover_window_visible`), so a stray in-window mode can never
+    /// make the popout appear, and the window can never be closed while the
+    /// flags still claim the surface is up. Pure so it is unit-testable.
+    fn flyover_window_wanted(windowed: bool, visible: bool) -> bool {
+        windowed && visible
+    }
+
+    /// Post-state `(windowed, open, visible)` for a ⌘` toggle. `showing` is the
+    /// *effective* state (`flyover_window_wanted`), not one flag, so a window
+    /// the user closed with its own close button — or one hidden by a
+    /// cancelled first-open picker — still comes back on the next press.
+    fn flyover_toggle_state(windowed: bool, visible: bool) -> (bool, bool, bool) {
+        let showing = Self::flyover_window_wanted(windowed, visible);
+        (true, !showing, !showing)
+    }
+
+    /// Toggle the flyover panel open/closed. The global terminal is always its
+    /// own real window, so this flips the *desired* visibility; the frame pump
+    /// reconciles the actual popout window against it. Sessions keep running
+    /// either way.
     pub(crate) fn toggle_flyover(&mut self) {
-        if self.flyover_windowed {
-            self.flyover_window_visible = !self.flyover_window_visible;
-            if self.flyover_window_visible {
-                self.flyover_mark_read();
-                if self.flyover_tabs.is_empty() {
-                    self.open_flyover_picker();
-                }
-            }
-            self.request_redraw();
-            return;
-        }
-        if self.flyover_open {
-            // Close: hide but keep sessions running.
-            self.flyover_open = false;
-            self.flyover_focused = false;
-            self.request_redraw();
-        } else {
-            // Open: show the panel.
-            self.flyover_open = true;
-            self.flyover_focused = true;
+        let (windowed, open, visible) =
+            Self::flyover_toggle_state(self.flyover_windowed, self.flyover_window_visible);
+        self.flyover_windowed = windowed;
+        self.flyover_open = open;
+        self.flyover_window_visible = visible;
+        if open {
             self.flyover_mark_read();
             if self.flyover_tabs.is_empty() {
                 // First-ever open: open directory picker to create the first tab.
                 self.open_flyover_picker();
             }
-            self.request_redraw();
         }
+        self.request_redraw();
     }
 
     /// Apply a ⌘ action to the flyover's tabs — the subset of shortcuts the
@@ -3112,7 +3128,7 @@ impl App {
     }
 
     fn start_fork(&mut self, repo: std::path::PathBuf, name: String, from: Option<String>) {
-        self.message = Some((format!("Provisioning worktree for {name}…"), false));
+        self.toast_status(format!("Provisioning worktree for {name}…"));
         self.request_redraw();
 
         let events_tx = self.events_tx.clone();
@@ -3345,13 +3361,14 @@ impl App {
         };
         match pwrspace::save_profile(path, &profile) {
             Ok(()) => {
-                self.message = Some((
-                    format!("Saved workspace \"{}\" to {}", profile.name, tilde(path)),
-                    true,
+                self.toast_notification(format!(
+                    "Saved workspace \"{}\" to {}",
+                    profile.name,
+                    tilde(path)
                 ));
             },
             Err(e) => {
-                self.message = Some((format!("Save failed: {e}"), true));
+                self.toast_notification(format!("Save failed: {e}"));
             },
         }
         self.request_redraw();
@@ -4118,11 +4135,10 @@ impl App {
     /// mouse-down handler treats as modal), so mouse reports must not fire
     /// underneath it.
     fn modal_overlay_open(&self) -> bool {
-        self.confirm.is_some()
-            || self.message.is_some()
-            || self.save_ws.is_some()
-            || self.webview_prompt.is_some()
-            || self.command.is_some()
+        // The palette is not in this list: it owns a separate window, so the
+        // main window keeps taking mouse input while the Spotlight-style
+        // palette floats over whatever is in front.
+        self.confirm.is_some() || self.save_ws.is_some() || self.webview_prompt.is_some()
     }
 
     /// Right/middle button press: forward it to a mouse-tracking pane under the
@@ -4169,17 +4185,17 @@ impl App {
             self.just_expanded = None;
         }
 
-        // Overlays are modal: they intercept clicks in priority order
-        // (confirm → message → fork picker → dir picker) before anything else.
+        // True modals intercept clicks in priority order (confirm → save
+        // workspace → webview prompt) before anything else. The command palette
+        // is deliberately absent: it owns a separate window, so the main window
+        // keeps taking clicks while it floats in front.
         if self.confirm.is_some()
-            || self.message.is_some()
             || self.save_ws.is_some()
             || self.webview_prompt.is_some()
-            || self.command.is_some()
         {
-            // Every modal is an element tree now (modal_ui / save_ui /
-            // palette_ui / picker_ui): its occluding scrim keeps the click
-            // off the canvas, so there is nothing to resolve here.
+            // Both remaining modals are element trees (modal_ui / save_ui):
+            // their occluding scrim keeps the click off the canvas, so there is
+            // nothing to resolve here.
             return;
         }
 
@@ -4560,11 +4576,7 @@ impl App {
                 // Resize-handle hover: suppress while any overlay is open so the
                 // cursor/highlight don't fight the modal. Hit-test matches
                 // on_mouse_down exactly via workspace::resize_hover_at.
-                let hover = if self.confirm.is_some()
-                    || self.message.is_some()
-                    || self.webview_prompt.is_some()
-                    || self.command.is_some()
-                {
+                let hover = if self.confirm.is_some() || self.webview_prompt.is_some() {
                     None
                 } else if self.flyover_open
                     && !self.flyover_windowed
@@ -4606,9 +4618,7 @@ impl App {
                 // Link hover: suppress when any overlay is open or not in Sessions page.
                 let link_hover = if self.page != Page::Sessions
                     || self.confirm.is_some()
-                    || self.message.is_some()
                     || self.webview_prompt.is_some()
-                    || self.command.is_some()
                 {
                     None
                 } else {
@@ -4726,12 +4736,7 @@ impl App {
         }
         // An open overlay owns the keyboard: route to it before ⌘ shortcuts or
         // the PTY so typing filters the list rather than reaching the shell.
-        if self.confirm.is_some()
-            || self.message.is_some()
-            || self.save_ws.is_some()
-            || self.webview_prompt.is_some()
-            || self.command.is_some()
-        {
+        if self.confirm.is_some() || self.save_ws.is_some() || self.webview_prompt.is_some() {
             self.handle_picker_key(ev);
             return;
         }
@@ -4834,16 +4839,6 @@ impl App {
             self.request_redraw();
             return;
         }
-        // A provisioning/error message overlay is topmost. A dismissable one
-        // clears on any key; a non-dismissable one swallows the key while work
-        // is in flight. Either way the key is consumed here.
-        if let Some((_, dismissable)) = self.message.as_ref() {
-            if *dismissable {
-                self.message = None;
-            }
-            self.request_redraw();
-            return;
-        }
         if self.webview_prompt.is_some() {
             match key {
                 "enter" => self.submit_new_webview_prompt(),
@@ -4859,29 +4854,42 @@ impl App {
             self.handle_save_key(ev);
             return;
         }
-        // The unified command palette: navigation here, editing in the
-        // shared Input (the root listener still fires while it is focused,
-        // and never stops it).
-        if let Some(pal) = self.command.as_ref() {
-            let query_empty = pal.query().is_empty();
-            if Action::CommandPalette.binding().matches(&ev.keystroke) {
-                self.close_command();
-            } else {
-                match key {
-                    "escape" => self.close_command(),
-                    "enter" => self.command_enter(),
-                    "up" | "down" => {
-                        if let Some(c) = self.command.as_mut() {
-                            c.move_selection(if key == "up" { -1 } else { 1 });
-                            self.command_scroll_to = Some(c.selected());
-                        }
-                    },
-                    "backspace" if query_empty => self.command_back(),
-                    _ => {},
-                }
+        // The palette's own keys are routed by its window (`palette_key`);
+        // nothing here belongs to it any more — the modal-search field is
+        // only the webview prompt's, and `search_modal_open` says so.
+        self.request_redraw();
+    }
+
+    /// Keyboard routing for the palette window's keystrokes.
+    ///
+    /// The palette lives in its own window, so navigation arrives here rather
+    /// than through the main window's overlay routing. Typing and editing
+    /// belong to the shared Input rendered in that window; the model owns
+    /// these keys. Returns true when the palette consumed the keystroke.
+    pub(crate) fn palette_key(&mut self, ev: &KeyDownEvent) -> bool {
+        let Some(pal) = self.command.as_ref() else {
+            return false;
+        };
+        let key = ev.keystroke.key.as_str();
+        let query_empty = pal.query().is_empty();
+        if Action::CommandPalette.binding().matches(&ev.keystroke) {
+            self.close_command();
+        } else {
+            match key {
+                "escape" => self.close_command(),
+                "enter" => self.command_enter(),
+                "up" | "down" => {
+                    if let Some(c) = self.command.as_mut() {
+                        c.move_selection(if key == "up" { -1 } else { 1 });
+                        self.command_scroll_to = Some(c.selected());
+                    }
+                },
+                "backspace" if query_empty => self.command_back(),
+                _ => return false,
             }
         }
         self.request_redraw();
+        true
     }
 
     /// Keyboard routing for the save-as-workspace modal. Field stage: typing
@@ -5476,10 +5484,10 @@ impl App {
     /// redraw is needed.
     fn drain_events(&mut self) -> bool {
         let mut redraw = false;
-        // Expire an ephemeral toast note on its own timer. The drain runs on
+        // Expire the status rows on their own timer. The drain runs on
         // the foreground executor every ~16ms, so the toast disappears within
         // a frame of its deadline; redraw only flips on the expiry frame.
-        if self.toast_note_due() {
+        if self.toast_due() {
             redraw = true;
         }
         while let Ok(event) = self.events_rx.try_recv() {
@@ -5536,7 +5544,7 @@ impl App {
                     // Only worth a note while the tab is still around to sit on
                     // its fallback page.
                     if self.webview_tab_exists(id) {
-                        self.message = Some((format!("Webview URL command {message}"), true));
+                        self.toast_notification(format!("Webview URL command {message}"));
                         redraw = true;
                     }
                 },
@@ -5544,6 +5552,13 @@ impl App {
                     if self.set_webview_title(id, title) {
                         redraw = true;
                     }
+                },
+                TermEvent::GlobalPalette => {
+                    // ⌥⌘P pressed with pwrde in the background: the
+                    // Spotlight-style summon, so the palette toggles exactly as
+                    // the in-app ⌘P does.
+                    self.toggle_command_root();
+                    redraw = true;
                 },
                 TermEvent::WebviewFocused { id } => {
                     let tile = self.workspaces[self.active].root.tiles().iter().find_map(|tile| {
@@ -5582,11 +5597,11 @@ impl App {
                     }
                 },
                 // A backgrounded worktree drop finished: clear the provisioning
-                // message and open the new group — with the profile chosen
+                // status note and open the new group — with the profile chosen
                 // before provisioning, when there was one — or surface the
                 // failure (dropping any pending profile with it).
                 TermEvent::GroupReady { name, cwd } => {
-                    self.message = None;
+                    self.clear_status_toasts();
                     match self.pending_group_profile.take() {
                         Some(profile) => self.add_group_with_profile(name, Some(cwd), &profile),
                         None => self.add_group(name, Some(cwd)),
@@ -5602,7 +5617,7 @@ impl App {
                 TermEvent::GroupFailed { message } => {
                     self.pending_group_profile = None;
                     self.pending_group_section = None;
-                    self.message = Some((format!("drop failed: {message}"), true));
+                    self.toast_notification(format!("drop failed: {message}"));
                     redraw = true;
                 },
                 // A web page handed to us as a browser: a webview tab in the
@@ -5614,7 +5629,7 @@ impl App {
                         self.add_group(workspace::webview_title(&url), None);
                     }
                     if let Err(error) = self.add_webview_tab_to_group(self.active, url) {
-                        self.message = Some((format!("open URL failed: {error}"), true));
+                        self.toast_notification(format!("open URL failed: {error}"));
                     }
                     redraw = true;
                 },
@@ -6147,11 +6162,18 @@ impl Render for App {
         // Shared modal search field: a freshly opened modal claims it (clear,
         // placeholder, focus); a closed one releases it back to the app.
         if let Some(placeholder) = self.modal_search_reset.take() {
-            self.modal_search.update(cx, |input, cx| {
-                input.placeholder(placeholder);
-                input.set_text("", cx);
-            });
-            window.focus(&self.modal_search.read(cx).focus_handle(cx), cx);
+            if self.command.is_some() {
+                // The palette renders the shared Input inside its own window;
+                // leave the claim for `PaletteWindow::render` to consume
+                // there so main-window focus never lands on a hidden field.
+                self.modal_search_reset = Some(placeholder);
+            } else {
+                self.modal_search.update(cx, |input, cx| {
+                    input.placeholder(placeholder);
+                    input.set_text("", cx);
+                });
+                window.focus(&self.modal_search.read(cx).focus_handle(cx), cx);
+            }
         } else if !self.search_modal_open()
             && self.modal_search.read(cx).focus_handle(cx).is_focused(window)
         {
@@ -6344,15 +6366,16 @@ impl Render for App {
             // top edge): elements own the cursor and the drag start; the
             // canvas still drives the drag (`resize_ui`).
             .child(self.render_resize_handles(cx))
-            // Command palette and the pickers (element trees; see
-            // `palette_ui` / `picker_ui`).
-            .child(self.render_command(cx))
+            // The pickers (element trees; see `picker_ui`). The command
+            // palette is not here: it is its own window (`palette_window`),
+            // so nothing is ever painted over a webview.
             .child(self.render_new_webview_prompt(cx))
             // Save-as-workspace modal (element tree; see `save_ui`).
             .child(self.render_save(cx))
-            // Modal overlays (confirm dialog, message panel): last, so they
-            // sit above every page overlay; the canvas flyover is painted
-            // inside the canvas element, so they cover it too.
+            // The modal overlay (the confirm dialog): last, so it
+            // sits above every page overlay; the canvas flyover is painted
+            // inside the canvas element, so it covers that too. Notes and results
+            // are toast rows in the sidebar instead — see `toast_ui`.
             .child(self.render_modals(cx))
     }
 }
@@ -6454,7 +6477,6 @@ impl App {
             // panel never fall through, so hover mustn't either. Modal
             // overlays sit above the flyover, so they keep the live cursor.
             element_modal: self.confirm.is_some()
-                || self.message.is_some()
                 || self.save_ws.is_some()
                 || self.search_modal_open(),
             cursor: {
@@ -6786,7 +6808,7 @@ impl App {
 
 /// The `NSWindow` behind a gpui window, for the AppKit surgery below.
 #[cfg(target_os = "macos")]
-fn ns_window(window: &Window) -> Option<*mut objc::runtime::Object> {
+pub(crate) fn ns_window(window: &Window) -> Option<*mut objc::runtime::Object> {
     use objc::runtime::Object;
     use objc::{msg_send, sel, sel_impl};
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -7499,7 +7521,13 @@ impl Render for FlyoverPopout {
 /// Open the flyover popout window and store its handle on the [`App`].
 /// Called by the frame pump when windowed mode wants a window up.
 fn open_flyover_window(app: gpui::Entity<App>, cx: &mut GpuiApp) {
-    let bounds = Bounds::centered(None, gpui::size(px(880.0), px(480.0)), cx);
+    // The global terminal is always its own real window, sized to the whole
+    // visible screen (hotkey-window style) so it can cover any pane — including
+    // the native webview tabs that no in-window element tree can layer over.
+    let bounds = cx
+        .primary_display()
+        .map(|d| d.visible_bounds())
+        .unwrap_or_else(|| Bounds::centered(None, gpui::size(px(880.0), px(480.0)), cx));
     let app_for_view = app.clone();
     let app_for_close = app.clone();
     let handle = cx.open_window(
@@ -7640,6 +7668,11 @@ fn main() {
         .with_quit_mode(QuitMode::LastWindowClosed);
 
     let (events_tx, events_rx) = mpsc::channel::<TermEvent>();
+    // System-wide palette hotkey (⌥⌘P): registered on its own thread before the
+    // window exists, so a press is already queued when the first frame drains —
+    // that is the whole point, since it has to work while pwrde is in the
+    // background. Best-effort: a refusal warns and the in-app ⌘P stays.
+    global_hotkey::spawn(events_tx.clone());
     // Command bus: listen before any session spawns so child shells inherit
     // `PWRDE_SOCKET` and `pwrde-cli` inside a tab targets this instance.
     bus_exec::start(events_tx.clone());
@@ -7802,8 +7835,8 @@ fn main() {
                         pending_group_profile: None,
                         pending_group_section: None,
                         save_ws: None,
-                        message: None,
-                        toast_note: None,
+                        toasts: Vec::new(),
+                        next_toast_id: 0,
                         confirm: None,
                         pending_primary_cmd: std::collections::HashMap::new(),
                         command_input: {
@@ -7939,6 +7972,7 @@ fn main() {
                         flyover_window_visible: false,
                         flyover_window: None,
                         main_window: None,
+                        palette_window: None,
                         pending_keys: Vec::new(),
                         preview_dark: theme::dark_active(),
                         appearance_menu: None,
@@ -7977,7 +8011,7 @@ fn main() {
                                 .timer(Duration::from_millis(16))
                                 .await;
                             let Some(app) = handle.upgrade() else { break };
-                            let (redraw, want_popout, popout, (pending_keys, main)) =
+                            let (redraw, want_popout, popout, want_palette, palette, (pending_keys, main)) =
                                 app.update(cx, |app: &mut App, cx| {
                                     let redraw = app.drain_events();
                                     if redraw {
@@ -7985,8 +8019,16 @@ fn main() {
                                     }
                                     (
                                         redraw,
-                                        app.flyover_windowed && app.flyover_window_visible,
+                                        App::flyover_window_wanted(
+                                            app.flyover_windowed,
+                                            app.flyover_window_visible,
+                                        ),
                                         app.flyover_window,
+                                        // The palette window exists exactly while the
+                                        // palette model does: no per-site plumbing, a
+                                        // stage change keeps the same surface up.
+                                        app.command.is_some(),
+                                        app.palette_window,
                                         // Only dequeue once the main window
                                         // exists: keys pressed over the bus
                                         // during startup wait rather than
@@ -8047,6 +8089,27 @@ fn main() {
                                     });
                                 },
                                 // Steady state: forward redraws to the popout.
+                                (_, Some(w)) => {
+                                    if redraw {
+                                        let _ = w.update(cx, |_, _, cx| cx.notify());
+                                    }
+                                },
+                                (false, None) => {},
+                            }
+                            // Reconcile the palette window the same way.
+                            match (want_palette, palette) {
+                                (true, None) => {
+                                    let app_entity = app.clone();
+                                    let _ = cx.update(|cx| {
+                                        crate::palette_window::open_palette_window(app_entity, cx)
+                                    });
+                                },
+                                (false, Some(w)) => {
+                                    let _ = w.update(cx, |_, window, _| window.remove_window());
+                                    let _ = app.update(cx, |app: &mut App, _| {
+                                        app.palette_window = None;
+                                    });
+                                },
                                 (_, Some(w)) => {
                                     if redraw {
                                         let _ = w.update(cx, |_, _, cx| cx.notify());
@@ -8435,5 +8498,39 @@ mod tool_page_title_tests {
             "drip --tui"
         );
         assert_eq!(tool_label(None, "drip --tui"), "drip --tui");
+    }
+}
+
+#[cfg(test)]
+mod flyover_window_tests {
+    use super::App;
+
+    /// The pump's predicate, the ⌘` toggle, and the popout action all have to
+    /// agree: whatever state the flags are in, a toggle inverts the predicate
+    /// and never leaves it true while the window is down (the docked↔popout
+    /// press that used to blank the global terminal).
+    #[test]
+    fn toggle_inverts_the_window_predicate() {
+        for (windowed, open, visible) in [
+            (false, false, false),
+            (true, false, false),
+            (true, true, true),
+            // Hidden by the popout's own close button: `visible` cleared first.
+            (true, false, true),
+            // Hidden by a cancelled first-open picker: `open` cleared first.
+            (true, true, false),
+        ] {
+            let showing = App::flyover_window_wanted(windowed, visible);
+            let (w, o, v) = App::flyover_toggle_state(windowed, visible);
+            assert!(w, "the window is the only surface: windowed stays true");
+            assert_eq!(
+                App::flyover_window_wanted(w, v),
+                !showing,
+                "toggle from (windowed={windowed}, open={open}, visible={visible}) must invert the predicate",
+            );
+            assert_eq!(o, v, "open mirrors visible");
+        }
+        // A stray in-window mode can never open the popout window by accident.
+        assert!(!App::flyover_window_wanted(false, true));
     }
 }

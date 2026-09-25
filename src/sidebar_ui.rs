@@ -1,8 +1,9 @@
 //! The sessions sidebar as a gpui element tree over the canvas: the flat
 //! region ground, the sessions list (header chips + two-line rows in the
 //! GANTRY mock's style, the folder's pinned rows in a "Pinned" section on
-//! top), the Settings page's rows, and the floating "Show sessions" button
-//! while everything is hidden. The folders card beside the list lives in
+//! top\), the Settings page's rows, the toast stack at the region's bottom
+//! edge ([`crate::toast_ui`]), and the floating "Show sessions" button while
+//! everything is hidden. The folders card beside the list lives in
 //! [`crate::folders_ui`].
 //!
 //! Geometry lives in [`crate::workspace`] (`sessions_list_rect`,
@@ -47,7 +48,7 @@ const ROW_PAD: f32 = 12.0;
 /// Unread / attention dot under a row's PR-state icon.
 const UNREAD_DOT: f32 = 6.0;
 /// Corner radius of a session row's selection / hover fill (mock: 9px).
-const ROW_RADIUS: f32 = 9.0;
+pub(crate) const ROW_RADIUS: f32 = 9.0;
 /// Side of the PR-state icon on a row's first line (mock: 11px, tinted
 /// with the PR palette below).
 const STATUS_ICON: f32 = 12.0;
@@ -142,6 +143,10 @@ impl App {
             .when(self.folders_visible(), |d| d.child(self.render_folders_card(&theme, cx)))
             .child(self.clipped_row_layer(&theme, cx))
             .child(self.drop_feedback_layer(&theme))
+            // The toast stack sits at the region's bottom edge — inside the one
+            // column a webview child view never covers, which is why notes and
+            // notifications are not full-viewport overlays any more.
+            .child(self.toast_layer(&theme, cx))
             .child(self.sessions_header(&theme, cx.entity().downgrade()))
             .into_any_element()
     }
