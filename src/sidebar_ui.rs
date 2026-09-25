@@ -37,7 +37,7 @@ use std::time::SystemTime;
 use crate::App;
 use crate::git_context::{PrRollup, derive_rollup};
 use crate::sidebar_card::{
-    CardAvatar, avatar_for, diffstat_line, relative_time,
+    CardAvatar, avatar_for, diffstat_line, preview_line, relative_time,
 };
 use crate::ui::icon;
 use crate::ui::theme::Theme;
@@ -935,7 +935,18 @@ impl App {
             ctx.and_then(|c| c.pr.as_ref()).is_some_and(|p| p.is_draft),
         );
         let stamp = ws.attention_at().map(|t| relative_time(t, SystemTime::now()));
+        // The top-right run reads timestamp, PR number, state icon: the icon is
+        // what the eye lands on, and the number is what it looks up next.
+        let pr_number = ctx
+            .and_then(|c| c.pr.as_ref())
+            .map(|p| format!("#{}", p.number));
         let diff = ctx.and_then(diffstat_line);
+        // Third line: what this checkout *is*. With no context gathered yet the
+        // row still knows its own directory, so the line never has to be
+        // dropped (which would reflow the list as snapshots arrive).
+        let preview = ctx
+            .map(preview_line)
+            .or_else(|| ws.cwd.as_deref().map(crate::tilde));
         // A directory outside any repository has no PR state to show and
         // nothing to say about code: its status is a plain dot and its
         // second line is the directory itself.
@@ -948,14 +959,13 @@ impl App {
                 Some(repo) if !repo.is_empty() => format!("{repo}/{b}"),
                 _ => b.to_string(),
             }));
-        let second_line = match (&diff, no_repo) {
-            (Some(_), _) => None,
-            (None, false) => Some(branch.unwrap_or_else(|| "no code changes".to_string())),
-            (None, true) => Some(
-                ws.cwd
-                    .as_deref()
-                    .map_or_else(|| "no directory".to_string(), crate::tilde),
-            ),
+        // Outside a repository the directory is the third line's job, so this
+        // one keeps the spec's degradation instead of repeating the path a row
+        // lower.
+        let second_line = match &diff {
+            Some(_) => None,
+            None if no_repo => Some("no code changes".to_string()),
+            None => Some(branch.unwrap_or_else(|| "no code changes".to_string())),
         };
 
         let strong = theme.foreground;
@@ -1015,6 +1025,15 @@ impl App {
                                 .text_size(px(scaled(11.0)))
                                 .text_color(soft)
                                 .child(s),
+                        )
+                    })
+                    .when_some(pr_number, |d, n| {
+                        d.child(
+                            div()
+                                .flex_none()
+                                .text_size(px(scaled(11.0)))
+                                .text_color(soft)
+                                .child(n),
                         )
                     })
                     .child(
@@ -1098,6 +1117,18 @@ impl App {
                             }),
                     ),
             )
+            .when_some(preview, |d, line| {
+                d.child(
+                    div()
+                        .min_w(px(0.0))
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .text_size(px(scaled(11.0)))
+                        .text_color(soft)
+                        .child(line),
+                )
+            })
             .when(!last, |d| {
                 d.child(
                     div()
@@ -1310,6 +1341,7 @@ mod tests {
             repo: Some("pwrde".to_string()),
             branch: Some("main".to_string()),
             default_branch: Some("main".to_string()),
+            head_sha: Some("4737017".to_string()),
             branch_diff: None,
             dirty: Some(crate::git::DirtyStats {
                 files: 7,

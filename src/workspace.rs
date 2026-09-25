@@ -619,11 +619,12 @@ pub const TITLEBAR_H: f32 = 44.0;
 /// Height of a one-line Settings sidebar row (iTerm2/native-mac source-list
 /// style).
 const TAB_H: f32 = 28.0;
-/// Height of a two-line session row (GANTRY mock): 10px padding, a 12.5px
-/// title line, a 2px gap and an 11px diffstat line, 10px padding, with
-/// headroom so descenders never clip. Group rows use this; `tab_rect`'s
-/// Settings rows keep [`TAB_H`].
-pub const CARD_H: f32 = 52.0;
+/// Height of a three-line session row (GANTRY mock): 10px padding, a 12.5px
+/// title line, a 2px gap, an 11px diffstat line, another 2px gap, the 11px
+/// preview line (the PR title, else `repo sha`, else the directory) and 10px
+/// padding, with headroom so descenders never clip. Group rows use this;
+/// `tab_rect`'s Settings rows keep [`TAB_H`].
+pub const CARD_H: f32 = 68.0;
 
 /// Ceiling on the sidebar's text-size factor.
 ///
