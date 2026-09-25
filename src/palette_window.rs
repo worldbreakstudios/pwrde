@@ -14,6 +14,10 @@
 //! `command_scroll_to`, `modal_search`); this view only renders it in its own
 //! window and routes the keys the model owns. The panel itself is
 //! `App::command_panel_card`.
+//!
+//! The window contains nothing but that one field, so this view keeps the
+//! shared `Input` focused for as long as the window is up: opening the palette
+//! is immediately typeable, with no click needed.
 
 use gpui::{
     div, px, size, App as GpuiApp, AppContext, Bounds, Context, Focusable, FocusHandle,
@@ -36,6 +40,7 @@ impl Render for PaletteWindow {
         // stage's placeholder, clear it, and focus it in THIS window.
         let claim = self.app.update(cx, |app, _| app.modal_search_reset.take());
         let input = self.app.read(cx).modal_search.clone();
+        let input_focus = input.read(cx).focus_handle(cx);
         if let Some(placeholder) = claim {
             self.app.update(cx, |app, cx| {
                 app.modal_search.update(cx, |input, cx| {
@@ -43,7 +48,16 @@ impl Render for PaletteWindow {
                     input.set_text("", cx);
                 });
             });
-            window.focus(&input.read(cx).focus_handle(cx), cx);
+        }
+        // The palette window holds exactly one editable field and nothing else,
+        // so that field is always the focused element. This covers a freshly
+        // opened window (whose creation focused the root view, not the field), a
+        // window that just regained key status after pwrde sat in the background,
+        // and each stage's claim. Without it the palette opens with the window
+        // key but the field unfocused, so the first keystroke goes nowhere until
+        // the user clicks the field.
+        if !input_focus.is_focused(window) {
+            window.focus(&input_focus, cx);
         }
         let panel = self.app.update(cx, |app, cx| app.command_panel_card(cx));
         div()
@@ -121,11 +135,12 @@ pub(crate) fn open_palette_window(app: gpui::Entity<App>, cx: &mut GpuiApp) {
         },
     );
     if let Ok(w) = handle {
-        let _ = w.update(cx, |view, window, cx| {
+        let _ = w.update(cx, |_view, window, _cx| {
             strip_window_chrome(window);
+            // The field claims focus on the first render
+            // (`PaletteWindow::render`), so do not park focus on the root view
+            // here: that would steal it back from the input on open.
             window.activate_window();
-            let fh = view.focus_handle.clone();
-            window.focus(&fh, cx);
         });
         let _ = app.update(cx, |app, _| app.palette_window = Some(w));
     }
