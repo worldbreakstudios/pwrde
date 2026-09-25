@@ -376,6 +376,22 @@ pub fn current_branch(dir: &Path) -> Option<String> {
     (!name.is_empty() && name != "HEAD").then_some(name)
 }
 
+/// The short SHA of `HEAD` (`git rev-parse --short HEAD`) — the commit a
+/// checkout is sitting on.
+///
+/// `None` when there is nothing to name: a directory that is not a repository,
+/// or a freshly `git init`-ed one whose `HEAD` does not resolve to a commit
+/// yet. Cheap enough (`TIMEOUT_QUICK`) for the same background poll that
+/// gathers the rest of a card's context.
+pub fn head_sha(dir: &Path) -> Option<String> {
+    let out = output_within(git(dir).args(["rev-parse", "--short", "HEAD"]), TIMEOUT_QUICK).ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!sha.is_empty()).then_some(sha)
+}
+
 /// Derive a repo name from a `--git-common-dir` path.
 ///
 /// The common dir is `<repo>/.git` for a normal checkout and a bare `<repo>.git`
@@ -558,6 +574,85 @@ mod tests {
             Some("pwrde".to_string())
         );
         assert_eq!(repo_name_from_common_dir(Path::new("/")), None);
+    }
+
+    /// A throwaway repository under the temp dir, with one commit in it.
+    ///
+    /// Returns `(dir, full_sha)`; the caller removes the directory.
+    fn temp_repo(tag: &str) -> (PathBuf, String) {
+        let dir = std::env::temp_dir().join(format!("pwrde-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let run = |args: &[&str]| {
+            let out = Command::new("git")
+                .current_dir(&dir)
+                .args(args)
+                .env("LC_ALL", "C")
+                .env("GIT_AUTHOR_NAME", "pwrde test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "pwrde test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        run(&["init", "-q"]);
+        std::fs::write(dir.join("a.txt"), "x\n").expect("write");
+        run(&["add", "a.txt"]);
+        // Signing is off explicitly: a global `commit.gpgsign = true` would
+        // otherwise make this commit (and so the test) depend on a key.
+        run(&["-c", "commit.gpgsign=false", "commit", "-q", "-m", "one"]);
+        let full = run(&["rev-parse", "HEAD"]);
+        (dir, full)
+    }
+
+    #[test]
+    fn head_sha_is_a_prefix_of_the_commits_full_id() {
+        // Checked against the FULL object id from a different invocation, so
+        // this pins that the short form really names the same commit rather
+        // than agreeing with itself.
+        let (dir, full) = temp_repo("head-sha");
+        // `head_sha` reads under `TIMEOUT_QUICK` and reports a timed-out read
+        // as `None`. A cold `git` exec on a loaded machine can exceed that
+        // deadline, which used to panic here; the property under test is the
+        // *value* (the short form names this commit), not the latency, so
+        // retry the read before calling it a failure.
+        let mut sha = None;
+        for _ in 0..5 {
+            sha = head_sha(&dir);
+            if sha.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        let sha = sha.expect("a committed repo has a HEAD");
+        assert!(full.starts_with(&sha), "{sha} must name {full}");
+        assert!(sha.len() >= 7, "git's short form is at least 7 chars: {sha}");
+        assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn head_sha_is_none_before_the_first_commit_and_outside_a_repo() {
+        let dir = std::env::temp_dir().join(format!("pwrde-head-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        // Not a repository at all.
+        assert_eq!(head_sha(&dir), None);
+        // A repository with no commits: `HEAD` does not resolve yet.
+        let out = Command::new("git")
+            .current_dir(&dir)
+            .args(["init", "-q"])
+            .output()
+            .expect("git runs");
+        assert!(out.status.success());
+        assert_eq!(head_sha(&dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

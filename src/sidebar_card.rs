@@ -408,6 +408,49 @@ pub fn status_line(ctx: &GitContext) -> String {
     if draft { format!("Draft · {phrase}") } else { phrase }
 }
 
+/// The card's third line: which work this checkout *is*, named as precisely as
+/// the machine allows.
+///
+/// The ladder, in the order the goal asked for it:
+///
+/// 1. A pull request's title. The title is what a human named the work, and it
+///    reads the same for every worktree carrying it.
+/// 2. `repo sha` — repository plus the commit `HEAD` points at. Without a PR
+///    this is the most specific honest answer available: it says both where the
+///    code lives and exactly which revision is checked out, so two worktrees of
+///    one repository (the usual pwrde shape) still read differently.
+/// 3. The checkout's own directory, abbreviated with `~`.
+///
+/// Never empty: a `GitContext` always carries the directory it describes, so
+/// the caller can paint this line unconditionally.
+pub fn preview_line(ctx: &GitContext) -> String {
+    if let Some(pr) = ctx.pr.as_ref() {
+        let title = pr.title.trim();
+        if !title.is_empty() {
+            return title.to_string();
+        }
+        // A cold `lfg`/`gh` cache can hand back a number with no title yet;
+        // the number still identifies the work, a blank line does not.
+        return format!("PR #{}", pr.number);
+    }
+
+    if ctx.is_git {
+        let repo = ctx.repo.as_deref().filter(|r| !r.is_empty());
+        let sha = ctx.head_sha.as_deref().filter(|s| !s.is_empty());
+        match (repo, sha) {
+            (Some(repo), Some(sha)) => return format!("{repo} {sha}"),
+            (Some(repo), None) => return repo.to_string(),
+            // A repository whose name could not be read — a bare-ish or odd
+            // common dir — still has a commit worth naming.
+            (None, Some(sha)) => return sha.to_string(),
+            (None, None) => {},
+        }
+    }
+
+    // Not a repository (or nothing above resolved): where the session is.
+    crate::tilde(&ctx.cwd)
+}
+
 /// `1 uncommitted file` / `18 uncommitted files`, thousands-separated.
 fn uncommitted_phrase(files: u32) -> String {
     let noun = if files == 1 { "file" } else { "files" };
@@ -633,6 +676,7 @@ mod tests {
             repo: Some("pwrde".to_string()),
             branch: Some("main".to_string()),
             default_branch: Some("main".to_string()),
+            head_sha: None,
             dirty: None,
             branch_diff: None,
             pr: None,
@@ -786,6 +830,61 @@ mod tests {
         GitContext {
             pr: Some(summary),
             ..ctx()
+        }
+    }
+
+    #[test]
+    fn preview_line_walks_the_pr_title_then_repo_sha_then_cwd_ladder() {
+        // 1. A pull request names the work.
+        assert_eq!(preview_line(&with_pr(pr(12, "open"))), "Treemap");
+        // A PR whose title has not arrived yet still names itself rather than
+        // painting a blank line.
+        assert_eq!(
+            preview_line(&with_pr(PrSummary {
+                title: "   ".to_string(),
+                ..pr(12, "open")
+            })),
+            "PR #12"
+        );
+        // A PR that has left the board names the work just the same.
+        assert_eq!(preview_line(&with_pr(pr(7, "merged"))), "Treemap");
+
+        // 2. No PR: the repository and the commit it is on.
+        let mut committed = ctx();
+        committed.head_sha = Some("4737017".to_string());
+        assert_eq!(preview_line(&committed), "pwrde 4737017");
+        // A repo with nothing committed yet has no sha to show.
+        assert_eq!(preview_line(&ctx()), "pwrde");
+        // No readable repo name, but a commit: the commit still stands.
+        let mut unnamed = ctx();
+        unnamed.repo = None;
+        unnamed.head_sha = Some("4737017".to_string());
+        assert_eq!(preview_line(&unnamed), "4737017");
+        // A failed PR lookup is not a PR: the ladder skips to repo + sha.
+        let mut errored = ctx();
+        errored.head_sha = Some("4737017".to_string());
+        errored.pr_error = Some("gh sign-in required".to_string());
+        assert_eq!(preview_line(&errored), "pwrde 4737017");
+
+        // 3. Neither: the directory itself.
+        assert_eq!(preview_line(&non_git_ctx()), "/src/pwrde");
+        let mut no_repo_name = non_git_ctx();
+        no_repo_name.cwd = PathBuf::from("/tmp/somewhere else");
+        assert_eq!(preview_line(&no_repo_name), "/tmp/somewhere else");
+    }
+
+    #[test]
+    fn preview_line_is_never_empty_for_any_context_it_is_handed() {
+        // The element tree paints this line unconditionally, so an empty
+        // string would read as a card that failed to load.
+        let mut cases = vec![ctx(), non_git_ctx(), with_pr(pr(12, "open"))];
+        cases.push(GitContext {
+            branch: None,
+            repo: None,
+            ..ctx()
+        });
+        for (i, c) in cases.iter().enumerate() {
+            assert!(!preview_line(c).trim().is_empty(), "case {i} painted blank");
         }
     }
 

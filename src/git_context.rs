@@ -38,6 +38,10 @@ pub struct GitContext {
     pub branch: Option<String>,
     /// The remote's default branch, e.g. `origin/main`.
     pub default_branch: Option<String>,
+    /// Short SHA of `HEAD` — the commit this checkout is sitting on. Names the
+    /// work when there is no pull request to name it, and tells two worktrees
+    /// of one repository apart.
+    pub head_sha: Option<String>,
     /// Uncommitted work relative to HEAD.
     pub dirty: Option<DirtyStats>,
     /// This branch's *committed* work, versus its merge-base with the base
@@ -64,6 +68,7 @@ impl GitContext {
             repo: None,
             branch: None,
             default_branch: None,
+            head_sha: None,
             dirty: None,
             branch_diff: None,
             pr: None,
@@ -178,6 +183,7 @@ pub fn fetch(dir: &Path) -> GitContext {
     ctx.repo = Some(repo);
     ctx.dirty = git::dirty_stats(dir);
     ctx.branch = git::current_branch(dir);
+    ctx.head_sha = git::head_sha(dir);
 
     if let Some(branch) = ctx.branch.clone() {
         ctx.default_branch = git::default_remote_branch(dir);
@@ -241,6 +247,10 @@ pub fn merge(prev: &GitContext, next: GitContext) -> GitContext {
     }
     if merged.branch_diff.is_none() {
         merged.branch_diff = prev.branch_diff;
+    }
+    // Same reason as `dirty`: a miss must not drop the commit a card names.
+    if merged.head_sha.is_none() {
+        merged.head_sha = prev.head_sha.clone();
     }
     merged
 }
