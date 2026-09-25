@@ -6808,7 +6808,7 @@ impl App {
 
 /// The `NSWindow` behind a gpui window, for the AppKit surgery below.
 #[cfg(target_os = "macos")]
-fn ns_window(window: &Window) -> Option<*mut objc::runtime::Object> {
+pub(crate) fn ns_window(window: &Window) -> Option<*mut objc::runtime::Object> {
     use objc::runtime::Object;
     use objc::{msg_send, sel, sel_impl};
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};

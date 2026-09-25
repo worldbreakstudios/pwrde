@@ -37,15 +37,11 @@ use crate::ui::assets::{
 use crate::ui::theme::Theme;
 use crate::ui::{Badge, Button, ButtonSize, ButtonVariant, Kbd};
 
-/// Panel width.
-const PANEL_W: f32 = 560.0;
+/// Panel width — and the palette window's width: the window is the card, so
+/// the panel fills it edge to edge.
+pub(crate) const PANEL_W: f32 = 560.0;
 /// Panel corner radius.
 const PANEL_RADIUS: f32 = 14.0;
-/// Where the panel sits: its top edge at this fraction of the window height,
-/// so it reads as centered-high like the mock rather than pinned to the top.
-const PANEL_TOP_FRAC: f32 = 0.2;
-/// Never closer to the top edge than this, on short windows.
-const PANEL_TOP_MIN: f32 = 40.0;
 /// The list's cap before it scrolls.
 const LIST_MAX_H: f32 = 350.0;
 /// A rounded tile for a glyph, the mock's 24px command glyph well.
@@ -181,17 +177,14 @@ impl App {
         self.command.as_ref().map_or("", |c| c.placeholder())
     }
 
-    /// The palette panel alone, laid out for the window it is rendered in.
+    /// The palette card alone — the palette window's whole surface.
     ///
     /// The palette lives in its own window (`crate::palette_window`), so the
-    /// panel is the whole surface: no scrim, no click-to-dismiss backdrop,
-    /// and nothing painted over the main window's webviews.
-    pub(crate) fn render_command_panel(
-        &mut self,
-        win_w: f32,
-        win_h: f32,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    /// card is the window: no scrim, no click-to-dismiss backdrop, no
+    /// placement math, and nothing painted over the main window's webviews.
+    /// The window is sized to this card (`PaletteWindow::render`), so the
+    /// panel fills it edge to edge instead of floating in a transparent one.
+    pub(crate) fn command_panel_card(&mut self, cx: &mut Context<Self>) -> AnyElement {
         // Keyboard navigation keeps its row in view; the wheel is free
         // otherwise (the target is consumed here, not re-applied per frame).
         if let Some(ix) = self.command_scroll_to.take() {
@@ -205,7 +198,6 @@ impl App {
         let theme = Theme::of(cx).clone();
         let chrome = crate::theme::current();
         let entity = cx.entity().downgrade();
-        let panel_w = PANEL_W.min(win_w - 32.0).max(280.0);
 
         let chip_bg = theme.foreground.opacity(0.08);
         let hairline = theme.border;
@@ -740,11 +732,11 @@ impl App {
             .child(div().flex_1())
             .child(pal.footer());
 
-        // ── Panel + scrim, on its own top-most deferred layer ──
+        // ── The card: the window's entire surface ──
         let panel = div()
             .id("command-palette")
             .occlude()
-            .w(px(panel_w))
+            .w_full()
             .flex()
             .flex_col()
             .rounded(px(PANEL_RADIUS))
@@ -783,15 +775,6 @@ impl App {
             .child(list)
             .child(footer);
 
-        // Centered-high in its own window, exactly as it sat in the mock:
-        // `PANEL_TOP_FRAC` of the window height, never closer than
-        // `PANEL_TOP_MIN` to the top edge.
-        let top = (win_h * PANEL_TOP_FRAC).max(PANEL_TOP_MIN);
-        div()
-            .absolute()
-            .left(px(((win_w - panel_w) / 2.0).max(0.0)))
-            .top(px(top))
-            .child(panel)
-            .into_any_element()
+        panel.into_any_element()
     }
 }
