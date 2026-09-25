@@ -1456,6 +1456,19 @@ impl App {
         self.tools.len()
     }
 
+    /// The label tool `i`'s row shows in the folders card: its terminal's own
+    /// pane title once one is running, else the tool's command — never the name
+    /// it was registered under (see [`tool_label`]).
+    fn tool_row_label(&self, i: usize) -> String {
+        let command = self.tools.get(i).map(|t| t.command.as_str()).unwrap_or("");
+        let session_title = self
+            .tool_sessions
+            .get(i)
+            .and_then(|slot| slot.as_ref())
+            .map(|ts| ts.tab.title());
+        tool_label(session_title.as_deref(), command)
+    }
+
     /// The tool page's terminal card: the whole content area.
     fn tool_area(&self) -> workspace::LayoutRect {
         let (w, h) = self.renderer.surface_size();
@@ -8362,6 +8375,13 @@ fn image_suffix(bytes: &[u8]) -> &'static str {
     }
 }
 
+/// The label a tool's row in the folders card shows: the terminal's own pane
+/// title when its pane reports one, else the tool's command. `None` means no
+/// terminal has been spawned for that tool yet.
+fn tool_label(session_title: Option<&str>, command: &str) -> String {
+    tool_page_title(session_title.unwrap_or(""), command)
+}
+
 /// The label a CLI tool page's strip shows: the terminal's own pane title, or
 /// the tool's command while the pane has none. The name a tool was registered
 /// under is a Settings label, never a strip label — the strip mirrors the
@@ -8398,5 +8418,22 @@ mod tool_page_title_tests {
         assert_eq!(tool_page_title("", "drop -d"), "drop -d");
         assert_eq!(tool_page_title("   ", "drop -d"), "drop -d");
         assert_eq!(tool_page_title("\twezterm\n", "drop -d"), "drop -d");
+    }
+
+    /// The same rule for the folders card's tool row: the live pane title names
+    /// the row ("this pane is named test", not "drip --tui"), and a tool with no
+    /// terminal — or a terminal with no title of its own — falls back to the
+    /// command.
+    #[test]
+    fn tool_row_shows_the_pane_title_not_the_command() {
+        use super::tool_label;
+        assert_eq!(tool_label(Some("test"), "drip --tui"), "test");
+        assert_eq!(tool_label(Some("drop"), "drop -d"), "drop");
+        assert_eq!(tool_label(Some("  "), "drip --tui"), "drip --tui");
+        assert_eq!(
+            tool_label(Some(crate::term::STOCK_TITLE), "drip --tui"),
+            "drip --tui"
+        );
+        assert_eq!(tool_label(None, "drip --tui"), "drip --tui");
     }
 }
