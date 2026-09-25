@@ -296,7 +296,7 @@ impl Action {
             Action::OpenSettings => "Open settings",
             Action::CommandPalette => "Command palette",
             Action::ToggleFlyover => "Toggle Flyover Terminal",
-            Action::FlyoverPopout => "Flyover: panel ↔ window",
+            Action::FlyoverPopout => "Flyover: show/hide window",
             Action::SaveWorkspace => "Save as workspace",
             Action::OpenPrInGithub => "Open PR in GitHub",
             Action::ToggleFlow => "Toggle Flow agent",

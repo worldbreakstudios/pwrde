@@ -2343,22 +2343,22 @@ impl App {
         self.request_redraw();
     }
 
-    /// Move the flyover between the in-window panel and its own popout
-    /// window. The sessions never move — only which surface renders them.
+    /// Show or hide the flyover's own window. The in-window panel is retired —
+    /// the global terminal is always a real window — so this is only the
+    /// window's visibility toggle: it never unsets `flyover_windowed` (which is
+    /// what used to blank the terminal on a docked↔popout press and could
+    /// restore the in-window paint path) and it moves `flyover_open` with
+    /// `flyover_window_visible`, so the pump's predicate stays coherent. The
+    /// sessions never move.
     fn flyover_toggle_windowed(&mut self) {
-        if self.flyover_windowed {
-            // Dock back: the pump closes the window; the panel takes over.
-            self.flyover_windowed = false;
-            self.flyover_window_visible = false;
-            self.flyover_open = true;
-            self.flyover_focused = true;
+        self.flyover_windowed = true;
+        let showing =
+            Self::flyover_window_wanted(self.flyover_windowed, self.flyover_window_visible);
+        self.flyover_window_visible = !showing;
+        self.flyover_open = !showing;
+        self.flyover_focused = !showing;
+        if !showing {
             self.flyover_mark_read();
-        } else {
-            // Pop out: the panel slides away; the pump opens the window.
-            self.flyover_windowed = true;
-            self.flyover_window_visible = true;
-            self.flyover_open = false;
-            self.flyover_focused = false;
             if self.flyover_tabs.is_empty() {
                 self.open_flyover_picker();
             }
@@ -2854,6 +2854,7 @@ impl App {
                         self.spawn_flyover_tab(entry.path);
                     } else if self.flyover_tabs.is_empty() {
                         self.flyover_open = false;
+                        self.flyover_window_visible = false;
                     }
                 } else {
                     let root = entry.path.clone().or(repo);
@@ -2985,19 +2986,37 @@ impl App {
         self.request_redraw();
     }
 
-    /// Toggle the flyover panel open/closed. In windowed mode this shows or
-    /// hides the popout window instead (the pump reconciles the actual
-    /// window); sessions keep running either way.
+    /// The one predicate for "the global terminal's window belongs on screen":
+    /// the frame pump reconciles the real window against exactly this, and the
+    /// ⌘` / popout toggles flip it. `flyover_windowed` is pinned true at every
+    /// entry point (`flyover_open` is the retired in-window flag and just
+    /// mirrors `flyover_window_visible`), so a stray in-window mode can never
+    /// make the popout appear, and the window can never be closed while the
+    /// flags still claim the surface is up. Pure so it is unit-testable.
+    fn flyover_window_wanted(windowed: bool, visible: bool) -> bool {
+        windowed && visible
+    }
+
+    /// Post-state `(windowed, open, visible)` for a ⌘` toggle. `showing` is the
+    /// *effective* state (`flyover_window_wanted`), not one flag, so a window
+    /// the user closed with its own close button — or one hidden by a
+    /// cancelled first-open picker — still comes back on the next press.
+    fn flyover_toggle_state(windowed: bool, visible: bool) -> (bool, bool, bool) {
+        let showing = Self::flyover_window_wanted(windowed, visible);
+        (true, !showing, !showing)
+    }
+
+    /// Toggle the flyover panel open/closed. The global terminal is always its
+    /// own real window, so this flips the *desired* visibility; the frame pump
+    /// reconciles the actual popout window against it. Sessions keep running
+    /// either way.
     pub(crate) fn toggle_flyover(&mut self) {
-        // The global terminal is always its own real window now: the toggle
-        // only flips the *desired* visibility, and the frame pump reconciles
-        // the actual popout window against it (open it, or close it).
-        // Forcing the windowed flag here keeps the legacy in-window paint path
-        // unreachable from this entry point whatever else flips it.
-        self.flyover_windowed = true;
-        self.flyover_open = !self.flyover_open;
-        self.flyover_window_visible = self.flyover_open;
-        if self.flyover_open {
+        let (windowed, open, visible) =
+            Self::flyover_toggle_state(self.flyover_windowed, self.flyover_window_visible);
+        self.flyover_windowed = windowed;
+        self.flyover_open = open;
+        self.flyover_window_visible = visible;
+        if open {
             self.flyover_mark_read();
             if self.flyover_tabs.is_empty() {
                 // First-ever open: open directory picker to create the first tab.
@@ -8000,7 +8019,10 @@ fn main() {
                                     }
                                     (
                                         redraw,
-                                        app.flyover_open && app.flyover_window_visible,
+                                        App::flyover_window_wanted(
+                                            app.flyover_windowed,
+                                            app.flyover_window_visible,
+                                        ),
                                         app.flyover_window,
                                         // The palette window exists exactly while the
                                         // palette model does: no per-site plumbing, a
@@ -8476,5 +8498,39 @@ mod tool_page_title_tests {
             "drip --tui"
         );
         assert_eq!(tool_label(None, "drip --tui"), "drip --tui");
+    }
+}
+
+#[cfg(test)]
+mod flyover_window_tests {
+    use super::App;
+
+    /// The pump's predicate, the ⌘` toggle, and the popout action all have to
+    /// agree: whatever state the flags are in, a toggle inverts the predicate
+    /// and never leaves it true while the window is down (the docked↔popout
+    /// press that used to blank the global terminal).
+    #[test]
+    fn toggle_inverts_the_window_predicate() {
+        for (windowed, open, visible) in [
+            (false, false, false),
+            (true, false, false),
+            (true, true, true),
+            // Hidden by the popout's own close button: `visible` cleared first.
+            (true, false, true),
+            // Hidden by a cancelled first-open picker: `open` cleared first.
+            (true, true, false),
+        ] {
+            let showing = App::flyover_window_wanted(windowed, visible);
+            let (w, o, v) = App::flyover_toggle_state(windowed, visible);
+            assert!(w, "the window is the only surface: windowed stays true");
+            assert_eq!(
+                App::flyover_window_wanted(w, v),
+                !showing,
+                "toggle from (windowed={windowed}, open={open}, visible={visible}) must invert the predicate",
+            );
+            assert_eq!(o, v, "open mirrors visible");
+        }
+        // A stray in-window mode can never open the popout window by accident.
+        assert!(!App::flyover_window_wanted(false, true));
     }
 }

@@ -67,31 +67,41 @@ Readers: `modal_overlay_open` (`src/main.rs:4120-4123`), overlay gating at `:213
 
 ## 4. Design
 
+Status note: §4.1–§4.3 are the design as planned before it landed; where the shipped shape
+differs the paragraph carries a **Landed** note (§4.1's row struct, §4.4's reconciliation).
+The code is the reference for the shipped contract.
+
 ### 4.1 Toasts live in the sidebar — two kinds
 
-`App.toasts: Vec<Toast>` (keep the name `Toast` only inside `sidebar_ui`/`ui`, call the row
+`App.toasts: Vec<ToastNote>` (keep the name `Toast` only inside `sidebar_ui`/`ui`, call the row
 kind `ToastKind`) at the bottom of the sessions list, above the folders card's tail, painted
 **inside the sidebar region rect** (`App::sidebar_w()`, `sidebar_ui.rs:104-130`). Because the
 region is a later element sibling of the canvas and never overlaps a webview child view, this
 is the one place chrome can be stacked freely.
 
 ```
-struct Toast { id: u64, kind: ToastKind, title: String, body: Option<String>, created: Instant }
+// Landed (`src/toast_ui.rs`): one text line per row, no title/body split.
+struct ToastNote { id: u64, kind: ToastKind, text: String, shown: Instant }
 enum ToastKind { Status, Notification }
 ```
 
+(The sketch this plan started from said `title`/`body`/`created`; the landed row keeps a single
+`text` and an `Instant`, and a click dismisses a `Notification` only — a `Status` has no × and
+expires on its own timer.)
+
 - **`Status`** — direct feedback for an action just taken (screenshot copied, session spawned,
-  webview error). Auto-expires after `STATUS_TTL = 3s` (`toast_note_due`/`toast_note_expired`
-  in `src/bus_exec.rs:700-710` already model exactly this, with a passing test — reuse them).
+  webview error). Auto-expires after `TOAST_TTL = 3s` (`toast_ui::status_expired`, pinned by
+  `toast_note_expires_after_lifetime` in `src/bus_exec.rs`).
 - **`Notification`** — a true notification (drop provisioning failure, `open URL failed`,
   webview could not open). No timer; it stays until dismissed with its × button, and is
   capped (`MAX_TOASTS = 4`, oldest `Status` evicted first).
 - Rendering: newest at the bottom (closest to where the eye lands after an action), stacked
   with a small gap; each card is a slim rcn-`Toast`-style row (icon, one line, optional ×),
-  width = sidebar width − padding. `sidebar_ui` already owns the region ground
-  (`:1250+`) and the clip helper, so the stack reuses them and needs no new geometry math.
-- Clicking a toast dismisses it; clicks pass through otherwise (mirrors the current
-  `Toast` behaviour, `src/ui/toast.rs:139` `occlude()`).
+  width = sidebar width − padding, mounted as the sidebar region's own element layer (an
+  element sibling of the canvas, not `paint_terminal` pixels) so a native webview NSView can
+  never cover it — that is the whole point of moving off the overlay.
+- Clicking a `Notification` dismisses it; a `Status` has no × and expires on its own. Clicks
+  pass through otherwise (mirrors `src/ui/toast.rs:139` `occlude()`).
 - Bus: `state_json` (`src/bus_exec.rs:528-543`) reports `"toasts": [{kind, text, persistent}]`
   and keeps `"message"` as the newest toast's text for one release, so a CLI consumer that only
   knows `message` never sees the field go missing; note it in the PR.
@@ -149,19 +159,24 @@ another overlay gone, and the sidebar regains the full column height.
 
 **Landed on this branch:** `toggle_flyover` forces `flyover_windowed = true` at the single
 toggle entry point and `open_flyover_window` sizes the popout from the display's
-`visible_bounds()`, so the flyover is always its own fullscreen window and the in-window paint
-path is unreachable (no entry point turns it on: the `FlyoverPopout` dock-back action and the
-maximize chip are the only other writers of that mode).
+`visible_bounds()`, so the flyover is always its own fullscreen window.
 
-**Deferred to a follow-up (not done):** deleting the now-dead in-window machinery — the canvas
-paint block (`main.rs:6528-6555`), the `paint_flyover_layer` call in `paint_terminal`,
+**Reconciled after review:** the pump's predicate and the `FlyoverPopout` action disagreed —
+the dock branch flipped `flyover_windowed` back off, which both blanked the terminal on that
+press and left the in-window paint path reachable. The dock branch is gone: the action now only
+shows or hides the window and never unsets `windowed` (its label reads "Flyover: show/hide
+window"), and the pump asks one pure predicate, `App::flyover_window_wanted(windowed, visible)`,
+which the ⌘` toggle also flips against (unit-tested, `src/main.rs`). `flyover_open` is the
+retired in-window flag and now only mirrors `flyover_window_visible`.
+
+**Deferred to a follow-up (not done):** deleting the remaining dead in-window machinery — the
+canvas paint block (`main.rs:6528-6555`), the `paint_flyover_layer` call in `paint_terminal`,
 `flyover_ceiling` + the sidebar clip (`sidebar_ui.rs:112-130`, `:357`), the flyover resize band
 (`resize_ui.rs:229-240`), the flyover mouse hit-tests (`main.rs:4018`, `:4095`, `:4198-4217`,
-`:4504-4512`, `:4565`), the `flyover_anim` tick (`main.rs:5705-5712`), and
-`flyover_toggle_windowed` / `flyover_toggle_maximized` (`main.rs:2340-2367`) with the
-`Action::FlyoverPopout` branch (`main.rs:5243`). It is scaffolding, not a live overlay — nothing
-reaches it — but it is still code that reads like an overlay path, so the deletion is worth a
-scoped commit of its own rather than being folded into the shipping change.
+`:4504-4512`, `:4565`), the `flyover_anim` tick (`main.rs:5705-5712`), and `flyover_maximized`
+(`main.rs:2340-2344`). Each is unreachable while `flyover_windowed` stays true, but it is still
+code that reads like an overlay path, so the deletion is worth a scoped commit of its own
+rather than being folded into the shipping change.
 
 ## 5. PR plan
 
@@ -184,4 +199,4 @@ Risks: (a) sub-window z-order — a palette window must be activated explicitly
 (`window.activate_window()` + `focus`, as the flyover does) or it can open behind Slack;
 (b) the global hotkey needs Accessibility/Input Monitoring permission on first use (the same
 permission the input helper in repo memory already documents); (c) `message` disappearing from
-`state_json` is an API change for CLI consumers — keep the null field for one release.
+`state_json` is an API change for CLI consumers — keep `message` (the newest toast's text) for one release.
