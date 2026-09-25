@@ -1425,9 +1425,12 @@ impl App {
         }
     }
 
-    /// A tool page's terminal: the user's login shell running `command` from
-    /// `cwd`. Never persisted, never shpool-attached.
-    fn spawn_tool_session(&mut self, cwd: &std::path::Path, command: &str) -> Session {
+    /// A tool page's terminal: the user's login shell spawned in `cwd` with no
+    /// command of its own — the tool's command is written into it once the
+    /// prompt is up (see [`App::ensure_tool_session`]), so the terminal stays
+    /// spawned after the command finishes instead of leaving a dead frame.
+    /// Never persisted, never shpool-attached.
+    fn spawn_tool_session(&mut self, cwd: &std::path::Path) -> Session {
         let id = self.next_session_id;
         self.next_session_id += 1;
         let (cw, ch) = self.cell_px();
@@ -1439,7 +1442,7 @@ impl App {
             ch,
             self.dpi(),
             Some(cwd),
-            Some(command),
+            None,
             self.events_tx.clone(),
             None,
         )
@@ -1448,16 +1451,31 @@ impl App {
     /// Launch tool `i`'s command unless it is already running (first visit,
     /// or its last run exited).
     fn ensure_tool_session(&mut self, i: usize) {
-        let Some(tool) = self.tools.get(i).cloned() else { return };
-        let live =
-            self.tool_sessions.get(i).and_then(|s| s.as_ref()).is_some_and(|s| !s.exited);
+        let Some(tool) = self.tools.get(i).cloned() else {
+            return;
+        };
+        let live = self
+            .tool_sessions
+            .get(i)
+            .and_then(|s| s.as_ref())
+            .is_some_and(|s| !s.exited);
         if live {
             return;
         }
         let cwd = cli_tools::expand_cwd(&tool.cwd);
-        let session = self.spawn_tool_session(&cwd, &tool.command);
-        self.tool_sessions[i] =
-            Some(ToolSession { tab: workspace::Tab::new(session), exited: false });
+        let session = self.spawn_tool_session(&cwd);
+        // The command is *typed into* a plain login shell rather than run as
+        // `sh -lc cmd`: the terminal then stays spawned once the command
+        // finishes — and keeps reporting a live pane title — instead of
+        // leaving an exited frame the user has to relaunch. Queued for the
+        // pane's first wakeup (the prompt is up by then), exactly like the
+        // primary command.
+        self.pending_primary_cmd
+            .insert(session.id, tool.command.clone());
+        self.tool_sessions[i] = Some(ToolSession {
+            tab: workspace::Tab::new(session),
+            exited: false,
+        });
         self.sync_tool_layout(true);
         self.request_redraw();
     }
@@ -5333,6 +5351,9 @@ impl App {
             .flat_map(|ws| ws.root.tiles())
             .flat_map(|tile| tile.tabs.iter())
             .chain(self.flyover_tabs.iter())
+            // Tool pages live outside the workspace tree too, and their strip
+            // shows the pane title, so they want a name like any other tab.
+            .chain(self.tool_sessions.iter().flatten().map(|ts| &ts.tab))
             .filter_map(Tab::session)
             .filter(|session| {
                 // A pane with neither a pid nor a shpool session can never
@@ -6400,9 +6421,13 @@ impl App {
             && let Some(Some(ts)) = self.tool_sessions.get(i)
         {
             let area = self.tool_area();
-            let title = self.tools.get(i).map(|t| t.name.as_str()).unwrap_or("");
+            // The strip mirrors the terminal, the way every other tab does:
+            // the pane's own title, or the tool's command while it has none.
+            // The name a tool was registered under is a Settings label only.
+            let fallback = self.tools.get(i).map(|t| t.command.as_str()).unwrap_or("");
+            let title = tool_page_title(&ts.tab.title(), fallback);
             let (quads, pane, fg_quads, labels) =
-                self.renderer.tool_page(&ts.tab, &area, title, ts.exited, !overlay_open);
+                self.renderer.tool_page(&ts.tab, &area, &title, ts.exited, !overlay_open);
             let tool_hits: Vec<ImageHit> = pane
                 .images
                 .iter()
@@ -8268,5 +8293,44 @@ fn image_suffix(bytes: &[u8]) -> &'static str {
             "webp"
         },
         _ => "png",
+    }
+}
+
+/// The label a CLI tool page's strip shows: the terminal's own pane title, or
+/// the tool's command while the pane has none. The name a tool was registered
+/// under is a Settings label, never a strip label — the strip mirrors the
+/// terminal, like every other tab — and the emulator's stock placeholder is not
+/// a name either.
+fn tool_page_title(session_title: &str, fallback: &str) -> String {
+    let title = session_title.trim();
+    if title.is_empty() || title == crate::term::STOCK_TITLE {
+        fallback.to_string()
+    } else {
+        title.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tool_page_title_tests {
+    use super::tool_page_title;
+
+    /// A live pane title names the strip.
+    #[test]
+    fn pane_title_wins_over_the_command() {
+        assert_eq!(tool_page_title("drop", "drop -d"), "drop");
+        assert_eq!(tool_page_title(" Cleanup ", "drop -d"), "Cleanup");
+    }
+
+    /// The emulator's stock placeholder and an empty title are not names, so
+    /// the tool's command stands in.
+    #[test]
+    fn placeholder_and_empty_fall_back_to_the_command() {
+        assert_eq!(
+            tool_page_title(crate::term::STOCK_TITLE, "drop -d"),
+            "drop -d"
+        );
+        assert_eq!(tool_page_title("", "drop -d"), "drop -d");
+        assert_eq!(tool_page_title("   ", "drop -d"), "drop -d");
+        assert_eq!(tool_page_title("\twezterm\n", "drop -d"), "drop -d");
     }
 }
