@@ -77,7 +77,10 @@ pub(crate) struct ToastNote {
 /// Has a status toast outlived [`TOAST_TTL`] at `now`? Notifications have no
 /// deadline, so they are never passed here.
 pub(crate) fn status_expired(shown: Instant, now: Instant) -> bool {
-    now.duration_since(shown) >= TOAST_TTL
+    // Saturating: an inverted pair (a `shown` stamped after `now`, which a
+    // clock adjustment can produce) reads as "not yet expired" instead of
+    // panicking.
+    now.saturating_duration_since(shown) >= TOAST_TTL
 }
 
 /// Append a row, evicting to stay within [`MAX_TOASTS`]. Returns the new id.
@@ -138,6 +141,7 @@ impl App {
     /// Drop one row (a notification's click, or its ×).
     pub(crate) fn dismiss_toast(&mut self, id: u64) {
         self.toasts.retain(|t| t.id != id);
+        self.request_redraw();
     }
 
     /// Drop the status rows still up — a longer job finished, so the note it

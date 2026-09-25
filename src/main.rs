@@ -2132,10 +2132,9 @@ impl App {
     /// (which scrolls its own content), since the alternate screen has no
     /// scrollback of ours to move.
     fn on_scroll(&mut self, delta: gpui::ScrollDelta, cell_height: f32) {
-        if self.confirm.is_some()
-            || self.webview_prompt.is_some()
-            || self.command.is_some()
-        {
+        // The command palette is deliberately absent from this gate: it owns a
+        // separate window, so the main window keeps scrolling behind it.
+        if self.confirm.is_some() || self.webview_prompt.is_some() {
             return;
         }
         // Flyover panel scroll: intercept first when panel is open and cursor is inside.
@@ -2541,8 +2540,9 @@ impl App {
         if self.page != Page::Sessions
             || self.confirm.is_some()
             || self.webview_prompt.is_some()
-            || self.command.is_some()
         {
+            // The palette is not a modal here: it is its own window, so a
+            // right-click in the main window is resolved normally.
             return;
         }
         let Some(view) = context_menu::ns_view(window) else { return };
@@ -4166,16 +4166,17 @@ impl App {
             self.just_expanded = None;
         }
 
-        // Overlays are modal: they intercept clicks in priority order
-        // (confirm → message → fork picker → dir picker) before anything else.
+        // True modals intercept clicks in priority order (confirm → save
+        // workspace → webview prompt) before anything else. The command palette
+        // is deliberately absent: it owns a separate window, so the main window
+        // keeps taking clicks while it floats in front.
         if self.confirm.is_some()
             || self.save_ws.is_some()
             || self.webview_prompt.is_some()
-            || self.command.is_some()
         {
-            // Every modal is an element tree now (modal_ui / save_ui /
-            // palette_ui / picker_ui): its occluding scrim keeps the click
-            // off the canvas, so there is nothing to resolve here.
+            // Both remaining modals are element trees (modal_ui / save_ui):
+            // their occluding scrim keeps the click off the canvas, so there is
+            // nothing to resolve here.
             return;
         }
 
@@ -4556,10 +4557,7 @@ impl App {
                 // Resize-handle hover: suppress while any overlay is open so the
                 // cursor/highlight don't fight the modal. Hit-test matches
                 // on_mouse_down exactly via workspace::resize_hover_at.
-                let hover = if self.confirm.is_some()
-                    || self.webview_prompt.is_some()
-                    || self.command.is_some()
-                {
+                let hover = if self.confirm.is_some() || self.webview_prompt.is_some() {
                     None
                 } else if self.flyover_open
                     && !self.flyover_windowed
@@ -4602,7 +4600,6 @@ impl App {
                 let link_hover = if self.page != Page::Sessions
                     || self.confirm.is_some()
                     || self.webview_prompt.is_some()
-                    || self.command.is_some()
                 {
                     None
                 } else {

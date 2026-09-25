@@ -92,9 +92,9 @@ enum ToastKind { Status, Notification }
   (`:1250+`) and the clip helper, so the stack reuses them and needs no new geometry math.
 - Clicking a toast dismisses it; clicks pass through otherwise (mirrors the current
   `Toast` behaviour, `src/ui/toast.rs:139` `occlude()`).
-- Bus: `state_json` (`src/bus_exec.rs:513`, `:544`) reports `"toasts": [{kind, title, body}]`
-  instead of `"message"`; keep `"message"` as `null` for one release so CLI consumers do not
-  break, and note it in the PR.
+- Bus: `state_json` (`src/bus_exec.rs:528-543`) reports `"toasts": [{kind, text, persistent}]`
+  and keeps `"message"` as the newest toast's text for one release, so a CLI consumer that only
+  knows `message` never sees the field go missing; note it in the PR.
 - After the conversion `App.message` and `modal_ui::render_message` are deleted, and `message`
   drops out of `modal_overlay_open` — that is the actual "no full-screen overlay" win.
 

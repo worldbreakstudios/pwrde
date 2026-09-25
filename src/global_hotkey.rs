@@ -12,11 +12,12 @@
 //! the main thread — the same path every other background signal takes, so no
 //! gpui type is ever touched off-thread.
 //!
-//! The default binding is ⌥⌘P (⌃⌘Space is the fallback if the machine already
-//! owns ⌥⌘P); `keyboard.global_palette` in settings overrides it, so the rest
-//! of the global command table has somewhere to grow. Registration is
-//! best-effort: a hotkey macOS refuses (or that another app owns) warns and the
-//! in-app ⌘P binding keeps working.
+//! The default binding is ⌥⌘P; `keyboard.global_palette` in settings overrides
+//! it with any `global-hotkey` chord spec (e.g. `ctrl+meta+Space`), so a machine
+//! that already owns ⌥⌘P can rebind, and the rest of the global command table
+//! has somewhere to grow. Registration is best-effort: a hotkey macOS refuses
+//! (or that another app already owns) warns, and the in-app ⌘P binding — which
+//! needs no permission and no global registration — keeps working.
 
 use std::sync::mpsc::Sender;
 

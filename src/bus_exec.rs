@@ -227,10 +227,10 @@ impl App {
         } else {
             ScreenshotTarget::File(default_screenshot_path())
         };
-        // Success is a toast note: purely informational, so it passes keys
-        // and clicks through and expires on its own timer — the old centered
-        // pill was a non-dismissable modal panel that lingered forever.
-        // Failure stays a modal note the user must acknowledge.
+        // Success is a status toast: purely informational, so it takes no
+        // clicks and expires on its own timer — the old centered pill was a
+        // non-dismissable modal panel that lingered forever. Failure is a
+        // notification toast, which the user dismisses by clicking it.
         match screenshot_main_window(&target) {
             Ok(()) => match target {
                 ScreenshotTarget::Clipboard => {
@@ -1162,7 +1162,8 @@ mod key_tests {
 
     /// The screenshot toast expires after its 3-second lifetime: fresh
     /// notes stay visible, notes at or past `TOAST_TTL` expire so
-    /// `App::drain_events` clears them (see `toast_note_due`).
+    /// `App::toast_due` clears them on the next frame (`drain_events` polls
+    /// it every tick).
     #[test]
     fn toast_note_expires_after_lifetime() {
         let now = std::time::Instant::now();
