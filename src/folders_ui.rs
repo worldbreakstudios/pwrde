@@ -172,8 +172,11 @@ impl App {
                         press(entity.clone(), |this, _ev, _cx| this.toggle_tools_collapsed()),
                     ),
                 FolderRow::Tool(ti) => {
-                    let Some(tool) = self.tools.get(ti) else { continue };
-                    self.tool_row(theme, &r, tool, selected, row_hovered)
+                    if self.tools.get(ti).is_none() {
+                        continue;
+                    }
+                    let label = self.tool_row_label(ti);
+                    self.tool_row(theme, &r, &label, selected, row_hovered)
                         .on_mouse_down(
                             MouseButton::Left,
                             press(entity.clone(), move |this, _ev, _cx| {
@@ -261,12 +264,14 @@ impl App {
             .child(icon(chevron, px(scaled(ROW_ICON)), theme.muted_foreground))
     }
 
-    /// One pinned CLI-tool row: green dot + the tool's command in monospace.
+    /// One pinned CLI-tool row: a green dot and the terminal's own pane title —
+    /// or the tool's command while that terminal has none of its own
+    /// ([`App::tool_row_label`]) — in monospace.
     fn tool_row(
         &self,
         theme: &Theme,
         r: &LayoutRect,
-        tool: &crate::cli_tools::CliTool,
+        label: &str,
         selected: bool,
         hovered: bool,
     ) -> gpui::Stateful<gpui::Div> {
@@ -292,7 +297,7 @@ impl App {
                     .font_family(crate::renderer::FONT_FAMILY)
                     .text_size(px(scaled(11.5)))
                     .text_color(ink)
-                    .child(tool.command.clone()),
+                    .child(label.to_string()),
             )
     }
 
