@@ -218,26 +218,6 @@ impl App {
         }
     }
 
-    /// Show an ephemeral informational toast (screenshot copied/saved).
-    /// Purely visual: keys and clicks pass through, and `drain_events`
-    /// expires it after `TOAST_NOTE_SECS`.
-    pub(crate) fn show_toast_note(&mut self, text: impl Into<String>) {
-        self.toast_note = Some((text.into(), std::time::Instant::now()));
-        self.request_redraw();
-    }
-
-    /// True when the ephemeral toast has just expired: clears it exactly
-    /// once, then stays false until the next toast.
-    pub(crate) fn toast_note_due(&mut self) -> bool {
-        let Some((_, shown)) = self.toast_note else {
-            return false;
-        };
-        if !toast_note_expired(shown, std::time::Instant::now()) {
-            return false;
-        }
-        self.toast_note = None;
-        true
-    }
 
     /// The `Screenshot to clipboard` / `Screenshot to file` actions: same
     /// capture as the bus command, reported through the status message.
@@ -254,13 +234,13 @@ impl App {
         match screenshot_main_window(&target) {
             Ok(()) => match target {
                 ScreenshotTarget::Clipboard => {
-                    self.show_toast_note("Screenshot copied to clipboard");
+                    self.toast_status("Screenshot copied to clipboard");
                 }
                 ScreenshotTarget::File(p) => {
-                    self.show_toast_note(format!("Screenshot saved to {}", p.display()));
+                    self.toast_status(format!("Screenshot saved to {}", p.display()));
                 }
             },
-            Err(e) => self.message = Some((format!("Screenshot failed: {e}"), true)),
+            Err(e) => self.toast_notification(format!("Screenshot failed: {e}")),
         }
         self.request_redraw();
     }
@@ -541,7 +521,21 @@ impl App {
                     }))
                     .collect::<Vec<_>>(),
             },
-            "message": self.message.as_ref().map(|(m, _)| m.clone()),
+            // The toast stack replaced the single `message` overlay. `message`
+            // stays as the newest toast's text for one release so an existing
+            // CLI consumer keeps working; `toasts` carries the whole stack.
+            "message": self.toasts.last().map(|t| t.text.clone()),
+            "toasts": self
+                .toasts
+                .iter()
+                .map(|t| {
+                    json!({
+                        "kind": t.kind.as_str(),
+                        "text": t.text,
+                        "persistent": t.kind.is_notification(),
+                    })
+                })
+                .collect::<Vec<_>>(),
         })
     }
 
@@ -696,16 +690,6 @@ pub(crate) fn pane_matches(
 
 /// Refusal reason while the experimental flag is off.
 const FLOW_DISABLED: &str = "Flow is disabled — enable it under Settings > Feature Flags";
-
-/// How long an ephemeral toast note (screenshot copied/saved) stays on
-/// screen before `App::drain_events` expires it.
-const TOAST_NOTE_SECS: std::time::Duration = std::time::Duration::from_secs(3);
-
-/// Pure expiry predicate for an ephemeral toast note, split out from
-/// `App::toast_note_due` so the lifecycle is unit-testable.
-fn toast_note_expired(shown: std::time::Instant, now: std::time::Instant) -> bool {
-    now.duration_since(shown) >= TOAST_NOTE_SECS
-}
 
 pub(crate) fn page_from_name(name: &str) -> Option<Page> {
     match name.trim().to_ascii_lowercase().replace('-', "_").as_str() {
@@ -1170,20 +1154,20 @@ mod key_tests {
         assert!(bus_keystroke("cmd-shift-x-y").is_err());
     }
 
-    use crate::bus_exec::{TOAST_NOTE_SECS, toast_note_expired};
+    use crate::toast_ui::{TOAST_TTL, status_expired};
 
     /// The screenshot toast expires after its 3-second lifetime: fresh
-    /// notes stay visible, notes at or past `TOAST_NOTE_SECS` expire so
+    /// notes stay visible, notes at or past `TOAST_TTL` expire so
     /// `App::drain_events` clears them (see `toast_note_due`).
     #[test]
     fn toast_note_expires_after_lifetime() {
         let now = std::time::Instant::now();
-        assert!(!toast_note_expired(now, now), "fresh note must stay up");
-        let recent = now - TOAST_NOTE_SECS + std::time::Duration::from_millis(100);
-        assert!(!toast_note_expired(recent, now), "just under 3s stays up");
-        let boundary = now - TOAST_NOTE_SECS;
-        assert!(toast_note_expired(boundary, now), "exactly 3s expires");
-        let past = now - TOAST_NOTE_SECS - std::time::Duration::from_secs(10);
-        assert!(toast_note_expired(past, now), "well past 3s expires");
+        assert!(!status_expired(now, now), "fresh note must stay up");
+        let recent = now - TOAST_TTL + std::time::Duration::from_millis(100);
+        assert!(!status_expired(recent, now), "just under 3s stays up");
+        let boundary = now - TOAST_TTL;
+        assert!(status_expired(boundary, now), "exactly 3s expires");
+        let past = now - TOAST_TTL - std::time::Duration::from_secs(10);
+        assert!(status_expired(past, now), "well past 3s expires");
     }
 }

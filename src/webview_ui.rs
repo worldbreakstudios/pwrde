@@ -74,11 +74,17 @@ impl App {
             .and_then(|tab| tab.url().map(str::to_string))
     }
 
-    fn webview_error(&mut self, result: Result<(), String>) {
-        if let Err(error) = result {
-            self.message = Some((error, true));
+    /// Report a webview failure as a persistent sidebar notification.
+    /// Returns whether it failed, so a caller can skip a focus it would
+    /// only take back from the page it just refused to open.
+    fn webview_error(&mut self, result: Result<(), String>) -> bool {
+        match result {
+            Ok(()) => false,
+            Err(error) => {
+                self.toast_notification(error);
+                true
+            },
         }
-        self.request_redraw();
     }
 
     fn focus_webview_tab(&mut self, id: u64) {
@@ -203,8 +209,7 @@ impl App {
                 let value = self.webview_address.read(cx).text().to_string();
                 if let Some(id) = id {
                     let result = self.navigate_webview(id, &value);
-                    self.webview_error(result);
-                    if self.message.is_none() {
+                    if !self.webview_error(result) {
                         window.focus(&self.focus_handle, cx);
                         self.webviews.focus(id);
                     }
@@ -224,7 +229,7 @@ impl App {
                 if let Some(id) = self.webview_find_for {
                     let query = self.webview_find.read(cx).text().to_string();
                     let result = self.webviews.find(id, &query);
-                    self.webview_error(result);
+                    let _ = self.webview_error(result);
                 }
             }
             "escape" if find_focused => {
@@ -686,8 +691,9 @@ impl App {
                                             && let Err(error) =
                                                 std::process::Command::new("open").arg(url).spawn()
                                         {
-                                            this.message =
-                                                Some((format!("open browser: {error}"), true));
+                                            this.toast_notification(format!(
+                                                "open browser: {error}"
+                                            ));
                                         }
                                         this.request_redraw();
                                     });

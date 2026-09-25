@@ -1,23 +1,26 @@
-//! The modal overlays — the confirm dialog and the one-line message panel —
-//! as a gpui element tree above everything else.
+//! The confirm dialog — the one modal overlay left — as a gpui element tree
+//! above everything else.
 //!
-//! Both used to be canvas-painted (`Renderer::confirm_overlay` /
-//! `message_overlay`) with their buttons hit-tested in `main.rs`'s
-//! `overlay_click`. They are now built from the vendored rcn `AlertDialog`
-//! (a deferred, full-viewport occluding scrim with a centered panel) and rcn
-//! `Button`s, styled with the exact chrome tokens the canvas used: the
-//! chrome `scrim` at 30%, a `card` panel at 96% with the tile-card radius and
-//! shadow, chrome-font text, and an accent accept button. Mounted last in
-//! `App::render` so it sits over every page overlay and the canvas flyover;
-//! being `deferred`, it paints after its siblings regardless.
+//! It used to be canvas-painted (`Renderer::confirm_overlay`) with its buttons
+//! hit-tested in `main.rs`'s `overlay_click`. It is now built from the vendored
+//! rcn `AlertDialog` (a deferred, full-viewport occluding scrim with a centered
+//! panel) and rcn `Button`s, styled with the exact chrome tokens the canvas
+//! used: the chrome `scrim` at 30%, a `card` panel at 96% with the tile-card
+//! radius and shadow, chrome-font text, and an accent accept button. Mounted
+//! last in `App::render` so it sits over every page overlay and the canvas
+//! flyover; being `deferred`, it paints after its siblings regardless.
 //!
-//! Keyboard handling (Enter accepts, Escape cancels; any key dismisses a
-//! dismissable message) stays in `main.rs`'s `on_key_down` — the state is
-//! `App::confirm` / `App::message`, and this tree only renders it.
+//! The one-line message panel that used to live here is gone: notes and
+//! results are toast rows in the sidebar (`crate::toast_ui`), inside the one
+//! column a webview child view can never be painted over. A confirm is a real
+//! decision an action waits on, so it keeps its scrim.
+//!
+//! Keyboard handling (Enter accepts, Escape cancels) stays in `main.rs`'s
+//! `on_key_down` — the state is `App::confirm`, and this tree only renders it.
 
 use gpui::{
-    AnyElement, App as GpuiApp, BoxShadow, ClickEvent, Context, InteractiveElement, IntoElement,
-    ParentElement, StatefulInteractiveElement, Styled, Window, div, point, px,
+    AnyElement, App as GpuiApp, BoxShadow, ClickEvent, Context, IntoElement, ParentElement, Styled,
+    Window, div, point, px,
 };
 
 use crate::App;
@@ -30,16 +33,13 @@ const PAD: f32 = 16.0;
 const GAP: f32 = 10.0;
 
 impl App {
-    /// The open modal, if any: the confirm dialog wins over a message.
+    /// The open modal, if any: the confirm dialog is the only full-viewport
+    /// overlay left. Notes and results render in the sidebar toast stack
+    /// (`crate::toast_ui`), which is why nothing here has to know about a
+    /// webview's child view any more.
     pub fn render_modals(&self, cx: &mut Context<Self>) -> AnyElement {
         if let Some(confirm) = self.confirm.as_ref() {
             return self.render_confirm(&confirm.text, confirm.accept_label(), cx);
-        }
-        if let Some((text, dismissable)) = self.message.as_ref() {
-            return self.render_message(text, *dismissable, cx);
-        }
-        if let Some((text, _)) = self.toast_note.as_ref() {
-            return self.render_toast_note(text, cx);
         }
         div().into_any_element()
     }
@@ -115,66 +115,11 @@ impl App {
             )
             .into_any_element()
     }
-
-    /// Centered one-line message panel (worktree provisioning / failure
-    /// note). A dismissable one clears on any click; a modal one — work in
-    /// flight — swallows it.
-    fn render_message(&self, text: &str, dismissable: bool, cx: &mut Context<Self>) -> AnyElement {
-        cx.set_global(Theme::from_chrome(crate::theme::current()));
-        let theme = Theme::of(cx).clone();
-        let chrome = crate::theme::current();
-        let font = crate::renderer::chrome_font();
-        let entity = cx.entity().downgrade();
-
-        let dismiss = move |app: &mut GpuiApp| {
-            if let Some(entity) = entity.upgrade() {
-                entity.update(app, |this, cx| {
-                    if this.message.as_ref().is_some_and(|(_, d)| *d) {
-                        this.message = None;
-                        this.request_redraw();
-                        cx.notify();
-                    }
-                });
-            }
-        };
-        let backdrop_dismiss = dismiss.clone();
-
-        let mut line = div()
-            .id("message-panel-text")
-            .font_family(crate::renderer::FONT_FAMILY)
-            .text_size(px(font))
-            .text_color(theme.foreground)
-            .whitespace_nowrap()
-            .child(text.to_string());
-        if dismissable {
-            line = line.on_click(move |_ev: &ClickEvent, _win: &mut Window, app: &mut GpuiApp| {
-                dismiss(app)
-            });
-        }
-
-        panel_style(AlertDialog::new("message-panel").open(true), &theme, chrome)
-            .scrim(crate::renderer::color(chrome.scrim, 0.30))
-            .on_backdrop_click(move |_ev, _win, app| backdrop_dismiss(app))
-            .child(line)
-            .into_any_element()
-    }
-
-    /// Ephemeral informational toast (screenshot copied/saved): a standard
-    /// rcn `Toast` in a full-window `ToastViewport`. It is purely visual —
-    /// the viewport paints no scrim and intercepts no input (the toast is
-    /// excluded from `modal_overlay_open`, so keys and mouse pass through),
-    /// and `App::drain_events` expires it after `TOAST_NOTE_SECS`.
-    fn render_toast_note(&self, text: &str, cx: &mut Context<Self>) -> AnyElement {
-        cx.set_global(Theme::from_chrome(crate::theme::current()));
-
-        crate::ui::ToastViewport::new()
-            .child(crate::ui::Toast::new("toast-note", text.to_string()))
-            .into_any_element()
-    }
 }
 
-/// The panel treatment both modals share: the canvas painted `th.card` at
-/// 96% with the tile-card radius and `Shadow::Card`, content-sized.
+/// The panel treatment the modal shared with the removed message panel: the
+/// canvas painted `th.card` at 96% with the tile-card radius and
+/// `Shadow::Card`, content-sized.
 pub(crate) fn panel_style(
     dialog: AlertDialog,
     theme: &Theme,

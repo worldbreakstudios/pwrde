@@ -54,6 +54,8 @@ pub use label::Label;
 pub use switch::Switch;
 
 pub use table::{Table, TableBody, TableCell, TableRow};
+#[allow(unused_imports)] // vendored rcn surface: the sidebar toast
+// stack (`crate::toast_ui`) paints its own rows, so nothing calls these yet
 pub use toast::{Toast, ToastViewport};
 
 pub mod alert_dialog;

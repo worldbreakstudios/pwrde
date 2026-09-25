@@ -50,6 +50,7 @@ mod sidebar_card;
 mod sidebar_ui;
 mod term;
 mod tile_ui;
+mod toast_ui;
 mod term_theme;
 mod theme;
 // Vendored shadcn-style component copies (see ui/mod.rs). Kept faithful to
@@ -444,13 +445,15 @@ struct App {
     /// the field, sets that placeholder and focuses it (opening happens in
     /// handlers without a `Window`).
     modal_search_reset: Option<String>,
-    /// A centered one-line message. `bool` is `dismissable`: false while `drop`
-    /// provisions (input swallowed), true for a failure note the user can close.
-    message: Option<(String, bool)>,
-    /// An ephemeral informational toast (screenshot copied/saved): rendered
-    /// as a standard rcn `Toast`, passing keys and clicks through, expiring
-    /// on its own timer instead of lingering until replaced.
-    toast_note: Option<(String, std::time::Instant)>,
+    /// The sidebar toast stack, oldest first: status notes (an action just
+    /// taken) expire on their own after `toast_ui::TOAST_TTL`, notifications
+    /// (a failure, a result worth reading) stay until they are clicked. This
+    /// replaces the centered `message` overlay — see `toast_ui` for why a
+    /// webview makes an in-window overlay the wrong tool.
+    toasts: Vec<crate::toast_ui::ToastNote>,
+    /// Monotonic id for the next toast, so a row keeps its identity while the
+    /// stack shifts under the pointer.
+    next_toast_id: u64,
     /// The open close-primary-pane confirmation dialog, or `None`.
     confirm: Option<ConfirmClose>,
     /// Primary-pane sessions awaiting their auto-run command, keyed by session
@@ -1144,8 +1147,7 @@ impl App {
         if let Some(error) =
             self.webviews.sync(window, &live, &placements, focus, &self.events_tx)
         {
-            self.message = Some((format!("Could not open webview: {error}"), true));
-            self.request_redraw();
+            self.toast_notification(format!("Could not open webview: {error}"));
         }
     }
 
@@ -2109,7 +2111,7 @@ impl App {
             },
             ConfirmAction::ClearWebviewData { id } => {
                 if let Err(error) = self.webviews.clear_browsing_data(id) {
-                    self.message = Some((error, true));
+                    self.toast_notification(error);
                 }
                 self.webview_panel = None;
             },
@@ -2125,7 +2127,6 @@ impl App {
     /// scrollback of ours to move.
     fn on_scroll(&mut self, delta: gpui::ScrollDelta, cell_height: f32) {
         if self.confirm.is_some()
-            || self.message.is_some()
             || self.webview_prompt.is_some()
             || self.command.is_some()
         {
@@ -2533,7 +2534,6 @@ impl App {
         }
         if self.page != Page::Sessions
             || self.confirm.is_some()
-            || self.message.is_some()
             || self.webview_prompt.is_some()
             || self.command.is_some()
         {
@@ -3112,7 +3112,7 @@ impl App {
     }
 
     fn start_fork(&mut self, repo: std::path::PathBuf, name: String, from: Option<String>) {
-        self.message = Some((format!("Provisioning worktree for {name}…"), false));
+        self.toast_status(format!("Provisioning worktree for {name}…"));
         self.request_redraw();
 
         let events_tx = self.events_tx.clone();
@@ -3345,13 +3345,14 @@ impl App {
         };
         match pwrspace::save_profile(path, &profile) {
             Ok(()) => {
-                self.message = Some((
-                    format!("Saved workspace \"{}\" to {}", profile.name, tilde(path)),
-                    true,
+                self.toast_notification(format!(
+                    "Saved workspace \"{}\" to {}",
+                    profile.name,
+                    tilde(path)
                 ));
             },
             Err(e) => {
-                self.message = Some((format!("Save failed: {e}"), true));
+                self.toast_notification(format!("Save failed: {e}"));
             },
         }
         self.request_redraw();
@@ -4119,7 +4120,6 @@ impl App {
     /// underneath it.
     fn modal_overlay_open(&self) -> bool {
         self.confirm.is_some()
-            || self.message.is_some()
             || self.save_ws.is_some()
             || self.webview_prompt.is_some()
             || self.command.is_some()
@@ -4172,7 +4172,6 @@ impl App {
         // Overlays are modal: they intercept clicks in priority order
         // (confirm → message → fork picker → dir picker) before anything else.
         if self.confirm.is_some()
-            || self.message.is_some()
             || self.save_ws.is_some()
             || self.webview_prompt.is_some()
             || self.command.is_some()
@@ -4561,7 +4560,6 @@ impl App {
                 // cursor/highlight don't fight the modal. Hit-test matches
                 // on_mouse_down exactly via workspace::resize_hover_at.
                 let hover = if self.confirm.is_some()
-                    || self.message.is_some()
                     || self.webview_prompt.is_some()
                     || self.command.is_some()
                 {
@@ -4606,7 +4604,6 @@ impl App {
                 // Link hover: suppress when any overlay is open or not in Sessions page.
                 let link_hover = if self.page != Page::Sessions
                     || self.confirm.is_some()
-                    || self.message.is_some()
                     || self.webview_prompt.is_some()
                     || self.command.is_some()
                 {
@@ -4727,7 +4724,6 @@ impl App {
         // An open overlay owns the keyboard: route to it before ⌘ shortcuts or
         // the PTY so typing filters the list rather than reaching the shell.
         if self.confirm.is_some()
-            || self.message.is_some()
             || self.save_ws.is_some()
             || self.webview_prompt.is_some()
             || self.command.is_some()
@@ -4830,16 +4826,6 @@ impl App {
                 "enter" => self.confirm_accept(),
                 "escape" => self.confirm = None,
                 _ => {},
-            }
-            self.request_redraw();
-            return;
-        }
-        // A provisioning/error message overlay is topmost. A dismissable one
-        // clears on any key; a non-dismissable one swallows the key while work
-        // is in flight. Either way the key is consumed here.
-        if let Some((_, dismissable)) = self.message.as_ref() {
-            if *dismissable {
-                self.message = None;
             }
             self.request_redraw();
             return;
@@ -5476,10 +5462,10 @@ impl App {
     /// redraw is needed.
     fn drain_events(&mut self) -> bool {
         let mut redraw = false;
-        // Expire an ephemeral toast note on its own timer. The drain runs on
+        // Expire the status rows on their own timer. The drain runs on
         // the foreground executor every ~16ms, so the toast disappears within
         // a frame of its deadline; redraw only flips on the expiry frame.
-        if self.toast_note_due() {
+        if self.toast_due() {
             redraw = true;
         }
         while let Ok(event) = self.events_rx.try_recv() {
@@ -5536,7 +5522,7 @@ impl App {
                     // Only worth a note while the tab is still around to sit on
                     // its fallback page.
                     if self.webview_tab_exists(id) {
-                        self.message = Some((format!("Webview URL command {message}"), true));
+                        self.toast_notification(format!("Webview URL command {message}"));
                         redraw = true;
                     }
                 },
@@ -5582,11 +5568,11 @@ impl App {
                     }
                 },
                 // A backgrounded worktree drop finished: clear the provisioning
-                // message and open the new group — with the profile chosen
+                // status note and open the new group — with the profile chosen
                 // before provisioning, when there was one — or surface the
                 // failure (dropping any pending profile with it).
                 TermEvent::GroupReady { name, cwd } => {
-                    self.message = None;
+                    self.clear_status_toasts();
                     match self.pending_group_profile.take() {
                         Some(profile) => self.add_group_with_profile(name, Some(cwd), &profile),
                         None => self.add_group(name, Some(cwd)),
@@ -5602,7 +5588,7 @@ impl App {
                 TermEvent::GroupFailed { message } => {
                     self.pending_group_profile = None;
                     self.pending_group_section = None;
-                    self.message = Some((format!("drop failed: {message}"), true));
+                    self.toast_notification(format!("drop failed: {message}"));
                     redraw = true;
                 },
                 // A web page handed to us as a browser: a webview tab in the
@@ -5614,7 +5600,7 @@ impl App {
                         self.add_group(workspace::webview_title(&url), None);
                     }
                     if let Err(error) = self.add_webview_tab_to_group(self.active, url) {
-                        self.message = Some((format!("open URL failed: {error}"), true));
+                        self.toast_notification(format!("open URL failed: {error}"));
                     }
                     redraw = true;
                 },
@@ -6350,9 +6336,10 @@ impl Render for App {
             .child(self.render_new_webview_prompt(cx))
             // Save-as-workspace modal (element tree; see `save_ui`).
             .child(self.render_save(cx))
-            // Modal overlays (confirm dialog, message panel): last, so they
-            // sit above every page overlay; the canvas flyover is painted
-            // inside the canvas element, so they cover it too.
+            // The modal overlay (the confirm dialog): last, so it
+            // sits above every page overlay; the canvas flyover is painted
+            // inside the canvas element, so it covers that too. Notes and results
+            // are toast rows in the sidebar instead — see `toast_ui`.
             .child(self.render_modals(cx))
     }
 }
@@ -6454,7 +6441,6 @@ impl App {
             // panel never fall through, so hover mustn't either. Modal
             // overlays sit above the flyover, so they keep the live cursor.
             element_modal: self.confirm.is_some()
-                || self.message.is_some()
                 || self.save_ws.is_some()
                 || self.search_modal_open(),
             cursor: {
@@ -7802,8 +7788,8 @@ fn main() {
                         pending_group_profile: None,
                         pending_group_section: None,
                         save_ws: None,
-                        message: None,
-                        toast_note: None,
+                        toasts: Vec::new(),
+                        next_toast_id: 0,
                         confirm: None,
                         pending_primary_cmd: std::collections::HashMap::new(),
                         command_input: {
