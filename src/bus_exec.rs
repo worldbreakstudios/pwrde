@@ -491,6 +491,10 @@ impl App {
             "groups": groups,
             "sections": sections,
             "command_palette_open": self.command.is_some(),
+            // The palette's own window, distinct from the model flag above:
+            // `command_palette_open` says the palette wants a surface,
+            // `palette_window_open` says the pump has actually got one open.
+            "palette_window_open": self.palette_window.is_some(),
             "new_webview_prompt_open": self.webview_prompt.is_some(),
             "sidebar": {
                 "collapsed": self.sidebar_collapsed,

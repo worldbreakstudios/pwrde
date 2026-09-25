@@ -32,12 +32,14 @@ mod flyover_ui;
 mod gh;
 mod git;
 mod git_context;
+mod global_hotkey;
 mod lfg;
 mod modal_ui;
 mod settings_ui;
 mod links;
 mod pages;
 mod palette;
+mod palette_window;
 mod persist;
 mod picker;
 mod pwrspace;
@@ -542,6 +544,10 @@ struct App {
     /// The main window, so popout-initiated flows (new-tab picker, docking)
     /// can bring it forward.
     main_window: Option<gpui::AnyWindowHandle>,
+    /// The open command-palette window, when the pump has one up. The palette
+    /// model (`command`) is the source of truth for whether it should exist;
+    /// the pump reconciles the window against it every tick.
+    palette_window: Option<gpui::WindowHandle<crate::palette_window::PaletteWindow>>,
     /// Keystrokes queued by the bus `key` command, drained through the real
     /// gpui key-down handler so bindings and overlay routing are exercised.
     pending_keys: Vec<gpui::Keystroke>,
@@ -2737,7 +2743,9 @@ impl App {
 
     /// True while the command palette owns the shared search field.
     fn search_modal_open(&self) -> bool {
-        self.command.is_some() || self.webview_prompt.is_some()
+        // The palette's search field lives in the palette's own window, so it
+        // no longer counts as a modal owning the main window's field.
+        self.webview_prompt.is_some()
     }
 
     /// Point the shared search field at the palette's current stage: clear
@@ -2981,33 +2989,22 @@ impl App {
     /// hides the popout window instead (the pump reconciles the actual
     /// window); sessions keep running either way.
     pub(crate) fn toggle_flyover(&mut self) {
-        if self.flyover_windowed {
-            self.flyover_window_visible = !self.flyover_window_visible;
-            if self.flyover_window_visible {
-                self.flyover_mark_read();
-                if self.flyover_tabs.is_empty() {
-                    self.open_flyover_picker();
-                }
-            }
-            self.request_redraw();
-            return;
-        }
+        // The global terminal is always its own real window now: the toggle
+        // only flips the *desired* visibility, and the frame pump reconciles
+        // the actual popout window against it (open it, or close it).
+        // Forcing the windowed flag here keeps the legacy in-window paint path
+        // unreachable from this entry point whatever else flips it.
+        self.flyover_windowed = true;
+        self.flyover_open = !self.flyover_open;
+        self.flyover_window_visible = self.flyover_open;
         if self.flyover_open {
-            // Close: hide but keep sessions running.
-            self.flyover_open = false;
-            self.flyover_focused = false;
-            self.request_redraw();
-        } else {
-            // Open: show the panel.
-            self.flyover_open = true;
-            self.flyover_focused = true;
             self.flyover_mark_read();
             if self.flyover_tabs.is_empty() {
                 // First-ever open: open directory picker to create the first tab.
                 self.open_flyover_picker();
             }
-            self.request_redraw();
         }
+        self.request_redraw();
     }
 
     /// Apply a ⌘ action to the flyover's tabs — the subset of shortcuts the
@@ -4119,10 +4116,10 @@ impl App {
     /// mouse-down handler treats as modal), so mouse reports must not fire
     /// underneath it.
     fn modal_overlay_open(&self) -> bool {
-        self.confirm.is_some()
-            || self.save_ws.is_some()
-            || self.webview_prompt.is_some()
-            || self.command.is_some()
+        // The palette is not in this list: it owns a separate window, so the
+        // main window keeps taking mouse input while the Spotlight-style
+        // palette floats over whatever is in front.
+        self.confirm.is_some() || self.save_ws.is_some() || self.webview_prompt.is_some()
     }
 
     /// Right/middle button press: forward it to a mouse-tracking pane under the
@@ -4723,11 +4720,7 @@ impl App {
         }
         // An open overlay owns the keyboard: route to it before ⌘ shortcuts or
         // the PTY so typing filters the list rather than reaching the shell.
-        if self.confirm.is_some()
-            || self.save_ws.is_some()
-            || self.webview_prompt.is_some()
-            || self.command.is_some()
-        {
+        if self.confirm.is_some() || self.save_ws.is_some() || self.webview_prompt.is_some() {
             self.handle_picker_key(ev);
             return;
         }
@@ -4845,29 +4838,42 @@ impl App {
             self.handle_save_key(ev);
             return;
         }
-        // The unified command palette: navigation here, editing in the
-        // shared Input (the root listener still fires while it is focused,
-        // and never stops it).
-        if let Some(pal) = self.command.as_ref() {
-            let query_empty = pal.query().is_empty();
-            if Action::CommandPalette.binding().matches(&ev.keystroke) {
-                self.close_command();
-            } else {
-                match key {
-                    "escape" => self.close_command(),
-                    "enter" => self.command_enter(),
-                    "up" | "down" => {
-                        if let Some(c) = self.command.as_mut() {
-                            c.move_selection(if key == "up" { -1 } else { 1 });
-                            self.command_scroll_to = Some(c.selected());
-                        }
-                    },
-                    "backspace" if query_empty => self.command_back(),
-                    _ => {},
-                }
+        // The palette's own keys are routed by its window (`palette_key`);
+        // nothing here belongs to it any more — the modal-search field is
+        // only the webview prompt's, and `search_modal_open` says so.
+        self.request_redraw();
+    }
+
+    /// Keyboard routing for the palette window's keystrokes.
+    ///
+    /// The palette lives in its own window, so navigation arrives here rather
+    /// than through the main window's overlay routing. Typing and editing
+    /// belong to the shared Input rendered in that window; the model owns
+    /// these keys. Returns true when the palette consumed the keystroke.
+    pub(crate) fn palette_key(&mut self, ev: &KeyDownEvent) -> bool {
+        let Some(pal) = self.command.as_ref() else {
+            return false;
+        };
+        let key = ev.keystroke.key.as_str();
+        let query_empty = pal.query().is_empty();
+        if Action::CommandPalette.binding().matches(&ev.keystroke) {
+            self.close_command();
+        } else {
+            match key {
+                "escape" => self.close_command(),
+                "enter" => self.command_enter(),
+                "up" | "down" => {
+                    if let Some(c) = self.command.as_mut() {
+                        c.move_selection(if key == "up" { -1 } else { 1 });
+                        self.command_scroll_to = Some(c.selected());
+                    }
+                },
+                "backspace" if query_empty => self.command_back(),
+                _ => return false,
             }
         }
         self.request_redraw();
+        true
     }
 
     /// Keyboard routing for the save-as-workspace modal. Field stage: typing
@@ -5531,6 +5537,13 @@ impl App {
                         redraw = true;
                     }
                 },
+                TermEvent::GlobalPalette => {
+                    // ⌥⌘P pressed with pwrde in the background: the
+                    // Spotlight-style summon, so the palette toggles exactly as
+                    // the in-app ⌘P does.
+                    self.toggle_command_root();
+                    redraw = true;
+                },
                 TermEvent::WebviewFocused { id } => {
                     let tile = self.workspaces[self.active].root.tiles().iter().find_map(|tile| {
                         tile.active_tab()
@@ -6133,11 +6146,18 @@ impl Render for App {
         // Shared modal search field: a freshly opened modal claims it (clear,
         // placeholder, focus); a closed one releases it back to the app.
         if let Some(placeholder) = self.modal_search_reset.take() {
-            self.modal_search.update(cx, |input, cx| {
-                input.placeholder(placeholder);
-                input.set_text("", cx);
-            });
-            window.focus(&self.modal_search.read(cx).focus_handle(cx), cx);
+            if self.command.is_some() {
+                // The palette renders the shared Input inside its own window;
+                // leave the claim for `PaletteWindow::render` to consume
+                // there so main-window focus never lands on a hidden field.
+                self.modal_search_reset = Some(placeholder);
+            } else {
+                self.modal_search.update(cx, |input, cx| {
+                    input.placeholder(placeholder);
+                    input.set_text("", cx);
+                });
+                window.focus(&self.modal_search.read(cx).focus_handle(cx), cx);
+            }
         } else if !self.search_modal_open()
             && self.modal_search.read(cx).focus_handle(cx).is_focused(window)
         {
@@ -6330,9 +6350,9 @@ impl Render for App {
             // top edge): elements own the cursor and the drag start; the
             // canvas still drives the drag (`resize_ui`).
             .child(self.render_resize_handles(cx))
-            // Command palette and the pickers (element trees; see
-            // `palette_ui` / `picker_ui`).
-            .child(self.render_command(cx))
+            // The pickers (element trees; see `picker_ui`). The command
+            // palette is not here: it is its own window (`palette_window`),
+            // so nothing is ever painted over a webview.
             .child(self.render_new_webview_prompt(cx))
             // Save-as-workspace modal (element tree; see `save_ui`).
             .child(self.render_save(cx))
@@ -7485,7 +7505,13 @@ impl Render for FlyoverPopout {
 /// Open the flyover popout window and store its handle on the [`App`].
 /// Called by the frame pump when windowed mode wants a window up.
 fn open_flyover_window(app: gpui::Entity<App>, cx: &mut GpuiApp) {
-    let bounds = Bounds::centered(None, gpui::size(px(880.0), px(480.0)), cx);
+    // The global terminal is always its own real window, sized to the whole
+    // visible screen (hotkey-window style) so it can cover any pane — including
+    // the native webview tabs that no in-window element tree can layer over.
+    let bounds = cx
+        .primary_display()
+        .map(|d| d.visible_bounds())
+        .unwrap_or_else(|| Bounds::centered(None, gpui::size(px(880.0), px(480.0)), cx));
     let app_for_view = app.clone();
     let app_for_close = app.clone();
     let handle = cx.open_window(
@@ -7626,6 +7652,11 @@ fn main() {
         .with_quit_mode(QuitMode::LastWindowClosed);
 
     let (events_tx, events_rx) = mpsc::channel::<TermEvent>();
+    // System-wide palette hotkey (⌥⌘P): registered on its own thread before the
+    // window exists, so a press is already queued when the first frame drains —
+    // that is the whole point, since it has to work while pwrde is in the
+    // background. Best-effort: a refusal warns and the in-app ⌘P stays.
+    global_hotkey::spawn(events_tx.clone());
     // Command bus: listen before any session spawns so child shells inherit
     // `PWRDE_SOCKET` and `pwrde-cli` inside a tab targets this instance.
     bus_exec::start(events_tx.clone());
@@ -7925,6 +7956,7 @@ fn main() {
                         flyover_window_visible: false,
                         flyover_window: None,
                         main_window: None,
+                        palette_window: None,
                         pending_keys: Vec::new(),
                         preview_dark: theme::dark_active(),
                         appearance_menu: None,
@@ -7963,7 +7995,7 @@ fn main() {
                                 .timer(Duration::from_millis(16))
                                 .await;
                             let Some(app) = handle.upgrade() else { break };
-                            let (redraw, want_popout, popout, (pending_keys, main)) =
+                            let (redraw, want_popout, popout, want_palette, palette, (pending_keys, main)) =
                                 app.update(cx, |app: &mut App, cx| {
                                     let redraw = app.drain_events();
                                     if redraw {
@@ -7971,8 +8003,13 @@ fn main() {
                                     }
                                     (
                                         redraw,
-                                        app.flyover_windowed && app.flyover_window_visible,
+                                        app.flyover_open && app.flyover_window_visible,
                                         app.flyover_window,
+                                        // The palette window exists exactly while the
+                                        // palette model does: no per-site plumbing, a
+                                        // stage change keeps the same surface up.
+                                        app.command.is_some(),
+                                        app.palette_window,
                                         // Only dequeue once the main window
                                         // exists: keys pressed over the bus
                                         // during startup wait rather than
@@ -8033,6 +8070,27 @@ fn main() {
                                     });
                                 },
                                 // Steady state: forward redraws to the popout.
+                                (_, Some(w)) => {
+                                    if redraw {
+                                        let _ = w.update(cx, |_, _, cx| cx.notify());
+                                    }
+                                },
+                                (false, None) => {},
+                            }
+                            // Reconcile the palette window the same way.
+                            match (want_palette, palette) {
+                                (true, None) => {
+                                    let app_entity = app.clone();
+                                    let _ = cx.update(|cx| {
+                                        crate::palette_window::open_palette_window(app_entity, cx)
+                                    });
+                                },
+                                (false, Some(w)) => {
+                                    let _ = w.update(cx, |_, window, _| window.remove_window());
+                                    let _ = app.update(cx, |app: &mut App, _| {
+                                        app.palette_window = None;
+                                    });
+                                },
                                 (_, Some(w)) => {
                                     if redraw {
                                         let _ = w.update(cx, |_, _, cx| cx.notify());

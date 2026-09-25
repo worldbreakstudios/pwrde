@@ -22,7 +22,7 @@ use std::rc::Rc;
 use gpui::{
     AnyElement, App as GpuiApp, BoxShadow, ClickEvent, Context, Hsla,
     InteractiveElement, IntoElement, ParentElement, SharedString, StatefulInteractiveElement,
-    Styled, Window, deferred, anchored, div, point, px, prelude::FluentBuilder as _,
+    Styled, Window, div, point, px, prelude::FluentBuilder as _,
 };
 
 use crate::ui::icon;
@@ -185,8 +185,17 @@ impl App {
         self.command.as_ref().map_or("", |c| c.placeholder())
     }
 
-    /// The unified command palette, or an empty element while it is closed.
-    pub fn render_command(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    /// The palette panel alone, laid out for the window it is rendered in.
+    ///
+    /// The palette lives in its own window (`crate::palette_window`), so the
+    /// panel is the whole surface: no scrim, no click-to-dismiss backdrop,
+    /// and nothing painted over the main window's webviews.
+    pub(crate) fn render_command_panel(
+        &mut self,
+        win_w: f32,
+        win_h: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         // Keyboard navigation keeps its row in view; the wheel is free
         // otherwise (the target is consumed here, not re-applied per frame).
         if let Some(ix) = self.command_scroll_to.take() {
@@ -200,9 +209,6 @@ impl App {
         let theme = Theme::of(cx).clone();
         let chrome = crate::theme::current();
         let entity = cx.entity().downgrade();
-        let scale = self.scale();
-        let (surface_w, surface_h) = self.renderer.surface_size();
-        let (win_w, win_h) = (surface_w as f32 / scale, surface_h as f32 / scale);
         let panel_w = PANEL_W.min(win_w - 32.0).max(280.0);
 
         let chip_bg = theme.foreground.opacity(0.08);
@@ -781,41 +787,15 @@ impl App {
             .child(list)
             .child(footer);
 
-        let dismiss_entity = entity;
+        // Centered-high in its own window, exactly as it sat in the mock:
+        // `PANEL_TOP_FRAC` of the window height, never closer than
+        // `PANEL_TOP_MIN` to the top edge.
         let top = (win_h * PANEL_TOP_FRAC).max(PANEL_TOP_MIN);
-        // The click-to-dismiss layer spans the window, but the dimming scrim
-        // only covers the content area: the sidebar keeps its colours so the
-        // folders card does not read as blacked out behind the palette.
-        let scrim_x = self.sidebar_w();
-        let scrim = div()
+        div()
             .absolute()
-            .left(px(scrim_x))
-            .top(px(0.0))
-            .w(px((win_w - scrim_x).max(0.0)))
-            .h(px(win_h))
-            .bg(crate::renderer::color(chrome.scrim, 0.30));
-        let backdrop = div()
-            .id("command-scrim")
-            .occlude()
-            .w(px(win_w))
-            .h(px(win_h))
-            .flex()
-            .justify_center()
-            .items_start()
-            .pt(px(top))
-            .child(scrim)
-            .on_click(move |_ev: &ClickEvent, _win: &mut Window, app: &mut GpuiApp| {
-                if let Some(entity) = dismiss_entity.upgrade() {
-                    entity.update(app, |this, cx| {
-                        this.close_command();
-                        cx.notify();
-                    });
-                }
-            })
-            .child(panel);
-
-        deferred(anchored().position(point(px(0.0), px(0.0))).child(backdrop))
-            .priority(LAYER_PRIORITY)
+            .left(px(((win_w - panel_w) / 2.0).max(0.0)))
+            .top(px(top))
+            .child(panel)
             .into_any_element()
     }
 }

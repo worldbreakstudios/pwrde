@@ -27,6 +27,10 @@ pub const STOCK_TITLE: &str = "wezterm";
 /// User events forwarded to the gpui app over an mpsc channel.
 #[derive(Debug, Clone)]
 pub enum TermEvent {
+    /// A system-wide hotkey fired (⌥⌘P by default) while pwrde may not be the
+    /// frontmost app. Forwarded from the global-hotkey thread so the palette
+    /// can be summoned over whatever is in front.
+    GlobalPalette,
     /// Grid changed; a redraw is needed (coalesced). Tagged with the session id.
     Wakeup(u64),
     /// Shell exited. Tagged with the session id.
