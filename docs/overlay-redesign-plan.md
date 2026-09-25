@@ -142,10 +142,26 @@ where future global commands go.
 ### 4.4 Global terminal: always the fullscreen window
 
 Per the operator follow-up, the in-window flyover paint path goes away:
-`flyover_toggle` (`main.rs:2995-3016`) always opens `FlyoverPopout`, sized to the active
+`flyover_toggle` (`main.rs:2991-3008`) always opens `FlyoverPopout`, sized to the active
 screen instead of `880×480`; the canvas flyover paint, `flyover_ceiling` + the sidebar clip
 (`sidebar_ui.rs:112-130`, `:357`), `flyover_windowed`, and `flyover_anim` are deleted. That is
 another overlay gone, and the sidebar regains the full column height.
+
+**Landed on this branch:** `toggle_flyover` forces `flyover_windowed = true` at the single
+toggle entry point and `open_flyover_window` sizes the popout from the display's
+`visible_bounds()`, so the flyover is always its own fullscreen window and the in-window paint
+path is unreachable (no entry point turns it on: the `FlyoverPopout` dock-back action and the
+maximize chip are the only other writers of that mode).
+
+**Deferred to a follow-up (not done):** deleting the now-dead in-window machinery — the canvas
+paint block (`main.rs:6528-6555`), the `paint_flyover_layer` call in `paint_terminal`,
+`flyover_ceiling` + the sidebar clip (`sidebar_ui.rs:112-130`, `:357`), the flyover resize band
+(`resize_ui.rs:229-240`), the flyover mouse hit-tests (`main.rs:4018`, `:4095`, `:4198-4217`,
+`:4504-4512`, `:4565`), the `flyover_anim` tick (`main.rs:5705-5712`), and
+`flyover_toggle_windowed` / `flyover_toggle_maximized` (`main.rs:2340-2367`) with the
+`Action::FlyoverPopout` branch (`main.rs:5243`). It is scaffolding, not a live overlay — nothing
+reaches it — but it is still code that reads like an overlay path, so the deletion is worth a
+scoped commit of its own rather than being folded into the shipping change.
 
 ## 5. PR plan
 
