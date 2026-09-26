@@ -234,15 +234,6 @@ impl ToolForm {
     }
 }
 
-/// A side effect [`App::popout_key`] needs applied to a window other than
-/// the popout itself (entity code can't touch foreign windows directly).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PopoutEffect {
-    /// Bring the main window forward (the picker and the docked panel
-    /// render there).
-    ActivateMain,
-}
-
 /// The save-as-workspace modal: two text buffers, the focused field, and —
 /// once Enter moves past the fields — the destination choice.
 struct SaveWorkspaceModal {
@@ -533,15 +524,7 @@ struct App {
     flyover_height_frac: f32,
     /// Whether the panel fills the whole window (the □ button toggles it).
     flyover_maximized: bool,
-    /// Whether the flyover lives in its own popout window instead of the
-    /// in-window panel.
-    flyover_windowed: bool,
-    /// Desired visibility of the popout window; the frame pump reconciles
-    /// the actual window against this (⌘` flips it in windowed mode).
-    flyover_window_visible: bool,
-    /// The open popout window, when the pump has one up.
-    flyover_window: Option<gpui::WindowHandle<FlyoverPopout>>,
-    /// The main window, so popout-initiated flows (new-tab picker, docking)
+    /// The main window, so palette-initiated flows (new-tab picker, docking)
     /// can bring it forward.
     main_window: Option<gpui::AnyWindowHandle>,
     /// The open command-palette window, when the pump has one up. The palette
@@ -1122,7 +1105,7 @@ impl App {
         }
         let obscured = self.page != Page::Sessions
             || self.modal_overlay_open()
-            || (self.flyover_anim > 0.0 && !self.flyover_windowed)
+            || self.flyover_anim > 0.0
             || self.flow.open
             || matches!(self.drag, Drag::Tab { .. } | Drag::Group { .. } | Drag::Folder { .. });
         let mut placements = Vec::new();
@@ -2294,7 +2277,7 @@ impl App {
     /// Clear the unread dot on the flyover tab that just came on screen
     /// (panel opened or active tab switched).
     fn flyover_mark_read(&mut self) {
-        if !self.flyover_open && !(self.flyover_windowed && self.flyover_window_visible) {
+        if !self.flyover_open {
             return;
         }
         if let Some(tab) = self.flyover_tabs.get_mut(self.flyover_active) {
@@ -2325,7 +2308,6 @@ impl App {
         if self.flyover_tabs.is_empty() {
             self.flyover_open = false;
             self.flyover_focused = false;
-            self.flyover_window_visible = false;
         } else {
             if ti < self.flyover_active {
                 self.flyover_active -= 1;
@@ -2340,29 +2322,6 @@ impl App {
     pub(crate) fn flyover_toggle_maximized(&mut self) {
         self.flyover_maximized = !self.flyover_maximized;
         self.sync_flyover_layout(true);
-        self.request_redraw();
-    }
-
-    /// Show or hide the flyover's own window. The in-window panel is retired —
-    /// the global terminal is always a real window — so this is only the
-    /// window's visibility toggle: it never unsets `flyover_windowed` (which is
-    /// what used to blank the terminal on a docked↔popout press and could
-    /// restore the in-window paint path) and it moves `flyover_open` with
-    /// `flyover_window_visible`, so the pump's predicate stays coherent. The
-    /// sessions never move.
-    fn flyover_toggle_windowed(&mut self) {
-        self.flyover_windowed = true;
-        let showing =
-            Self::flyover_window_wanted(self.flyover_windowed, self.flyover_window_visible);
-        self.flyover_window_visible = !showing;
-        self.flyover_open = !showing;
-        self.flyover_focused = !showing;
-        if !showing {
-            self.flyover_mark_read();
-            if self.flyover_tabs.is_empty() {
-                self.open_flyover_picker();
-            }
-        }
         self.request_redraw();
     }
 
@@ -2390,11 +2349,10 @@ impl App {
     }
 
     /// True when the session is the active tab of the flyover and the flyover
-    /// is on screen — panel open, or popout window showing. On screen
-    /// regardless of which page is showing, since both surfaces overlay them.
+    /// is on screen. On screen regardless of which page is showing, since the
+    /// panel overlays them.
     fn flyover_visible(&self, id: u64) -> bool {
-        let showing =
-            if self.flyover_windowed { self.flyover_window_visible } else { self.flyover_open };
+        let showing = self.flyover_open;
         showing
             && self
                 .flyover_tabs
@@ -2790,7 +2748,6 @@ impl App {
         if for_flyover && self.flyover_tabs.is_empty() {
             self.flyover_open = false;
             self.flyover_focused = false;
-            self.flyover_window_visible = false;
         }
         self.request_redraw();
     }
@@ -2854,7 +2811,6 @@ impl App {
                         self.spawn_flyover_tab(entry.path);
                     } else if self.flyover_tabs.is_empty() {
                         self.flyover_open = false;
-                        self.flyover_window_visible = false;
                     }
                 } else {
                     let root = entry.path.clone().or(repo);
@@ -2986,44 +2942,26 @@ impl App {
         self.request_redraw();
     }
 
-    /// The one predicate for "the global terminal's window belongs on screen":
-    /// the frame pump reconciles the real window against exactly this, and the
-    /// ⌘` / popout toggles flip it. `flyover_windowed` is pinned true at every
-    /// entry point (`flyover_open` is the retired in-window flag and just
-    /// mirrors `flyover_window_visible`), so a stray in-window mode can never
-    /// make the popout appear, and the window can never be closed while the
-    /// flags still claim the surface is up. Pure so it is unit-testable.
-    fn flyover_window_wanted(windowed: bool, visible: bool) -> bool {
-        windowed && visible
-    }
-
-    /// Post-state `(windowed, open, visible)` for a ⌘` toggle. `showing` is the
-    /// *effective* state (`flyover_window_wanted`), not one flag, so a window
-    /// the user closed with its own close button — or one hidden by a
-    /// cancelled first-open picker — still comes back on the next press.
-    fn flyover_toggle_state(windowed: bool, visible: bool) -> (bool, bool, bool) {
-        let showing = Self::flyover_window_wanted(windowed, visible);
-        (true, !showing, !showing)
-    }
-
-    /// Toggle the flyover panel open/closed. The global terminal is always its
-    /// own real window, so this flips the *desired* visibility; the frame pump
-    /// reconciles the actual popout window against it. Sessions keep running
+    /// Toggle the flyover panel open/closed. The panel is an in-window overlay
+    /// that covers the whole window while maximized; sessions keep running
     /// either way.
     pub(crate) fn toggle_flyover(&mut self) {
-        let (windowed, open, visible) =
-            Self::flyover_toggle_state(self.flyover_windowed, self.flyover_window_visible);
-        self.flyover_windowed = windowed;
-        self.flyover_open = open;
-        self.flyover_window_visible = visible;
-        if open {
+        if self.flyover_open {
+            // Close: hide but keep sessions running.
+            self.flyover_open = false;
+            self.flyover_focused = false;
+            self.request_redraw();
+        } else {
+            // Open: show the panel.
+            self.flyover_open = true;
+            self.flyover_focused = true;
             self.flyover_mark_read();
             if self.flyover_tabs.is_empty() {
                 // First-ever open: open directory picker to create the first tab.
                 self.open_flyover_picker();
             }
+            self.request_redraw();
         }
-        self.request_redraw();
     }
 
     /// Apply a ⌘ action to the flyover's tabs — the subset of shortcuts the
@@ -3092,39 +3030,6 @@ impl App {
             session.scroll_to_bottom();
             session.clear_selection();
         }
-    }
-
-    /// Keyboard routing for the popout window. Global actions that concern
-    /// the main window (group switching, settings, …) are ignored here rather
-    /// than fired against a window that isn't showing. Returns an effect the
-    /// popout view must apply outside this entity.
-    fn popout_key(&mut self, ev: &KeyDownEvent) -> Option<PopoutEffect> {
-        self.modifiers = ev.keystroke.modifiers;
-        if ev.keystroke.modifiers.platform {
-            if pages::Action::ToggleFlyover.binding().matches(&ev.keystroke) {
-                // Hide: the pump closes the window; sessions keep running.
-                self.flyover_window_visible = false;
-                self.request_redraw();
-                return None;
-            }
-            if let Some(action) = pages::match_action(&ev.keystroke) {
-                if action == Action::FlyoverPopout {
-                    self.flyover_toggle_windowed();
-                    return Some(PopoutEffect::ActivateMain);
-                }
-                if self.flyover_shortcut(action) {
-                    self.request_redraw();
-                    // The new-tab picker renders in the main window.
-                    if action == Action::NewTab {
-                        return Some(PopoutEffect::ActivateMain);
-                    }
-                }
-            }
-            return None;
-        }
-        self.flyover_write_key(&ev.keystroke);
-        self.request_redraw();
-        None
     }
 
     fn start_fork(&mut self, repo: std::path::PathBuf, name: String, from: Option<String>) {
@@ -4579,7 +4484,6 @@ impl App {
                 let hover = if self.confirm.is_some() || self.webview_prompt.is_some() {
                     None
                 } else if self.flyover_open
-                    && !self.flyover_windowed
                     && !self.flyover_tabs.is_empty()
                     && self.flyover_rect_now().contains(px, py)
                 {
@@ -5259,7 +5163,6 @@ impl App {
             | Action::NewSection
             | Action::ToggleFlow => {},
             Action::ToggleFlyover => self.toggle_flyover(),
-            Action::FlyoverPopout => self.flyover_toggle_windowed(),
             // Open the active group's pull request in the browser; no-op (and
             // reported as such over the bus) when the group is known to have
             // no PR or isn't git-backed.
@@ -5798,7 +5701,6 @@ impl App {
             if self.flyover_tabs.is_empty() {
                 self.flyover_open = false;
                 self.flyover_focused = false;
-                self.flyover_window_visible = false;
             } else {
                 self.flyover_active = self.flyover_active.min(self.flyover_tabs.len() - 1);
             }
@@ -6135,7 +6037,6 @@ impl Render for App {
         // tile's tab strip when it collapses, and over a maximized flyover's
         // tab strip while that covers the window.
         let flyover_maxed = self.flyover_open
-            && !self.flyover_windowed
             && !self.flyover_tabs.is_empty()
             && self.flyover_maximized;
         let spot = workspace::traffic_light_spot(self.sidebar_collapsed, flyover_maxed);
@@ -6444,7 +6345,6 @@ impl App {
         // hovering the grab zone or mid-drag.
         if !overlay_open
             && self.flyover_open
-            && !self.flyover_windowed
             && !self.flyover_maximized
             && !self.flyover_tabs.is_empty()
         {
@@ -6483,7 +6383,6 @@ impl App {
                 let (cx, cy) = (self.cursor.0 as f32, self.cursor.1 as f32);
                 let flyover_covers = !overlay_open
                     && self.flyover_open
-                    && !self.flyover_windowed
                     && !self.flyover_tabs.is_empty()
                     && self.flyover_rect_now().contains(cx, cy);
                 if matches!(self.drag, Drag::None) && !flyover_covers {
@@ -6543,12 +6442,12 @@ impl App {
         // The flyover panel lives outside the workspace tree, so its layer is
         // built here from App state and slotted into the frame's flyover
         // fields (painted above tiles/labels, below the modal overlays).
-        // In windowed mode the popout window renders it instead. The gate
-        // matches the on_mouse_down hit-test (and sidebar_ui::flyover_ceiling):
+        // The gate matches the on_mouse_down hit-test (and
+        // sidebar_ui::flyover_ceiling):
         // with no tabs there is nothing to paint, and an empty card would
         // otherwise linger over the Sessions empty state during the close
         // animation.
-        if self.flyover_anim > 0.0 && !self.flyover_tabs.is_empty() && !self.flyover_windowed {
+        if self.flyover_anim > 0.0 && !self.flyover_tabs.is_empty() {
             let panel = self.flyover_rect_now();
             let flyover_cursor = if overlay_open || !matches!(self.drag, Drag::None) {
                 None
@@ -7011,8 +6910,8 @@ fn paint_quad(
     window.paint_quad(quad);
 }
 
-/// Per-frame constants the flyover layer painter needs — one bundle so the
-/// main window's paint and the popout window's paint stay in lockstep.
+/// Per-frame constants the flyover layer painter needs, bundled so the
+/// card, strip and terminal text are measured from one set of metrics.
 struct FlyoverPaintMetrics {
     origin: Point<Pixels>,
     /// Physical px → logical px (1.0 / scale).
@@ -7027,8 +6926,7 @@ struct FlyoverPaintMetrics {
 
 /// Paint one flyover layer (card + tab-strip quads, terminal text, geometry
 /// quads). The strip's pixels ride the element tree, so this is canvas
-/// quads + terminal text only. Shared by `paint_terminal`'s 4.5 step and
-/// the popout window's paint.
+/// quads + terminal text only. Used by `paint_terminal`'s 4.5 step.
 fn paint_flyover_layer(
     window: &mut Window,
     cx: &mut GpuiApp,
@@ -7073,510 +6971,6 @@ fn paint_flyover_layer(
     }
 }
 
-/// Root view of the flyover's popout window: a thin shell that renders the
-/// flyover tabs straight out of the shared [`App`] entity with its own
-/// [`Renderer`]. The sessions never move — only which surface paints them.
-/// The frame pump opens/closes this window to match
-/// `App::flyover_window_visible`.
-struct FlyoverPopout {
-    app: gpui::Entity<App>,
-    renderer: Renderer,
-    focus_handle: FocusHandle,
-    /// Pointer position in this window's physical px.
-    cursor: (f64, f64),
-    /// Keyboard modifiers from the last pointer event, so a mouse-tracking TUI
-    /// sees Shift/Alt/Ctrl on forwarded clicks (and Shift can override the grab).
-    modifiers: Modifiers,
-    /// True while a selection drag is in flight.
-    selecting: bool,
-    /// Buttons currently forwarded to a mouse-tracking TUI in this popout
-    /// (bit 0 = left, 1 = middle, 2 = right); mirrors `App::mouse_report`.
-    mouse_report_buttons: u8,
-    /// Sub-notch wheel travel, as in `App::scroll_accum`.
-    scroll_accum: f64,
-    /// Interactive rects from the last paint (tab strip controls), mirroring
-    /// `App::hot_rects` so hover repaints and the pointing hand work here too.
-    hot_rects: Vec<workspace::LayoutRect>,
-    /// Index into `hot_rects` of the hovered control (topmost wins).
-    ui_hover: Option<usize>,
-    /// Inline-image placements from the last paint (this window's px), so a
-    /// click on a picture opens it in Preview here too.
-    image_hits: Vec<ImageHit>,
-}
-
-impl FlyoverPopout {
-    /// The flyover fills the whole popout window.
-    fn panel_rect(&self) -> workspace::LayoutRect {
-        let (w, h) = self.renderer.surface_size();
-        workspace::LayoutRect { x: 0.0, y: 0.0, w: w as f32, h: h as f32 }
-    }
-
-    /// True when the popout's active terminal has grabbed the mouse and Shift
-    /// isn't held to force local selection.
-    fn popout_grabs_mouse(&self, cx: &mut Context<Self>) -> bool {
-        if self.modifiers.shift {
-            return false;
-        }
-        let app = self.app.read(cx);
-        app.flyover_tabs
-            .get(app.flyover_active)
-            .and_then(Tab::session)
-            .is_some_and(Session::app_grabs_mouse)
-    }
-
-    /// Forward one button event to the popout's active terminal as a mouse
-    /// report, mapping the pointer through this window's renderer. Mirrors
-    /// [`App::forward_mouse_report`].
-    fn forward_popout_mouse(&self, phase: MousePhase, btn: MouseBtn, cx: &mut Context<Self>) {
-        let scale = self.renderer.scale;
-        let content = workspace::flyover_content(&self.panel_rect(), scale);
-        let (mx, my) = (self.cursor.0 as f32, self.cursor.1 as f32);
-        let (col, row) = self.renderer.cell_at(&content, mx, my).unwrap_or((0, 0));
-        let m = self.modifiers;
-        self.app.update(cx, |app, _| {
-            if let Some(session) = app
-                .flyover_tabs
-                .get(app.flyover_active)
-                .and_then(Tab::session)
-            {
-                session.forward_mouse(phase, btn, col, row, m.shift, m.alt, m.control);
-            }
-        });
-    }
-
-    /// Forward a button press to a mouse-tracking terminal in the popout and
-    /// mark it held; `true` when consumed (so the caller skips selection).
-    fn popout_press(&mut self, btn: MouseBtn, cx: &mut Context<Self>) -> bool {
-        if !self.popout_grabs_mouse(cx) {
-            return false;
-        }
-        self.forward_popout_mouse(MousePhase::Press, btn, cx);
-        self.mouse_report_buttons |= MouseReport::bit(btn);
-        cx.notify();
-        true
-    }
-
-    /// Forward a button release for a held forwarded button; `true` when it
-    /// was held (and thus consumed as a report).
-    fn popout_release(&mut self, btn: MouseBtn, cx: &mut Context<Self>) -> bool {
-        let bit = MouseReport::bit(btn);
-        if self.mouse_report_buttons & bit == 0 {
-            return false;
-        }
-        self.mouse_report_buttons &= !bit;
-        self.forward_popout_mouse(MousePhase::Release, btn, cx);
-        cx.notify();
-        true
-    }
-
-    fn on_mouse_down(&mut self, cx: &mut Context<Self>) {
-        let scale = self.renderer.scale;
-        let (mx, my) = (self.cursor.0 as f32, self.cursor.1 as f32);
-        let panel = self.panel_rect();
-        let tab_bar = workspace::flyover_tab_bar(&panel, scale);
-        let content = workspace::flyover_content(&panel, scale);
-        let cell = self.renderer.cell_at(&content, mx, my);
-
-        let n = self.app.read(cx).flyover_tabs.len();
-        if n == 0 {
-            return;
-        }
-        if tab_bar.contains(mx, my) {
-            let tr = workspace::flyover_tab_rect(&panel, 0, n, scale, false);
-            let ti = (((mx - tr.x).max(0.0) / tr.w).floor() as usize).min(n - 1);
-            self.app.update(cx, |app, _| {
-                if workspace::flyover_tab_close_rect(&panel, ti, n, scale, false).contains(mx, my) {
-                    app.close_flyover_tab(ti);
-                } else {
-                    app.flyover_active = ti;
-                    app.flyover_mark_read();
-                    app.request_redraw();
-                }
-            });
-            cx.notify();
-            return;
-        }
-        // Content: an inline image is a click target (open in Preview); then a
-        // mouse-tracking TUI takes the click; else select text.
-        if let Some(data) = renderer::image_at(&self.image_hits, mx, my) {
-            if let Err(e) = open_image_in_preview(&data) {
-                eprintln!("pwrde: could not open the inline image in Preview: {e}");
-            }
-            return;
-        }
-        if self.popout_press(MouseBtn::Left, cx) {
-            return;
-        }
-        if let Some((col, row)) = cell {
-            self.app.update(cx, |app, _| {
-                if let Some(session) = app
-                    .flyover_tabs
-                    .get(app.flyover_active)
-                    .and_then(Tab::session)
-                {
-                    session.begin_selection(col, row);
-                }
-                app.request_redraw();
-            });
-            self.selecting = true;
-        }
-        cx.notify();
-    }
-
-    fn on_mouse_move(&mut self, cx: &mut Context<Self>) {
-        let scale = self.renderer.scale;
-        let (mx, my) = (self.cursor.0 as f32, self.cursor.1 as f32);
-        // A held forwarded button turns motion into drag reports.
-        if self.mouse_report_buttons != 0 {
-            for btn in [MouseBtn::Left, MouseBtn::Middle, MouseBtn::Right] {
-                if self.mouse_report_buttons & MouseReport::bit(btn) != 0 {
-                    self.forward_popout_mouse(MousePhase::Move, btn, cx);
-                }
-            }
-            cx.notify();
-            return;
-        }
-        if !self.selecting {
-            // Control hover: repaint only when the hovered control changes
-            // (mirrors `App::on_mouse_move`'s change detection).
-            let ui_hover = self
-                .hot_rects
-                .iter()
-                .enumerate()
-                .rev()
-                .find(|(_, r)| r.contains(mx, my))
-                .map(|(i, _)| i);
-            if ui_hover != self.ui_hover {
-                self.ui_hover = ui_hover;
-                cx.notify();
-            }
-            return;
-        }
-        let panel = self.panel_rect();
-        let content = workspace::flyover_content(&panel, scale);
-        if let Some((col, row)) = self.renderer.cell_at(&content, mx, my) {
-            self.app.update(cx, |app, _| {
-                if let Some(session) = app
-                    .flyover_tabs
-                    .get(app.flyover_active)
-                    .and_then(Tab::session)
-                {
-                    session.update_selection(col, row);
-                    app.request_redraw();
-                }
-            });
-            cx.notify();
-        }
-    }
-
-    fn on_scroll(&mut self, delta: gpui::ScrollDelta, cx: &mut Context<Self>) {
-        let scale = self.renderer.scale;
-        let panel = self.panel_rect();
-        let content = workspace::flyover_content(&panel, scale);
-        let (mx, my) = (self.cursor.0 as f32, self.cursor.1 as f32);
-        let cell_h = f64::from(self.renderer.cell_height);
-        let notches = match delta {
-            gpui::ScrollDelta::Lines(p) => f64::from(p.y),
-            gpui::ScrollDelta::Pixels(p) => f64::from(f32::from(p.y)) / (cell_h * 3.0),
-        };
-        let steps = scroll_steps(&mut self.scroll_accum, notches);
-        if steps == 0 {
-            return;
-        }
-        let cell = self.renderer.cell_at(&content, mx, my);
-        self.app.update(cx, |app, _| {
-            if let Some(session) = app
-                .flyover_tabs
-                .get(app.flyover_active)
-                .and_then(Tab::session)
-            {
-                let up = steps > 0;
-                if session.app_consumes_wheel() {
-                    let (col, row) = cell.unwrap_or((0, 0));
-                    for _ in 0..steps.unsigned_abs() {
-                        session.forward_wheel(up, col, row);
-                    }
-                } else {
-                    session.scroll_by(steps * 3);
-                }
-                app.request_redraw();
-            }
-        });
-        cx.notify();
-    }
-
-    /// Paint the flyover into the popout window. Mirrors `paint_terminal`'s
-    /// scale/resize discipline, then reuses the shared layer painter.
-    fn paint(&mut self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
-        let scale = window.scale_factor();
-        let phys_w = (f32::from(bounds.size.width) * scale) as u32;
-        let phys_h = (f32::from(bounds.size.height) * scale) as u32;
-        let term_font = renderer::terminal_font();
-        let chrome_font = renderer::chrome_font();
-        if scale != self.renderer.scale
-            || term_font != self.renderer.term_font()
-            || chrome_font != self.renderer.chrome_font_logical()
-        {
-            let term_cw = renderer::measure_cell_width(window, scale, term_font);
-            let chrome_cw = renderer::measure_cell_width(window, scale, chrome_font);
-            self.renderer.update_metrics(scale, term_font, term_cw, chrome_font, chrome_cw);
-        }
-        self.renderer.resize(phys_w, phys_h);
-
-        let panel = self.panel_rect();
-        let content = workspace::flyover_content(&panel, scale);
-        let (cols, rows) = self.renderer.grid_size_for(&content);
-        let (cw, ch) = self.renderer.pty_cell_size();
-        let dpi = (96.0 * scale) as u32;
-        let focused = window.is_window_active();
-
-        let renderer = &self.renderer;
-        let popout_cursor = if self.selecting {
-            None
-        } else {
-            Some((self.cursor.0 as f32, self.cursor.1 as f32))
-        };
-        let mut hot = Vec::new();
-        let (quads, panes, fg_quads) = self.app.update(cx, |app, _| {
-            // The popout owns these grids while windowed: keep the PTYs sized
-            // to this window, not the main panel.
-            for tab in &mut app.flyover_tabs {
-                if (cols, rows) != (tab.cols, tab.rows) {
-                    tab.cols = cols;
-                    tab.rows = rows;
-                    if let Some(session) = tab.session() {
-                        session.resize(cols, rows, cw, ch, dpi);
-                    }
-                }
-            }
-            renderer.flyover_overlay(
-                &app.flyover_tabs,
-                app.flyover_active,
-                &panel,
-                focused,
-                true,
-                false,
-                false,
-                popout_cursor,
-                // Strip pixels ride the element tree now; the canvas path
-                // only emits hot rects.
-                &mut hot,
-            )
-        });
-        self.image_hits = panes
-            .iter()
-            .flat_map(|pane| {
-                pane.images
-                    .iter()
-                    .map(|img| ImageHit::from_pane(pane.origin, img))
-            })
-            .collect();
-        self.hot_rects = hot;
-        self.ui_hover = popout_cursor.and_then(|(mx, my)| {
-            self.hot_rects
-                .iter()
-                .enumerate()
-                .rev()
-                .find(|(_, r)| r.contains(mx, my))
-                .map(|(i, _)| i)
-        });
-        let over_image = popout_cursor
-            .is_some_and(|(mx, my)| renderer::image_at(&self.image_hits, mx, my).is_some());
-        if self.ui_hover.is_some() || over_image {
-            window.set_window_cursor_style(CursorStyle::PointingHand);
-        }
-
-        let origin = bounds.origin;
-        let inv = 1.0 / scale;
-        let th = self.renderer.theme();
-        let metrics = FlyoverPaintMetrics {
-            origin,
-            inv,
-            font: gpui::font(renderer::FONT_FAMILY),
-            font_size: px(self.renderer.font_size() * inv),
-            line_height: px(self.renderer.cell_height * inv),
-            cell_height: self.renderer.cell_height,
-            shadow_rgb: th.shadow,
-        };
-        let term_bg = self.renderer.term_scheme_bg();
-        window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
-            window.paint_quad(gpui::fill(bounds, renderer::color(term_bg, 1.0)));
-            paint_flyover_layer(window, cx, &metrics, &quads, &panes, &fg_quads);
-        });
-    }
-}
-
-impl Render for FlyoverPopout {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let view = cx.entity();
-        let scale = window.scale_factor();
-        let panel = self.panel_rect();
-        let popout_cursor = if self.selecting {
-            None
-        } else {
-            Some((self.cursor.0 as f32, self.cursor.1 as f32))
-        };
-        div()
-            .size_full()
-            .track_focus(&self.focus_handle)
-            .key_context("Terminal")
-            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _win, cx| {
-                let effect = this.app.update(cx, |app, _| app.popout_key(ev));
-                if effect == Some(PopoutEffect::ActivateMain)
-                    && let Some(main) = this.app.read(cx).main_window
-                {
-                    let _ = main.update(cx, |_, window, _| window.activate_window());
-                }
-                cx.notify();
-            }))
-            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _window, cx| {
-                let s = f64::from(this.renderer.scale);
-                this.cursor = (f64::from(ev.position.x) * s, f64::from(ev.position.y) * s);
-                this.modifiers = ev.modifiers;
-                this.on_mouse_move(cx);
-            }))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, ev: &MouseDownEvent, _window, cx| {
-                    let s = f64::from(this.renderer.scale);
-                    this.cursor = (f64::from(ev.position.x) * s, f64::from(ev.position.y) * s);
-                    this.modifiers = ev.modifiers;
-                    this.on_mouse_down(cx);
-                }),
-            )
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(|this, ev: &MouseDownEvent, _window, cx| {
-                    let s = f64::from(this.renderer.scale);
-                    this.cursor = (f64::from(ev.position.x) * s, f64::from(ev.position.y) * s);
-                    this.modifiers = ev.modifiers;
-                    this.popout_press(MouseBtn::Right, cx);
-                }),
-            )
-            .on_mouse_down(
-                MouseButton::Middle,
-                cx.listener(|this, ev: &MouseDownEvent, _window, cx| {
-                    let s = f64::from(this.renderer.scale);
-                    this.cursor = (f64::from(ev.position.x) * s, f64::from(ev.position.y) * s);
-                    this.modifiers = ev.modifiers;
-                    this.popout_press(MouseBtn::Middle, cx);
-                }),
-            )
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, ev: &MouseUpEvent, _window, cx| {
-                    let s = f64::from(this.renderer.scale);
-                    this.cursor = (f64::from(ev.position.x) * s, f64::from(ev.position.y) * s);
-                    this.modifiers = ev.modifiers;
-                    if this.popout_release(MouseBtn::Left, cx) {
-                        return;
-                    }
-                    this.selecting = false;
-                    cx.notify();
-                }),
-            )
-            .on_mouse_up(
-                MouseButton::Right,
-                cx.listener(|this, ev: &MouseUpEvent, _window, cx| {
-                    let s = f64::from(this.renderer.scale);
-                    this.cursor = (f64::from(ev.position.x) * s, f64::from(ev.position.y) * s);
-                    this.modifiers = ev.modifiers;
-                    this.popout_release(MouseBtn::Right, cx);
-                }),
-            )
-            .on_mouse_up(
-                MouseButton::Middle,
-                cx.listener(|this, ev: &MouseUpEvent, _window, cx| {
-                    let s = f64::from(this.renderer.scale);
-                    this.cursor = (f64::from(ev.position.x) * s, f64::from(ev.position.y) * s);
-                    this.modifiers = ev.modifiers;
-                    this.popout_release(MouseBtn::Middle, cx);
-                }),
-            )
-            .on_scroll_wheel(cx.listener(|this, ev: &gpui::ScrollWheelEvent, _win, cx| {
-                this.on_scroll(ev.delta, cx);
-            }))
-            .child(
-                canvas(
-                    move |_bounds, _window, _cx| {},
-                    move |bounds, _prepaint, window, cx| {
-                        view.update(cx, |this, cx| {
-                            this.paint(bounds, window, cx);
-                        });
-                    },
-                )
-                .size_full(),
-            )
-            // Flyover tab strip: pixels on the element tree, painted over the
-            // canvas (which fills the window with the terminal background);
-            // clicks and drags still resolve on the canvas rects underneath.
-            .child(
-                self.app.update(cx, |app, cx| {
-                    app.render_flyover_chrome_popout(panel, scale, popout_cursor, cx)
-                }),
-            )
-    }
-}
-
-/// Open the flyover popout window and store its handle on the [`App`].
-/// Called by the frame pump when windowed mode wants a window up.
-fn open_flyover_window(app: gpui::Entity<App>, cx: &mut GpuiApp) {
-    // The global terminal is always its own real window, sized to the whole
-    // visible screen (hotkey-window style) so it can cover any pane — including
-    // the native webview tabs that no in-window element tree can layer over.
-    let bounds = cx
-        .primary_display()
-        .map(|d| d.visible_bounds())
-        .unwrap_or_else(|| Bounds::centered(None, gpui::size(px(880.0), px(480.0)), cx));
-    let app_for_view = app.clone();
-    let app_for_close = app.clone();
-    let handle = cx.open_window(
-        WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
-            titlebar: Some(gpui::TitlebarOptions {
-                title: Some("pwrde — flyover".into()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        },
-        move |window, cx| {
-            // The close button hides the window (sessions keep running);
-            // ⌘` or the dock action bring it back.
-            window.on_window_should_close(cx, move |_, cx| {
-                let _ = app_for_close.update(cx, |app, _| {
-                    app.flyover_window_visible = false;
-                    app.flyover_window = None;
-                });
-                true
-            });
-            let scale = window.scale_factor();
-            let cell_width = renderer::measure_cell_width(window, scale, renderer::FONT_SIZE);
-            cx.new(|cx| FlyoverPopout {
-                app: app_for_view.clone(),
-                renderer: Renderer::new(scale, cell_width, 0, 0),
-                focus_handle: cx.focus_handle(),
-                cursor: (0.0, 0.0),
-                modifiers: Modifiers::default(),
-                selecting: false,
-                mouse_report_buttons: 0,
-                hot_rects: Vec::new(),
-                ui_hover: None,
-                image_hits: Vec::new(),
-                scroll_accum: 0.0,
-            })
-        },
-    );
-    if let Ok(w) = handle {
-        let _ = w.update(cx, |view, window, cx| {
-            window.activate_window();
-            let fh = view.focus_handle.clone();
-            window.focus(&fh, cx);
-        });
-        let _ = app.update(cx, |app, _| app.flyover_window = Some(w));
-    }
-}
-
-/// Percent-decode a URL component (`%20` → space, and so on).
 fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -7967,10 +7361,7 @@ fn main() {
                         flyover_height_frac: settings::get_str("flyover.height")
                             .and_then(|s| s.parse().ok())
                             .unwrap_or(workspace::FLYOVER_DEFAULT_FRAC),
-                        flyover_maximized: false,
-                        flyover_windowed: false,
-                        flyover_window_visible: false,
-                        flyover_window: None,
+                        flyover_maximized: true,
                         main_window: None,
                         palette_window: None,
                         pending_keys: Vec::new(),
@@ -8011,7 +7402,7 @@ fn main() {
                                 .timer(Duration::from_millis(16))
                                 .await;
                             let Some(app) = handle.upgrade() else { break };
-                            let (redraw, want_popout, popout, want_palette, palette, (pending_keys, main)) =
+                            let (redraw, want_palette, palette, (pending_keys, main)) =
                                 app.update(cx, |app: &mut App, cx| {
                                     let redraw = app.drain_events();
                                     if redraw {
@@ -8019,11 +7410,6 @@ fn main() {
                                     }
                                     (
                                         redraw,
-                                        App::flyover_window_wanted(
-                                            app.flyover_windowed,
-                                            app.flyover_window_visible,
-                                        ),
-                                        app.flyover_window,
                                         // The palette window exists exactly while the
                                         // palette model does: no per-site plumbing, a
                                         // stage change keeps the same surface up.
@@ -8068,33 +7454,6 @@ fn main() {
                                 {
                                     eprintln!("bus key: main window gone, dropped {n} keystroke(s)");
                                 }
-                            }
-                            // Reconcile the popout window with the desired
-                            // state — window lifecycle stays here, on the
-                            // foreground executor, so entity code never has
-                            // to touch a window it doesn't own.
-                            match (want_popout, popout) {
-                                // Desired but not open: spawn it.
-                                (true, None) => {
-                                    let app_entity = app.clone();
-                                    let _ =
-                                        cx.update(|cx| open_flyover_window(app_entity, cx));
-                                },
-                                // Open but no longer desired: close it.
-                                (false, Some(w)) => {
-                                    let _ =
-                                        w.update(cx, |_, window, _| window.remove_window());
-                                    let _ = app.update(cx, |app: &mut App, _| {
-                                        app.flyover_window = None;
-                                    });
-                                },
-                                // Steady state: forward redraws to the popout.
-                                (_, Some(w)) => {
-                                    if redraw {
-                                        let _ = w.update(cx, |_, _, cx| cx.notify());
-                                    }
-                                },
-                                (false, None) => {},
                             }
                             // Reconcile the palette window the same way.
                             match (want_palette, palette) {
@@ -8170,7 +7529,7 @@ fn main() {
             },
         )
         .expect("open window");
-        // Remember the main window so popout flows can bring it forward.
+        // Remember the main window so the palette window can bring it forward.
         let _ = main_window.update(cx, |app, _, _| app.main_window = Some(main_window.into()));
 
         cx.activate(true);
@@ -8498,39 +7857,5 @@ mod tool_page_title_tests {
             "drip --tui"
         );
         assert_eq!(tool_label(None, "drip --tui"), "drip --tui");
-    }
-}
-
-#[cfg(test)]
-mod flyover_window_tests {
-    use super::App;
-
-    /// The pump's predicate, the ⌘` toggle, and the popout action all have to
-    /// agree: whatever state the flags are in, a toggle inverts the predicate
-    /// and never leaves it true while the window is down (the docked↔popout
-    /// press that used to blank the global terminal).
-    #[test]
-    fn toggle_inverts_the_window_predicate() {
-        for (windowed, open, visible) in [
-            (false, false, false),
-            (true, false, false),
-            (true, true, true),
-            // Hidden by the popout's own close button: `visible` cleared first.
-            (true, false, true),
-            // Hidden by a cancelled first-open picker: `open` cleared first.
-            (true, true, false),
-        ] {
-            let showing = App::flyover_window_wanted(windowed, visible);
-            let (w, o, v) = App::flyover_toggle_state(windowed, visible);
-            assert!(w, "the window is the only surface: windowed stays true");
-            assert_eq!(
-                App::flyover_window_wanted(w, v),
-                !showing,
-                "toggle from (windowed={windowed}, open={open}, visible={visible}) must invert the predicate",
-            );
-            assert_eq!(o, v, "open mirrors visible");
-        }
-        // A stray in-window mode can never open the popout window by accident.
-        assert!(!App::flyover_window_wanted(false, true));
     }
 }

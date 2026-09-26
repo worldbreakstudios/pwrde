@@ -717,7 +717,6 @@ pub fn action_group(action: Action) -> &'static str {
         Action::ToggleSidebar
         | Action::ToggleFolders
         | Action::ToggleFlyover
-        | Action::FlyoverPopout
         | Action::OpenPrInGithub
         | Action::ToggleFlow
         | Action::IncreaseFontSize
@@ -767,7 +766,6 @@ pub fn action_icon(action: Action) -> &'static str {
         Action::ToggleSidebar => ICON_PANEL_LEFT,
         Action::ToggleFolders => ICON_FOLDER_OPEN,
         Action::ToggleFlyover => ICON_ARROW_DOWN_TO_LINE,
-        Action::FlyoverPopout => ICON_PICTURE_IN_PICTURE_2,
         Action::OpenSettings => ICON_SETTINGS,
         Action::CommandPalette => ICON_COMMAND,
         Action::Quit => ICON_POWER,

@@ -1,5 +1,9 @@
 # rcn Port Audit — canvas-painted surfaces and a port plan
 
+> **Historical (tw-kanazawa-94wyt):** the flyover-as-a-separate-window work this audit
+> describes was reverted at the operator's request — the global terminal is an in-window
+> overlay again (maximized by default). Flyover rows below are read-only history.
+
 Scope note. This audit was written against worktree `7871e227` on 2026-08-29. Two small
 corrections to the brief came out of reading the code, and are reflected in the text
 below rather than in CLAUDE.md (which was not modified): (1) the sidebar collapse is a
@@ -47,8 +51,8 @@ match `App::right_w_for`, comment 542-546) → `terminal_area` (558) → `layout
 | 21 | Command palette | `palette_overlay` src/renderer.rs:1226+ (model in src/palette.rs), scrim 1240-1241 | palette layout consts | same modal chain; keyboard actions through gpui keystrokes, not canvas `on_key_down` | palette query/selection | Same layer. |
 | 22 | Confirm dialog + scrim | `confirm_overlay` src/renderer.rs:1685+ (scrim 1699+) | confirm layout consts | first in modal chain (src/main.rs:3090-3102) | `confirm` | Gates the Cleanup element tree off while open (`render_cleanup` shown only when `confirm.is_none()`, src/main.rs:5643-5645) — the canvas scrim owns the whole screen. |
 | 23 | Toast / message banner | `message_overlay` src/renderer.rs:1748+ | message layout consts | same modal chain | `message` | Same layer. |
-| 24 | Flyover — tab bar (tabs, close, unread dots, labels) | `flyover_overlay` src/renderer.rs:1794-1938 (card bg + `Shadow::Card` 1835, top border 1837-1843); in-window layer painted at src/main.rs:5830 gated only on `flyover_anim > 0 && !flyover_windowed`; popout paints unconditionally (src/main.rs:6502) | `flyover_rect` (1639-1659), `flyover_tab_bar` (1662-1664), `flyover_tab_rect` (1683-1699 — cedes `TRAFFIC_LIGHT_SAFE_W` when maximized), `flyover_tab_close_rect` (1703-1719), `flyover_buttons_w` (1674-1676) | popout: `FlyoverPopout::on_mouse_down` src/main.rs:6343-6384; in-window: flyover branch 3110-3160 (tab index 3136+, × close) | `flyover_active`, tabs, `flyover_anim`, `flyover_windowed` | Second window (`FlyoverPopout`, src/main.rs:6260-6281) paints from the *shared* App entity with its own Renderer ("The sessions never move — only which surface paints them", 6255-6259); labels clipped via `with_content_mask` in `paint_flyover_layer` (6242-6251). |
-| 25 | Flyover — minimize / maximize buttons ("–" / "□") | src/renderer.rs:1940-1977; hit-test src/main.rs:3126-3133 (min → `toggle_flyover`, max → `flyover_toggle_maximized`) | `flyover_minimize_rect` (1722-1725), `flyover_maximize_rect` (1728-1731); `flyover_buttons_w` reserves two bar-heights at the bar's right end, shaping *every* flyover tab width | as #24 | `flyover_anim`, `flyover_windowed`, `overlay_open` | Paint is **not** gated on `overlay_open` while hot rects are (5855-5857) — bug 3 (§c). |
+| 24 | Flyover — tab bar (tabs, close, unread dots, labels) | `flyover_overlay` src/renderer.rs:1794-1938 (card bg + `Shadow::Card` 1835, top border 1837-1843); in-window layer painted at src/main.rs:5830 gated only on `flyover_anim > 0 && !windowed mode`; popout paints unconditionally (src/main.rs:6502) | `flyover_rect` (1639-1659), `flyover_tab_bar` (1662-1664), `flyover_tab_rect` (1683-1699 — cedes `TRAFFIC_LIGHT_SAFE_W` when maximized), `flyover_tab_close_rect` (1703-1719), `flyover_buttons_w` (1674-1676) | popout: `the flyover popout view::on_mouse_down` src/main.rs:6343-6384; in-window: flyover branch 3110-3160 (tab index 3136+, × close) | `flyover_active`, tabs, `flyover_anim`, `windowed mode` | Second window (`the flyover popout view`, src/main.rs:6260-6281) paints from the *shared* App entity with its own Renderer ("The sessions never move — only which surface paints them", 6255-6259); labels clipped via `with_content_mask` in `paint_flyover_layer` (6242-6251). |
+| 25 | Flyover — minimize / maximize buttons ("–" / "□") | src/renderer.rs:1940-1977; hit-test src/main.rs:3126-3133 (min → `toggle_flyover`, max → `flyover_toggle_maximized`) | `flyover_minimize_rect` (1722-1725), `flyover_maximize_rect` (1728-1731); `flyover_buttons_w` reserves two bar-heights at the bar's right end, shaping *every* flyover tab width | as #24 | `flyover_anim`, `windowed mode`, `overlay_open` | Paint is **not** gated on `overlay_open` while hot rects are (5855-5857) — bug 3 (§c). |
 | 26 | Flyover — resize grab (top edge) + content | Top-edge grab → `Drag::FlyoverResize` unless maximized (src/main.rs:3115-3120, `FLYOVER_RESIZE_GRAB` 1619); content via `snapshot_pane` src/renderer.rs:1989-2002 | `flyover_content` (1667-1670), `FLYOVER_INSET` (1607), `MIN/MAX_FRAC` (1614-1615) | popout scroll/forward: src/main.rs:6428-6458; `forward_popout_mouse` maps cursor→cell (6305-6316) | `flyover_frac`, session scroll | Popout mouse reporting duplicates the app-side scroll/report logic — keep parity if the surface moves. |
 | 27 | Debug frame stats overlay | src/renderer.rs:1035-1052 | none | none | `debug.overlay` setting | Dev-only; harmless to keep or drop. |
 
@@ -127,7 +131,7 @@ dock-reserve vs float-overlap.
 **Bug 3 — stray minimize/maximize pair at bottom-right while a picker modal is open.**
 The flyover layer paints its own "–"/"□" window controls at src/renderer.rs:1940-1977
 (rects: src/workspace.rs:1722-1731). The in-window layer is gated only on
-`self.flyover_anim > 0.0 && !self.flyover_windowed` (src/main.rs:5830) — **not** on
+`self.flyover_anim > 0.0 && !self.windowed mode` (src/main.rs:5830) — **not** on
 `overlay_open` — while the modal system only clears *hot rects* when an overlay is open
 (src/renderer.rs:1057-1059; append suppressed at src/main.rs:5855-5857) and nulls the
 cursor. The picker's 0.30-alpha scrim (src/renderer.rs:1119-1122; painted over at
@@ -153,7 +157,7 @@ included — never both off in one PR. rcn components marked "registry" need `rc
    Surfaces: flyover min/max buttons (#25). Change: gate the in-window layer and the
    popout paint on `!overlay_open`, mirroring the hot-rect suppression (src/main.rs:5855-5857).
    rcn: none. Geometry: unchanged. Handlers: unchanged. Risk: low (a `where` clause on
-   one paint call site + one in `FlyoverPopout::paint`). Acceptance: open the dir
+   one paint call site + one in `the flyover popout view::paint`). Acceptance: open the dir
    picker while the flyover is visible — no "–"/"□" at bottom-right; hot rects and
    clicks unchanged.
 
@@ -340,7 +344,7 @@ Rough size check: steps 1-4 are each well under 300 lines; 5-8 are 300-600 each;
   `MAX_ROW_FONT_SCALE` 388) for all chrome text; renderer caps at
   `MIN_FONT_SIZE`/`MAX_FONT_SIZE` (src/renderer.rs:296-297). Both must keep applying
   after the port.
-- **Popout parity**: whatever the in-window flyover layer does, `FlyoverPopout`
+- **Popout parity**: whatever the in-window flyover layer does, `the flyover popout view`
   (src/main.rs:6260-6281) must keep painting the same layer from the shared App entity
   ("The sessions never move — only which surface paints them", 6255-6259) — including
   mouse-report buttons, scroll accumulation, and `popout_grabs_mouse` shift override.

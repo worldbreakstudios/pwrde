@@ -228,7 +228,6 @@ impl App {
         // is no meaningful height to drag).
         if self.flyover_anim > 0.0
             && self.flyover_open
-            && !self.flyover_windowed
             && !self.flyover_maximized
             && !self.flyover_tabs.is_empty()
         {

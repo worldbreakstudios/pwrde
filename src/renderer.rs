@@ -843,7 +843,7 @@ impl Renderer {
 
     /// The terminal background the active colors want: the selected scheme's
     /// bg, or the chrome theme's terminal background under the adaptive
-    /// default. The popout window fills with this behind the flyover card.
+    /// default. The flyover card sits on this when the panel is up.
     pub fn term_scheme_bg(&self) -> (u8, u8, u8) {
         crate::term_theme::selected(crate::theme::dark_active())
             .map_or(self.theme().term_bg, |t| t.bg)
@@ -852,14 +852,13 @@ impl Renderer {
     /// Build all geometry for the flyover terminal panel (card, tab strip,
     /// terminal text). Returns the frame fields to be set on the caller's Frame.
     /// `tabs` is the flyover tab list, `active` is the active tab index,
-    /// `panel_rect` is where the panel sits — the slide-animated bottom strip
-    /// in the main window (`workspace::flyover_rect`), or the full window in
-    /// the popout — and `focused` indicates whether it holds keyboard focus.
+    /// `panel_rect` is where the panel sits (`workspace::flyover_rect`: the
+    /// full window when maximized, otherwise the slide-animated bottom strip),
+    /// and `focused` indicates whether it holds keyboard focus.
     /// An open-but-empty panel (first-open picker flow) still paints its card
     /// so the slide-in reads; only the tab/content parts need tabs.
-    /// `show_window_buttons` draws the minimize/maximize squares at the
-    /// bar's right — the in-window panel wants them, the popout window has
-    /// real window controls instead.
+    /// `show_window_buttons` draws the minimize/maximize squares at the bar's
+    /// right, mirroring the native window controls.
     pub fn flyover_overlay(
         &self,
         tabs: &[crate::workspace::Tab],

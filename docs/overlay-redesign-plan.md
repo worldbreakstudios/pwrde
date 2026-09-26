@@ -1,4 +1,8 @@
 # Overlay redesign — toasts in the sidebar, a real command-palette window, a fullscreen global terminal
+> **Superseded (tw-kanazawa-94wyt):** the separate flyover popout window this document
+> argues for was reverted at the operator's request — the global terminal is an
+> in-window overlay again (maximized by default). References below are historical.
+
 
 Status: **shipped on this branch** — §4.1 (`src/toast_ui.rs`: the two-kind
 sidebar toast stack, every producer/reader rewired, no `App.message` left), §4.2
@@ -62,7 +66,7 @@ the two big panels become their own OS windows.
 | Message panel | `App.message: Option<(String, bool)>` (`src/main.rs:450-452`) | `modal_ui::render_message` (`:118+`) | **Converted to toasts.** `bool` = dismissable. |
 | Toast note | `App.toast_note: Option<(String, Instant)>` (`src/main.rs:453-456`) | rcn `Toast` (`src/ui/toast.rs`) | Already a toast; moves from bottom-right viewport into the sidebar stack. Expiry logic + tests already exist (`src/bus_exec.rs:700-710`, test at `:1181`). |
 | Command palette | `App.command: Option<CommandPalette>` | `command_ui::render_command` (`src/command_ui.rs:189`) | **Becomes a real window.** |
-| Global terminal (flyover) | `flyover_open` / `flyover_windowed` | canvas paint + `flyover_ui` strip | **Always the fullscreen window** (operator follow-up). |
+| Global terminal (flyover) | `flyover_open` | canvas paint + `flyover_ui` strip | **In-window overlay, maximized by default** (the fullscreen-window follow-up was reverted). |
 | Save-workspace / webview prompt | `App.save_ws`, `App.webview_prompt` | inline panels | Small; unchanged for now. |
 
 Producers of the `message` overlay that must be re-pointed: `src/bus_exec.rs:263` (screenshot
@@ -116,16 +120,16 @@ expires on its own timer.)
 
 ### 4.2 Command palette — a separate window
 
-pwrde already does exactly this for the flyover (`open_flyover_window`, `src/main.rs:7495-7545`,
-`FlyoverPopout` at `:7059`): a lazily created `cx.open_window` view that **reuses `App` as the
-single source of truth** and pulls `App.window` only for native operations. The palette copies
-that shape — **landed as `src/palette_window.rs` on this branch**, with the pump reconciling
-the window against `App.command.is_some()`:
+pwrde already does exactly this for the palette: a lazily created `cx.open_window` view that
+**reuses `App` as the single source of truth** and pulls `App.window` only for native operations
+(the flyover briefly used the same shape before it went back in-window, see §4.4). **Landed as
+`src/palette_window.rs` on this branch**, with the pump reconciling the window against
+`App.command.is_some()`:
 
 - `PaletteWindow` view in `src/palette.rs` (or a new `src/palette_window.rs`), holding the
   same `App` entity plus a `Renderer`-light context for text measurement.
 - `App.command` stays the state; a new `App.palette_window: Option<WindowHandle<PaletteWindow>>`
-  plus `palette_window_visible: bool` mirror `flyover_window*` (`:533-538`).
+  plus `palette_window_visible: bool` mirror the flyover's old window flags (`:533-538`).
 - Hotkey: `show → open or activate_window + focus the search input`; pressed again while the
   palette is up → `hide` (window kept alive, like the flyover's `on_window_should_close` hide
   hook). Window is `WindowBounds::Windowed`, centered, ~560×420, `titlebar` transparent so it
@@ -158,35 +162,25 @@ shortcut on the machine). Registered while pwrde runs, so the palette can be sum
 pwrde in the background — that is the "spotlight / raycast" flow, and the same hotkey table is
 where future global commands go.
 
-### 4.4 Global terminal: always the fullscreen window
+### 4.4 Global terminal: back in-window (reverted)
 
-Per the operator follow-up, the in-window flyover paint path goes away:
-`flyover_toggle` (`main.rs:2991-3008`) always opens `FlyoverPopout`, sized to the active
-screen instead of `880×480`; the canvas flyover paint, `flyover_ceiling` + the sidebar clip
-(`sidebar_ui.rs:112-130`, `:357`), `flyover_windowed`, and `flyover_anim` are deleted. That is
-another overlay gone, and the sidebar regains the full column height.
+The operator follow-up this section described — the flyover as its own fullscreen window — was
+**reverted on `tw-kanazawa-94wyt`**. The global terminal is painted inside the main window
+again, covering the whole frame, with the macOS traffic lights drawn on its strip and
+`flyover_maximized` defaulting to true. The popout view, the window-opening helper, the
+windowed/visibility flags and the frame pump's flyover reconciliation are all deleted;
+`toggle_flyover` is a plain `flyover_open` flip, and `flyover_open` is again the single
+visibility flag. The command-palette window (§4.2) is unchanged.
 
-**Landed on this branch:** `toggle_flyover` forces `flyover_windowed = true` at the single
-toggle entry point and `open_flyover_window` sizes the popout from the display's
-`visible_bounds()`, so the flyover is always its own fullscreen window.
+Historical detail, as it landed before the revert: `flyover_toggle` forced a now-deleted
+windowed flag at the single toggle entry point and the window-opening helper sized the popout
+from the display's `visible_bounds()`; the dock action only showed or hid the window and never
+unset that flag, and the pump asked one pure predicate `App::flyover_window_wanted(windowed,
+visible)` which the ⌘` toggle flipped against too.
 
-**Reconciled after review:** the pump's predicate and the `FlyoverPopout` action disagreed —
-the dock branch flipped `flyover_windowed` back off, which both blanked the terminal on that
-press and left the in-window paint path reachable. The dock branch is gone: the action now only
-shows or hides the window and never unsets `windowed` (its label reads "Flyover: show/hide
-window"), and the pump asks one pure predicate, `App::flyover_window_wanted(windowed, visible)`,
-which the ⌘` toggle also flips against (unit-tested, `src/main.rs`). `flyover_open` is the
-retired in-window flag and now only mirrors `flyover_window_visible`.
-
-**Deferred to a follow-up (not done):** deleting the remaining dead in-window machinery — the
-canvas paint block (`main.rs:6528-6555`), the `paint_flyover_layer` call in `paint_terminal`,
-`flyover_ceiling` + the sidebar clip (`sidebar_ui.rs:112-130`, `:357`), the flyover resize band
-(`resize_ui.rs:229-240`), the flyover mouse hit-tests (`main.rs:4018`, `:4095`, `:4198-4217`,
-`:4504-4512`, `:4565`), the `flyover_anim` tick (`main.rs:5705-5712`), `flyover_maximized`
-(`main.rs:2340-2344`), and the retired `flyover_open` / `flyover_focused` flags (which now
-only mirror the window's visibility). Each is unreachable while `flyover_windowed` stays
-true, but it is still code that reads like an overlay path, so the deletion is worth a
-scoped commit of its own rather than being folded into the shipping change.
+Because the in-window paint path was never deleted, the revert is small: canvas paint,
+`flyover_ceiling` + the sidebar clip (`sidebar_ui.rs`), the flyover resize band
+(`resize_ui.rs`), the flyover mouse hit-tests and `flyover_anim` are all live again.
 
 ## 5. PR plan
 
