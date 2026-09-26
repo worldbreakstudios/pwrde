@@ -971,7 +971,7 @@ fn resize_main_window(_width: f32, _height: f32) -> Result<(), String> {
 }
 
 /// The app's main `NSWindow`: `NSApp.mainWindow`, else the largest window
-/// (the flyover popout is a separate, smaller window).
+/// (the palette window is a separate, smaller window).
 #[cfg(target_os = "macos")]
 unsafe fn main_ns_window() -> Result<*mut objc::runtime::Object, String> {
     use objc::runtime::{Class, Object};

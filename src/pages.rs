@@ -149,7 +149,6 @@ pub enum Action {
     OpenSettings,
     CommandPalette,
     ToggleFlyover,
-    FlyoverPopout,
     SaveWorkspace,
     OpenPrInGithub,
     ToggleFlow,
@@ -164,7 +163,7 @@ pub enum Action {
 
 impl Action {
     /// Keyboard-page row order.
-    pub const ALL: [Action; 44] = [
+    pub const ALL: [Action; 43] = [
         Action::SplitRight,
         Action::SplitDown,
         Action::NewTab,
@@ -198,7 +197,6 @@ impl Action {
         Action::OpenSettings,
         Action::CommandPalette,
         Action::ToggleFlyover,
-        Action::FlyoverPopout,
         Action::SaveWorkspace,
         Action::OpenPrInGithub,
         Action::ToggleFlow,
@@ -247,7 +245,6 @@ impl Action {
             Action::OpenSettings => "open_settings",
             Action::CommandPalette => "command_palette",
             Action::ToggleFlyover => "toggle_flyover",
-            Action::FlyoverPopout => "flyover_popout",
             Action::SaveWorkspace => "save_workspace",
             Action::OpenPrInGithub => "open_pr_in_github",
             Action::ToggleFlow => "toggle_flow",
@@ -296,7 +293,6 @@ impl Action {
             Action::OpenSettings => "Open settings",
             Action::CommandPalette => "Command palette",
             Action::ToggleFlyover => "Toggle Flyover Terminal",
-            Action::FlyoverPopout => "Flyover: show/hide window",
             Action::SaveWorkspace => "Save as workspace",
             Action::OpenPrInGithub => "Open PR in GitHub",
             Action::ToggleFlow => "Toggle Flow agent",
@@ -353,7 +349,6 @@ impl Action {
             Action::OpenSettings => (false, false, false, ","),
             Action::CommandPalette => (false, false, false, "p"),
             Action::ToggleFlyover => (false, false, false, "`"),
-            Action::FlyoverPopout => (true, false, false, "`"),
             Action::SaveWorkspace => (true, false, false, "s"),
             Action::OpenPrInGithub => (true, false, false, "g"),
             Action::ToggleFlow => (false, false, false, "j"),

@@ -360,7 +360,7 @@ impl App {
     /// slide animation, so the sidebar's floor tracks the panel on the way in
     /// and out instead of snapping once it lands.
     pub(crate) fn flyover_ceiling(&self) -> Option<f32> {
-        if !self.flyover_open || self.flyover_windowed || self.flyover_tabs.is_empty() {
+        if !self.flyover_open || self.flyover_tabs.is_empty() {
             return None;
         }
         let panel = self.flyover_rect_now();

@@ -8,11 +8,6 @@
 //! path, which still resolves every click, drag and resize. The card, its
 //! borders, the divider and the terminal content stay on the canvas.
 //!
-//! The popout window (`FlyoverPopout`) rides the same element strip via
-//! [`render_flyover_chrome_popout`]: no window buttons there, its own cursor,
-//! and the canvas path below it keeps resolving clicks — `flyover_overlay`
-//! now emits hot rects only, never strip pixels.
-
 use std::rc::Rc;
 
 use gpui::{
@@ -38,7 +33,7 @@ impl App {
     /// The flyover strip while the panel shows in this window, or an empty
     /// element.
     pub fn render_flyover_chrome(&self, cx: &mut Context<Self>) -> AnyElement {
-        if self.flyover_anim <= 0.0 || self.flyover_windowed || self.flyover_tabs.is_empty() {
+        if self.flyover_anim <= 0.0 || self.flyover_tabs.is_empty() {
             return div().into_any_element();
         }
         cx.set_global(Theme::from_chrome(crate::theme::current()));
@@ -170,80 +165,6 @@ impl App {
             }
         }
 
-        div()
-            .absolute()
-            .left(px(0.0))
-            .top(px(0.0))
-            .size_full()
-            .font_family(crate::renderer::FONT_FAMILY)
-            .text_size(px(font))
-            .child(strip_el)
-            .into_any_element()
-    }
-
-    /// The popout window's tab strip: the same element tree as
-    /// [`Self::render_flyover_chrome`] — same `workspace::flyover_*` rects,
-    /// same [`PressHandler`] → [`App::press_flyover_tab`] dispatch — minus
-    /// window buttons and the in-window modal/animation gates, since the
-    /// popout has no other chrome. `panel` / `scale` / `cursor` come from the
-    /// popout's own render pass (mirroring what its canvas paint computes).
-    /// Clicks still resolve on the canvas rects underneath.
-    pub fn render_flyover_chrome_popout(
-        &self,
-        panel: LayoutRect,
-        scale: f32,
-        cursor: Option<(f32, f32)>,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        if self.flyover_tabs.is_empty() {
-            return div().into_any_element();
-        }
-        cx.set_global(Theme::from_chrome(crate::theme::current()));
-        let th = crate::theme::current();
-        let inv = 1.0 / scale;
-        let bar = workspace::flyover_tab_bar(&panel, scale);
-        let n = self.flyover_tabs.len();
-        let style = StripStyle {
-            pill_radius: Some(PILL_RADIUS),
-            chip_radius: Some(CHIP_RADIUS),
-            ..StripStyle::from_scheme(th, 0.09)
-        };
-        let hov = |r: &LayoutRect| cursor.is_some_and(|(x, y)| r.contains(x, y));
-        let font = crate::renderer::chrome_font();
-        let entity = cx.entity().downgrade();
-        let tabs: Vec<StripTab> = self
-            .flyover_tabs
-            .iter()
-            .enumerate()
-            .map(|(i, tab)| StripTab {
-                title: tab.title(),
-                unread: tab.unread,
-                pinned: tab.pinned,
-                tab: workspace::flyover_tab_rect(&panel, i, n, scale, false),
-                close: workspace::flyover_tab_close_rect(&panel, i, n, scale, false),
-            })
-            .collect();
-        let press_entity = entity;
-        let on_press: PressHandler = Rc::new(move |ti, close, ev, app| {
-            app.stop_propagation();
-            if let Some(entity) = press_entity.upgrade() {
-                entity.update(app, |this, cx| {
-                    this.note_pointer(ev);
-                    this.press_flyover_tab(ti, close);
-                    cx.notify();
-                });
-            }
-        });
-        let strip_el = tab_strip(
-            &bar,
-            inv,
-            &tabs,
-            self.flyover_active,
-            &hov,
-            &style,
-            &cx.global::<Theme>().icons.x(),
-            on_press,
-        );
         div()
             .absolute()
             .left(px(0.0))

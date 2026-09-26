@@ -246,7 +246,7 @@ impl App {
     fn chrome_placements(&self) -> Vec<ChromePlacement> {
         if self.page != crate::pages::Page::Sessions
             || self.modal_overlay_open()
-            || (self.flyover_anim > 0.0 && !self.flyover_windowed)
+            || self.flyover_anim > 0.0
             || self.flow.open
             || matches!(
                 self.drag,
