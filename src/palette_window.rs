@@ -20,17 +20,27 @@
 //! is immediately typeable, with no click needed.
 
 use gpui::{
-    div, px, size, App as GpuiApp, AppContext, Bounds, Context, Focusable, FocusHandle,
-    InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Render, Styled, Window,
-    WindowBounds, WindowOptions,
+    div, point, px, size, AnyWindowHandle, App as GpuiApp, AppContext, Bounds, Context, DisplayId,
+    Focusable, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Pixels,
+    Render, Size, Styled, Window, WindowBounds, WindowOptions,
 };
 
 use crate::App;
+
+/// How far down its display the card's top edge sits: 30% of the display's
+/// height. Dead center (50%) leaves the card floating in the middle of the
+/// screen; a search-bar height reads as "hanging from above".
+const TOP_FRAC: f32 = 0.30;
 
 /// The palette window's view: one panel, sized to the window it owns.
 pub(crate) struct PaletteWindow {
     app: gpui::Entity<App>,
     focus_handle: FocusHandle,
+    /// The card's top edge, in logical px from the top of its display. The
+    /// card is only measured after prepaint and the window resizes from its
+    /// bottom-left corner, so the top is re-anchored to this whenever the
+    /// card's height changes.
+    top_px: f32,
 }
 
 impl Render for PaletteWindow {
@@ -60,6 +70,7 @@ impl Render for PaletteWindow {
             window.focus(&input_focus, cx);
         }
         let panel = self.app.update(cx, |app, cx| app.command_panel_card(cx));
+        let top_px = self.top_px;
         div()
             .size_full()
             .flex()
@@ -79,11 +90,16 @@ impl Render for PaletteWindow {
                     .w_full()
                     .flex()
                     .flex_col()
-                    .on_children_prepainted(|bounds, window, _cx| {
+                    .on_children_prepainted(move |bounds, window, _cx| {
                         let Some(card) = bounds.first() else { return };
                         let current = f32::from(window.viewport_size().height);
                         if (f32::from(card.size.height) - current).abs() > 1.0 {
                             window.resize(card.size);
+                            // AppKit keeps the bottom-left corner fixed through a
+                            // resize, so without this the top edge would creep
+                            // down (card shrinks) or hang off the display (card
+                            // grows). Put it back on the 30% line it opened on.
+                            pin_window_top(window, top_px);
                         }
                     })
                     .child(panel),
@@ -100,11 +116,27 @@ pub(crate) fn open_palette_window(app: gpui::Entity<App>, cx: &mut GpuiApp) {
     // The window is the card: exactly `PANEL_W` wide (narrower than
     // `Bounds::centered`'s default), then shrunk to the panel's height on the
     // first prepaint. The height here is only the pre-measure placeholder.
-    let bounds = Bounds::centered(None, size(px(crate::command_ui::PANEL_W), px(240.0)), cx);
+    let panel_size = size(px(crate::command_ui::PANEL_W), px(240.0));
+    // Open where the user is looking. `Bounds::centered(None, ..)` always fell
+    // back to the primary display; on a multi-monitor setup that is not where
+    // the focused window is. Preference order: the focused window's display
+    // (⌘P inside pwrde), then pwrde's main window (the global ⌥⌘P hotkey can
+    // fire while another app is frontmost), then the primary display.
+    let main_window = app.read(cx).main_window;
+    let display = palette_display_id(cx, main_window)
+        .and_then(|id| cx.find_display(id))
+        .or_else(|| cx.primary_display());
+    let display_id = display.as_ref().map(|display| display.id());
+    let bounds = match display.as_ref() {
+        Some(display) => palette_bounds(display.bounds(), panel_size),
+        None => Bounds { origin: point(px(0.), px(0.)), size: panel_size },
+    };
+    let top_px = f32::from(bounds.origin.y);
     let app_for_view = app.clone();
     let app_for_close = app.clone();
     let handle = cx.open_window(
         WindowOptions {
+            display_id,
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             // Chrome-less: the traffic lights are hidden right after open and
             // `appears_transparent` gives the card the whole frame (no title
@@ -131,18 +163,131 @@ pub(crate) fn open_palette_window(app: gpui::Entity<App>, cx: &mut GpuiApp) {
             cx.new(|cx| PaletteWindow {
                 app: app_for_view.clone(),
                 focus_handle: cx.focus_handle(),
+                top_px,
             })
         },
     );
     if let Ok(w) = handle {
         let _ = w.update(cx, |_view, window, _cx| {
             strip_window_chrome(window);
+            // Enforce the placement on the window we just opened too, so the
+            // pre-measure height cannot leave the card off the 30% line.
+            pin_window_top(window, top_px);
             // The field claims focus on the first render
             // (`PaletteWindow::render`), so do not park focus on the root view
             // here: that would steal it back from the input on open.
             window.activate_window();
         });
         let _ = app.update(cx, |app, _| app.palette_window = Some(w));
+    }
+}
+
+/// Where the palette window sits on `display_bounds` — expressed in that
+/// display's own coordinate space: horizontally centered, with its top edge at
+/// [`TOP_FRAC`] of the display's height.
+///
+/// Pure so the placement is unit-tested without a window server. A card taller
+/// than the space below the line is pulled up until it fits, so a full-height
+/// window can never hang off the bottom of the display.
+pub(crate) fn palette_bounds(
+    display_bounds: Bounds<Pixels>,
+    size: Size<Pixels>,
+) -> Bounds<Pixels> {
+    let display_top = f32::from(display_bounds.origin.y);
+    let display_h = f32::from(display_bounds.size.height);
+    let top = display_top + display_h * TOP_FRAC;
+    let max_top = display_top + (display_h - f32::from(size.height)).max(0.0);
+    let x = f32::from(display_bounds.origin.x)
+        + (f32::from(display_bounds.size.width) - f32::from(size.width)) * 0.5;
+    let origin = point(px(x), px(top.min(max_top)));
+    Bounds { origin, size }
+}
+
+/// The display the palette should open on: the focused window's display when
+/// there is one, else the app's main window's, else `None` (the caller falls
+/// back to the primary display).
+fn palette_display_id(
+    cx: &mut GpuiApp,
+    main_window: Option<AnyWindowHandle>,
+) -> Option<DisplayId> {
+    let display_of = |cx: &mut GpuiApp, handle: AnyWindowHandle| {
+        handle
+            .update(cx, |_, window, cx| {
+                window.display(cx).map(|display| display.id())
+            })
+            .ok()
+            .flatten()
+    };
+    let active = cx.active_window();
+    if let Some(id) = active.and_then(|handle| display_of(cx, handle)) {
+        return Some(id);
+    }
+    main_window.and_then(|handle| display_of(cx, handle))
+}
+
+/// Re-anchor the window's top edge to `logical_top` (px from the top of its
+/// display) after AppKit resized it from the bottom-left corner.
+///
+/// The logical coordinate is converted back to AppKit's bottom-left screen
+/// space using the window's own screen, so it holds on any monitor of a
+/// multi-monitor setup.
+fn pin_window_top(window: &Window, logical_top: f32) {
+    use objc::runtime::Object;
+    use objc::{msg_send, sel, sel_impl};
+
+    // AppKit geometry declared locally: the crate has no CoreGraphics structs
+    // and `objc` needs a type encoding to send these selectors.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CGPoint {
+        x: f64,
+        y: f64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CGSize {
+        width: f64,
+        height: f64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CGRect {
+        origin: CGPoint,
+        size: CGSize,
+    }
+
+    unsafe impl objc::Encode for CGPoint {
+        fn encode() -> objc::Encoding {
+            unsafe { objc::Encoding::from_str("{CGPoint=dd}") }
+        }
+    }
+
+    unsafe impl objc::Encode for CGSize {
+        fn encode() -> objc::Encoding {
+            unsafe { objc::Encoding::from_str("{CGSize=dd}") }
+        }
+    }
+
+    unsafe impl objc::Encode for CGRect {
+        fn encode() -> objc::Encoding {
+            unsafe { objc::Encoding::from_str("{CGRect={CGPoint=dd}{CGSize=dd}}") }
+        }
+    }
+
+    let Some(ns_window) = crate::ns_window(window) else {
+        return;
+    };
+    unsafe {
+        let screen: *mut Object = msg_send![ns_window, screen];
+        if screen.is_null() {
+            return;
+        }
+        let screen_frame: CGRect = msg_send![screen, frame];
+        let frame: CGRect = msg_send![ns_window, frame];
+        let top = screen_frame.origin.y + screen_frame.size.height - logical_top as f64;
+        let _: () = msg_send![ns_window, setFrameTopLeftPoint: CGPoint { x: frame.origin.x, y: top }];
     }
 }
 
@@ -174,5 +319,44 @@ fn strip_window_chrome(window: &Window) {
         // hide it explicitly rather than merely leaving `title: None`.
         let _: () = msg_send![ns_window, setTitleVisibility: 1isize];
         let _: () = msg_send![ns_window, setTitlebarAppearsTransparent: YES];
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{point, px, size};
+
+    fn display(x: f32, y: f32, w: f32, h: f32) -> Bounds<Pixels> {
+        Bounds { origin: point(px(x), px(y)), size: size(px(w), px(h)) }
+    }
+
+    fn card() -> Size<Pixels> {
+        size(px(crate::command_ui::PANEL_W), px(240.0))
+    }
+
+    #[test]
+    fn top_edge_sits_at_thirty_percent_of_the_display() {
+        let bounds = palette_bounds(display(0.0, 0.0, 1440.0, 900.0), card());
+        let top = f32::from(bounds.origin.y);
+        let left = f32::from(bounds.origin.x);
+        assert!((top - 270.0).abs() < 0.01, "top {top} != 30% of 900");
+        assert!((left - 440.0).abs() < 0.01, "left {left} != centered");
+    }
+
+    #[test]
+    fn top_follows_a_secondary_displays_origin() {
+        // A display laid out to the right of the primary: the card must land on
+        // that display's own 30% line, not the primary's.
+        let bounds = palette_bounds(display(1920.0, 0.0, 1440.0, 900.0), card());
+        assert!((f32::from(bounds.origin.x) - 2360.0).abs() < 0.01);
+        assert!((f32::from(bounds.origin.y) - 270.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_card_taller_than_the_space_below_is_pulled_up() {
+        let card = size(px(560.0), px(800.0));
+        let bounds = palette_bounds(display(0.0, 0.0, 1440.0, 900.0), card);
+        assert!((f32::from(bounds.origin.y) - 100.0).abs() < 0.01, "card must stay on screen");
     }
 }
