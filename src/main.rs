@@ -40,6 +40,7 @@ mod links;
 mod pages;
 mod palette;
 mod palette_window;
+mod settings_window;
 mod persist;
 mod picker;
 mod pwrspace;
@@ -459,12 +460,18 @@ struct App {
     /// The Settings sidebar's search field: a real rcn text input. Its text
     /// is mirrored into `settings_query` (an observer keeps them in step) so
     /// gpui-free readers keep working, and its focus is reflected into
-    /// `settings_search_focus` once per render.
     settings_search: gpui::Entity<crate::ui::Input>,
     /// Search query in the Settings sidebar search box.
     settings_query: String,
-    /// Whether the Settings sidebar search box has keyboard focus.
-    settings_search_focus: bool,
+    /// Whether the Settings window should be up (the pump reconciles the
+    /// actual window against this, like the palette window).
+    settings_open: bool,
+    /// The open Settings window, when the pump has one up.
+    settings_window: Option<gpui::WindowHandle<crate::settings_window::SettingsWindow>>,
+    /// Set when an OpenSettings action found the window already up: the pump
+    /// consumes it and brings the window forward (activation needs a
+    /// `GpuiApp`, which the key paths that run actions do not carry).
+    settings_activate: bool,
     /// In-progress sidebar section rename: `(section_id, buffer)`, or `None`
     /// when not editing. Enter commits via `apply_section_rename`, Esc cancels.
     editing_section: Option<(u64, String)>,
@@ -594,11 +601,21 @@ impl App {
         }
     }
 
-    /// Whether the folders card is showing: the user's toggle, except on the
-    /// Settings page, whose sidebar is its own section list and has no
-    /// folders to filter.
+    /// Open the Settings window, or bring the open one forward. Activation
+    /// needs a `GpuiApp`, which action handlers and the bus dispatcher do not
+    /// carry — the frame pump performs it (see `settings_activate`). Shared by
+    /// ⌘, (`Action::OpenSettings`), the sidebar gear chip and `page settings`.
+    pub(crate) fn open_settings(&mut self) {
+        if self.settings_window.is_some() {
+            self.settings_activate = true;
+        } else {
+            self.settings_open = true;
+        }
+    }
+
+    /// Whether the folders card is showing: the user's toggle.
     pub(crate) fn folders_visible(&self) -> bool {
-        self.folders_open && self.page != Page::Settings
+        self.folders_open
     }
 
     /// The sessions list rect (physical px at `scale`) every row helper takes.
@@ -762,12 +779,8 @@ impl App {
     }
 
     /// The flat session rows the list paints and hit-tests: the active folder
-    /// filter applied to the non-pinned groups, and nothing on the Settings
-    /// page (its sidebar holds section tabs, not groups).
+    /// filter applied to the non-pinned groups.
     pub(crate) fn sidebar_rows(&self) -> Vec<workspace::SidebarRow> {
-        if self.page == Page::Settings {
-            return Vec::new();
-        }
         workspace::sidebar_rows_filtered(
             &self.workspaces,
             &self.sections,
@@ -777,11 +790,11 @@ impl App {
         )
     }
 
-    /// Whether the current page paints the session rows (every page but
-    /// Settings, whose sidebar is its section list). Drawing and hit-testing
+    /// Whether the current page paints the session rows (always true now
+    /// that Settings lives in its own window). Drawing and hit-testing
     /// both go through this so they can't drift apart.
     fn card_rows(&self) -> bool {
-        self.page != Page::Settings
+        true
     }
 
     /// The active group's cwd (or the process cwd when the group inherits it),
@@ -1605,7 +1618,7 @@ impl App {
         if let Page::Tool(i) = self.page
             && i >= n
         {
-            self.set_page(Page::Settings);
+            self.set_page(Page::Sessions);
         }
     }
 
@@ -1642,7 +1655,7 @@ impl App {
         cli_tools::remove_tool(i);
         if let Page::Tool(j) = self.page {
             if j == i {
-                self.page = Page::Settings;
+                self.page = Page::Sessions;
             } else if j > i {
                 self.page = Page::Tool(j - 1);
             }
@@ -2164,7 +2177,7 @@ impl App {
                 self.scroll_folders(delta);
                 return;
             }
-            if self.page != Page::Settings && self.sessions_list(scale).contains(px, py) {
+            if self.sessions_list(scale).contains(px, py) {
                 self.scroll_sessions(delta);
                 return;
             }
@@ -4080,7 +4093,7 @@ impl App {
         true
     }
 
-    fn on_mouse_down(&mut self, window: &mut Window, click_count: usize, cx: &mut Context<Self>) {
+    fn on_mouse_down(&mut self, _window: &mut Window, click_count: usize, _cx: &mut Context<Self>) {
         let scale = self.renderer.scale;
         let (px, py) = (self.cursor.0 as f32, self.cursor.1 as f32);
         let (_, h) = self.renderer.surface_size();
@@ -4208,14 +4221,6 @@ impl App {
             // that occlude the canvas (`sidebar_ui::sessions_header`,
             // `folders_ui`), so a press that reaches here is never on one of
             // them.
-            if self.page == Page::Settings {
-                // The search field and the section rows are element click
-                // targets now (`sidebar_ui::settings_row_layer`), occluding
-                // the canvas; a click anywhere else in the sidebar only blurs
-                // the search field, as it always did.
-                self.blur_settings_search(window, cx);
-                return;
-            }
             // Every other sidebar row — the session rows (pinned or not) and
             // the folder rows with their delete chip — is an element click
             // target now (`sidebar_ui`, `folders_ui`),
@@ -4224,10 +4229,6 @@ impl App {
             return;
         }
 
-        // Settings page: the gpui overlay owns all content-area clicks.
-        if self.page == Page::Settings {
-            return;
-        }
         // Tool page: the whole content area is one terminal — forward the
         // click to a mouse-tracking TUI or start a text selection, exactly
         // like a click in the flyover's content.
@@ -4690,11 +4691,6 @@ impl App {
             self.handle_section_key(ev);
             return;
         }
-        // The Settings page owns the keyboard: no PTY to type into.
-        if self.page == Page::Settings {
-            self.handle_settings_key(ev, window, cx);
-            return;
-        }
         // A tool page's terminal owns the keyboard; ⌘ shortcuts stay global.
         if let Page::Tool(_) = self.page {
             if ev.keystroke.modifiers.platform {
@@ -5020,7 +5016,7 @@ impl App {
             Action::NextSidebarTab => self.cycle_sidebar_tab(1),
             Action::ToggleSidebar => self.toggle_sidebar(),
             Action::ToggleFolders => self.toggle_folders(),
-            Action::OpenSettings => self.set_page(Page::Settings),
+            Action::OpenSettings => self.open_settings(),
             Action::Quit => {
                 // Take the agent children down before the abrupt exit below;
                 // each backend kills its CLI and unblocks its reader thread.
@@ -5203,21 +5199,11 @@ impl App {
     }
 
     /// ⌘⇧↑/↓: step through the sidebar's tabs, wrapping at both ends —
-    /// groups on the Sessions page, sections on the Settings page.
+    /// the workspace groups on the Sessions page.
     fn cycle_sidebar_tab(&mut self, delta: isize) {
-        match self.page {
-            Page::Sessions => {
-                let i = pages::cycle(self.active, self.workspaces.len(), delta);
-                self.switch_workspace(i);
-            },
-            Page::Settings => {
-                let cur = Section::ALL.iter().position(|s| *s == self.section).unwrap_or(0);
-                let i = pages::cycle(cur, Section::ALL.len(), delta);
-                self.section = Section::ALL[i];
-                self.request_redraw();
-            },
-            // Tool pages have no sidebar tabs of their own.
-            Page::Tool(_) => {},
+        if let Page::Sessions = self.page {
+            let i = pages::cycle(self.active, self.workspaces.len(), delta);
+            self.switch_workspace(i);
         }
     }
 
@@ -5232,14 +5218,9 @@ impl App {
         if self.page != page {
             self.page = page;
             self.recording = None;
-            self.settings_query.clear();
-            self.settings_search_focus = false;
             // The sidebar cards are on screen again; top up whatever went
             // stale while another page was up.
-            if self.card_rows() {
-                self.spawn_git_context_refresh();
-            }
-            // Grids may have gone stale while the Settings page was up.
+            self.spawn_git_context_refresh();
             if page == Page::Sessions {
                 self.sync_layout();
                 self.mark_visible_read();
@@ -6045,20 +6026,6 @@ impl Render for App {
             window.set_traffic_light_position(gpui::point(px(x), px(y)));
             self.traffic_lights_for = Some(spot);
         }
-        // Settings search field: focus lives in the window, so reflect it
-        // into the flag the sidebar styles from, and drop it (and any stale
-        // query) the moment the field is off screen — leaving Settings must
-        // not leave a hidden field eating keystrokes.
-        let search_focused = self.settings_search.read(cx).focus_handle(cx).is_focused(window);
-        if self.page != Page::Settings {
-            if search_focused {
-                window.focus(&self.focus_handle, cx);
-            }
-            if !self.settings_search.read(cx).text().is_empty() {
-                self.clear_settings_search(cx);
-            }
-        }
-        self.settings_search_focus = self.page == Page::Settings && search_focused;
         self.sync_save_focus(window, cx);
         // Shared modal search field: a freshly opened modal claims it (clear,
         // placeholder, focus); a closed one releases it back to the app.
@@ -6254,9 +6221,6 @@ impl Render for App {
             // Sessions empty state ("New group" pill + hint): element tree in
             // the terminal area; its click resolves on the element.
             .child(self.render_empty_state(cx))
-            // Settings page overlay: element tree over the canvas. Sidebar search +
-            // section tabs stay canvas-painted; the content card is elements.
-            .when(self.page == Page::Settings, |el| el.child(self.render_settings(cx)))
             // Flow agent (experimental, `features.flow`): bottom-centered pill
             // bar + chat panel, on every page so it follows the user (`flow_ui`).
             .when(
@@ -7330,7 +7294,6 @@ fn main() {
                             input
                         },
                         modal_search_reset: None,
-                        settings_search_focus: false,
                         editing_section: None,
                         // Single focus handle, minted once; focused below.
                         focus_handle: cx.focus_handle(),
@@ -7364,6 +7327,9 @@ fn main() {
                         flyover_maximized: true,
                         main_window: None,
                         palette_window: None,
+                        settings_open: false,
+                        settings_window: None,
+                        settings_activate: false,
                         pending_keys: Vec::new(),
                         preview_dark: theme::dark_active(),
                         appearance_menu: None,
@@ -7402,7 +7368,7 @@ fn main() {
                                 .timer(Duration::from_millis(16))
                                 .await;
                             let Some(app) = handle.upgrade() else { break };
-                            let (redraw, want_palette, palette, (pending_keys, main)) =
+                            let (redraw, want_palette, palette, want_settings, settings, activate_settings, (pending_keys, main)) =
                                 app.update(cx, |app: &mut App, cx| {
                                     let redraw = app.drain_events();
                                     if redraw {
@@ -7415,6 +7381,11 @@ fn main() {
                                         // stage change keeps the same surface up.
                                         app.command.is_some(),
                                         app.palette_window,
+                                        // The Settings window exists exactly while
+                                        // `settings_open` is set.
+                                        app.settings_open,
+                                        app.settings_window,
+                                        std::mem::take(&mut app.settings_activate),
                                         // Only dequeue once the main window
                                         // exists: keys pressed over the bus
                                         // during startup wait rather than
@@ -7467,6 +7438,30 @@ fn main() {
                                     let _ = w.update(cx, |_, window, _| window.remove_window());
                                     let _ = app.update(cx, |app: &mut App, _| {
                                         app.palette_window = None;
+                                    });
+                                },
+                                (_, Some(w)) => {
+                                    if redraw {
+                                        let _ = w.update(cx, |_, _, cx| cx.notify());
+                                    }
+                                },
+                                (false, None) => {},
+                            }
+                            // Reconcile the Settings window the same way.
+                            match (want_settings, settings) {
+                                (true, None) => {
+                                    let app_entity = app.clone();
+                                    let _ = cx.update(|cx| {
+                                        crate::settings_window::open_settings_window(app_entity, cx)
+                                    });
+                                },
+                                (_, Some(w)) if activate_settings => {
+                                    let _ = w.update(cx, |_, window, _| window.activate_window());
+                                },
+                                (false, Some(w)) => {
+                                    let _ = w.update(cx, |_, window, _| window.remove_window());
+                                    let _ = app.update(cx, |app: &mut App, _| {
+                                        app.settings_window = None;
                                     });
                                 },
                                 (_, Some(w)) => {
@@ -7859,3 +7854,6 @@ mod tool_page_title_tests {
         assert_eq!(tool_label(None, "drip --tui"), "drip --tui");
     }
 }
+
+
+

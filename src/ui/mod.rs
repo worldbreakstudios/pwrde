@@ -53,6 +53,7 @@ pub use kbd::Kbd;
 pub use label::Label;
 pub use switch::Switch;
 
+#[allow(unused_imports)] // vendored rcn surface: kept exported while no caller uses it
 pub use table::{Table, TableBody, TableCell, TableRow};
 #[allow(unused_imports)] // vendored rcn surface: the sidebar toast
 // stack (`crate::toast_ui`) paints its own rows, so nothing calls these yet

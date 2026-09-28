@@ -206,7 +206,7 @@ pub(crate) fn palette_bounds(
 /// The display the palette should open on: the focused window's display when
 /// there is one, else the app's main window's, else `None` (the caller falls
 /// back to the primary display).
-fn palette_display_id(
+pub(crate) fn palette_display_id(
     cx: &mut GpuiApp,
     main_window: Option<AnyWindowHandle>,
 ) -> Option<DisplayId> {

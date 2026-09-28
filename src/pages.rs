@@ -1,11 +1,11 @@
 //! Top-level page navigation + rebindable keyboard actions.
 //!
-//! pwrde has Arc-style *pages*: Sessions (the terminal workspace), one page
-//! per user-registered CLI tool (see [`crate::cli_tools`]), and Settings.
-//! Tool pages are opened from the folders card's pinned-tool rows and
-//! Settings from the sessions header's gear chip (`crate::folders_ui`,
-//! `crate::sidebar_ui`). ⌘⇧←/→ cycle pages with wraparound; ⌘⇧↑/↓ cycle the
-//! sidebar's tabs (groups on Sessions, sections on Settings) the same way.
+//! pwrde has Arc-style *pages*: Sessions (the terminal workspace) and one page
+//! per user-registered CLI tool (see [`crate::cli_tools`]), opened from the
+//! folders card's pinned-tool rows (`crate::folders_ui`). Settings is not a
+//! page but its own window (`crate::settings_window`), opened by ⌘, or the
+//! sessions header's gear chip; its [`Section`]s live here. ⌘⇧←/→ cycle pages
+//! with wraparound; ⌘⇧↑/↓ cycle the sidebar's groups the same way.
 //!
 //! Every ⌘ shortcut is an [`Action`] dispatched through a bindings table
 //! resolved from the settings store (`"keyboard.<action>"` keys, falling back
@@ -20,16 +20,14 @@ pub enum Page {
     /// a full-page, non-persisted terminal running that tool's command from
     /// its configured directory.
     Tool(usize),
-    Settings,
 }
 
 impl Page {
     /// Page order for `n_tools` registered CLI tools; `cycle` (⌘⇧←/→)
-    /// walks it. Tool pages sit between Sessions and Settings.
+    /// walks it. Settings is a separate window, not a page.
     pub fn all(n_tools: usize) -> Vec<Page> {
         let mut v = vec![Page::Sessions];
         v.extend((0..n_tools).map(Page::Tool));
-        v.push(Page::Settings);
         v
     }
 
@@ -47,40 +45,37 @@ pub fn cycle(i: usize, n: usize, delta: isize) -> usize {
 /// Sections of the Settings page (sidebar tabs while it is active).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Section {
-    Sessions,
-    Keyboard,
-    Terminal,
+    General,
     Appearance,
-    /// Registered CLI tool pages (see [`crate::cli_tools`]).
     Tools,
-    Accessibility,
-    Debug,
-    FeatureFlags,
+    Keyboard,
+    Advanced,
 }
 
 impl Section {
-    pub const ALL: [Section; 8] = [
-        Section::Sessions,
-        Section::Keyboard,
-        Section::Terminal,
+    pub const ALL: [Section; 5] = [
+        Section::General,
         Section::Appearance,
         Section::Tools,
-        Section::Accessibility,
-        Section::Debug,
-        Section::FeatureFlags,
+        Section::Keyboard,
+        Section::Advanced,
     ];
 
     pub fn label(self) -> &'static str {
         match self {
-            Section::Sessions => "Sessions",
-            Section::Keyboard => "Keyboard",
-            Section::Terminal => "Terminal",
+            Section::General => "General",
             Section::Appearance => "Appearance",
             Section::Tools => "Tools",
-            Section::Accessibility => "Accessibility",
-            Section::Debug => "Debug",
-            Section::FeatureFlags => "Feature Flags",
+            Section::Keyboard => "Keyboard",
+            Section::Advanced => "Advanced",
         }
+    }
+
+}
+
+impl Default for Section {
+    fn default() -> Self {
+        Section::General
     }
 }
 
@@ -210,6 +205,40 @@ impl Action {
     ];
 
     /// Stable identifier used in the settings key (`keyboard.<name>`).
+    /// The Settings block a rebindable action is listed under on the Keyboard
+    /// page. Every `Action` belongs to exactly one of the five groups
+    /// (`Layout`, `Tabs & sessions`, `Focus`, `Editing`, `App`).
+    pub fn keyboard_group(self) -> &'static str {
+        match self {
+            // Splits, collapse/expand and the sidebar/folders/title-bar toggles.
+            Action::SplitRight
+            | Action::SplitDown
+            | Action::ToggleCollapse
+            | Action::ToggleFocusOthers
+            | Action::ToggleSidebar
+            | Action::ToggleFolders => "Layout",
+            // Tabs, groups, sessions and webviews.
+            Action::NewTab
+            | Action::NewWebview
+            | Action::NewSection
+            | Action::PrevTab
+            | Action::NextTab
+            => "Tabs & sessions",
+            Action::NextTile | Action::PrevTile => "Focus",
+            // Moving focus between tiles and sidebar tabs.
+            Action::FocusLeft
+            | Action::FocusDown
+            | Action::FocusUp
+            | Action::FocusRight
+            | Action::PrevSidebarTab
+            | Action::NextSidebarTab => "Focus",
+            // Clipboard editing.
+            Action::Copy | Action::Paste => "Editing",
+            // Everything else is an app-level command or page navigation.
+            _ => "App",
+        }
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Action::SplitRight => "split_right",
@@ -522,22 +551,22 @@ pub fn settings_index() -> Vec<SettingsEntry> {
 
     // Sessions
     out.push(SettingsEntry {
-        section: Section::Sessions,
+        section: Section::General,
         label: "Primary command",
         keywords: "runs in the primary pane when a group opens",
     });
     out.push(SettingsEntry {
-        section: Section::Sessions,
+        section: Section::General,
         label: "Pull request CLI",
         keywords: "git cli lfg gh pull request pr diff tool source control",
     });
     out.push(SettingsEntry {
-        section: Section::Sessions,
+        section: Section::General,
         label: "Async streaming (lfg -A)",
         keywords: "git async streaming lfg force-async sse cache refresh",
     });
 
-    // Keyboard — one entry per action
+    // Keyboard — one entry per action, plus the section-wide reset.
     for action in &Action::ALL {
         out.push(SettingsEntry {
             section: Section::Keyboard,
@@ -545,10 +574,15 @@ pub fn settings_index() -> Vec<SettingsEntry> {
             keywords: action.name(),
         });
     }
+    out.push(SettingsEntry {
+        section: Section::Keyboard,
+        label: "Restore defaults",
+        keywords: "restore defaults reset shortcuts rebind keyboard clear unbind",
+    });
 
     // Terminal
     out.push(SettingsEntry {
-        section: Section::Terminal,
+        section: Section::General,
         label: "Persist sessions",
         keywords: "persist sessions restore shpool panes survive restart layout folder",
     });
@@ -579,19 +613,19 @@ pub fn settings_index() -> Vec<SettingsEntry> {
 
     // Accessibility
     out.push(SettingsEntry {
-        section: Section::Accessibility,
+        section: Section::Appearance,
         label: "Terminal text size",
         keywords: "font size terminal zoom larger smaller accessibility text",
     });
     out.push(SettingsEntry {
-        section: Section::Accessibility,
+        section: Section::Appearance,
         label: "App text size",
         keywords: "font size app chrome ui zoom larger smaller accessibility text",
     });
 
     // Debug
     out.push(SettingsEntry {
-        section: Section::Debug,
+        section: Section::Advanced,
         label: "Show frame stats",
         keywords: "frame stats fps debug performance",
     });
@@ -599,17 +633,34 @@ pub fn settings_index() -> Vec<SettingsEntry> {
     // Feature Flags — the section itself, then one entry per experimental
     // flag (so the section stays searchable even when no flags are defined).
     out.push(SettingsEntry {
-        section: Section::FeatureFlags,
+        section: Section::Advanced,
         label: "Experimental features",
         keywords: "feature flags experimental toggles beta",
     });
     for flag in crate::features::ALL {
         out.push(SettingsEntry {
-            section: Section::FeatureFlags,
+            section: Section::Advanced,
             label: flag.label,
             keywords: flag.description,
         });
     }
+
+    // Advanced — diagnostics.
+    out.push(SettingsEntry {
+        section: Section::Advanced,
+        label: "Diagnostics",
+        keywords: "diagnostics debug build settings file chrome scale surface cell workspaces tiles",
+    });
+    out.push(SettingsEntry {
+        section: Section::Advanced,
+        label: "Copy all",
+        keywords: "copy all clipboard diagnostics report",
+    });
+    out.push(SettingsEntry {
+        section: Section::Advanced,
+        label: "Reveal settings.json",
+        keywords: "reveal settings json finder open folder file",
+    });
 
     out
 }
@@ -639,12 +690,12 @@ mod tests {
     /// Tool pages sit between Sessions and Settings, one per registered
     /// tool.
     #[test]
-    fn tool_pages_slot_between_sessions_and_settings() {
+    fn tool_pages_slot_after_sessions() {
         assert_eq!(
             Page::all(2),
-            vec![Page::Sessions, Page::Tool(0), Page::Tool(1), Page::Settings]
+            vec![Page::Sessions, Page::Tool(0), Page::Tool(1)]
         );
-        assert_eq!(Page::all(0), vec![Page::Sessions, Page::Settings]);
+        assert_eq!(Page::all(0), vec![Page::Sessions]);
     }
 
     #[test]
@@ -927,11 +978,11 @@ mod tests {
     }
 
     #[test]
-    fn search_settings_finds_terminal_entry() {
+    fn search_settings_finds_persist_entry() {
         let results = search_settings("persist");
         assert!(
-            results.iter().any(|e| e.section == Section::Terminal),
-            "search_settings(\"persist\") should find a Terminal entry",
+            results.iter().any(|e| e.section == Section::General),
+            "search_settings(\"persist\") should find a General entry",
         );
     }
 
@@ -953,4 +1004,45 @@ mod tests {
         assert!(search_settings("").is_empty(), "empty query should return empty vec");
         assert!(search_settings("   ").is_empty(), "whitespace query should return empty vec");
     }
+
+    #[test]
+    fn sections_are_the_five_general_pages() {
+        assert_eq!(Section::ALL.len(), 5);
+        assert_eq!(
+            Section::ALL,
+            [
+                Section::General,
+                Section::Appearance,
+                Section::Tools,
+                Section::Keyboard,
+                Section::Advanced,
+            ]
+        );
+        assert_eq!(Section::default(), Section::General);
+    }
+
+    #[test]
+    fn every_action_has_a_known_keyboard_group() {
+        const GROUPS: [&str; 5] = ["Layout", "Tabs & sessions", "Focus", "Editing", "App"];
+        for action in Action::ALL {
+            let group = action.keyboard_group();
+            assert!(
+                GROUPS.contains(&group),
+                "{:?} maps to unknown keyboard group {group:?}",
+                action,
+            );
+        }
+    }
+
+    #[test]
+    fn every_keyboard_group_is_populated() {
+        const GROUPS: [&str; 5] = ["Layout", "Tabs & sessions", "Focus", "Editing", "App"];
+        for group in GROUPS {
+            assert!(
+                Action::ALL.iter().any(|a| a.keyboard_group() == group),
+                "keyboard group {group:?} has no actions",
+            );
+        }
+    }
+
 }

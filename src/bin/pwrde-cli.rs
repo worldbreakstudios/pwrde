@@ -310,11 +310,23 @@ fn parse_command(sub: &str, args: &[String]) -> Result<Command, CliError> {
         "screenshot" => {
             let mut path: Option<PathBuf> = None;
             let mut clipboard = false;
+            let mut window: Option<String> = None;
             let mut i = 0;
             while i < args.len() {
                 let a = &args[i];
                 if a == "--clipboard" {
                     clipboard = true;
+                } else if a == "--window" {
+                    i += 1;
+                    let Some(name) = args.get(i) else {
+                        return Err(CliError::Usage("--window requires main|settings".into()));
+                    };
+                    if name != "main" && name != "settings" {
+                        return Err(CliError::Usage(format!(
+                            "--window expects main or settings, got {name:?}"
+                        )));
+                    }
+                    window = Some(name.clone());
                 } else if a.starts_with('-') {
                     return Err(CliError::Usage(format!("unknown flag: {a}")));
                 } else if path.is_none() {
@@ -329,7 +341,7 @@ fn parse_command(sub: &str, args: &[String]) -> Result<Command, CliError> {
                     "screenshot: give a path or --clipboard, not both".into(),
                 ));
             }
-            Ok(Command::Screenshot { path, clipboard })
+            Ok(Command::Screenshot { path, clipboard, window })
         }
         "read" => parse_read(args),
         "flow-send" => {
@@ -635,6 +647,19 @@ mod tests {
     fn rejects_blank_new_webview_command() {
         assert!(parse_command("new-webview-command", &args(&[])).is_err());
         assert!(parse_command("new-webview-command", &args(&["   "])).is_err());
+    }
+
+    #[test]
+    fn screenshot_window_flag() {
+        match parse_command("screenshot", &args(&["--window", "settings"])) {
+            Ok(Command::Screenshot { window, path, clipboard }) => {
+                assert_eq!(window.as_deref(), Some("settings"));
+                assert!(path.is_none() && !clipboard);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(parse_command("screenshot", &args(&["--window"])).is_err());
+        assert!(parse_command("screenshot", &args(&["--window", "foo"])).is_err());
     }
 
     #[test]

@@ -67,6 +67,10 @@ pub enum Command {
         path: Option<PathBuf>,
         #[serde(default)]
         clipboard: bool,
+        /// Which of our windows: `None` / `"main"` for the main window,
+        /// `"settings"` for the Settings window (an error while it is closed).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        window: Option<String>,
     },
     ReadPane {
         session: u64,
@@ -188,7 +192,7 @@ pub fn command_specs() -> Vec<CommandSpec> {
         CommandSpec {
             name: "go_to_page",
             args: "<page>",
-            help: "Navigate to a page (sessions, settings, tool:<n> or a tool's name)",
+            help: "Navigate to a page (sessions, tool:<n> or a tool's name), or open the Settings window (settings, settings:<section>)",
             read_only: false,
         },
         CommandSpec {
@@ -199,8 +203,8 @@ pub fn command_specs() -> Vec<CommandSpec> {
         },
         CommandSpec {
             name: "screenshot",
-            args: "[path] [--clipboard]",
-            help: "Capture the window to a PNG file (default: a temp path) or, with --clipboard, the pasteboard",
+            args: "[path] [--clipboard] [--window main|settings]",
+            help: "Capture the main window (or --window settings) to a PNG file (default: a temp path) or, with --clipboard, the pasteboard",
             read_only: false,
         },
         CommandSpec {
@@ -526,10 +530,12 @@ mod tests {
             Command::Screenshot {
                 path: Some(PathBuf::from("/tmp/s.png")),
                 clipboard: true,
+                window: None,
             },
             Command::Screenshot {
                 path: None,
                 clipboard: false,
+                window: None,
             },
             Command::ReadPane {
                 session: 7,
@@ -569,6 +575,7 @@ mod tests {
             Command::Screenshot {
                 path: None,
                 clipboard: false,
+                window: None,
             }
         );
     }
@@ -668,6 +675,7 @@ mod tests {
             Command::Screenshot {
                 path: None,
                 clipboard: false,
+                window: None,
             },
             Command::ReadPane {
                 session: 1,
@@ -757,6 +765,7 @@ mod tests {
             &Command::Screenshot {
                 path: None,
                 clipboard: false,
+                window: None,
             },
             timeout,
         )

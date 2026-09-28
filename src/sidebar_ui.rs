@@ -1,7 +1,7 @@
 //! The sessions sidebar as a gpui element tree over the canvas: the flat
 //! region ground, the sessions list (header chips + two-line rows in the
 //! GANTRY mock's style, the folder's pinned rows in a "Pinned" section on
-//! top\), the Settings page's rows, the toast stack at the region's bottom
+//! top), the toast stack at the region's bottom
 //! edge ([`crate::toast_ui`]), and the floating "Show sessions" button while
 //! everything is hidden. The folders card beside the list lives in
 //! [`crate::folders_ui`].
@@ -12,9 +12,10 @@
 //! same rects. That is deliberate — the rects are the single authority that
 //! keeps painting, hit-testing and PTY resize in agreement, so this tree is
 //! *absolutely positioned to match them* rather than reimplementing layout or
-//! drag-and-drop in gpui's paradigm. The header chips, the Settings rows and
-//! the collapsed-state button are gpui-owned click targets that `occlude()`
-//! the canvas.
+//! drag-and-drop in gpui's paradigm. The header chips and the
+//! collapsed-state button are gpui-owned click targets that `occlude()`
+//! the canvas. (Settings has its own window, `crate::settings_window`; only
+//! its search placeholder is defined here.)
 //!
 //! Colors come from the live chrome theme ([`crate::ui::theme::Theme`]), never
 //! from the mock's hardcoded palette, so the region reads correctly in both
@@ -28,7 +29,7 @@
 //! its run on a click.
 use gpui::{
     AnyElement, App as GpuiApp, BoxShadow, ClickEvent, Context, FontWeight, Hsla,
-    InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, SharedString,
+    InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
     StatefulInteractiveElement, Styled, Window, div, point,
     prelude::FluentBuilder as _, px,
 };
@@ -54,9 +55,7 @@ pub(crate) const ROW_RADIUS: f32 = 9.0;
 const STATUS_ICON: f32 = 12.0;
 /// Side of the SVG glyph inside a header chip (mock: 17px chips).
 const HEADER_ICON: f32 = 17.0;
-/// Extra left inset for an indented simple row (a section member).
-const ROW_INDENT: f32 = 14.0;
-/// Placeholder text of the Settings page search box; `main.rs` reads it
+/// Placeholder text of the Settings window's search box; `main.rs` reads it
 /// when it builds the rcn `Input`.
 pub(crate) const SEARCH_SETTINGS_PLACEHOLDER: &str = "Search settings";
 
@@ -444,7 +443,6 @@ impl App {
             }
         };
 
-        let settings = self.page == crate::Page::Settings;
         let mut layer = div().absolute().left(px(0.0)).top(px(0.0)).size_full();
 
         if let Some(show) = chips.show_folders {
@@ -484,18 +482,12 @@ impl App {
                     }),
             )
             .child(
-                icon_chip(theme, &chips.gear, hovered(&chips.gear), settings, crate::ui::assets::ICON_SETTINGS)
+                icon_chip(theme, &chips.gear, hovered(&chips.gear), false, crate::ui::assets::ICON_SETTINGS)
                     .id("sidebar-settings")
                     .occlude()
                     .when(!modal, |c| {
-                        c.cursor_pointer().on_click(handler(entity, |this| {
-                            let page = if this.page == crate::Page::Settings {
-                                crate::Page::Sessions
-                            } else {
-                                crate::Page::Settings
-                            };
-                            this.set_page(page);
-                        }))
+                        c.cursor_pointer()
+                            .on_click(handler(entity.clone(), |this| this.open_settings()))
                     }),
             )
     }
@@ -504,8 +496,8 @@ impl App {
     fn clipped_row_layer(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
         let list = self.list_rect();
         // Rows start below the list header — exactly where
-        // `workspace::sidebar_row_rect` and `tab_rect` start their stacks —
-        // and stop at the list's bottom edge, the region's padding.
+        // `workspace::sidebar_row_rect` starts its stack — and stop at the
+        // list's bottom edge, the region's padding.
         let top = list.y + crate::workspace::SESSIONS_HEADER_H;
         let bottom = (list.y + list.h).max(top);
         let height = self.logical_height() as f32;
@@ -528,118 +520,12 @@ impl App {
     }
 
 
-    /// The row layer for whichever page is showing.
-    ///
-    /// Every page draws its rows into the same absolutely positioned layer
-    /// over the panel, but they do not share a row *vocabulary*: Sessions
-    /// gets card-height preview rows laid out by
-    /// [`crate::workspace::sidebar_row_rect`], while Settings
-    /// gets one-line rows at [`crate::workspace::tab_rect`] — the very
-    /// rects `main.rs` already hit-tests for those pages. The split is
-    /// [`App::card_rows`], the same predicate the geometry helpers take.
+    /// The row layer: card-height preview rows laid out by
+    /// [`crate::workspace::sidebar_row_rect`] — the very rects `main.rs`
+    /// hit-tests. Every page shares it now that Settings is its own window.
     fn sidebar_row_layer(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
         let entity = cx.entity().downgrade();
-        if self.card_rows() {
-            return self.card_row_layer(theme, entity);
-        }
-        match self.page {
-            crate::Page::Settings => self.settings_row_layer(theme, cx),
-            // Any page without rows of its own still gets the shell.
-            _ => div().absolute().left(px(0.0)).top(px(0.0)).size_full(),
-        }
-    }
-
-    /// The Settings rows: the live search box in slot 0 and one tab per
-    /// [`crate::pages::Section`] at slot `i + 1`, the shift `main.rs`'s
-    /// `Page::Settings` mouse branch makes to leave room for the box.
-    fn settings_row_layer(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
-        let list = self.list_rect();
-        let entity = cx.entity().downgrade();
-        let mut layer = div()
-            .absolute()
-            .left(px(0.0))
-            .top(px(0.0))
-            .size_full()
-            .child(self.settings_search_row(theme, cx));
-        for (i, section) in crate::pages::Section::ALL.iter().enumerate() {
-            let rect = crate::workspace::tab_rect(i + 1, 1.0, &list);
-            let active = *section == self.section;
-            let section = *section;
-            let entity = entity.clone();
-            layer = layer.child(
-                self.simple_row(theme, &rect, section.label(), active, false, true)
-                    .id(("settings-section", i))
-                    .occlude()
-                    .cursor_pointer()
-                    .on_click(move |_ev: &ClickEvent, win: &mut Window, app: &mut GpuiApp| {
-                        if let Some(entity) = entity.upgrade() {
-                            entity.update(app, |this, cx| {
-                                this.section = section;
-                                this.recording = None;
-                                this.clear_settings_search(cx);
-                                this.blur_settings_search(win, cx);
-                                cx.notify();
-                            });
-                        }
-                    }),
-            );
-        }
-        layer
-    }
-
-    /// The Settings search box, sitting in slot 0 where
-    /// [`crate::workspace::settings_search_rect`] expects it. The field
-    /// itself is the rcn [`crate::ui::Input`] entity in `App::settings_search`
-    /// (bare, at the row's type size), so typing, selection and the caret are
-    /// the framework's; this row supplies the sidebar shell around it: the
-    /// active-row treatment while focused, and a painted fill even when
-    /// unfocused (unlike a row, which is transparent until hovered) because
-    /// it is an affordance, not a selection. It occludes the canvas, so the
-    /// click that focuses it never reaches the canvas mouse path.
-    fn settings_search_row(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
-        let rect = crate::workspace::settings_search_rect(1.0, &self.list_rect());
-        let focused = self.settings_search_focus;
-        // Same lift as `simple_row`: dark chrome's card token needs it to read
-        // as light glass over the panel material.
-        let fill = if theme.dark {
-            shade(theme.card, 0.12)
-        } else {
-            theme.card
-        };
-        // The row's type size tracks the Accessibility text setting; keep the
-        // field's in step (no-op when unchanged).
-        let text_size = px(scaled(12.0));
-        self.settings_search.update(cx, |input, _| input.set_text_size(Some(text_size)));
-
-        div()
-            .id("settings-search")
-            .absolute()
-            .left(px(rect.x))
-            .top(px(rect.y))
-            .w(px(rect.w))
-            .h(px(rect.h))
-            .occlude()
-            .rounded(px(ROW_RADIUS))
-            .when(focused, |d| {
-                d.bg(fill.opacity(0.78))
-                    .border_1()
-                    .border_color(theme.foreground.opacity(0.28))
-                    .shadow(vec![BoxShadow {
-                        color: gpui::black().opacity(if theme.dark { 0.35 } else { 0.12 }),
-                        offset: point(px(0.0), px(1.0)),
-                        blur_radius: px(4.0),
-                        spread_radius: px(0.0),
-                        inset: false,
-                    }])
-            })
-            .when(!focused, |d| {
-                d.bg(theme.muted.opacity(if theme.dark { 0.5 } else { 0.7 }))
-            })
-            .flex()
-            .items_center()
-            .pl(px(scaled(ROW_PAD)))
-            .pr(px(scaled(ROW_PAD)))
-            .child(self.settings_search.clone())
+        self.card_row_layer(theme, entity)
     }
 
 
@@ -822,80 +708,6 @@ impl App {
         layer
     }
 
-
-    /// One one-line row, for the pages with no git context worth previewing:
-    /// Settings' section tabs.
-    ///
-    /// `rect` is whatever [`crate::workspace::tab_rect`] handed the mouse path
-    /// for this row's index, so the pixels and the hit box cannot drift apart.
-    /// `indent` steps a nested row's label in, and `dim` marks a row whose
-    /// label is secondary — the canvas painted those in `ink_dim` unless they
-    /// were active. The fills mirror the canvas painter exactly: the active row
-    /// gets the card pill plus a soft shadow, a merely hovered row gets a
-    /// weaker muted fill, and every other row stays transparent. Hover comes
-    /// from [`App::sidebar_cursor`], so it is suppressed mid-drag here too.
-    fn simple_row(
-        &self,
-        theme: &Theme,
-        rect: &crate::workspace::LayoutRect,
-        label: impl Into<SharedString>,
-        active: bool,
-        indent: bool,
-        dim: bool,
-    ) -> gpui::Div {
-        let hovered = self
-            .sidebar_cursor()
-            .is_some_and(|(x, y)| rect.contains(x, y));
-        // Dark chrome's card token sits *below* the panel material, so the
-        // canvas lifted it toward white to read as light glass; light chrome's
-        // card already does.
-        let fill = if theme.dark {
-            shade(theme.card, 0.12)
-        } else {
-            theme.card
-        };
-        let ink = if active || !dim {
-            theme.foreground
-        } else {
-            theme.muted_foreground
-        };
-
-        div()
-            .absolute()
-            .left(px(rect.x))
-            .top(px(rect.y))
-            .w(px(rect.w))
-            .h(px(rect.h))
-            .rounded(px(ROW_RADIUS))
-            .when(active, |d| {
-                d.bg(fill.opacity(0.78))
-                    .border_1()
-                    .border_color(theme.foreground.opacity(0.28))
-                    .shadow(vec![BoxShadow {
-                        color: gpui::black().opacity(if theme.dark { 0.35 } else { 0.12 }),
-                        offset: point(px(0.0), px(1.0)),
-                        blur_radius: px(4.0),
-                        spread_radius: px(0.0),
-                        inset: false,
-                    }])
-            })
-            .when(!active && hovered, |d| {
-                d.bg(theme.muted.opacity(if theme.dark { 0.5 } else { 0.7 }))
-            })
-            .flex()
-            .items_center()
-            .pl(px(scaled(ROW_PAD + if indent { ROW_INDENT } else { 0.0 })))
-            .pr(px(scaled(ROW_PAD)))
-            .text_size(px(scaled(12.0)))
-            .text_color(ink)
-            .child(
-                div()
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .text_ellipsis()
-                    .child(label.into()),
-            )
-    }
 
     /// Cursor position in logical pixels for hover tests, or `None` while a
     /// drag is in flight or a modal overlay owns the frame — the canvas
@@ -1179,7 +991,7 @@ fn avatar_icon(kind: CardAvatar) -> &'static str {
 /// (System follows macOS), resolved by `theme::accent_color`. Pinned to that
 /// rather than the chrome theme's own `accent`, which the user retints
 /// freely: the selected card has to agree with the focused pane's tab pill.
-fn accent() -> Hsla {
+pub(crate) fn accent() -> Hsla {
     let (r, g, b) = crate::theme::accent_color();
     gpui::Rgba {
         r: r as f32 / 255.0,
@@ -1320,15 +1132,6 @@ fn hover_cursor(
     Some((cursor.0 as f32 / s, cursor.1 as f32 / s))
 }
 
-
-/// Nudge a token's lightness by `delta`, clamped, so a fill derives from the
-/// live theme instead of the mock's fixed grays.
-fn shade(color: Hsla, delta: f32) -> Hsla {
-    Hsla {
-        l: (color.l + delta).clamp(0.0, 1.0),
-        ..color
-    }
-}
 
 #[cfg(test)]
 mod tests {
