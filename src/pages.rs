@@ -565,6 +565,11 @@ pub fn settings_index() -> Vec<SettingsEntry> {
         label: "Async streaming (lfg -A)",
         keywords: "git async streaming lfg force-async sse cache refresh",
     });
+    out.push(SettingsEntry {
+        section: Section::General,
+        label: "Open in webview tab",
+        keywords: "webview tab browser pull request pr open github issue",
+    });
 
     // Keyboard — one entry per action, plus the section-wide reset.
     for action in &Action::ALL {
@@ -686,6 +691,25 @@ pub fn search_settings(query: &str) -> Vec<SettingsEntry> {
 mod tests {
     use super::*;
     use gpui::Modifiers;
+
+    /// The ⇧⌘G "Open in webview tab" toggle must be in the settings index and
+    /// findable by the words a user would search for.
+    #[test]
+    fn webview_pr_toggle_is_searchable() {
+        let entry = settings_index()
+            .into_iter()
+            .find(|e| e.label == "Open in webview tab")
+            .expect("Open in webview tab missing from the settings index");
+        assert_eq!(entry.section, Section::General);
+        for term in ["webview", "browser", "pull request", "pr", "issue"] {
+            assert!(
+                search_settings(term)
+                    .iter()
+                    .any(|e| e.label == "Open in webview tab"),
+                "search for {term:?} did not surface the webview PR toggle"
+            );
+        }
+    }
 
     /// Tool pages sit between Sessions and Settings, one per registered
     /// tool.

@@ -53,6 +53,10 @@ pub enum TermEvent {
     /// An `http(s)` URL handed to the app from outside (the app is registered
     /// as a browser, or `open -a Pwrde https://…`): open it as a webview tab.
     OpenUrl { url: String },
+    /// A ⇧⌘G background `pr list` resolved a pull-request URL while the
+    /// `git.open_pr_in_webview` setting is on. The worker thread cannot touch
+    /// `App`, so the URL comes back here and the main thread opens the tab.
+    OpenPrUrl { url: String },
     /// A Wry top-level navigation committed; folded into the owning tab on
     /// the main thread so its address, title, and persisted URL stay current.
     WebviewNavigated { id: u64, url: String },
