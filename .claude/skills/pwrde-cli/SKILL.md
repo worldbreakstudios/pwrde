@@ -54,11 +54,11 @@ pwrde-cli send-text 'cargo test' --enter         # raw keystrokes into the focus
 pwrde-cli send-text $'\x03'                      # control bytes pass through (^C, escape sequences)
 pwrde-cli key cmd-p escape                       # press chords through the app's key handler (tests bindings/overlays; gpui syntax: cmd-shift-t, ctrl-c, enter)
 pwrde-cli action split_right                     # any Action by name (split_right, new_tab, close_tab, focus_left, toggle_sidebar, screenshot_to_file, …)
-pwrde-cli page settings                          # sessions | settings | tool:<n>
+pwrde-cli page settings                          # sessions | tool:<n>; `settings` opens the Settings window, `settings:keyboard` jumps to a section
 pwrde-cli focus pwrde                            # by group name, sidebar title, or 0-based index
 pwrde-cli new-section Work && pwrde-cli move pwrde Work
 pwrde-cli resize 1100 700                        # window content size in points
-pwrde-cli screenshot /tmp/app.png                # PNG of the app window (no Screen Recording prompt); no path = temp file printed on stdout; --clipboard
+pwrde-cli screenshot /tmp/app.png                # PNG of the app window (no Screen Recording prompt); --window settings captures the Settings window; no path = temp file printed on stdout; --clipboard
 pwrde-cli raw '{"cmd":"send_text","text":"ls\r","group":"pwrde"}'   # anything the protocol accepts
 ```
 

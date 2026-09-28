@@ -469,6 +469,22 @@ const ICONS: &[(&str, &[u8])] = &[
         "icons/arrow-right-to-line.svg",
         br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 19V5"/><path d="m11 6 6 6-6 6"/><path d="M7 12h10"/></svg>"##,
     ),
+    (
+        "icons/palette.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="13.5" cy="6.5" r=".5" fill="currentColor"/><circle cx="17.5" cy="10.5" r=".5" fill="currentColor"/><circle cx="8.5" cy="7.5" r=".5" fill="currentColor"/><circle cx="6.5" cy="12.5" r=".5" fill="currentColor"/><path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.926 0 1.648-.746 1.648-1.688 0-.437-.18-.835-.437-1.125-.29-.289-.438-.652-.438-1.125a1.64 1.64 0 0 1 1.668-1.668h1.996c3.051 0 5.555-2.503 5.555-5.554C21.965 6.012 17.461 2 12 2z"/></svg>"##,
+    ),
+    (
+        "icons/keyboard.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 8h.01"/><path d="M12 12h.01"/><path d="M14 8h.01"/><path d="M16 12h.01"/><path d="M18 10v.01"/><path d="M22 13a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2v-2c0-.45.1-.87.28-1.25L3.5 6A2 2 0 0 1 5.34 4.7l10.3-2.33a2 2 0 0 1 2.4 1.5l1.13 5.03A2 2 0 0 1 22 11v2z"/><path d="M6 8h.01"/><path d="M6 12h.01"/><path d="M8 12h.01"/></svg>"##,
+    ),
+    (
+        "icons/sliders.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" x2="4" y1="21" y2="14"/><line x1="4" x2="4" y1="10" y2="3"/><line x1="12" x2="12" y1="21" y2="12"/><line x1="12" x2="12" y1="8" y2="3"/><line x1="20" x2="20" y1="21" y2="16"/><line x1="20" x2="20" y1="12" y2="3"/><line x1="2" x2="6" y1="14" y2="14"/><line x1="10" x2="14" y1="8" y2="8"/><line x1="18" x2="22" y1="16" y2="16"/></svg>"##,
+    ),
+    (
+        "icons/search.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>"##,
+    ),
 ];
 
 /// Sidebar PR-state icons (see the table above).
@@ -509,6 +525,12 @@ pub const ICON_GIT_BRANCH: &str = "icons/git-branch.svg";
 pub const ICON_TERMINAL: &str = "icons/terminal.svg";
 pub const ICON_ARROW_UP: &str = "icons/arrow-up.svg";
 pub const ICON_MINUS: &str = "icons/minus.svg";
+
+/// Settings-window icons (see the table above).
+pub const ICON_PALETTE: &str = "icons/palette.svg";
+pub const ICON_KEYBOARD: &str = "icons/keyboard.svg";
+pub const ICON_SLIDERS: &str = "icons/sliders.svg";
+pub const ICON_SEARCH: &str = "icons/search.svg";
 
 /// Command palette action icons (see the table above).
 pub const ICON_X: &str = "icons/x.svg";

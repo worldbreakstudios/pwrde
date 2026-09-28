@@ -1,50 +1,65 @@
-//! Settings page as a gpui element tree over the canvas.
+//! Settings content as a gpui element tree.
 //!
-//! The rest of the app stays canvas-painted; this module builds a real
-//! component tree (vendored rcn Card/Input/Switch/…) positioned over
-//! [`workspace::terminal_area`]. Confirm dialogs stay on the canvas path, so
-//! the overlay is skipped while one is open. The Settings sidebar (search +
-//! section tabs) remains canvas-painted; the Appearance section's body is
-//! built here as a gpui tree (segmented controls, Selects, WYSIWYG previews).
+//! [`App::settings_content`] builds a plain flex column that fills whatever
+//! parent it is placed in — today the Settings window's right-hand pane (the
+//! window's own nav sidebar lives in `settings_window.rs`).
+//!
+//! Layout: a vertically scrollable column (max-width 720, horizontally
+//! centered, padding 44/32/80, gap 26) holding a page header and one block
+//! per group. A block is a small uppercase caption plus a rounded card of
+//! rows; each row is a label/description cell on the left and a control on
+//! the right, separated by hairline dividers. The five sections — General,
+//! Appearance, Tools, Keyboard, Advanced — share the shell plus the control
+//! helpers below (segmented control, toggle, stepper, key caps, accent
+//! swatches, selects). Search results render on the same shell as a single
+//! flat card. Colors derive from the rcn [`Theme`] via white/black alpha
+//! overlays chosen by polarity; no hex ground colors are hard-coded.
+
+use std::time::{Duration, Instant};
 
 use gpui::{
-    div, px, AnyElement, App as GpuiApp, ClickEvent, Context, InteractiveElement, IntoElement,
-    ParentElement, StatefulInteractiveElement, Styled, Window,
+    div, linear_color_stop, linear_gradient, px, AnyElement, App as GpuiApp, ClickEvent,
+    ClipboardItem, Context, FontWeight, InteractiveElement, IntoElement, ParentElement,
+    StatefulInteractiveElement, Styled, Window,
 };
 
 use crate::pages::{self, Action, AppearanceDropdown, Section};
 use crate::settings;
 use crate::ui::select::Select;
 use crate::ui::theme::{alpha, Theme};
-use crate::ui::{
-    Badge, BadgeVariant, Button, ButtonSize, ButtonVariant, Card, CardContent, CardHeader,
-    CardTitle, Kbd, Switch, Table, TableBody, TableCell, TableRow,
-};
+use crate::ui::{Badge, BadgeVariant, Switch};
 use crate::App;
 
-/// Settings rows read badly stretched across a fullscreen window; the card
-/// stays page-wide (matching Cleanup and the canvas Appearance section) but
-/// its content column caps out at this width.
-const CONTENT_MAX_W: f32 = 760.0;
+/// Settings rows read badly stretched across a fullscreen window; the content
+/// column caps out at this width and centers in the overlay.
+const CONTENT_MAX_W: f32 = 720.0;
+
+/// How long the Diagnostics "Copied" label stays up after a copy.
+const COPIED_FOR: Duration = Duration::from_millis(1500);
+
+static COPIED_AT: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+
+// ── Page shell ──────────────────────────────────────────────────────────
 
 impl App {
-    /// Build the Settings page overlay (logical px, absolutely positioned over
-    /// the content area). Call only when `page == Settings` and no confirm is up.
-    pub fn render_settings(&self, cx: &mut Context<Self>) -> AnyElement {
+    /// The Settings content column: a flex column that fills its parent and
+    /// hosts the 720px centred scroll column. The Settings window renders it as
+    /// its right-hand pane.
+    pub fn settings_content(&self, cx: &mut Context<Self>) -> AnyElement {
         // Keep the rcn Theme global in sync with live chrome tokens.
         cx.set_global(crate::ui::theme::Theme::from_chrome(crate::theme::current()));
 
-        // Mirror workspace::terminal_area as logical edge insets rather than
-        // computing w/h from the renderer's surface size: insets re-resolve
-        // in gpui layout every frame, so the overlay tracks a live window
-        // resize instead of waiting for the next entity notify.
-        let pad = crate::workspace::AREA_PAD;
-        let sidebar = self.sidebar_w();
-        let left = if sidebar == 0.0 { pad } else { sidebar };
-        let right = pad;
-
         let theme = Theme::of(cx).clone();
         let entity = cx.entity().downgrade();
+
+        // Style the vendored Inputs down to the rows' type size; the vendored
+        // field keeps its own border + focus ring.
+        self.command_input.update(cx, |i, _| {
+            i.set_text_size(Some(px(12.5)));
+        });
+        for input in self.tool_form.inputs() {
+            input.update(cx, |i, _| i.set_text_size(Some(px(12.5))));
+        }
 
         let searching = !self.settings_query.is_empty();
         let title: String = if searching {
@@ -52,34 +67,78 @@ impl App {
         } else {
             self.section.label().into()
         };
+        let subtitle: Option<&'static str> = if searching {
+            None
+        } else {
+            Some(match self.section {
+                Section::General => "How sessions start, persist and talk to your forge.",
+                Section::Appearance => "Theme, accent, text size and terminal colors.",
+                Section::Tools => {
+                    "Each tool gets a sidebar page running its command in a fresh terminal. \
+                     Not persisted."
+                }
+                Section::Keyboard => "Click a shortcut to rebind it. Press Esc to cancel, ⌫ to clear.",
+                Section::Advanced => {
+                    "Experiments and diagnostics. Things here may change or disappear."
+                }
+            })
+        };
 
         let body = if searching {
             render_search_results(self, &theme, entity.clone())
         } else {
             match self.section {
-                Section::Sessions => render_sessions(self, &theme, entity.clone()),
-                Section::Keyboard => render_keyboard(self, &theme, entity.clone()),
-                Section::Terminal => render_terminal(&theme, entity.clone()),
-                Section::Accessibility => render_accessibility(&theme, entity.clone()),
-                Section::Debug => render_debug(self, &theme, entity.clone()),
-                Section::FeatureFlags => {
-                    render_feature_flags(self, &theme, entity.clone())
-                }
+                Section::General => render_general(self, &theme, entity.clone()),
                 Section::Appearance => render_appearance(self, &theme, entity.clone()),
                 Section::Tools => render_tools(self, &theme, entity.clone()),
+                Section::Keyboard => render_keyboard(self, &theme, entity.clone()),
+                Section::Advanced => render_advanced(self, &theme, entity.clone()),
             }
         };
 
-        let header = CardHeader::new().child(CardTitle::new().child(title));
+        let mut header = div().flex().flex_col();
+        header = header.child(
+            div()
+                .text_size(px(22.))
+                .font_weight(FontWeight::BOLD)
+                .text_color(theme.foreground)
+                .child(title),
+        );
+        if let Some(sub) = subtitle {
+            if !sub.is_empty() {
+                header = header.child(
+                    div()
+                        .mt(px(2.))
+                        .text_size(px(12.5))
+                        .text_color(theme.muted_foreground)
+                        .child(sub),
+                );
+            }
+        }
+        // The Keyboard page header carries the "Restore defaults" pill on the
+        // right; other sections keep the header alone.
+        let header = if !searching && self.section == Section::Keyboard {
+            div()
+                .flex()
+                .flex_row()
+                .items_end()
+                .justify_between()
+                .child(header)
+                .child(restore_defaults_pill(&theme, &entity))
+                .into_any_element()
+        } else {
+            header.into_any_element()
+        };
 
         let bg_entity = entity.clone();
         div()
-            .absolute()
-            .left(px(left))
-            .top(px(pad))
-            .right(px(right))
-            .bottom(px(pad))
-            // Any press in the card first drops transient input state — an
+            .flex()
+            .flex_col()
+            .w_full()
+            .h_full()
+            .min_h(px(0.))
+            .bg(theme.background)
+            // Any press in the page first drops transient input state — an
             // armed recording and the sidebar search box's focus — exactly
             // like the old canvas settings_click. Row/control handlers run
             // at mouse-up (on_click), so they re-arm on top of this.
@@ -93,542 +152,314 @@ impl App {
                 }
             })
             .child(
-                // h_full/flex_1 are local additions: the card fills the page
-                // and the content band absorbs the height the header leaves
-                // over, keeping any row scroller bounded.
-                Card::new()
+                div()
+                    .id("settings-scroll")
+                    .flex()
+                    .flex_col()
                     .h_full()
-                    .glass()
-                    .child(header)
+                    .w_full()
+                    .overflow_y_scroll()
                     .child(
-                        CardContent::new().flex_1().child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .h_full()
-                                .min_h(px(0.))
-                                .w_full()
-                                .max_w(px(CONTENT_MAX_W))
-                                .mx_auto()
-                                .child(body),
-                        ),
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(26.))
+                            .w_full()
+                            .max_w(px(CONTENT_MAX_W))
+                            .mx_auto()
+                            .pt(px(44.))
+                            .px(px(32.))
+                            .pb(px(80.))
+                            .child(header)
+                            .child(body),
                     ),
             )
             .into_any_element()
     }
+
 }
 
-// ── Shared row chrome ───────────────────────────────────────────────────
+// ── Shared shell helpers ────────────────────────────────────────────────
 
+/// A white overlay in dark polarity, a black overlay in light polarity —
+/// fills and borders derive from this, never from hard-coded hex colors.
+fn overlay(theme: &Theme, a: f32) -> gpui::Hsla {
+    if theme.dark {
+        alpha(gpui::white(), a)
+    } else {
+        alpha(gpui::black(), a)
+    }
+}
+
+/// Inset surfaces (segment wells, icon chips) read darker: black alpha.
+fn inset(_theme: &Theme, a: f32) -> gpui::Hsla {
+    alpha(gpui::black(), a)
+}
+
+/// The card's fill/border alphas by polarity.
+fn card_fill(theme: &Theme) -> gpui::Hsla {
+    overlay(theme, if theme.dark { 0.035 } else { 0.03 })
+}
+
+fn card_border(theme: &Theme) -> gpui::Hsla {
+    overlay(theme, if theme.dark { 0.07 } else { 0.08 })
+}
+
+/// An 11px uppercase section caption above a card.
+fn settings_caption(theme: &Theme, text: &'static str) -> gpui::Div {
+    div()
+        .pl(px(12.))
+        .text_size(px(11.))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(theme.muted_foreground)
+        .child(text.to_uppercase())
+}
+
+/// A caption plus an optional right-aligned control on one line.
+fn caption_row(theme: &Theme, text: &'static str, right: Option<AnyElement>) -> gpui::Div {
+    let mut row = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .child(settings_caption(theme, text));
+    if let Some(r) = right {
+        row = row.child(r);
+    }
+    row
+}
+
+/// A rounded card of settings rows with hairline dividers between them
+/// (never above the first).
+fn settings_card(theme: &Theme, rows: Vec<AnyElement>) -> gpui::Div {
+    let mut card = div()
+        .flex()
+        .flex_col()
+        .w_full()
+        .rounded(px(12.))
+        .border_1()
+        .border_color(card_border(theme))
+        .bg(card_fill(theme))
+        .overflow_hidden();
+    for (ix, row) in rows.into_iter().enumerate() {
+        if ix > 0 {
+            card = card.child(div().h(px(1.)).flex_shrink_0().bg(overlay(theme, 0.06)));
+        }
+        card = card.child(row);
+    }
+    card
+}
+
+/// One block: a caption and its card.
+fn settings_block(theme: &Theme, caption: &'static str, rows: Vec<AnyElement>) -> gpui::Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(6.))
+        .child(caption_row(theme, caption, None))
+        .child(settings_card(theme, rows))
+}
+
+/// A settings row: label/description on the left, control on the right.
 fn settings_row() -> gpui::Div {
     div()
         .flex()
         .flex_row()
         .items_center()
-        .justify_between()
-        .gap_3()
-        .px_3()
-        .py_2()
-        .rounded_md()
+        .gap(px(16.))
+        .px(px(12.))
+        .py(px(11.))
+        .w_full()
 }
 
-/// macOS System Settings-style grouped box: related rows in an inset rounded
-/// container — a faint lifted wash with a hairline border, rows separated by
-/// inset hairline dividers. This is what gives the glass panel its depth.
-fn settings_group(theme: &Theme, rows: Vec<AnyElement>) -> gpui::Div {
-    let mut boxed = div()
-        .flex()
-        .flex_col()
-        // Never shrink: `overflow_hidden` zeroes this box's automatic
-        // minimum size, so as a direct child of a scrolling column it would
-        // be squeezed to a sliver once the page overflows.
-        .flex_none()
-        .rounded(theme.radius_lg())
-        .bg(alpha(theme.foreground, 0.04))
-        .border_1()
-        .border_color(alpha(theme.foreground, 0.08))
-        .overflow_hidden();
-    for (ix, row) in rows.into_iter().enumerate() {
-        if ix > 0 {
-            boxed = boxed.child(
-                div().ml_3().h(px(1.)).bg(alpha(theme.foreground, 0.06)),
-            );
-        }
-        boxed = boxed.child(row);
-    }
-    boxed
-}
-
-/// A row's left cell: 13px title with an optional 12px muted description
+/// A row's left cell: a 13px title with an optional 11.5px muted description
 /// under it — the shape every settings row shares.
-fn row_text(theme: &Theme, title: &'static str, desc: Option<&'static str>) -> gpui::Div {
+fn row_text(theme: &Theme, title: impl Into<gpui::SharedString>, desc: Option<&str>) -> gpui::Div {
     let mut cell = div()
         .flex()
         .flex_col()
-        .child(div().text_size(px(13.)).child(title));
+        .flex_1()
+        .min_w(px(0.))
+        .text_size(px(13.))
+        .text_color(theme.foreground)
+        .child(title.into());
     if let Some(desc) = desc {
         cell = cell.child(
             div()
-                .text_size(px(12.))
+                .mt(px(2.))
+                .text_size(px(11.5))
                 .text_color(theme.muted_foreground)
-                .child(desc),
+                .child(desc.to_string()),
         );
     }
     cell
 }
 
-// ── Search results ──────────────────────────────────────────────────────
+// ── Controls ────────────────────────────────────────────────────────────
 
-fn render_search_results(
-    app: &App,
+/// A segmented control writing one settings key: a dark well holding pill
+/// segments; the active one wears the accent. `mono` renders the labels in
+/// the monospace face (the lfg | gh CLI picker).
+fn segmented(
     theme: &Theme,
-    entity: gpui::WeakEntity<App>,
-) -> AnyElement {
-    let results = pages::search_settings(&app.settings_query);
-    if results.is_empty() {
-        return div()
-            .px_3()
-            .py_2()
-            .text_size(px(13.))
-            .text_color(theme.muted_foreground)
-            .child("no settings match")
-            .into_any_element();
-    }
-
-    let hover_bg = alpha(theme.foreground, 0.08);
-    let mut rows: Vec<AnyElement> = Vec::new();
-    for (ix, entry) in results.into_iter().enumerate() {
-        let section = entry.section;
-        let row_entity = entity.clone();
-        rows.push(
-            settings_row()
-                .id(("settings-search", ix))
-                .cursor_pointer()
-                .hover(move |s| s.bg(hover_bg))
-                .on_click(move |_ev: &ClickEvent, win: &mut Window, gpui_app: &mut GpuiApp| {
-                    gpui_app.stop_propagation();
-                    if let Some(entity) = row_entity.upgrade() {
-                        entity.update(gpui_app, move |this, cx| {
-                            this.section = section;
-                            this.clear_settings_search(cx);
-                            this.blur_settings_search(win, cx);
-                            cx.notify();
-                        });
-                    }
-                })
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.))
-                        .text_size(px(13.))
-                        .child(entry.label),
-                )
-                .child(
-                    Badge::new()
-                        .variant(BadgeVariant::Outline)
-                        .child(entry.section.label()),
-                )
-                .into_any_element(),
-        );
-    }
-    div()
-        .id("settings-rows")
+    id: &'static str,
+    key: &'static str,
+    options: &[(&'static str, &'static str)],
+    active_ix: usize,
+    mono: bool,
+    entity: &gpui::WeakEntity<App>,
+) -> gpui::Div {
+    let hover = overlay(theme, 0.04);
+    let mut out = div()
         .flex()
-        .flex_col()
-        .flex_1()
-        .min_h(px(0.))
-        .overflow_y_scroll()
-        .child(settings_group(theme, rows))
-        .into_any_element()
-}
-
-// ── Sessions ────────────────────────────────────────────────────────────
-
-fn render_sessions(app: &App, theme: &Theme, entity: gpui::WeakEntity<App>) -> AnyElement {
-    let input_el = div()
-        .flex_1()
-        .min_w(px(0.))
-        .max_w(px(360.))
-        .child(app.command_input.clone());
-
-    div()
-        .flex()
-        .flex_col()
-        .gap_4()
-        .child(settings_group(
-            theme,
-            vec![
-                settings_row()
-                    .child(row_text(
-                        theme,
-                        "Primary command",
-                        Some("runs in the primary pane when a group opens (enter saves, esc cancels)"),
-                    ))
-                    .child(input_el)
-                    .into_any_element(),
-                git_cli_row(theme, entity.clone()),
-                git_async_row(entity),
-            ],
-        ))
-        .into_any_element()
-}
-
-/// The PR-data CLI selector (a small lfg | gh segmented control). Any other
-/// value can still be set directly in the settings file's `git.cli` key.
-fn git_cli_row(theme: &Theme, entity: gpui::WeakEntity<App>) -> AnyElement {
-    let current = crate::gh::cli();
-    let mk = |id: &'static str, name: &'static str| {
-        let active = current == name;
+        .flex_row()
+        .p(px(2.))
+        .gap(px(3.))
+        .rounded(px(8.))
+        .bg(inset(theme, if theme.dark { 0.25 } else { 0.05 }))
+        .border_1()
+        .border_color(alpha(gpui::black(), 0.08));
+    for (ix, (label, value)) in options.iter().enumerate() {
+        let value: &'static str = *value;
+        let active = ix == active_ix;
         let e = entity.clone();
-        Button::new(id)
-            .variant(if active { ButtonVariant::Default } else { ButtonVariant::Outline })
-            .size(ButtonSize::Sm)
-            .child(name)
-            .on_click(move |_ev: &ClickEvent, _win: &mut Window, gpui_app: &mut GpuiApp| {
-                gpui_app.stop_propagation();
-                if let Some(e) = e.upgrade() {
-                    e.update(gpui_app, move |_this, cx| {
-                        settings::set("git.cli", name.into());
-                        cx.notify();
-                    });
-                }
-            })
-    };
-    settings_row()
-        .child(row_text(
-            theme,
-            "Pull request CLI",
-            Some("tool used to fetch PR data (lfg is the fast, cached path)"),
-        ))
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .gap_1()
-                .child(mk("git-cli-lfg", "lfg"))
-                .child(mk("git-cli-gh", "gh")),
-        )
-        .into_any_element()
-}
-
-fn git_async_row(entity: gpui::WeakEntity<App>) -> AnyElement {
-    let on = crate::gh::async_enabled();
-    let toggle = Switch::new("git-async")
-        .checked(on)
-        .on_change(move |checked: &bool, _win: &mut Window, gpui_app: &mut GpuiApp| {
-            gpui_app.stop_propagation();
-            let enabled = *checked;
-            if let Some(e) = entity.upgrade() {
-                e.update(gpui_app, move |_this, cx| {
-                    settings::set("git.async", enabled.into());
-                    cx.notify();
-                });
-            }
-        });
-    settings_row()
-        .child(div().text_size(px(13.)).child("Async streaming (lfg -A)"))
-        .child(toggle)
-        .into_any_element()
-}
-
-// ── Keyboard ────────────────────────────────────────────────────────────
-
-fn render_keyboard(
-    app: &App,
-    theme: &Theme,
-    entity: gpui::WeakEntity<App>,
-) -> AnyElement {
-    let mut body = TableBody::new();
-    let count = Action::ALL.len();
-    for (ix, action) in Action::ALL.iter().copied().enumerate() {
-        let recording = app.recording == Some(action);
-        let row_entity = entity.clone();
-        let right: AnyElement = if recording {
-            div()
-                .text_size(px(12.))
-                .text_color(theme.muted_foreground)
-                .child("press keys… (esc cancels)")
-                .into_any_element()
-        } else {
-            Kbd::new()
-                .child(action.binding().display())
-                .into_any_element()
-        };
-
-        body = body.child(
-            TableRow::new()
-                .id(("kbd-row", ix))
-                .selected(recording)
-                .last(ix + 1 == count)
-                .on_click(move |_ev: &ClickEvent, _win: &mut Window, gpui_app: &mut GpuiApp| {
-                    gpui_app.stop_propagation();
-                    if let Some(entity) = row_entity.upgrade() {
-                        entity.update(gpui_app, move |this, cx| {
-                            this.recording = Some(action);
-                            cx.notify();
-                        });
-                    }
-                })
-                .child(TableCell::new().flex(1.).child(action.label()))
-                .child(
-                    TableCell::new()
-                        .w(px(200.))
-                        .child(div().flex().w_full().justify_end().child(right)),
-                ),
-        );
-    }
-
-    div()
-        .id("settings-rows")
-        .flex()
-        .flex_col()
-        .flex_1()
-        .min_h(px(0.))
-        .overflow_y_scroll()
-        .child(settings_group(
-            theme,
-            vec![Table::new().child(body).into_any_element()],
-        ))
-        .into_any_element()
-}
-
-// ── Tools ───────────────────────────────────────────────────────────────
-
-/// Registered CLI tool pages: a table of what's registered (name, icon,
-/// command, directory, Remove) over an add form. Only the command is
-/// required — see `App::add_tool_from_form` for the defaults.
-fn render_tools(app: &App, theme: &Theme, entity: gpui::WeakEntity<App>) -> AnyElement {
-    let tools = &app.tools;
-    let mut body = TableBody::new();
-    let count = tools.len();
-    for (ix, tool) in tools.iter().enumerate() {
-        let remove_entity = entity.clone();
-        let remove = Button::new(("tool-remove", ix))
-            .variant(ButtonVariant::Ghost)
-            .size(ButtonSize::Sm)
-            .child("Remove")
-            .on_click(move |_ev: &ClickEvent, _win: &mut Window, gpui_app: &mut GpuiApp| {
-                gpui_app.stop_propagation();
-                if let Some(entity) = remove_entity.upgrade() {
-                    entity.update(gpui_app, move |this, cx| {
-                        this.remove_tool(ix);
-                        cx.notify();
-                    });
-                }
-            });
-        body = body.child(
-            TableRow::new()
-                .id(("tool-row", ix))
-                .last(ix + 1 == count)
-                .child(TableCell::new().w(px(44.)).child(tool.icon.clone()))
-                .child(TableCell::new().flex(1.).child(tool.name.clone()))
-                .child(
-                    TableCell::new()
-                        .flex(1.5)
-                        .child(div().font_family("monospace").child(tool.command.clone())),
-                )
-                .child(
-                    TableCell::new()
-                        .flex(1.)
-                        .child(div().text_color(theme.muted_foreground).child(tool.cwd.clone())),
-                )
-                .child(
-                    TableCell::new()
-                        .w(px(96.))
-                        .child(div().flex().w_full().justify_end().child(remove)),
-                ),
-        );
-    }
-    let table: AnyElement = if count == 0 {
-        div()
+        let mut seg = div()
+            .id((id, ix as u64))
+            .px(px(11.))
+            .py(px(4.))
+            .rounded(px(6.))
             .text_size(px(12.))
-            .text_color(theme.muted_foreground)
-            .child("No tools registered — add one below.")
-            .into_any_element()
-    } else {
-        Table::new().child(body).into_any_element()
-    };
-
-    let field = |label: &'static str, input: gpui::Entity<crate::ui::Input>, flex: f32| {
-        div()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .flex_basis(px(0.))
-            .flex_grow(flex)
-            .min_w(px(0.))
-            .child(div().text_size(px(11.)).text_color(theme.muted_foreground).child(label))
-            .child(input)
-            .into_any_element()
-    };
-    let add_entity = entity;
-    let add = Button::new("tool-add")
-        .variant(ButtonVariant::Outline)
-        .size(ButtonSize::Sm)
-        .child("Add tool")
-        .on_click(move |_ev: &ClickEvent, _win: &mut Window, gpui_app: &mut GpuiApp| {
-            if let Some(entity) = add_entity.upgrade() {
-                entity.update(gpui_app, |this, cx| {
-                    this.add_tool_from_form(cx);
-                    cx.notify();
-                });
-            }
-        });
-    let form = div()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .w_full()
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .gap_2()
-                .w_full()
-                .child(field("Name", app.tool_form.name.clone(), 1.))
-                .child(field("Command", app.tool_form.command.clone(), 2.))
-                .child(field("Directory", app.tool_form.cwd.clone(), 1.))
-                .child(field("Icon", app.tool_form.icon.clone(), 0.5)),
-        )
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .justify_between()
-                .gap_4()
-                .child(
-                    div().flex_1().min_w(px(0.)).text_size(px(11.)).text_color(theme.muted_foreground).child(
-                        "Each tool gets a sidebar page running its command in a fresh terminal (not persisted). \
-                         Directory accepts ~; icon is any text — Nerd Font glyphs render like the built-ins.",
-                    ),
-                )
-                .child(add),
-        );
-
-    div()
-        .id("settings-rows")
-        .flex()
-        .flex_col()
-        .flex_1()
-        .min_h(px(0.))
-        .overflow_y_scroll()
-        .gap_4()
-        .child(settings_group(theme, vec![table]))
-        .child(div().child(group_label(theme, "Add a tool")).child(settings_group(theme, vec![form.into_any_element()])))
-        .into_any_element()
-}
-
-// ── Terminal ────────────────────────────────────────────────────────────
-
-fn render_terminal(theme: &Theme, entity: gpui::WeakEntity<App>) -> AnyElement {
-    let persist = settings::persist_sessions();
-    let switch_entity = entity.clone();
-    let toggle = Switch::new("terminal-persist")
-        .checked(persist)
-        .on_change(move |checked: &bool, _win: &mut Window, gpui_app: &mut GpuiApp| {
+            .font_weight(FontWeight::SEMIBOLD)
+            .cursor_pointer()
+            .child(*label);
+        if mono {
+            seg = seg.font_family("monospace");
+        }
+        if active {
+            seg = seg.bg(theme.primary).text_color(theme.primary_foreground);
+        } else {
+            seg = seg.text_color(theme.secondary_foreground).hover(move |s| s.bg(hover));
+        }
+        seg = seg.on_click(move |_ev: &ClickEvent, _win: &mut Window, gpui_app: &mut GpuiApp| {
             gpui_app.stop_propagation();
-            let on = *checked;
-            if let Some(entity) = switch_entity.upgrade() {
-                entity.update(gpui_app, move |this, cx| {
-                    settings::set("terminal.persist", on.into());
-                    this.persist_snapshot();
+            if let Some(e) = e.upgrade() {
+                e.update(gpui_app, move |_this, cx| {
+                    settings::set(key, (*value).into());
                     cx.notify();
                 });
             }
         });
-
-    div()
-        .flex()
-        .flex_col()
-        .child(settings_group(
-            theme,
-            vec![
-                settings_row()
-                    .child(row_text(
-                        theme,
-                        "Persist sessions",
-                        Some("Panes survive restarts via shpool; sessions, folders and layouts always persist."),
-                    ))
-                    .child(toggle)
-                    .into_any_element(),
-            ],
-        ))
-        .into_any_element()
+        out = out.child(seg);
+    }
+    out
 }
 
-// ── Accessibility ─────────────────────────────────────────────────────────
-
-/// Font-size controls. Two independent sizes — the terminal grid text and the
-/// app/chrome text — each with −/+ steppers and a reset. Mirrors the ⌘= / ⌘-
-/// zoom hotkeys, which nudge whichever size matches the focused surface.
-fn render_accessibility(theme: &Theme, entity: gpui::WeakEntity<App>) -> AnyElement {
-    div()
-        .flex()
-        .flex_col()
-        .gap_4()
-        .child(settings_group(
-            theme,
-            vec![
-                font_size_row(
-                    theme,
-                    entity.clone(),
-                    "term-font",
-                    "Terminal text size",
-                    "font size of the terminal grid (⌘= / ⌘- while a terminal is focused)",
-                    "terminal.font_size",
-                ),
-                font_size_row(
-                    theme,
-                    entity,
-                    "app-font",
-                    "App text size",
-                    "font size of tabs, sidebar, and other app chrome (⌘= / ⌘- elsewhere)",
-                    "appearance.font_size",
-                ),
-            ],
-        ))
-        .into_any_element()
-}
-
-/// One font-size stepper row: label + description on the left, a `−  N px  +`
-/// control plus Reset on the right. Each control writes `key` and notifies, so
-/// the next canvas paint re-measures and reflows.
-fn font_size_row(
+/// A toggle row bound to one settings key; `snapshot` additionally snapshots
+/// the workspace tree after the write (the shpool persistence knob);
+/// `disabled` dims the whole row to 45% and swallows the toggle.
+fn toggle_row(
     theme: &Theme,
-    entity: gpui::WeakEntity<App>,
+    title: &'static str,
+    desc: &'static str,
+    id: &'static str,
+    key: &'static str,
+    checked: bool,
+    snapshot: bool,
+    disabled: bool,
+    entity: &gpui::WeakEntity<App>,
+) -> AnyElement {
+    let e = entity.clone();
+    let mut toggle = Switch::new(id).checked(checked);
+    if disabled {
+        toggle = toggle.disabled(true);
+    }
+    toggle = toggle.on_change(move |checked: &bool, _win: &mut Window, gpui_app: &mut GpuiApp| {
+        gpui_app.stop_propagation();
+        if disabled {
+            return;
+        }
+        let on = *checked;
+        if let Some(e) = e.upgrade() {
+            e.update(gpui_app, move |this, cx| {
+                settings::set(key, on.into());
+                if snapshot {
+                    this.persist_snapshot();
+                }
+                cx.notify();
+            });
+        }
+    });
+    let mut row = settings_row()
+        .child(row_text(theme, title, Some(desc)))
+        .child(toggle);
+    if disabled {
+        row = row.opacity(0.45);
+    }
+    row.into_any_element()
+}
+
+/// A small square step button for the font-size steppers.
+fn step_button(
+    theme: &Theme,
+    id: impl Into<gpui::ElementId>,
+    glyph: &'static str,
+    key: &'static str,
+    delta: f32,
+    entity: &gpui::WeakEntity<App>,
+) -> gpui::Stateful<gpui::Div> {
+    let hover = overlay(theme, 0.04);
+    let e = entity.clone();
+    div()
+        .id(id)
+        .size(px(26.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(7.))
+        .text_size(px(13.))
+        .text_color(theme.secondary_foreground)
+        .border_1()
+        .border_color(overlay(theme, 0.08))
+        .cursor_pointer()
+        .hover(move |s| s.bg(hover))
+        .child(glyph)
+        .on_click(move |_ev: &ClickEvent, _win: &mut Window, gpui_app: &mut GpuiApp| {
+            gpui_app.stop_propagation();
+            if let Some(e) = e.upgrade() {
+                e.update(gpui_app, move |_this, cx| {
+                    crate::renderer::bump_font(key, delta);
+                    cx.notify();
+                });
+            }
+        })
+}
+
+/// A font-size stepper row: `−  N px  +  Reset` bound to one settings key.
+fn stepper_row(
+    theme: &Theme,
     id: &'static str,
     title: &'static str,
     desc: &'static str,
     key: &'static str,
+    entity: &gpui::WeakEntity<App>,
 ) -> AnyElement {
     let cur = settings::get_f32(key, crate::renderer::FONT_SIZE);
-
-    let step_btn = |idx: usize, glyph: &'static str, delta: f32| {
-        let e = entity.clone();
-        Button::new((id, idx))
-            .variant(ButtonVariant::Outline)
-            .size(ButtonSize::Sm)
-            .child(glyph)
-            .on_click(move |_ev: &ClickEvent, _win: &mut Window, gpui_app: &mut GpuiApp| {
-                gpui_app.stop_propagation();
-                if let Some(e) = e.upgrade() {
-                    e.update(gpui_app, move |_this, cx| {
-                        crate::renderer::bump_font(key, delta);
-                        cx.notify();
-                    });
-                }
-            })
-    };
-
-    let reset_e = entity.clone();
-    let reset_btn = Button::new((id, 2usize))
-        .variant(ButtonVariant::Ghost)
-        .size(ButtonSize::Sm)
+    let off_default = (cur - crate::renderer::FONT_SIZE).abs() > f32::EPSILON;
+    let e = entity.clone();
+    let reset = div()
+        .id(gpui::SharedString::from(format!("{id}-reset")))
+        .text_size(px(11.5))
+        .cursor_pointer()
         .child("Reset")
+        .text_color(if off_default {
+            theme.primary
+        } else {
+            alpha(theme.muted_foreground, 0.25)
+        })
+        .hover(move |s| s.text_color(theme.primary))
         .on_click(move |_ev: &ClickEvent, _win: &mut Window, gpui_app: &mut GpuiApp| {
             gpui_app.stop_propagation();
-            if let Some(e) = reset_e.upgrade() {
+            if let Some(e) = e.upgrade() {
                 e.update(gpui_app, move |_this, cx| {
                     settings::set(key, f64::from(crate::renderer::FONT_SIZE).into());
                     cx.notify();
@@ -643,292 +474,259 @@ fn font_size_row(
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap_1()
-                .child(step_btn(0, "−", -crate::renderer::FONT_SIZE_STEP))
+                .gap(px(6.))
+                .child(step_button(
+                    theme,
+                    (id, 0u64),
+                    "−",
+                    key,
+                    -crate::renderer::FONT_SIZE_STEP,
+                    entity,
+                ))
                 .child(
                     div()
-                        .min_w(px(52.))
-                        .text_size(px(13.))
-                        .text_color(theme.muted_foreground)
-                        .child(div().flex().w_full().justify_center().child(format!("{} px", cur as i32))),
+                        .w(px(46.))
+                        .flex()
+                        .justify_center()
+                        .text_size(px(12.5))
+                        .font_family("monospace")
+                        .text_color(theme.foreground)
+                        .child(format!("{} px", cur as i32)),
                 )
-                .child(step_btn(1, "+", crate::renderer::FONT_SIZE_STEP))
-                .child(reset_btn),
+                .child(step_button(
+                    theme,
+                    (id, 1u64),
+                    "+",
+                    key,
+                    crate::renderer::FONT_SIZE_STEP,
+                    entity,
+                ))
+                .child(reset),
         )
         .into_any_element()
 }
 
-// ── Feature Flags ───────────────────────────────────────────────────────
-
-/// Experimental feature toggles, one row per [`crate::features::ALL`] entry.
-/// Each flag is persisted as a `features.<key>` bool (default off).
-fn render_feature_flags(
-    _app: &App,
-    theme: &Theme,
-    entity: gpui::WeakEntity<App>,
-) -> AnyElement {
-    let mut rows: Vec<AnyElement> = Vec::new();
-    for flag in crate::features::ALL {
-        let key = flag.key;
-        let switch_entity = entity.clone();
-        let toggle = Switch::new(key)
-            .checked(crate::features::enabled(key))
-            .on_change(
-                move |checked: &bool,
-                      _win: &mut Window,
-                      gpui_app: &mut GpuiApp| {
-                    gpui_app.stop_propagation();
-                    let on = *checked;
-                    if let Some(entity) = switch_entity.upgrade() {
-                        entity.update(gpui_app, move |_this, cx| {
-                            settings::set(&format!("features.{key}"), on.into());
-                            cx.notify();
-                        });
-                    }
-                },
-            );
-
-        rows.push(
-            settings_row()
-                .child(row_text(theme, flag.label, Some(flag.description)))
-                .child(toggle)
-                .into_any_element(),
-        );
-    }
-
-    if rows.is_empty() {
-        return div()
-            .px_3()
-            .py_2()
-            .text_size(px(13.))
-            .text_color(theme.muted_foreground)
-            .child("No experimental flags right now.")
-            .into_any_element();
-    }
-
+/// One key cap: a small bordered chip for a modifier glyph or key name.
+fn key_cap(theme: &Theme, label: impl Into<gpui::SharedString>) -> gpui::Div {
     div()
+        .min_w(px(20.))
+        .h(px(20.))
+        .px(px(5.))
         .flex()
-        .flex_col()
-        .child(settings_group(theme, rows))
-        .into_any_element()
+        .items_center()
+        .justify_center()
+        .gap(px(3.))
+        .text_size(px(11.))
+        .text_color(theme.secondary_foreground)
+        .rounded(px(5.))
+        .border_1()
+        .border_color(overlay(theme, 0.14))
+        .border_b_2()
+        .bg(overlay(theme, 0.06))
+        .child(label.into())
 }
 
-// ── Debug ───────────────────────────────────────────────────────────────
-
-fn render_debug(
-    app: &App,
-    theme: &Theme,
-    entity: gpui::WeakEntity<App>,
-) -> AnyElement {
-    let th = crate::theme::current();
-    let (sw, sh) = app.renderer.surface_size();
-    let diags: [(&str, String); 7] = [
-        (
-            "settings file",
-            settings::path().to_string_lossy().into_owned(),
-        ),
-        (
-            "chrome",
-            format!(
-                "{} · accent #{:02x}{:02x}{:02x}",
-                th.label, th.accent.0, th.accent.1, th.accent.2
-            ),
-        ),
-        ("scale", format!("{:.2}", app.renderer.scale)),
-        ("surface", format!("{}×{} px", sw, sh)),
-        (
-            "cell",
-            format!(
-                "{}×{} px",
-                app.renderer.cell_width, app.renderer.cell_height
-            ),
-        ),
-        ("workspaces", app.workspaces.len().to_string()),
-        (
-            "tiles (active group)",
-            app.workspaces
-                .get(app.active)
-                .map(|ws| ws.root.tiles().len().to_string())
-                .unwrap_or_else(|| "0".into()),
-        ),
-    ];
-
-    let mut diag_rows: Vec<AnyElement> = Vec::new();
-    for (key, value) in diags {
-        diag_rows.push(
-            settings_row()
-                .child(
-                    div()
-                        .text_size(px(13.))
-                        .text_color(theme.muted_foreground)
-                        .child(key),
-                )
-                .child(div().text_size(px(13.)).child(value))
-                .into_any_element(),
-        );
+/// The key caps for a chord: one per modifier glyph (⌃ ⌥ ⇧ ⌘) plus the key.
+fn chord_caps(b: &pages::Binding) -> Vec<String> {
+    let mut caps = Vec::new();
+    if b.ctrl {
+        caps.push("⌃".to_string());
     }
+    if b.alt {
+        caps.push("⌥".to_string());
+    }
+    if b.shift {
+        caps.push("⇧".to_string());
+    }
+    caps.push("⌘".to_string());
+    caps.push(key_glyph(&b.key));
+    caps
+}
 
-    let overlay_on = settings::get_bool("debug.overlay", false);
-    let switch_entity = entity.clone();
-    let toggle = Switch::new("debug-overlay")
-        .checked(overlay_on)
-        .on_change(move |checked: &bool, _win: &mut Window, gpui_app: &mut GpuiApp| {
-            gpui_app.stop_propagation();
-            let on = *checked;
-            if let Some(entity) = switch_entity.upgrade() {
-                entity.update(gpui_app, move |_this, cx| {
-                    settings::set("debug.overlay", on.into());
-                    cx.notify();
-                });
-            }
-        });
+fn key_glyph(key: &str) -> String {
+    match key {
+        "left" => "←".into(),
+        "right" => "→".into(),
+        "up" => "↑".into(),
+        "down" => "↓".into(),
+        "minus" => "-".into(),
+        k => k.to_uppercase(),
+    }
+}
 
+/// The Beta badge shown next to an experiment's name.
+fn beta_badge(theme: &Theme) -> gpui::Div {
+    div()
+        .px(px(5.))
+        .py(px(1.))
+        .rounded(px(4.))
+        .text_size(px(9.5))
+        .font_weight(FontWeight::BOLD)
+        .text_color(theme.primary)
+        .border_1()
+        .border_color(alpha(theme.primary, 0.5))
+        .child("BETA")
+}
+
+// ── General ─────────────────────────────────────────────────────────────
+
+fn render_general(_app: &App, theme: &Theme, entity: gpui::WeakEntity<App>) -> AnyElement {
     div()
         .flex()
         .flex_col()
-        .gap_4()
-        .child(settings_group(theme, diag_rows))
-        .child(settings_group(
+        .gap(px(26.))
+        .child(settings_block(
             theme,
+            "Sessions",
             vec![
                 settings_row()
-                    .child(row_text(theme, "Show frame stats", None))
-                    .child(toggle)
+                    .child(row_text(
+                        theme,
+                        "Primary command",
+                        Some("Runs in the primary pane when a group opens."),
+                    ))
+                    .child(
+                        div()
+                            .w(px(220.))
+                            .font_family("monospace")
+                            .child(_app.command_input.clone()),
+                    )
                     .into_any_element(),
+                toggle_row(
+                    theme,
+                    "Persist sessions",
+                    "Panes survive restarts via shpool. Sessions, folders and layouts always \
+                     persist.",
+                    "persist-sessions",
+                    "terminal.persist",
+                    settings::persist_sessions(),
+                    true,
+                    false,
+                    &entity,
+                ),
+            ],
+        ))
+        .child(settings_block(
+            theme,
+            "Pull requests",
+            vec![
+                settings_row()
+                    .child(row_text(
+                        theme,
+                        "Pull request CLI",
+                        Some("Tool used to fetch PR data. lfg is the fast, cached path."),
+                    ))
+                    .child({
+                        let current = crate::gh::cli();
+                        let options = [("lfg", "lfg"), ("gh", "gh")];
+                        let active = options
+                            .iter()
+                            .position(|(value, _)| *value == current)
+                            .unwrap_or(0);
+                        segmented(theme, "git-cli", "git.cli", &options, active, true, &entity)
+                    })
+                    .into_any_element(),
+                toggle_row(
+                    theme,
+                    "Async streaming",
+                    "Stream results as they arrive (lfg -A). Requires lfg.",
+                    "git-async",
+                    "git.async",
+                    crate::gh::async_enabled(),
+                    false,
+                    crate::gh::cli() != "lfg",
+                    &entity,
+                ),
             ],
         ))
         .into_any_element()
 }
 
-// ── Appearance ─────────────────────────────────────────────────────────
-
-fn group_label(theme: &Theme, title: &'static str) -> gpui::Div {
-    div()
-        .px_1()
-        .text_size(px(12.))
-        .font_weight(gpui::FontWeight::MEDIUM)
-        .text_color(theme.muted_foreground)
-        .child(title)
-}
+// ── Appearance ──────────────────────────────────────────────────────────
 
 fn render_appearance(app: &App, theme: &Theme, entity: gpui::WeakEntity<App>) -> AnyElement {
     use crate::renderer::color;
-    use crate::theme::Mode;
+    use crate::theme::{Accent, Mode};
 
     let preview_dark = app.preview_dark;
     let current_mode = crate::theme::mode();
 
-    // ── Mode + Preview segmented controls ──────────────────────────────
+    // ── Mode segmented control ─────────────────────────────────────────
     let mode_seg = {
-        let mut row = div().flex().flex_row().gap_1();
-        for m in Mode::ALL {
-            let active = current_mode == m;
-            let e = entity.clone();
-            let name = m.name();
-            row = row.child(
-                Button::new(format!("appearance-mode-{}", name))
-                    .variant(if active {
-                        ButtonVariant::Default
-                    } else {
-                        ButtonVariant::Outline
-                    })
-                    .size(ButtonSize::Sm)
-                    .child(m.label())
-                    .on_click(move |_ev: &ClickEvent, _win: &mut Window, gpui_app: &mut GpuiApp| {
-                        gpui_app.stop_propagation();
-                        if let Some(e) = e.upgrade() {
-                            e.update(gpui_app, move |_this, cx| {
-                                settings::set("appearance.mode", name.into());
-                                cx.notify();
-                            });
-                        }
-                    }),
-            );
-        }
+        let options: Vec<(&'static str, &'static str)> =
+            Mode::ALL.iter().map(|m| (m.label(), m.name())).collect();
+        let active = Mode::ALL
+            .iter()
+            .position(|m| *m == current_mode)
+            .unwrap_or(0);
         settings_row()
             .child(row_text(theme, "Mode", None))
-            .child(row)
-            .into_any_element()
-    };
-
-    let preview_seg = {
-        let mk = |id: &'static str, label: &'static str, dark: bool| {
-            let active = preview_dark == dark;
-            let e = entity.clone();
-            Button::new(id)
-                .variant(if active {
-                    ButtonVariant::Default
-                } else {
-                    ButtonVariant::Outline
-                })
-                .size(ButtonSize::Sm)
-                .child(label)
-                .on_click(move |_ev: &ClickEvent, _win: &mut Window, gpui_app: &mut GpuiApp| {
-                    gpui_app.stop_propagation();
-                    if let Some(e) = e.upgrade() {
-                        e.update(gpui_app, move |this, cx| {
-                            this.preview_dark = dark;
-                            cx.notify();
-                        });
-                    }
-                })
-        };
-        settings_row()
-            .child(row_text(theme, "Preview", None))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .gap_1()
-                    .child(mk("appearance-preview-light", "Light", false))
-                    .child(mk("appearance-preview-dark", "Dark", true)),
-            )
+            .child(segmented(
+                theme,
+                "appearance-mode",
+                "appearance.mode",
+                &options,
+                active,
+                false,
+                &entity,
+            ))
             .into_any_element()
     };
 
     // ── Accent swatches ────────────────────────────────────────────────
-    // macOS-style dot row: System (follows the OS accent) first, then the
-    // mock's eight presets. The selected dot wears an ink ring.
+    // System (follows the OS accent) first as a rainbow swatch, then the
+    // eight presets. The selected dot wears a 2px swatch-colored ring
+    // separated from the dot by a 2px ground-colored gap.
     let accent_row = {
-        use crate::theme::Accent;
         let current = crate::theme::accent_setting();
         let system_rgb =
             crate::theme::resolve_accent(Accent::System, crate::theme::system_accent());
-        let mut swatches = div().flex().flex_row().items_center().gap(px(6.));
+        let ground = theme.background;
+        let mut swatches = div().flex().flex_row().items_center().gap(px(10.));
         for (ix, a) in Accent::ALL.into_iter().enumerate() {
             let active = current == a;
             let e = entity.clone();
             let name = a.name();
-            let fill = color(a.rgb().unwrap_or(system_rgb), 1.0);
-            let ring = if active { theme.foreground } else { gpui::transparent_black() };
-            let mut dot = div().size_full().rounded_full().bg(fill);
-            if a == Accent::System {
-                // The follow-the-OS swatch: a hollow center so it reads as
-                // "auto" rather than as one more fixed color.
-                dot = dot.flex().items_center().justify_center().child(
-                    div().size(px(5.)).rounded_full().bg(gpui::white()),
-                );
-            }
-            swatches = swatches.child(
+            let swatch = color(a.rgb().unwrap_or(system_rgb), 1.0);
+            let dot: gpui::AnyElement = if a == Accent::System {
+                // gpui has no conic gradient; approximate the rainbow with a
+                // diagonal two-stop linear gradient.
                 div()
-                    .id(("appearance-accent", ix))
-                    .size(px(22.))
-                    .p(px(2.))
+                    .size(px(16.))
                     .rounded_full()
-                    .border_2()
-                    .border_color(ring)
-                    .cursor_pointer()
-                    .on_click(move |_ev: &ClickEvent, _win: &mut Window, gpui_app: &mut GpuiApp| {
-                        gpui_app.stop_propagation();
-                        if let Some(e) = e.upgrade() {
-                            e.update(gpui_app, move |_this, cx| {
-                                settings::set("accent", name.into());
-                                cx.notify();
-                            });
-                        }
-                    })
-                    .child(dot),
-            );
+                    .bg(linear_gradient(
+                        135.,
+                        linear_color_stop(color((255, 59, 48), 1.0), 0.),
+                        linear_color_stop(color((0, 122, 255), 1.0), 1.),
+                    ))
+                    .into_any_element()
+            } else {
+                div().size(px(16.)).rounded_full().bg(swatch).into_any_element()
+            };
+            let mut ring = div()
+                .id(("appearance-accent", ix as u64))
+                .size(px(24.))
+                .rounded_full()
+                .p(px(2.))
+                .bg(ground)
+                .border_2()
+                .border_color(if active {
+                    swatch
+                } else {
+                    gpui::transparent_black()
+                })
+                .cursor_pointer()
+                .child(dot);
+            ring = ring.on_click(move |_ev: &ClickEvent, _win: &mut Window, gpui_app: &mut GpuiApp| {
+                gpui_app.stop_propagation();
+                if let Some(e) = e.upgrade() {
+                    e.update(gpui_app, move |_this, cx| {
+                        settings::set("accent", name.into());
+                        cx.notify();
+                    });
+                }
+            });
+            swatches = swatches.child(ring);
         }
         let desc: &'static str = match current {
             Accent::System => "System — follows macOS",
@@ -940,7 +738,25 @@ fn render_appearance(app: &App, theme: &Theme, entity: gpui::WeakEntity<App>) ->
             .into_any_element()
     };
 
-    // ── Terminal color selects ─────────────────────────────────────────
+    // ── Text size steppers ─────────────────────────────────────────────
+    let term_size = stepper_row(
+        theme,
+        "term-font",
+        "Terminal",
+        "Font size of the terminal grid. ⌘= / ⌘− while a terminal is focused.",
+        "terminal.font_size",
+        &entity,
+    );
+    let app_size = stepper_row(
+        theme,
+        "app-font",
+        "App chrome",
+        "Tabs, sidebar and other UI. ⌘= / ⌘− elsewhere.",
+        "appearance.font_size",
+        &entity,
+    );
+
+    // ── Terminal theme selects ─────────────────────────────────────────
     let term_select = |which: AppearanceDropdown| -> AnyElement {
         let dark = which.dark();
         let opts = pages::term_options(dark);
@@ -967,7 +783,7 @@ fn render_appearance(app: &App, theme: &Theme, entity: gpui::WeakEntity<App>) ->
         settings_row()
             .child(row_text(theme, label, None))
             .child(
-                div().w(px(220.)).child(
+                div().w(px(180.)).child(
                     Select::new(id)
                         .options(labels)
                         .value(value)
@@ -1004,55 +820,36 @@ fn render_appearance(app: &App, theme: &Theme, entity: gpui::WeakEntity<App>) ->
 
     // ── WYSIWYG preview cards ──────────────────────────────────────────
     let pt = crate::theme::selected(preview_dark);
-    let app_preview = {
-        let (pane_bg, pane_ink, pane_dim, pane_divider) =
-            match crate::term_theme::selected(preview_dark) {
-                Some(t) => (
-                    color(t.bg, 1.0),
-                    color(t.fg, 1.0),
-                    color(t.fg, 0.55),
-                    color(t.fg, 0.15),
-                ),
-                None => (
-                    color(pt.term_bg, 1.0),
-                    color(pt.text_bright, 1.0),
-                    color(pt.text_dim, 1.0),
-                    color(pt.card_divider, 1.0),
-                ),
-            };
-        let tokens = [pt.gradient_from, pt.card, pt.term_bg, pt.accent, pt.ink];
-        let mut chips = div().flex().flex_row().items_center().gap(px(6.));
-        for c in tokens {
-            chips = chips.child(
-                div()
-                    .w(px(14.))
-                    .h(px(14.))
-                    .rounded(px(3.))
-                    .border_1()
-                    .border_color(color(pt.ink, 0.25))
-                    .bg(color(c, 1.0)),
-            );
-        }
-        chips = chips.child(
-            div()
-                .text_size(px(11.))
-                .text_color(color(pt.ink_dim, 1.0))
-                .child("bg · surface · pane · accent · ink"),
-        );
+    let polarity = if preview_dark { "Dark" } else { "Light" };
 
-        let mut sidebar = div().flex().flex_col().gap(px(4.)).w(px(110.));
+    let app_preview = {
+        let ink = color(pt.ink, 1.0);
+        let ink_dim = color(pt.ink_dim, 1.0);
+        let surface = color(pt.card, 1.0);
+        let accent = color(pt.accent, 1.0);
+        let (pane_bg, pane_ink, pane_dim) = match crate::term_theme::selected(preview_dark) {
+            Some(t) => (color(t.bg, 1.0), color(t.fg, 1.0), color(t.fg, 0.55)),
+            None => (
+                color(pt.term_bg, 1.0),
+                color(pt.text_bright, 1.0),
+                color(pt.text_dim, 1.0),
+            ),
+        };
+
+        let mut sidebar = div().flex().flex_col().gap(px(4.)).w(px(82.));
         for (i, name) in ["flaky tests", "stripe v4", "docs pass"].iter().enumerate() {
-            let mut row = div()
+            let mut chip = div()
                 .px(px(7.))
                 .py(px(4.))
                 .rounded(px(6.))
-                .text_size(px(11.))
-                .text_color(color(if i == 0 { pt.ink } else { pt.ink_dim }, 1.0))
+                .text_size(px(10.5))
+                .truncate()
+                .text_color(if i == 0 { ink } else { ink_dim })
                 .child(*name);
             if i == 0 {
-                row = row.bg(color(pt.card, 0.9));
+                chip = chip.bg(surface);
             }
-            sidebar = sidebar.child(row);
+            sidebar = sidebar.child(chip);
         }
 
         let mini_term = div()
@@ -1062,28 +859,9 @@ fn render_appearance(app: &App, theme: &Theme, entity: gpui::WeakEntity<App>) ->
             .min_h(px(70.))
             .rounded(px(8.))
             .bg(pane_bg)
+            .border_1()
+            .border_color(overlay(theme, 0.1))
             .overflow_hidden()
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .gap(px(16.))
-                    .px(px(10.))
-                    .py(px(4.))
-                    .child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(pane_ink)
-                            .child("zsh"),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(pane_dim)
-                            .child("cargo"),
-                    ),
-            )
-            .child(div().h(px(1.)).bg(pane_divider))
             .child(
                 div()
                     .flex()
@@ -1093,15 +871,15 @@ fn render_appearance(app: &App, theme: &Theme, entity: gpui::WeakEntity<App>) ->
                     .py(px(6.))
                     .child(
                         div()
-                            .text_size(px(11.))
-                            .text_color(pane_ink)
+                            .text_size(px(10.5))
+                            .text_color(pane_dim)
                             .child("$ cargo run"),
                     )
                     .child(
                         div()
-                            .text_size(px(11.))
-                            .text_color(pane_dim)
-                            .child("   Compiling pwrde"),
+                            .text_size(px(10.5))
+                            .text_color(pane_ink)
+                            .child("Compiling pwrde"),
                     ),
             );
 
@@ -1109,8 +887,10 @@ fn render_appearance(app: &App, theme: &Theme, entity: gpui::WeakEntity<App>) ->
             .flex()
             .flex_col()
             .flex_1()
-            .min_h(px(220.))
-            .rounded(theme.radius_lg())
+            .min_h(px(200.))
+            .rounded(px(12.))
+            .border_1()
+            .border_color(card_border(theme))
             .bg(color(pt.gradient_from, 1.0))
             .p(px(12.))
             .gap(px(10.))
@@ -1119,58 +899,26 @@ fn render_appearance(app: &App, theme: &Theme, entity: gpui::WeakEntity<App>) ->
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(6.))
-                    .child(div().w(px(8.)).h(px(8.)).rounded_full().bg(color(pt.ink, 0.25)))
-                    .child(div().w(px(8.)).h(px(8.)).rounded_full().bg(color(pt.ink, 0.25)))
-                    .child(div().w(px(8.)).h(px(8.)).rounded_full().bg(color(pt.ink, 0.25)))
+                    .gap(px(4.))
+                    .child(div().size(px(7.)).rounded_full().bg(ink_dim))
+                    .child(div().size(px(7.)).rounded_full().bg(ink_dim))
+                    .child(div().size(px(7.)).rounded_full().bg(ink_dim))
                     .child(
                         div()
                             .ml(px(4.))
-                            .text_size(px(11.))
-                            .text_color(color(pt.ink_dim, 1.0))
-                            .child(format!("{} · Preview", pt.label)),
+                            .text_size(px(10.5))
+                            .text_color(ink_dim)
+                            .child(format!("{polarity} · App")),
                     ),
             )
             .child(
                 div()
                     .flex()
                     .flex_row()
-                    .gap(px(10.))
+                    .gap(px(8.))
                     .flex_1()
                     .child(sidebar)
                     .child(mini_term),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(4.))
-                    .rounded(px(7.))
-                    .bg(color(pt.card, 1.0))
-                    .px(px(8.))
-                    .py(px(6.))
-                    .child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(color(pt.ink, 1.0))
-                            .child("Surface card"),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .text_size(px(11.))
-                            .child(
-                                div()
-                                    .text_color(color(pt.ink_dim, 1.0))
-                                    .child("Secondary text on surface · "),
-                            )
-                            .child(
-                                div()
-                                    .text_color(color(pt.accent, 1.0))
-                                    .child("a link"),
-                            ),
-                    ),
             )
             .child(
                 div()
@@ -1182,9 +930,9 @@ fn render_appearance(app: &App, theme: &Theme, entity: gpui::WeakEntity<App>) ->
                             .px(px(10.))
                             .py(px(4.))
                             .rounded(px(6.))
-                            .bg(color(pt.accent, 1.0))
-                            .text_size(px(11.))
-                            .text_color(color((255, 255, 255), 1.0))
+                            .bg(accent)
+                            .text_size(px(10.5))
+                            .text_color(gpui::white())
                             .child("Primary"),
                     )
                     .child(
@@ -1192,13 +940,12 @@ fn render_appearance(app: &App, theme: &Theme, entity: gpui::WeakEntity<App>) ->
                             .px(px(10.))
                             .py(px(4.))
                             .rounded(px(6.))
-                            .bg(color(pt.ink, 0.08))
-                            .text_size(px(11.))
-                            .text_color(color(pt.ink, 1.0))
+                            .bg(surface)
+                            .text_size(px(10.5))
+                            .text_color(ink)
                             .child("Secondary"),
                     ),
             )
-            .child(chips)
             .into_any_element()
     };
 
@@ -1210,22 +957,22 @@ fn render_appearance(app: &App, theme: &Theme, entity: gpui::WeakEntity<App>) ->
         let red = color(ansi[1], 1.0);
         let green = color(ansi[2], 1.0);
         let yellow = color(ansi[3], 1.0);
-        let magenta = color(ansi[5], 1.0);
-        let cyan = color(ansi[6], 1.0);
+        let blue = color(ansi[4], 1.0);
 
-        let mut ansi_chips = div().flex().flex_row().items_center().gap(px(3.));
-        for c in ansi {
-            ansi_chips = ansi_chips.child(
-                div()
-                    .w(px(8.))
-                    .h(px(8.))
-                    .rounded(px(2.))
-                    .bg(color(c, 1.0)),
+        let mut ansi_squares = div().flex().flex_row().items_center().gap(px(3.));
+        for c in ansi.iter().take(6) {
+            ansi_squares = ansi_squares.child(
+                div().size(px(7.)).rounded(px(2.)).bg(color(*c, 1.0)),
             );
         }
 
         let line = |spans: Vec<AnyElement>| {
-            let mut row = div().flex().flex_row().text_size(px(11.));
+            let mut row = div()
+                .flex()
+                .flex_row()
+                .text_size(px(10.5))
+                .font_family("monospace")
+                .line_height(gpui::relative(1.7));
             for s in spans {
                 row = row.child(s);
             }
@@ -1239,8 +986,10 @@ fn render_appearance(app: &App, theme: &Theme, entity: gpui::WeakEntity<App>) ->
             .flex()
             .flex_col()
             .flex_1()
-            .min_h(px(220.))
-            .rounded(theme.radius_lg())
+            .min_h(px(200.))
+            .rounded(px(12.))
+            .border_1()
+            .border_color(card_border(theme))
             .bg(color(tbg, 1.0))
             .overflow_hidden()
             .child(
@@ -1251,17 +1000,17 @@ fn render_appearance(app: &App, theme: &Theme, entity: gpui::WeakEntity<App>) ->
                     .justify_between()
                     .px(px(12.))
                     .py(px(6.))
-                    .bg(color((0, 0, 0), 0.18))
+                    .bg(alpha(gpui::black(), 0.18))
                     .child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(px(10.5))
                             .text_color(color(tfg, 0.7))
                             .child(format!(
-                                "{} · Preview",
+                                "{} · Terminal",
                                 sel.map_or("Default", |t| t.label)
                             )),
                     )
-                    .child(ansi_chips),
+                    .child(ansi_squares),
             )
             .child(
                 div()
@@ -1270,54 +1019,66 @@ fn render_appearance(app: &App, theme: &Theme, entity: gpui::WeakEntity<App>) ->
                     .gap(px(2.))
                     .px(px(12.))
                     .py(px(8.))
+                    .child(line(vec![span("$ ", dimc), span("cargo test", fgc)]))
                     .child(line(vec![
-                        span("you@dev", green),
-                        span(":~/checkout$", dimc),
-                        span(" git status", fgc),
-                    ]))
-                    .child(line(vec![
-                        span("On branch ", dimc),
-                        span("feature/flaky-capture", cyan),
-                    ]))
-                    .child(line(vec![
-                        span("  modified:  ", red),
-                        span("tests/conftest.py", fgc),
-                    ]))
-                    .child(line(vec![
-                        span("  new file:  ", green),
-                        span("tests/test_clock.py", fgc),
-                    ]))
-                    .child(line(vec![
-                        span("you@dev", green),
-                        span(":~$", dimc),
-                        span(" pytest -q", fgc),
+                        span("Compiling ", green),
+                        span("pwrde v0.1.0", fgc),
                     ]))
                     .child(line(vec![
                         span("warning: ", yellow),
-                        span("2 deprecation warnings", fgc),
+                        span("unused import", fgc),
                     ]))
                     .child(line(vec![
-                        span("400 passed ", green),
-                        span("0 failed", red),
-                        span(" in ", fgc),
-                        span("41.2s", magenta),
+                        span("error[E0425]: ", red),
+                        span("cannot find value", fgc),
                     ]))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .text_size(px(11.))
-                            .child(span("❯ ", magenta))
-                            .child(span("agent watching e2e ", fgc))
-                            .child(
-                                div()
-                                    .w(px(7.))
-                                    .h(px(12.))
-                                    .bg(color(tfg, 0.9)),
-                            ),
-                    ),
+                    .child(line(vec![span("note: ", blue), span("see the docs", dimc)])),
             )
+            .into_any_element()
+    };
+
+    // The Light | Dark preview toggle rides the "Terminal colors" caption.
+    let preview_seg = {
+        let well_hover = overlay(theme, 0.04);
+        let mk = |id: &'static str, label: &'static str, dark: bool| {
+            let active = preview_dark == dark;
+            let e = entity.clone();
+            let mut seg = div()
+                .id(id)
+                .px(px(9.))
+                .py(px(2.))
+                .rounded(px(6.))
+                .text_size(px(11.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .cursor_pointer()
+                .child(label);
+            if active {
+                seg = seg.bg(theme.primary).text_color(theme.primary_foreground);
+            } else {
+                seg = seg.text_color(theme.secondary_foreground).hover(move |s| s.bg(well_hover));
+            }
+            seg = seg.on_click(move |_ev: &ClickEvent, _win: &mut Window, gpui_app: &mut GpuiApp| {
+                gpui_app.stop_propagation();
+                if let Some(e) = e.upgrade() {
+                    e.update(gpui_app, move |this, cx| {
+                        this.preview_dark = dark;
+                        cx.notify();
+                    });
+                }
+            });
+            seg
+        };
+        div()
+            .flex()
+            .flex_row()
+            .p(px(2.))
+            .gap(px(2.))
+            .rounded(px(8.))
+            .bg(inset(theme, if theme.dark { 0.25 } else { 0.05 }))
+            .border_1()
+            .border_color(alpha(gpui::black(), 0.08))
+            .child(mk("appearance-preview-light", "Light", false))
+            .child(mk("appearance-preview-dark", "Dark", true))
             .into_any_element()
     };
 
@@ -1325,18 +1086,16 @@ fn render_appearance(app: &App, theme: &Theme, entity: gpui::WeakEntity<App>) ->
         .id("settings-rows")
         .flex()
         .flex_col()
-        .flex_1()
-        .min_h(px(0.))
-        .overflow_y_scroll()
-        .gap_4()
-        .child(settings_group(theme, vec![mode_seg, accent_row, preview_seg]))
+        .gap(px(26.))
+        .child(settings_block(theme, "Theme", vec![mode_seg, accent_row]))
+        .child(settings_block(theme, "Text size", vec![term_size, app_size]))
         .child(
             div()
                 .flex()
                 .flex_col()
-                .gap_2()
-                .child(group_label(theme, "Terminal colors"))
-                .child(settings_group(
+                .gap(px(6.))
+                .child(caption_row(theme, "Terminal colors", Some(preview_seg)))
+                .child(settings_card(
                     theme,
                     vec![
                         term_select(AppearanceDropdown::TermLight),
@@ -1346,11 +1105,740 @@ fn render_appearance(app: &App, theme: &Theme, entity: gpui::WeakEntity<App>) ->
         )
         .child(
             div()
+                .mt(px(4.))
                 .flex()
                 .flex_row()
-                .gap_4()
-                .child(div().flex_1().min_w(px(0.)).child(app_preview))
-                .child(div().flex_1().min_w(px(0.)).child(term_preview)),
+                .gap(px(12.))
+                .child(app_preview)
+                .child(term_preview),
         )
         .into_any_element()
+}
+
+// ── Tools ───────────────────────────────────────────────────────────────
+
+fn render_tools(app: &App, theme: &Theme, entity: gpui::WeakEntity<App>) -> AnyElement {
+    let remove_hover = theme.destructive;
+    let mut rows: Vec<AnyElement> = Vec::new();
+    for (ix, tool) in app.tools.iter().enumerate() {
+        let remove_entity = entity.clone();
+        let remove = div()
+            .id(("tool-remove", ix as u64))
+            .size(px(14.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_size(px(12.))
+            .text_color(theme.muted_foreground)
+            .cursor_pointer()
+            .hover(move |s| s.text_color(remove_hover))
+            .child("✕")
+            .on_click(move |_ev: &ClickEvent, _win: &mut Window, gpui_app: &mut GpuiApp| {
+                gpui_app.stop_propagation();
+                if let Some(entity) = remove_entity.upgrade() {
+                    entity.update(gpui_app, move |this, cx| {
+                        this.remove_tool(ix);
+                        cx.notify();
+                    });
+                }
+            });
+        rows.push(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(12.))
+                .px(px(12.))
+                .py(px(10.))
+                .child(
+                    // 26×26 icon chip
+                    div()
+                        .size(px(26.))
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(7.))
+                        .bg(inset(theme, 0.05))
+                        .text_size(px(12.))
+                        .font_family("monospace")
+                        .child(tool.icon.clone()),
+                )
+                .child(
+                    div()
+                        .flex_basis(px(0.))
+                        .flex_grow(1.1)
+                        .min_w(px(0.))
+                        .text_size(px(13.))
+                        .text_color(theme.foreground)
+                        .truncate()
+                        .child(tool.name.clone()),
+                )
+                .child(
+                    div()
+                        .flex_basis(px(0.))
+                        .flex_grow(1.4)
+                        .min_w(px(0.))
+                        .text_size(px(12.))
+                        .font_family("monospace")
+                        .text_color(theme.secondary_foreground)
+                        .truncate()
+                        .child(tool.command.clone()),
+                )
+                .child(
+                    div()
+                        .flex_basis(px(0.))
+                        .flex_grow(1.0)
+                        .min_w(px(0.))
+                        .text_size(px(12.))
+                        .font_family("monospace")
+                        .text_color(theme.muted_foreground)
+                        .truncate()
+                        .child(tool.cwd.clone()),
+                )
+                .child(remove)
+                .into_any_element(),
+        );
+    }
+    if rows.is_empty() {
+        rows.push(
+            div()
+                .px(px(12.))
+                .py(px(18.))
+                .text_size(px(12.5))
+                .text_color(theme.muted_foreground)
+                .child("No tools yet.")
+                .into_any_element(),
+        );
+    }
+
+    let field =
+        |label: &'static str, input: &gpui::Entity<crate::ui::Input>, grow: f32| {
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(3.))
+                .flex_basis(px(0.))
+                .flex_grow(grow)
+                .min_w(px(0.))
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(theme.muted_foreground)
+                        .child(label),
+                )
+                .child(input.clone())
+                .into_any_element()
+        };
+
+    let add_entity = entity;
+    let add = div()
+        .id("tool-add")
+        .px(px(12.))
+        .py(px(6.))
+        .rounded(px(7.))
+        .text_size(px(12.))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(gpui::white())
+        .bg(theme.primary)
+        .cursor_pointer()
+        .child("Add tool")
+        .on_click(move |_ev: &ClickEvent, _win: &mut Window, gpui_app: &mut GpuiApp| {
+            gpui_app.stop_propagation();
+            if let Some(e) = add_entity.upgrade() {
+                e.update(gpui_app, move |this, cx| {
+                    let name = this.tool_form.name.read(cx).text().trim().to_string();
+                    let command = this.tool_form.command.read(cx).text().trim().to_string();
+                    if name.is_empty() || command.is_empty() {
+                        return;
+                    }
+                    this.add_tool_from_form(cx);
+                });
+            }
+        });
+
+    let form = div()
+        .flex()
+        .flex_col()
+        .gap(px(10.))
+        .w_full()
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .gap(px(12.))
+                .w_full()
+                .child(field("Name", &app.tool_form.name, 1.1))
+                .child(field("Command", &app.tool_form.command, 1.6))
+                .child(field("Directory", &app.tool_form.cwd, 1.0))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(3.))
+                        .w(px(64.))
+                        .flex_shrink_0()
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(theme.muted_foreground)
+                                .child("Icon"),
+                        )
+                        .child(app.tool_form.icon.clone()),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(12.))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .text_size(px(11.5))
+                        .text_color(theme.muted_foreground)
+                        .child(
+                            "Directory accepts ~. Icon is any text — Nerd Font glyphs render \
+                             like the built-ins.",
+                        ),
+                )
+                .child(add),
+        );
+
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(26.))
+        .child(settings_block(theme, "Installed", rows))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .child(settings_caption(theme, "Add a tool"))
+                .child(
+                    div()
+                        .w_full()
+                        .rounded(px(12.))
+                        .border_1()
+                        .border_color(card_border(theme))
+                        .bg(card_fill(theme))
+                        .p(px(12.))
+                        .overflow_hidden()
+                        .child(form),
+                ),
+        )
+        .into_any_element()
+}
+
+// ── Keyboard ────────────────────────────────────────────────────────────
+
+/// The Keyboard section's groups, in display order.
+const KEYBOARD_GROUPS: [&str; 5] = ["Layout", "Tabs & sessions", "Focus", "Editing", "App"];
+
+fn render_keyboard(app: &App, theme: &Theme, entity: gpui::WeakEntity<App>) -> AnyElement {
+    let query = app.settings_query.to_lowercase();
+    let mut blocks: Vec<AnyElement> = Vec::new();
+
+    for group in KEYBOARD_GROUPS {
+        let actions: Vec<Action> = Action::ALL
+            .iter()
+            .copied()
+            .filter(|a| a.keyboard_group() == group)
+            .filter(|a| {
+                query.is_empty()
+                    || a.label().to_lowercase().contains(&query)
+                    || group.to_lowercase().contains(&query)
+            })
+            .collect();
+        if actions.is_empty() {
+            continue;
+        }
+        let mut rows: Vec<AnyElement> = Vec::new();
+        for (ix, action) in actions.into_iter().enumerate() {
+            rows.push(keyboard_row(
+                theme,
+                ix,
+                action,
+                app.recording == Some(action),
+                &entity,
+            ));
+        }
+        blocks.push(settings_block(theme, group, rows).into_any_element());
+    }
+
+    let body: AnyElement = if blocks.is_empty() {
+        div()
+            .pl(px(12.))
+            .text_size(px(12.5))
+            .text_color(theme.muted_foreground)
+            .child(format!("No shortcuts match “{}”.", app.settings_query))
+            .into_any_element()
+    } else {
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(26.))
+            .children(blocks)
+            .into_any_element()
+    };
+
+    div()
+        .id("settings-rows")
+        .flex()
+        .flex_col()
+        .child(body)
+        .into_any_element()
+}
+
+/// One shortcut row: the label on the left, an accent dot when the binding is
+/// customized, and the chord as key caps (or a "Press keys…" pill while
+/// recording). Clicking the row arms or disarms the recorder.
+fn keyboard_row(
+    theme: &Theme,
+    ix: usize,
+    action: Action,
+    recording: bool,
+    entity: &gpui::WeakEntity<App>,
+) -> AnyElement {
+    let row_entity = entity.clone();
+    let right: AnyElement = if recording {
+        div()
+            .px(px(9.))
+            .py(px(3.))
+            .rounded(px(6.))
+            .text_size(px(11.5))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(gpui::white())
+            .bg(theme.primary)
+            .child("Press keys…")
+            .into_any_element()
+    } else {
+        let binding = action.binding();
+        if binding.key.is_empty() {
+            key_cap(theme, "—").into_any_element()
+        } else {
+            let mut caps = div().flex().flex_row().items_center().gap(px(3.));
+            for cap in chord_caps(&binding) {
+                caps = caps.child(key_cap(theme, cap));
+            }
+            caps.into_any_element()
+        }
+    };
+
+    let customized = action.binding() != action.default_binding();
+    let mut row = settings_row()
+        .id(("kbd-row", ix as u64))
+        .cursor_pointer()
+        .py(px(0.))
+        .h(px(38.))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .text_size(px(13.))
+                .text_color(theme.foreground)
+                .child(action.label()),
+        )
+        .child(
+            div()
+                .size(px(6.))
+                .flex_shrink_0()
+                .rounded_full()
+                .bg(if customized {
+                    theme.primary
+                } else {
+                    gpui::transparent_black()
+                }),
+        )
+        .child(right);
+    if recording {
+        row = row.bg(overlay(theme, 0.05));
+    }
+    row = row.on_click(move |_ev: &ClickEvent, _win: &mut Window, gpui_app: &mut GpuiApp| {
+        gpui_app.stop_propagation();
+        if let Some(entity) = row_entity.upgrade() {
+            entity.update(gpui_app, move |this, cx| {
+                this.recording = if this.recording == Some(action) {
+                    None
+                } else {
+                    Some(action)
+                };
+                cx.notify();
+            });
+        }
+    });
+    row.into_any_element()
+}
+
+/// The "Restore defaults" pill: writes every action's default binding back
+/// (settings.rs has no unset API; re-serializing the default keeps the value
+/// shape identical).
+fn restore_defaults_pill(
+    theme: &Theme,
+    entity: &gpui::WeakEntity<App>,
+) -> gpui::Stateful<gpui::Div> {
+    let hover = overlay(theme, 0.09);
+    let e = entity.clone();
+    div()
+        .id("restore-defaults")
+        .px(px(10.))
+        .py(px(5.))
+        .rounded_full()
+        .text_size(px(11.5))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(theme.primary)
+        .border_1()
+        .border_color(overlay(theme, 0.12))
+        .bg(overlay(theme, 0.05))
+        .cursor_pointer()
+        .hover(move |s| s.bg(hover))
+        .child("Restore defaults")
+        .on_click(move |_ev: &ClickEvent, _win: &mut Window, gpui_app: &mut GpuiApp| {
+            gpui_app.stop_propagation();
+            if let Some(e) = e.upgrade() {
+                e.update(gpui_app, move |_this, cx| {
+                    for action in Action::ALL {
+                        settings::set(
+                            &action.setting_key(),
+                            action.default_binding().serialize().into(),
+                        );
+                    }
+                    cx.notify();
+                });
+            }
+        })
+}
+
+// ── Advanced ────────────────────────────────────────────────────────────
+
+fn render_advanced(app: &App, theme: &Theme, entity: gpui::WeakEntity<App>) -> AnyElement {
+    // Flow's in-app description (the features.rs text names a source file the
+    // settings page shouldn't; the brief's string wins).
+    const FLOW_DESC: &str =
+        "Bottom command bar that drives this workspace through an embedded agent. ⌘J";
+
+    let mut rows: Vec<AnyElement> = Vec::new();
+    for flag in crate::features::ALL {
+        let desc: &str = if flag.key == crate::features::FLOW {
+            FLOW_DESC
+        } else {
+            flag.description
+        };
+        let label_cell = || {
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w(px(0.))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(6.))
+                        .text_size(px(13.))
+                        .text_color(theme.foreground)
+                        .child(flag.label)
+                        .child(beta_badge(theme)),
+                )
+                .child(
+                    div()
+                        .mt(px(2.))
+                        .text_size(px(11.5))
+                        .text_color(theme.muted_foreground)
+                        .child(desc),
+                )
+        };
+        let key = flag.key;
+        let e = entity.clone();
+        let toggle = Switch::new(gpui::SharedString::from(format!("flag-{key}")))
+            .checked(crate::features::enabled(key))
+            .on_change(move |checked: &bool, _win: &mut Window, gpui_app: &mut GpuiApp| {
+                gpui_app.stop_propagation();
+                let on = *checked;
+                if let Some(e) = e.upgrade() {
+                    e.update(gpui_app, move |_this, cx| {
+                        settings::set(&format!("features.{key}"), on.into());
+                        cx.notify();
+                    });
+                }
+            });
+        rows.push(settings_row().child(label_cell()).child(toggle).into_any_element());
+    }
+
+    // Show frame stats (debug.overlay).
+    {
+        let e = entity.clone();
+        let toggle = Switch::new("debug-overlay")
+            .checked(settings::get_bool("debug.overlay", false))
+            .on_change(move |checked: &bool, _win: &mut Window, gpui_app: &mut GpuiApp| {
+                gpui_app.stop_propagation();
+                let on = *checked;
+                if let Some(e) = e.upgrade() {
+                    e.update(gpui_app, move |_this, cx| {
+                        settings::set("debug.overlay", on.into());
+                        cx.notify();
+                    });
+                }
+            });
+        rows.push(
+            settings_row()
+                .child(row_text(
+                    theme,
+                    "Show frame stats",
+                    Some("Overlay render timing in the corner of each terminal."),
+                ))
+                .child(toggle)
+                .into_any_element(),
+        );
+    }
+
+    // ── Diagnostics ────────────────────────────────────────────────────
+    let th = crate::theme::current();
+    let (sw, sh) = app.renderer.surface_size();
+    let diags: [(&str, String); 7] = [
+        (
+            "Settings file",
+            settings::path().to_string_lossy().into_owned(),
+        ),
+        (
+            "Chrome",
+            format!(
+                "{} · accent #{:02x}{:02x}{:02x}",
+                th.label, th.accent.0, th.accent.1, th.accent.2
+            ),
+        ),
+        ("Scale", format!("{:.2}", app.renderer.scale)),
+        ("Surface", format!("{}×{} px", sw, sh)),
+        (
+            "Cell",
+            format!("{}×{} px", app.renderer.cell_width, app.renderer.cell_height),
+        ),
+        ("Workspaces", app.workspaces.len().to_string()),
+        (
+            "Tiles (active group)",
+            app.workspaces
+                .get(app.active)
+                .map(|ws| ws.root.tiles().len().to_string())
+                .unwrap_or_else(|| "—".into()),
+        ),
+    ];
+    let diag_rows: Vec<AnyElement> = diags
+        .iter()
+        .map(|(key, value)| {
+            settings_row()
+                .py(px(9.))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .text_size(px(12.5))
+                        .text_color(theme.muted_foreground)
+                        .child(*key),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .justify_end()
+                        .max_w(px(420.))
+                        .min_w(px(0.))
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .font_family("monospace")
+                                .text_color(theme.foreground)
+                                .truncate()
+                                .child(value.clone()),
+                        ),
+                )
+                .into_any_element()
+        })
+        .collect();
+
+    let copy_text = diags
+        .iter()
+        .map(|(k, v)| format!("{k}: {v}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let copied = COPIED_AT
+        .lock()
+        .ok()
+        .and_then(|g| *g)
+        .is_some_and(|t| t.elapsed() < COPIED_FOR);
+    let e = entity.clone();
+    let copy_all = div()
+        .id("copy-all")
+        .text_size(px(11.5))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(theme.primary)
+        .cursor_pointer()
+        .child(if copied { "Copied" } else { "Copy all" })
+        .on_click(move |_ev: &ClickEvent, _win: &mut Window, gpui_app: &mut GpuiApp| {
+            gpui_app.stop_propagation();
+            gpui_app.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
+            if let Ok(mut at) = COPIED_AT.lock() {
+                *at = Some(Instant::now());
+            }
+            if let Some(e) = e.upgrade() {
+                let eid = e.entity_id();
+                e.update(gpui_app, move |_this, cx| {
+                    cx.notify();
+                    cx.spawn_in(_win, async move |_this, cx| {
+                        cx.background_executor().timer(COPIED_FOR).await;
+                        let _ = cx.update(|_win, cx| cx.notify(eid));
+                    })
+                    .detach();
+                });
+            }
+        });
+
+    let reveal = div()
+        .id("reveal-settings")
+        .text_size(px(11.5))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(theme.primary)
+        .cursor_pointer()
+        .child("Reveal settings.json")
+        .hover(|s| s.opacity(0.8))
+        .on_click(move |_ev: &ClickEvent, _win: &mut Window, _gpui_app: &mut GpuiApp| {
+            let _ = std::process::Command::new("open")
+                .arg("-R")
+                .arg(settings::path())
+                .spawn();
+        });
+
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(26.))
+        .child(settings_block(theme, "Experiments", rows))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .child(caption_row(theme, "Diagnostics", Some(copy_all.into_any_element())))
+                .child(settings_card(theme, diag_rows))
+                .child(div().pl(px(12.)).mt(px(2.)).child(reveal)),
+        )
+        .into_any_element()
+}
+
+// ── Search results ──────────────────────────────────────────────────────
+
+fn render_search_results(app: &App, theme: &Theme, entity: gpui::WeakEntity<App>) -> AnyElement {
+    let results = pages::search_settings(&app.settings_query);
+    if results.is_empty() {
+        return div()
+            .pl(px(12.))
+            .text_size(px(12.5))
+            .text_color(theme.muted_foreground)
+            .child("no settings match")
+            .into_any_element();
+    }
+
+    let hover_bg = overlay(theme, 0.04);
+    let mut rows: Vec<AnyElement> = Vec::new();
+    for (ix, entry) in results.into_iter().enumerate() {
+        let section = entry.section;
+        let row_entity = entity.clone();
+        rows.push(
+            settings_row()
+                .id(("settings-search", ix as u64))
+                .cursor_pointer()
+                .hover(move |s| s.bg(hover_bg))
+                .on_click(move |_ev: &ClickEvent, win: &mut Window, gpui_app: &mut GpuiApp| {
+                    gpui_app.stop_propagation();
+                    if let Some(entity) = row_entity.upgrade() {
+                        entity.update(gpui_app, move |this, cx| {
+                            this.section = section;
+                            this.clear_settings_search(cx);
+                            this.blur_settings_search(win, cx);
+                            cx.notify();
+                        });
+                    }
+                })
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .text_size(px(13.))
+                        .child(entry.label),
+                )
+                .child(
+                    Badge::new()
+                        .variant(BadgeVariant::Outline)
+                        .child(entry.section.label()),
+                )
+                .into_any_element(),
+        );
+    }
+    settings_card(theme, rows).into_any_element()
+}
+
+// ── Tests ───────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chord_caps_orders_modifiers_then_key() {
+        let b = pages::Binding::parse("cmd-shift-left").unwrap();
+        assert_eq!(chord_caps(&b), vec!["⇧", "⌘", "←"]);
+        let b = pages::Binding::parse("cmd-ctrl-alt-t").unwrap();
+        assert_eq!(chord_caps(&b), vec!["⌃", "⌥", "⌘", "T"]);
+        let b = pages::Binding::parse("cmd-w").unwrap();
+        assert_eq!(chord_caps(&b), vec!["⌘", "W"]);
+    }
+
+    #[test]
+    fn key_glyph_maps_arrows_and_minus() {
+        assert_eq!(key_glyph("left"), "←");
+        assert_eq!(key_glyph("right"), "→");
+        assert_eq!(key_glyph("up"), "↑");
+        assert_eq!(key_glyph("down"), "↓");
+        assert_eq!(key_glyph("minus"), "-");
+        assert_eq!(key_glyph("w"), "W");
+    }
+
+    #[test]
+    fn overlay_follows_polarity() {
+        let dark = Theme::dark();
+        let light = Theme::light();
+        assert!(
+            overlay(&dark, 0.5).l > dark.background.l,
+            "dark polarity overlays white"
+        );
+        assert!(
+            overlay(&light, 0.5).l < light.background.l,
+            "light polarity overlays black"
+        );
+    }
+
+    #[test]
+    fn keyboard_groups_are_all_covered() {
+        for action in Action::ALL {
+            assert!(
+                KEYBOARD_GROUPS.contains(&action.keyboard_group()),
+                "{} has unknown group {}",
+                action.name(),
+                action.keyboard_group()
+            );
+        }
+    }
+
+    #[test]
+    fn every_keyboard_group_is_non_empty() {
+        for group in KEYBOARD_GROUPS {
+            assert!(
+                Action::ALL.iter().any(|a| a.keyboard_group() == group),
+                "group {group} has no actions"
+            );
+        }
+    }
 }

@@ -1199,9 +1199,54 @@ fn tab_rect_at(index: usize, scale: f32, font_scale: f32, list: &LayoutRect) -> 
     LayoutRect { x: list.x, y: top + index as f32 * (h + gap), w: list.w.max(0.0), h }
 }
 
-/// The search-box slot at the top of the Settings sidebar (index 0 slot).
-pub fn settings_search_rect(scale: f32, list: &LayoutRect) -> LayoutRect {
-    tab_rect(0, scale, list)
+/// Settings-window nav geometry — the sidebar of the separate Settings window
+/// (`src/settings_window.rs`), not the main window's sidebar. All logical px;
+/// pure, so the window's rows and any hit-testing agree.
+pub const SETTINGS_NAV_ROW_H: f32 = 30.0;
+/// Gap between two nav rows.
+pub const SETTINGS_NAV_GAP: f32 = 1.0;
+/// Horizontal inset of a nav row inside the nav pane.
+pub const SETTINGS_NAV_INSET: f32 = 8.0;
+/// Height of the traffic-light header strip above the search box.
+pub const SETTINGS_NAV_HEADER_H: f32 = 44.0;
+/// Height of the search box itself.
+pub const SETTINGS_NAV_SEARCH_H: f32 = 32.0;
+/// Padding below the search box, before the first row.
+pub const SETTINGS_NAV_SEARCH_PAD_BOTTOM: f32 = 10.0;
+/// Spacer between the four section rows and the Advanced caption.
+pub const SETTINGS_NAV_SPACER: f32 = 14.0;
+/// Height of the Advanced caption line.
+pub const SETTINGS_NAV_CAPTION_H: f32 = 18.0;
+/// Section rows before the Advanced group: General, Appearance, Tools,
+/// Keyboard. Index `0..SETTINGS_NAV_ROWS` are those; index
+/// `SETTINGS_NAV_ROWS` is the Advanced row, after the spacer and caption.
+pub const SETTINGS_NAV_ROWS: usize = 4;
+
+/// Y of the first nav row inside the Settings window's nav pane.
+pub fn settings_nav_rows_top(scale: f32, pane: &LayoutRect) -> f32 {
+    pane.y
+        + (SETTINGS_NAV_HEADER_H * scale).round()
+        + (SETTINGS_NAV_SEARCH_PAD_BOTTOM * scale).round()
+        + (SETTINGS_NAV_SEARCH_H * scale).round()
+}
+
+/// Rect of nav row `index` inside the Settings window's nav pane at text
+/// factor `scale` (`0..SETTINGS_NAV_ROWS` are the section rows; index
+/// `SETTINGS_NAV_ROWS` is the Advanced row). Pure.
+pub fn settings_nav_row_rect(scale: f32, pane: &LayoutRect, index: usize) -> LayoutRect {
+    let row_h = (SETTINGS_NAV_ROW_H * scale).round();
+    let gap = (SETTINGS_NAV_GAP * scale).round().max(1.0);
+    let top = settings_nav_rows_top(scale, pane);
+    let y = if index < SETTINGS_NAV_ROWS {
+        top + index as f32 * (row_h + gap)
+    } else {
+        top
+            + SETTINGS_NAV_ROWS as f32 * (row_h + gap)
+            + (SETTINGS_NAV_SPACER * scale).round()
+            + (SETTINGS_NAV_CAPTION_H * scale).round()
+    };
+    let inset = (SETTINGS_NAV_INSET * scale).round();
+    LayoutRect { x: pane.x + inset, y, w: (pane.w - 2.0 * inset).max(0.0), h: row_h }
 }
 
 /// One visible row of the flat sessions list: the group it shows. Section
@@ -4000,6 +4045,47 @@ mod tests {
         } else {
             panic!("root should be a leaf");
         }
+    }
+
+    #[test]
+    fn settings_nav_rows_stack_with_one_px_gaps() {
+        let pane = LayoutRect { x: 20.0, y: 0.0, w: 236.0, h: 620.0 };
+        let first = settings_nav_row_rect(1.0, &pane, 0);
+        assert_eq!(first.x, pane.x + SETTINGS_NAV_INSET);
+        assert_eq!(first.w, pane.w - 2.0 * SETTINGS_NAV_INSET);
+        assert_eq!(first.h, SETTINGS_NAV_ROW_H);
+        assert_eq!(
+            first.y,
+            pane.y + SETTINGS_NAV_HEADER_H + SETTINGS_NAV_SEARCH_PAD_BOTTOM + SETTINGS_NAV_SEARCH_H
+        );
+        for i in 1..SETTINGS_NAV_ROWS {
+            let prev = settings_nav_row_rect(1.0, &pane, i - 1);
+            let row = settings_nav_row_rect(1.0, &pane, i);
+            assert_eq!(row.y - (prev.y + prev.h), SETTINGS_NAV_GAP);
+            assert_eq!(row.x, prev.x);
+            assert_eq!(row.w, prev.w);
+            assert_eq!(row.h, prev.h);
+        }
+        // The Advanced row clears the 14px spacer and the caption.
+        let last = settings_nav_row_rect(1.0, &pane, SETTINGS_NAV_ROWS - 1);
+        let advanced = settings_nav_row_rect(1.0, &pane, SETTINGS_NAV_ROWS);
+        assert_eq!(
+            advanced.y - (last.y + last.h),
+            SETTINGS_NAV_GAP + SETTINGS_NAV_SPACER + SETTINGS_NAV_CAPTION_H
+        );
+        assert_eq!(advanced.h, SETTINGS_NAV_ROW_H);
+    }
+
+    #[test]
+    fn settings_nav_rows_follow_the_text_factor_and_stay_in_the_pane() {
+        let pane = LayoutRect { x: 0.0, y: 0.0, w: 236.0, h: 620.0 };
+        let one = settings_nav_row_rect(1.0, &pane, 0);
+        let bigger = settings_nav_row_rect(1.25, &pane, 0);
+        assert!(bigger.h > one.h, "rows grow with the text factor");
+        assert_eq!(bigger.h, (SETTINGS_NAV_ROW_H * 1.25).round());
+        let advanced = settings_nav_row_rect(1.25, &pane, SETTINGS_NAV_ROWS);
+        assert!(advanced.y + advanced.h < pane.y + pane.h);
+        assert!(advanced.x >= pane.x && advanced.x + advanced.w <= pane.x + pane.w);
     }
 
 }

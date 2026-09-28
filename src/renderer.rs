@@ -678,11 +678,10 @@ impl Renderer {
 
         if matches!(
             chrome.page,
-            Page::Settings | Page::Tool(_)
+            Page::Tool(_)
         ) {
-            // Content is a gpui overlay (settings_ui) or,
-            // for a tool page, painted by `tool_page` — the canvas paints the
-            // sidebar only here.
+            // A tool page's content is painted by `tool_page`; the canvas
+            // paints only the sidebar here.
         } else {
             let hair = (1.0 * self.scale).round().max(1.0);
             // Messages-style blending: only the focused pane is a *card*. The

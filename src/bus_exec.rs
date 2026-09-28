@@ -91,12 +91,23 @@ impl App {
             // A registered CLI tool's page answers to `tool:<index>` or to
             // the tool's name (case-insensitive), e.g. `cleanup`.
             Command::GoToPage { page } => match resolve_page(&page, &self.tools) {
-                Some(page) => {
+                Some(PageTarget::Page(page)) => {
                     self.set_page(page);
                     Reply::success(None)
                 }
+                // The Settings window: open it, or bring it forward (same
+                // semantics as the ⌘, action — the pump performs the
+                // activation, which needs a `GpuiApp`).
+                Some(PageTarget::Settings(section)) => {
+                    if let Some(section) = section {
+                        self.section = section;
+                        self.recording = None;
+                    }
+                    self.open_settings();
+                    Reply::success(None)
+                }
                 None => Reply::err(format!(
-                    "unknown page {page:?}; expected one of sessions, settings, tool:<n> or a registered tool's name"
+                    "unknown page {page:?}; expected one of sessions, settings[:section], tool:<n> or a registered tool's name"
                 )),
             },
             Command::NewSession { cwd, base, layout } => self.bus_new_session(cwd, base, layout),
@@ -184,16 +195,25 @@ impl App {
                     Err(e) => Reply::err(e),
                 }
             }
-            Command::Screenshot { path, clipboard } => {
+            Command::Screenshot { path, clipboard, window } => {
                 if clipboard && path.is_some() {
                     return Reply::err("screenshot: give a path or --clipboard, not both");
                 }
+                let number = match window.as_deref() {
+                    None | Some("main") => main_window_number(),
+                    Some("settings") => settings_window_number(),
+                    Some(other) => Err(format!("screenshot: unknown window {other:?} (main|settings)")),
+                };
+                let number = match number {
+                    Ok(n) => n,
+                    Err(e) => return Reply::err(e),
+                };
                 let target = if clipboard {
                     ScreenshotTarget::Clipboard
                 } else {
                     ScreenshotTarget::File(path.unwrap_or_else(default_screenshot_path))
                 };
-                match screenshot_main_window(&target) {
+                match screenshot_window(number, &target) {
                     Ok(()) => match target {
                         ScreenshotTarget::Clipboard => Reply::success(json!("clipboard")),
                         ScreenshotTarget::File(p) => Reply::success(json!(p.to_string_lossy())),
@@ -231,7 +251,7 @@ impl App {
         // clicks and expires on its own timer — the old centered pill was a
         // non-dismissable modal panel that lingered forever. Failure is a
         // notification toast, which the user dismisses by clicking it.
-        match screenshot_main_window(&target) {
+        match main_window_number().and_then(|n| screenshot_window(n, &target)) {
             Ok(()) => match target {
                 ScreenshotTarget::Clipboard => {
                     self.toast_status("Screenshot copied to clipboard");
@@ -495,6 +515,7 @@ impl App {
             // `command_palette_open` says the palette wants a surface,
             // `palette_window_open` says the pump has actually got one open.
             "palette_window_open": self.palette_window.is_some(),
+            "settings_window_open": self.settings_window.is_some(),
             "new_webview_prompt_open": self.webview_prompt.is_some(),
             "sidebar": {
                 "collapsed": self.sidebar_collapsed,
@@ -695,11 +716,37 @@ pub(crate) fn pane_matches(
 /// Refusal reason while the experimental flag is off.
 const FLOW_DISABLED: &str = "Flow is disabled — enable it under Settings > Feature Flags";
 
-pub(crate) fn page_from_name(name: &str) -> Option<Page> {
-    match name.trim().to_ascii_lowercase().replace('-', "_").as_str() {
-        "sessions" => Some(Page::Sessions),
-        "settings" => Some(Page::Settings),
-        s => s.strip_prefix("tool:").and_then(|n| n.parse().ok()).map(Page::Tool),
+/// Where a bus page token can land: a main-window [`Page`], or the
+/// Settings window (a separate window, not a page of the main one).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PageTarget {
+    Page(Page),
+    /// The Settings window, optionally jumping to one section
+    /// (`settings:keyboard`).
+    Settings(Option<crate::pages::Section>),
+}
+
+pub(crate) fn page_from_name(name: &str) -> Option<PageTarget> {
+    let lower = name.trim().to_ascii_lowercase();
+    // `settings:<section>` (also `settings-` / `settings_`) before the
+    // hyphen normalisation below, which would otherwise eat the separator.
+    if let Some(section) = ["settings:", "settings-", "settings_"]
+        .iter()
+        .find_map(|p| lower.strip_prefix(p))
+    {
+        return crate::pages::Section::ALL
+            .iter()
+            .copied()
+            .find(|sec| sec.label().eq_ignore_ascii_case(section))
+            .map(|sec| PageTarget::Settings(Some(sec)));
+    }
+    match lower.replace('-', "_").as_str() {
+        "sessions" => Some(PageTarget::Page(Page::Sessions)),
+        "settings" => Some(PageTarget::Settings(None)),
+        s => s
+            .strip_prefix("tool:")
+            .and_then(|n| n.parse().ok())
+            .map(|i| PageTarget::Page(Page::Tool(i))),
     }
 }
 
@@ -707,14 +754,19 @@ pub(crate) fn page_from_name(name: &str) -> Option<Page> {
 /// `tool:<n>` via [`page_from_name`] (rejecting an unregistered index, so a
 /// client learns its navigation failed instead of landing on Sessions), or a
 /// tool's name, case-insensitively.
-pub(crate) fn resolve_page(name: &str, tools: &[crate::cli_tools::CliTool]) -> Option<Page> {
+pub(crate) fn resolve_page(
+    name: &str,
+    tools: &[crate::cli_tools::CliTool],
+) -> Option<PageTarget> {
     match page_from_name(name) {
-        Some(Page::Tool(i)) => (i < tools.len()).then_some(Page::Tool(i)),
+        Some(PageTarget::Page(Page::Tool(i))) => {
+            (i < tools.len()).then_some(PageTarget::Page(Page::Tool(i)))
+        }
         Some(page) => Some(page),
         None => tools
             .iter()
             .position(|t| t.name.eq_ignore_ascii_case(name.trim()))
-            .map(Page::Tool),
+            .map(|i| PageTarget::Page(Page::Tool(i))),
     }
 }
 
@@ -722,7 +774,6 @@ pub(crate) fn page_name(page: Page) -> String {
     match page {
         Page::Sessions => "sessions".into(),
         Page::Tool(i) => format!("tool:{i}"),
-        Page::Settings => "settings".into(),
     }
 }
 
@@ -740,15 +791,14 @@ fn default_screenshot_path() -> PathBuf {
     std::env::temp_dir().join(format!("pwrde-{ms}.png"))
 }
 
-/// Capture the main window. In-process first: `CGWindowListCreateImage` on
+/// Capture one of our windows (by `NSWindow.windowNumber`). In-process first: `CGWindowListCreateImage` on
 /// one of our own windows needs no Screen Recording grant (the exemption is
 /// per calling process, so it works from `cargo run` and the bundle alike);
 /// PNG encoding and the pasteboard go through AppKit. If CoreGraphics hands
 /// back nothing, fall back to `screencapture`, which does need the grant.
 /// Synchronous: a single-window capture takes well under 100 ms, and the bus
 /// reply stays honest about whether the file exists.
-fn screenshot_main_window(target: &ScreenshotTarget) -> Result<(), String> {
-    let number = main_window_number()?;
+fn screenshot_window(number: i64, target: &ScreenshotTarget) -> Result<(), String> {
     if let ScreenshotTarget::File(path) = target
         && let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
@@ -1007,6 +1057,41 @@ unsafe fn main_ns_window() -> Result<*mut objc::runtime::Object, String> {
     }
 }
 
+/// The Settings window's `NSWindow.windowNumber`, found by its title among
+/// our windows (the bus dispatcher has no gpui context to ask the handle).
+#[cfg(target_os = "macos")]
+fn settings_window_number() -> Result<i64, String> {
+    use objc::runtime::{Class, Object};
+    use objc::{msg_send, sel, sel_impl};
+    unsafe {
+        let cls = Class::get("NSApplication").ok_or("NSApplication class missing")?;
+        let app: *mut Object = msg_send![cls, sharedApplication];
+        let windows: *mut Object = msg_send![app, windows];
+        let count: usize = msg_send![windows, count];
+        for i in 0..count {
+            let w: *mut Object = msg_send![windows, objectAtIndex: i];
+            let title: *mut Object = msg_send![w, title];
+            if title.is_null() {
+                continue;
+            }
+            let utf8: *const std::os::raw::c_char = msg_send![title, UTF8String];
+            if utf8.is_null() {
+                continue;
+            }
+            if std::ffi::CStr::from_ptr(utf8).to_str() == Ok("Settings") {
+                let number: i64 = msg_send![w, windowNumber];
+                return Ok(number);
+            }
+        }
+    }
+    Err("the Settings window is not open (pwrde-cli page settings opens it)".into())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn settings_window_number() -> Result<i64, String> {
+    Err("screenshots are macOS-only".into())
+}
+
 /// Where the bus listens: `~/.pwrde/bus.sock`, or the worktree-scoped
 /// variant beside that worktree's settings.json.
 pub(crate) fn socket_path() -> PathBuf {
@@ -1055,10 +1140,20 @@ mod tests {
     #[test]
     fn page_names_round_trip() {
         for page in Page::all(2) {
-            assert_eq!(page_from_name(&page_name(page)), Some(page));
+            assert_eq!(page_from_name(&page_name(page)), Some(PageTarget::Page(page)));
         }
-        assert_eq!(page_from_name("tool:1"), Some(Page::Tool(1)));
+        assert_eq!(page_from_name("tool:1"), Some(PageTarget::Page(Page::Tool(1))));
         assert_eq!(page_from_name("tool:x"), None);
+        assert_eq!(page_from_name("settings"), Some(PageTarget::Settings(None)));
+        assert_eq!(
+            page_from_name("settings:Keyboard"),
+            Some(PageTarget::Settings(Some(crate::pages::Section::Keyboard)))
+        );
+        assert_eq!(page_from_name("settings:nope"), None);
+        assert_eq!(
+            page_from_name("settings-advanced"),
+            Some(PageTarget::Settings(Some(crate::pages::Section::Advanced)))
+        );
     }
 
     /// Tool pages resolve by name (case-insensitive) or a registered index;
@@ -1066,11 +1161,17 @@ mod tests {
     #[test]
     fn tool_pages_resolve_by_name_or_registered_index() {
         let tools = crate::cli_tools::default_tools();
-        assert_eq!(resolve_page("cleanup", &tools), Some(Page::Tool(0)));
-        assert_eq!(resolve_page(" Cleanup ", &tools), Some(Page::Tool(0)));
-        assert_eq!(resolve_page("tool:0", &tools), Some(Page::Tool(0)));
+        assert_eq!(
+            resolve_page("cleanup", &tools),
+            Some(PageTarget::Page(Page::Tool(0)))
+        );
+        assert_eq!(
+            resolve_page(" Cleanup ", &tools),
+            Some(PageTarget::Page(Page::Tool(0)))
+        );
+        assert_eq!(resolve_page("tool:0", &tools), Some(PageTarget::Page(Page::Tool(0))));
         assert_eq!(resolve_page("tool:1", &tools), None);
-        assert_eq!(resolve_page("settings", &tools), Some(Page::Settings));
+        assert_eq!(resolve_page("settings", &tools), Some(PageTarget::Settings(None)));
         assert_eq!(resolve_page("nope", &tools), None);
         assert_eq!(page_from_name("nope"), None);
     }
