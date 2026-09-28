@@ -637,6 +637,17 @@ fn render_general(_app: &App, theme: &Theme, entity: gpui::WeakEntity<App>) -> A
                     crate::gh::cli() != "lfg",
                     &entity,
                 ),
+                toggle_row(
+                    theme,
+                    "Open in webview tab",
+                    "⇧⌘G opens the pull request in a webview tab instead of the browser.",
+                    "git-pr-webview",
+                    "git.open_pr_in_webview",
+                    settings::open_pr_in_webview(),
+                    false,
+                    false,
+                    &entity,
+                ),
             ],
         ))
         .into_any_element()

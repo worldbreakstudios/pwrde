@@ -825,14 +825,15 @@ impl App {
         hit
     }
 
-    /// ⇧⌘G (`Action::OpenPrInGithub`): open the active group's pull request
-    /// in the browser. The sidebar's git-context cache usually already holds
+    /// ⇧⌘G (`Action::OpenPrInGithub`): open the active group's pull request —
+    /// as a webview tab when `git.open_pr_in_webview` is on ([`Self::open_pr_url`]),
+    /// in the browser otherwise. The sidebar's git-context cache usually already holds
     /// the PR its card shows, so the common case is instant. A cached "no
     /// PR" is an honest no-op that also bumps that group's rollup stale, so a
     /// PR opened since the last poll is picked up on the next press. Only a
     /// group whose context hasn't been fetched yet falls back to one
     /// background `pr list`, guarded by `open_pr_busy` so repeated presses
-    /// can't queue up browser tabs. Returns whether the action applied — the
+    /// can't queue up opens. Returns whether the action applied — the
     /// tab was opened or the lookup that will open it was started — so the
     /// bus can report a no-op everywhere else.
     fn open_pr_in_github(&mut self) -> bool {
@@ -843,20 +844,24 @@ impl App {
         let Some(cwd) = self.active_repo_dir() else {
             return false;
         };
-        if let Some(ctx) = self.git_contexts.get(&cwd) {
+        if self.git_contexts.get(&cwd).is_some() {
             // Cached: open what the card shows, or report "no PR" honestly.
-            // An empty URL means a PR CLI that predates the `url` field.
-            match ctx.pr.as_ref().map(|pr| pr.url.as_str()) {
-                Some(url) if !url.is_empty() => {
-                    open_in_browser(url);
-                    return true;
-                },
-                _ => {
-                    self.git_contexts.mark_stale(&cwd);
-                    self.spawn_git_context_refresh();
-                    return false;
-                },
+            // An empty URL means a PR CLI that predates the `url` field. The
+            // URL is cloned out first so the cache borrow ends before
+            // `open_pr_url` takes `&mut self`.
+            let url = self
+                .git_contexts
+                .get(&cwd)
+                .and_then(|ctx| ctx.pr.as_ref())
+                .map(|pr| pr.url.clone())
+                .unwrap_or_default();
+            if !url.is_empty() {
+                self.open_pr_url(&url);
+                return true;
             }
+            self.git_contexts.mark_stale(&cwd);
+            self.spawn_git_context_refresh();
+            return false;
         }
         if self
             .open_pr_busy
@@ -868,6 +873,7 @@ impl App {
             return false;
         }
         let busy = self.open_pr_busy.clone();
+        let events_tx = self.events_tx.clone();
         std::thread::spawn(move || {
             if let Some(branch) = git::current_branch(&cwd)
                 && let Some(pr) = gh::pr_list_for_branch(&cwd, &branch)
@@ -875,11 +881,34 @@ impl App {
                     .and_then(git_context::select_pr)
                 && !pr.url.is_empty()
             {
-                open_in_browser(&pr.url);
+                if settings::open_pr_in_webview() {
+                    // A webview tab needs `&mut App`, which this worker thread
+                    // cannot touch, so the URL goes back over the event channel.
+                    let _ = events_tx.send(TermEvent::OpenPrUrl { url: pr.url });
+                } else {
+                    open_in_browser(&pr.url);
+                }
             }
             busy.store(false, Ordering::Release);
         });
         true
+    }
+
+    /// Open a pull-request URL from ⇧⌘G: as a webview tab in the active group
+    /// when `git.open_pr_in_webview` is on, in the browser otherwise. A webview
+    /// tab that cannot be created (no focused pane, rejected URL) falls back to
+    /// the browser rather than swallowing the press.
+    fn open_pr_url(&mut self, url: &str) {
+        if !settings::open_pr_in_webview() {
+            open_in_browser(url);
+            return;
+        }
+        if let Err(error) = self.add_webview_tab_to_group(self.active, url.to_string()) {
+            self.toast_notification(format!("open PR in webview failed: {error}"));
+            open_in_browser(url);
+        }
+        // `add_webview_tab_to_group` persists and redraws on success, and the
+        // browser fallbacks repaint through their own paths — nothing to do here.
     }
 
     fn dpi(&self) -> u32 {
@@ -5515,6 +5544,12 @@ impl App {
                     if let Err(error) = self.add_webview_tab_to_group(self.active, url) {
                         self.toast_notification(format!("open URL failed: {error}"));
                     }
+                    redraw = true;
+                },
+                // A ⇧⌘G URL that resolved on a worker thread while the webview
+                // setting is on: open the tab here, on the main thread.
+                TermEvent::OpenPrUrl { url } => {
+                    self.open_pr_url(&url);
                     redraw = true;
                 },
                 // A directory opened from outside the app (Finder, `open -a`, a

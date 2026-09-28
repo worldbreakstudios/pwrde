@@ -109,6 +109,15 @@ pub fn persist_sessions() -> bool {
     get_bool("terminal.persist", true)
 }
 
+/// Whether ⇧⌘G (`Action::OpenPrInGithub`) opens the pull request as a webview
+/// tab in the active group rather than in the default browser
+/// (`git.open_pr_in_webview`). Defaults to **off** — the browser is the
+/// long-standing behaviour and a webview tab costs a native view; a webview
+/// tab that can't be created still falls back to the browser.
+pub fn open_pr_in_webview() -> bool {
+    get_bool("git.open_pr_in_webview", false)
+}
+
 pub fn get_bool(key: &str, default: bool) -> bool {
     store()
         .read()
@@ -193,6 +202,13 @@ mod tests {
         // Losing every session on restart was the failure mode of an off
         // default; an unset key must read as persisted.
         assert!(persist_sessions());
+    }
+
+    #[test]
+    fn open_pr_in_webview_defaults_off() {
+        // An untouched store has no `git.open_pr_in_webview` key; the press
+        // must keep the historical browser behaviour.
+        assert!(!open_pr_in_webview());
     }
 
     #[test]
