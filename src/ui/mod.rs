@@ -18,7 +18,9 @@
 //! translucent glass panel over the blurred vibrancy ground,
 //! `Card::liquid_glass` for the full [`Glass::panel`] liquid-glass recipe),
 //! [`input`]
-//! (`Input::set_text_size` so a bare field can match its host row's type),
+//! (`Input::set_text_size` so a bare field can match its host row's type,
+//! and `Input::set_font_family` so the Settings terminal-color hex fields
+//! can wear the monospace face),
 //! and [`alert_dialog`] (`AlertDialog::scrim` for the chrome's own scrim
 //! color, `AlertDialog::on_backdrop_click` for clicks on the scrim outside
 //! the panel, `AlertDialog::top` to pin the panel below the viewport's top

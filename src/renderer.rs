@@ -10,7 +10,12 @@
 //! `build_frame` walks the workspace tree + terminal grids and produces a
 //! [`Frame`] of plain data (background/foreground quads, per-pane colored text
 //! runs, and chrome/picker labels). `main.rs`'s terminal `Element` consumes
-//! that data and does the actual painting.
+//! that data and does the actual painting. Pane colors come from
+//! `term_theme::resolved(dark)` — the polarity's preset or custom theme with
+//! that polarity's per-colour overrides already layered on — so an edited
+//! swatch reaches real panes on the next frame. The cursor uses the resolved
+//! cursor colour and `selection_rects` the resolved selection, still composited
+//! at alpha 0.30 exactly as before.
 //!
 //! Frame structure (paint order): window gradient (painted by `main.rs`) →
 //! chrome quads (sidebar rows, tile cards) → per-pane text (terminal grids) →
@@ -549,7 +554,13 @@ impl Renderer {
 
     /// Translucent highlight quads for the session's active selection, one
     /// per visible row of the span. No-op for an empty (zero-width) selection.
-    fn selection_rects(&self, session: &Session, origin: (f32, f32), rects: &mut Vec<Quad>) {
+    fn selection_rects(
+        &self,
+        session: &Session,
+        origin: (f32, f32),
+        sel_rgb: (u8, u8, u8),
+        rects: &mut Vec<Quad>,
+    ) {
         let Some((start, end)) = session.selection_span() else { return };
         // A zero-width selection (a bare click, no drag) paints nothing —
         // mirrors `selected_text`, which returns no text for the same state.
@@ -586,6 +597,9 @@ impl Renderer {
             if c1 <= c0 {
                 continue;
             }
+            // `sel_rgb` is the accent blend the renderer has always
+            // painted, unless the resolved palette states a selection
+            // colour explicitly (an override or a custom theme).
             rects.push(self.cell_rect(
                 origin,
                 c0,
@@ -594,7 +608,7 @@ impl Renderer {
                 0.0,
                 (c1 - c0) as f32,
                 1.0,
-                self.theme().accent,
+                sel_rgb,
                 0.30,
             ));
         }
@@ -613,13 +627,17 @@ impl Renderer {
         chrome: &ChromeState,
     ) -> Frame {
         let th = self.theme();
-        // Terminal scheme, resolved once per frame like the chrome theme so
-        // an Appearance-page click restyles the very next paint. Pane chrome
-        // (card fill, tab text, divider, active-tab pill) follows the scheme
-        // so tab strips stay legible on light palettes; the adaptive default
-        // keeps the chrome theme's exact colors.
+        // Terminal colors, resolved once per frame like the chrome theme so
+        // an Appearance-page click restyles the very next paint. Every colour
+        // the panes paint — preset, custom theme, and per-colour override
+        // alike — comes from this one resolution path (`term_theme::resolved`),
+        // so live terminals, the block cursor and the selection all follow the
+        // Settings page. Pane chrome (tab text, divider, active-tab pill)
+        // follows the scheme so tab strips stay legible on light palettes; the
+        // adaptive default keeps the chrome theme's exact colors.
+        let resolved = crate::term_theme::resolved(crate::theme::dark_active());
+        let term_palette = resolved.to_color_palette();
         let scheme = crate::term_theme::selected(crate::theme::dark_active());
-        let term_palette = crate::term_theme::build(scheme, th.term_bg);
         // `pane_bg` is deliberately dropped: the ground is painted in that
         // colour already (`term_scheme_bg`), so no pane fills itself.
         let (_, _pane_ink, _pane_ink_dim, pane_divider, pane_pill) = match scheme {
@@ -759,6 +777,7 @@ impl Renderer {
                     let (rows, images) = self.snapshot_pane(
                         session,
                         &term_palette,
+                        &resolved,
                         origin,
                         draw_cursor,
                         tile_hover,
@@ -766,7 +785,7 @@ impl Renderer {
                         &mut fg_quads,
                     );
                     panes.push(PaneText { origin, rows, images });
-                    self.selection_rects(session, origin, &mut fg_quads);
+                    self.selection_rects(session, origin, resolved.colors.sel, &mut fg_quads);
                 }
                 // A sideways strip has no room for the strip's labels: only
                 // the caret shows. A stacked collapse keeps its tab labels
@@ -840,12 +859,11 @@ impl Renderer {
     }
 
 
-    /// The terminal background the active colors want: the selected scheme's
-    /// bg, or the chrome theme's terminal background under the adaptive
-    /// default. The flyover card sits on this when the panel is up.
+    /// The terminal background the active colors want: the resolved
+    /// palette's bg (preset, custom theme, adaptive default or an override).
+    /// The flyover card sits on this when the panel is up.
     pub fn term_scheme_bg(&self) -> (u8, u8, u8) {
-        crate::term_theme::selected(crate::theme::dark_active())
-            .map_or(self.theme().term_bg, |t| t.bg)
+        crate::term_theme::resolved(crate::theme::dark_active()).colors.bg
     }
 
     /// Build all geometry for the flyover terminal panel (card, tab strip,
@@ -872,11 +890,14 @@ impl Renderer {
     ) -> (Vec<Quad>, Vec<PaneText>, Vec<Quad>) {
         let th = self.theme();
         let scale = self.scale;
-        // Resolve the terminal scheme exactly as `build_frame` does for tile
+        // Resolve the terminal colors exactly as `build_frame` does for tile
         // cards, so the flyover follows the Appearance-page terminal colors:
-        // scheme bg/fg drive the card and tab chrome when one is selected.
+        // resolved bg/fg drive the card and tab chrome when a scheme is
+        // selected, and every pane colour (overrides included) comes from the
+        // same resolution.
+        let resolved = crate::term_theme::resolved(crate::theme::dark_active());
+        let term_palette = resolved.to_color_palette();
         let scheme = crate::term_theme::selected(crate::theme::dark_active());
-        let term_palette = crate::term_theme::build(scheme, th.term_bg);
         let (pane_bg, _pane_ink, _pane_ink_dim, pane_divider) = match scheme {
             Some(t) => (t.bg, (t.fg, 1.0), (t.fg, 0.55), (t.fg, 0.15)),
             None => (
@@ -946,6 +967,7 @@ impl Renderer {
             let (rows, images) = self.snapshot_pane(
                 session,
                 &term_palette,
+                &resolved,
                 origin,
                 draw_cursor && focused,
                 None,
@@ -953,7 +975,7 @@ impl Renderer {
                 &mut fg_quads,
             );
             panes.push(PaneText { origin, rows, images });
-            self.selection_rects(session, origin, &mut fg_quads);
+            self.selection_rects(session, origin, resolved.colors.sel, &mut fg_quads);
         }
 
         (quads, panes, fg_quads)
@@ -972,8 +994,9 @@ impl Renderer {
     ) -> (Vec<Quad>, PaneText, Vec<Quad>, Vec<LabelSpec>) {
         let th = self.theme();
         let scale = self.scale;
+        let resolved = crate::term_theme::resolved(crate::theme::dark_active());
+        let term_palette = resolved.to_color_palette();
         let scheme = crate::term_theme::selected(crate::theme::dark_active());
-        let term_palette = crate::term_theme::build(scheme, th.term_bg);
         let (pane_bg, pane_ink, pane_ink_dim) = match scheme {
             Some(t) => (t.bg, (t.fg, 1.0), (t.fg, 0.55)),
             None => (th.term_bg, (th.text_bright, 1.0), (th.text_dim, 1.0)),
@@ -1023,13 +1046,14 @@ impl Renderer {
         let (rows, images) = self.snapshot_pane(
             session,
             &term_palette,
+            &resolved,
             origin,
             draw_cursor && !exited,
             None,
             &mut quads,
             &mut fg_quads,
         );
-        self.selection_rects(session, origin, &mut fg_quads);
+        self.selection_rects(session, origin, resolved.colors.sel, &mut fg_quads);
         (quads, PaneText { origin, rows, images }, fg_quads, labels)
     }
 
@@ -1055,6 +1079,7 @@ impl Renderer {
         &self,
         session: &Session,
         palette: &ColorPalette,
+        resolved: &crate::term_theme::Resolved,
         origin: (f32, f32),
         draw_cursor: bool,
         hover: Option<(usize, usize)>,
@@ -1185,9 +1210,11 @@ impl Renderer {
         }
 
         // Cursor: a solid quad, drawn on top of the text (focused tile only).
+        // The block cursor wears the resolved cursor colour — today's plain
+        // foreground unless an override or a custom theme states one.
         let cur = term.cursor_pos();
         if draw_cursor && cur.visibility == CursorVisibility::Visible && cur.y >= 0 {
-            let (r, g, b, _) = palette.foreground.to_srgb_u8();
+            let (r, g, b) = resolved.colors.cursor;
             rects.push(self.cell_rect(
                 origin,
                 cur.x,
