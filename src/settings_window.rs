@@ -80,6 +80,10 @@ impl Render for SettingsWindow {
                     .inputs()
                     .iter()
                     .any(|e| e.read(cx).focus_handle(cx).is_focused(window))
+                || app
+                    .term_hex_inputs
+                    .iter()
+                    .any(|e| e.read(cx).focus_handle(cx).is_focused(window))
         });
         if !keystrokes_owned && !search_focus.is_focused(window) {
             window.focus(&search_focus, cx);
