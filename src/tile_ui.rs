@@ -69,8 +69,14 @@ impl StripStyle {
     /// (`default_pill_alpha` differs between tiles and the flyover).
     pub(crate) fn from_scheme(th: &crate::theme::Theme, default_pill_alpha: f32) -> Self {
         let scheme = crate::term_theme::selected(crate::theme::dark_active());
+        // The ink follows the resolved foreground, so a per-colour override
+        // (or a custom theme that renames the base) reads on the strip too.
+        let resolved = crate::term_theme::resolved(crate::theme::dark_active());
         let (ink, ink_dim, pill_rgb, pill_alpha) = match scheme {
-            Some(t) => (color(t.fg, 1.0), color(t.fg, 0.55), t.fg, 0.12),
+            Some(_) => {
+                let fg = resolved.colors.fg;
+                (color(fg, 1.0), color(fg, 0.55), fg, 0.12)
+            },
             None => (
                 color(th.text_bright, 1.0),
                 color(th.text_dim, 1.0),

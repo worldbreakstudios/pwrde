@@ -79,34 +79,6 @@ impl Default for Section {
     }
 }
 
-// ── Appearance page layout ──────────────────────────────────────────────
-
-/// The terminal-color dropdown selectors on the Appearance page.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AppearanceDropdown {
-    TermLight,
-    TermDark,
-}
-
-impl AppearanceDropdown {
-    /// Whether this dropdown controls the dark-polarity slot.
-    pub fn dark(self) -> bool {
-        matches!(self, AppearanceDropdown::TermDark)
-    }
-}
-
-/// All terminal-scheme options for the given slot: `None` (the adaptive
-/// "Default") first, then every preset — mixing polarities is allowed —
-/// with the slot's own polarity sorted first for easier choosing.
-pub fn term_options(dark: bool) -> Vec<Option<&'static crate::term_theme::TermTheme>> {
-    let mut v: Vec<Option<&'static crate::term_theme::TermTheme>> = vec![None];
-    for matching in [true, false] {
-        let want = if matching { dark } else { !dark };
-        v.extend(crate::term_theme::ALL.iter().copied().filter(|t| t.dark == want).map(Some));
-    }
-    v
-}
-
 // ── Rebindable actions ──────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -606,7 +578,12 @@ pub fn settings_index() -> Vec<SettingsEntry> {
     out.push(SettingsEntry {
         section: Section::Appearance,
         label: "Terminal colors",
-        keywords: "terminal colors palette",
+        keywords: "terminal colors palette colour swatch hex background foreground cursor selection ansi normal bright",
+    });
+    out.push(SettingsEntry {
+        section: Section::Appearance,
+        label: "Custom terminal theme",
+        keywords: "terminal colors theme custom save as theme reset overrides",
     });
 
     // Tools
@@ -723,25 +700,21 @@ mod tests {
     }
 
     #[test]
-    fn appearance_dropdown_dark_polarity() {
-        assert!(!AppearanceDropdown::TermLight.dark());
-        assert!(AppearanceDropdown::TermDark.dark());
-    }
-
-    #[test]
-    fn term_options_start_with_default_then_matching_polarity() {
+    fn slot_options_start_with_default_then_matching_polarity() {
         for dark in [false, true] {
-            let opts = super::term_options(dark);
-            assert_eq!(opts.len(), crate::term_theme::ALL.len() + 1, "missing presets");
-            assert!(opts[0].is_none(), "term_options({dark}) must start with Default");
-            let matching = opts[1..]
+            let opts = crate::term_theme::slot_options(dark);
+            assert_eq!(opts[0].0, "default", "slot_options({dark}) must start with Default");
+            assert_eq!(opts[0].1, "Default");
+            let presets: Vec<&str> = crate::term_theme::ALL
                 .iter()
-                .take_while(|t| t.is_some_and(|t| t.dark == dark))
-                .count();
+                .filter(|t| t.dark == dark)
+                .map(|t| t.name)
+                .collect();
+            let listed: Vec<&str> = opts.iter().skip(1).map(|(n, _)| n.as_str()).collect();
             assert_eq!(
-                matching,
-                crate::term_theme::ALL.iter().filter(|t| t.dark == dark).count(),
-                "term_options({dark}) must sort its own polarity first"
+                &listed[..presets.len()],
+                presets.as_slice(),
+                "slot_options({dark}) must list that polarity's presets first"
             );
         }
     }

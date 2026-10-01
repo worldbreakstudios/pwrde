@@ -84,6 +84,12 @@ fn store() -> &'static RwLock<Map> {
     STORE.get_or_init(|| RwLock::new(Map::new()))
 }
 
+/// The raw JSON value under `key` — for settings stored as objects/arrays
+/// (the terminal colour overrides and custom themes).
+pub fn get_value(key: &str) -> Option<Value> {
+    store().read().ok()?.get(key).cloned()
+}
+
 pub fn get_str(key: &str) -> Option<String> {
     store().read().ok()?.get(key)?.as_str().map(str::to_owned)
 }

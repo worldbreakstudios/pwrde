@@ -9,8 +9,10 @@
 //! `cx.new(|cx| Input::new(cx))`, render the `Entity<Input>` directly, and
 //! call [`Input::register_key_bindings`] once at app startup.
 //!
-//! Local addition: [`Input::set_text_size`] overrides the 14px type size so
-//! a bare field can sit inside a sidebar row at the row's text size.
+//! Local additions: [`Input::set_text_size`] overrides the 14px type size so
+//! a bare field can sit inside a sidebar row at the row's text size, and
+//! [`Input::set_font_family`] pins a face (used by the Settings → Appearance
+//! hex fields, which must render monospace).
 
 use std::ops::Range;
 
@@ -55,6 +57,9 @@ pub struct Input {
     /// Local addition: override the shadcn `text-sm` (14px) type size, so a
     /// bare input can match the text of the row it is embedded in.
     text_size: Option<Pixels>,
+    /// Local addition: pin the shaped line's font family instead of the
+    /// face inherited from the surrounding element tree.
+    font_family: Option<SharedString>,
     selected_range: Range<usize>,
     selection_reversed: bool,
     marked_range: Option<Range<usize>>,
@@ -72,6 +77,7 @@ impl Input {
             disabled: false,
             bare: false,
             text_size: None,
+            font_family: None,
             selected_range: 0..0,
             selection_reversed: false,
             marked_range: None,
@@ -118,6 +124,14 @@ impl Input {
     /// render pass or before the field is shown.
     pub fn set_text_size(&mut self, size: Option<Pixels>) {
         self.text_size = size;
+    }
+
+    /// Local addition: shape this field in `family` (usually `"monospace"`)
+    /// instead of the inherited face. `None` restores the inherited face.
+    /// Does not notify — call it from a render pass or before the field is
+    /// shown.
+    pub fn set_font_family(&mut self, family: Option<impl Into<SharedString>>) {
+        self.font_family = family.map(Into::into);
     }
 
     pub fn text(&self) -> &str {
@@ -532,7 +546,12 @@ impl Element for TextElement {
         let content = input.content.clone();
         let selected_range = input.selected_range.clone();
         let cursor = input.cursor_offset();
-        let style = window.text_style();
+        let mut style = window.text_style();
+        // Local addition: a bare field may pin its own face (set_font_family)
+        // — the Appearance hex fields render monospace.
+        if let Some(font) = input.font_family.clone() {
+            style.font_family = font;
+        }
 
         let (display_text, text_color) = if content.is_empty() {
             (input.placeholder.clone(), theme.muted_foreground)

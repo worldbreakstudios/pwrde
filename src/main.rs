@@ -11,6 +11,12 @@
 //!   ⌘]/⌘[ cycle tile focus  ⇧⌘]/⇧⌘[ next/prev tab   ⌘Q quit
 //!   ⌘V paste                ⌘-click open link
 //!
+//! The Settings window types outside the canvas: `handle_settings_key` owns its
+//! text capture — search, the primary-command and Tools-form inputs, ⌘-chord
+//! recording, and the Appearance terminal-colour hex fields (Enter commits a
+//! valid `#rrggbb` and returns focus to the app, Escape or invalid text reverts
+//! the field to the effective colour).
+//!
 //! Port note: this file was ported from winit+wgpu to gpui. The old
 //! `EventLoop`/`ApplicationHandler`/`Window` are replaced by a gpui
 //! `Application`, a window, and a terminal `Element`. Terminal wakeups arrive
@@ -544,8 +550,12 @@ struct App {
     /// Polarity shown in the Appearance preview cards (independent of the
     /// system/user mode setting); seeded from the active polarity at launch.
     preview_dark: bool,
-    /// The appearance dropdown that currently has its option menu open, if any.
-    appearance_menu: Option<pages::AppearanceDropdown>,
+    /// The Terminal-colors theme select's option menu is open, if any.
+    appearance_term_menu: bool,
+    /// The 20 editable hex fields of the Terminal-colors swatch grid, one per
+    /// [`crate::term_theme::KEYS`] entry, in that order. They are entities so
+    /// the Settings key handler can commit/cancel them like `command_input`.
+    term_hex_inputs: Vec<gpui::Entity<crate::ui::Input>>,
     /// Whether a group cwd sits inside a git checkout, memoized per path —
     /// probed by git-backed actions on every invocation.
     git_cwd_cache: std::cell::RefCell<std::collections::HashMap<std::path::PathBuf, bool>>,
@@ -4966,6 +4976,37 @@ impl App {
             self.request_redraw();
             return;
         }
+        // Focused Terminal-colors hex field: enter commits a valid #rrggbb and
+        // returns focus to the app, escape (or invalid text) reverts the field
+        // to the effective colour. The Input owns ordinary character editing.
+        if let Some(ix) = self
+            .term_hex_inputs
+            .iter()
+            .position(|e| e.read(cx).focus_handle(cx).is_focused(window))
+        {
+            let dark = self.preview_dark;
+            let key = crate::term_theme::KEYS[ix];
+            let input = self.term_hex_inputs[ix].clone();
+            match ev.keystroke.key.as_str() {
+                "enter" => {
+                    let text = input.read(cx).text().trim().to_string();
+                    if crate::term_theme::parse_hex(&text).is_some() {
+                        crate::term_theme::set_override(dark, key, &text);
+                    }
+                    let shown = crate::term_theme::resolved(dark).hex(key).unwrap_or_default();
+                    input.update(cx, |i, cx| i.set_text(shown, cx));
+                    window.focus(&self.focus_handle, cx);
+                },
+                "escape" => {
+                    let shown = crate::term_theme::resolved(dark).hex(key).unwrap_or_default();
+                    input.update(cx, |i, cx| i.set_text(shown, cx));
+                    window.focus(&self.focus_handle, cx);
+                },
+                _ => {},
+            }
+            self.request_redraw();
+            return;
+        }
         // Focused primary-command Input: enter saves, escape resets + blurs.
         // Character editing is handled by the Input entity itself; other keys
         // fall through to it (this handler doesn't stop propagation).
@@ -7367,7 +7408,25 @@ fn main() {
                         settings_activate: false,
                         pending_keys: Vec::new(),
                         preview_dark: theme::dark_active(),
-                        appearance_menu: None,
+                        appearance_term_menu: false,
+                        term_hex_inputs: {
+                            let seeded = crate::term_theme::resolved(theme::dark_active());
+                            (0..crate::term_theme::KEYS.len())
+                                .map(|i| {
+                                    let seed = seeded
+                                        .hex(crate::term_theme::KEYS[i])
+                                        .unwrap_or_default();
+                                    cx.new(move |cx| {
+                                        let mut input = crate::ui::Input::new(cx);
+                                        input.set_bare(true);
+                                        input.set_text_size(Some(gpui::px(10.5)));
+                                        input.set_font_family(Some(crate::renderer::FONT_FAMILY));
+                                        input.set_text(seed, cx);
+                                        input
+                                    })
+                                })
+                                .collect()
+                        },
                         git_cwd_cache: Default::default(),
                         flow: crate::flow::FlowState::default(),
                         flow_backends: std::collections::HashMap::new(),

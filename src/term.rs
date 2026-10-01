@@ -117,9 +117,11 @@ struct TermConfig;
 impl TerminalConfiguration for TermConfig {
     /// The palette apps see through OSC color queries (10/11/4…). Resolved
     /// from the live settings each call so wezterm-term's lazy palette always
-    /// reports the scheme currently on screen, not the one at spawn time.
+    /// reports the scheme currently on screen, not the one at spawn time —
+    /// including per-colour overrides and custom themes, which the settings UI
+    /// can change while a pane is already running.
     fn color_palette(&self) -> ColorPalette {
-        crate::term_theme::palette(crate::theme::current())
+        crate::term_theme::resolved(crate::theme::dark_active()).to_color_palette()
     }
 
     /// Inline images are always on. The emulator (wezterm-term, built with its
