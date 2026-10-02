@@ -1,23 +1,29 @@
 //! Tab strips as a gpui element tree over the canvas: every tile's strip
 //! here, and — through [`tab_strip`] — the flyover panel's in `flyover_ui`.
 //!
-//! The tab pills, titles, × buttons and unread dots used to be canvas quads
-//! and labels (`Renderer::build_frame` / `flyover_overlay`). Only the
-//! *pixels* have moved here: geometry still comes from [`crate::workspace`]
-//! (`layout_tiles` / `tab_strip_rect` / `tile_tab_rect` /
-//! `tile_tab_close_rect`), and every click, drag and drop is still resolved
-//! on the canvas mouse path in `main.rs` against those same rects — the
-//! same first step the sidebar took. What the element tree buys is
-//! clipping: each strip is an `overflow_hidden` box, so a title can never
-//! bleed past its tab or its card, and the strip sits in the tree's
-//! z-order (under the sidebar and the modals) instead of in the canvas's
-//! hand-kept paint order.
+//! The mock: a 40px bar (6px of padding, a 30px tab row, 4px below) with no
+//! fill of its own, sitting on the terminal ground. The active tab is a chip —
+//! an 8px-rounded card of the mock's white at .07 with a .10 border (dimmed to
+//! .04 with no border while its tile is unfocused) — holding a 14px terminal /
+//! globe glyph, a 12.5px title clipped short of the ×, and the × itself.
+//! Inactive tabs are text only; a 1×14 hairline sits 10px off each tab edge,
+//! and a "+" New tab button follows the last one.
 //!
-//! Still canvas-painted, deliberately: the card divider, the side-strip
-//! hover fill, and the drag-and-drop hints — all of which sit *around* the
-//! strip rather than in it. The collapse caret was the last hand-painted
-//! glyph here; it is a standard `svg` chevron now (the animated rotation
-//! became the same icon swap `select` uses).
+//! The geometry — chips, closes, hairlines, the "+", the caret — is one pure
+//! computation per strip in [`crate::workspace`] (`tile_strip_layout` /
+//! `flyover_strip_layout`), and every click, drag and drop is still resolved
+//! on the canvas mouse path in `main.rs` against that same layout, so painted
+//! and hit-tested rects cannot disagree.
+//!
+//! What the element tree buys is clipping: each strip is an `overflow_hidden`
+//! box, so a title can never bleed past its tab or its card, and the strip sits
+//! in the tree's z-order (under the sidebar and the modals) instead of in the
+//! canvas's hand-kept paint order.
+//!
+//! Still canvas-painted, deliberately: the card divider, the side-strip hover
+//! fill, and the drag-and-drop hints — all of which sit *around* the strip
+//! rather than in it. The collapse caret is the same standard `svg` chevron it
+//! became when the canvas glyphs went away.
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -29,71 +35,78 @@ use gpui::{
 
 use crate::App;
 use crate::renderer::color;
+use crate::ui::assets::{ICON_GLOBE, ICON_PLUS, ICON_TERMINAL};
 use crate::ui::icon;
 use crate::ui::theme::Theme;
 use crate::workspace::{self, LayoutRect};
 
-/// Inset of the active/hover pill from its tab's edges.
-const PILL_INSET: f32 = 4.0;
-/// Inset of the × hover chip from the close rect.
-const CHIP_INSET: f32 = 3.0;
-/// Left padding of a tab's title.
-const TEXT_PAD: f32 = 8.0;
+/// The chip: radius 8, 10px of padding on the left, 8px on the right, and 8px
+/// between its children.
+const CHIP_RADIUS: f32 = 8.0;
+const CHIP_PAD_L: f32 = 10.0;
+const CHIP_PAD_R: f32 = 8.0;
+const CHIP_GAP: f32 = 8.0;
+/// Horizontal padding inside an inactive tab.
+const TAB_PAD_H: f32 = 6.0;
+/// The tab glyph (terminal / globe) and the title's type size.
+const GLYPH: f32 = 14.0;
+const TITLE_SIZE: f32 = 12.5;
+/// The "+" New tab glyph.
+const NEW_TAB_GLYPH: f32 = 15.0;
+/// Room an active chip keeps clear at its right for the ×: the 8px gap plus
+/// the 14px glyph.
+const CLOSE_AREA: f32 = 22.0;
 /// Unread dot diameter and the gap after it.
 const DOT: f32 = 6.0;
 const DOT_GAP: f32 = 5.0;
-/// The on-accent ink for the focused pane's active tab.
-const ON_ACCENT_INK: (u8, u8, u8) = (255, 255, 255);
+/// The mock's whites as alphas over the scheme ink (`pill_rgb`): the chip's
+/// fill and border, the dimmed unfocused chip, the faint hover preview, the
+/// × chip and the separator hairlines.
+const CHIP_FILL: f32 = 0.07;
+const CHIP_BORDER: f32 = 0.10;
+const CHIP_FILL_DIM: f32 = 0.04;
+const CHIP_FILL_HOVER: f32 = 0.035;
+const CLOSE_CHIP: f32 = 0.12;
+const SEP_ALPHA: f32 = 0.12;
 
-/// The colors a strip paints with — resolved from the terminal scheme the
-/// way the canvas did, so strips stay legible on light palettes.
+/// The colors a strip paints with — resolved from the terminal scheme the way
+/// the canvas did, so strips stay legible on light palettes.
+///
+/// The mock's whites are alphas over the scheme ink (`pill_rgb`) and its two
+/// greys are `ink` / `ink_dim`, so a light palette stays legible: on the dark
+/// default the result is the mock's .07 chip, .10 border, bright title ink and
+/// dim icon / × / inactive ink.
 #[derive(Clone)]
 pub(crate) struct StripStyle {
+    /// The title ink (a focused chip's title) and the dim ink for everything
+    /// else — icons, inactive titles, the ×, and an unfocused tile's title.
     pub ink: Hsla,
     pub ink_dim: Hsla,
+    /// The white the chip, its border and the hairlines are painted with.
     pub pill_rgb: (u8, u8, u8),
-    pub pill_alpha: f32,
-    /// `Some(accent)`: the active tab wears a solid accent pill with
-    /// on-accent ink (a focused tile). `None`: glass, as the flyover does.
-    pub accent: Option<Hsla>,
+    /// The tile owns focus: its active chip is the mock's full-strength .07
+    /// fill with a .10 border. An unfocused tile dims the chip to .04 and
+    /// drops the border. The flyover is always focused while it is up.
+    pub focused: bool,
     pub unread: Hsla,
-    /// `Some(r)` for a fixed pill radius; `None` for a capsule.
-    pub pill_radius: Option<f32>,
-    /// `Some(r)` for a fixed × chip radius; `None` for a capsule.
-    pub chip_radius: Option<f32>,
 }
 
 impl StripStyle {
-    /// The canvas's scheme mapping: a selected terminal scheme drives the
-    /// ink and pill, the adaptive default keeps the chrome theme's colors
-    /// (`default_pill_alpha` differs between tiles and the flyover).
-    pub(crate) fn from_scheme(th: &crate::theme::Theme, default_pill_alpha: f32) -> Self {
+    /// The canvas's scheme mapping: a selected terminal scheme drives the ink
+    /// and the chip white, the adaptive default keeps the chrome theme's.
+    pub(crate) fn from_scheme(th: &crate::theme::Theme) -> Self {
         let scheme = crate::term_theme::selected(crate::theme::dark_active());
         // The ink follows the resolved foreground, so a per-colour override
         // (or a custom theme that renames the base) reads on the strip too.
         let resolved = crate::term_theme::resolved(crate::theme::dark_active());
-        let (ink, ink_dim, pill_rgb, pill_alpha) = match scheme {
+        let (ink, ink_dim, pill_rgb) = match scheme {
             Some(_) => {
                 let fg = resolved.colors.fg;
-                (color(fg, 1.0), color(fg, 0.55), fg, 0.12)
+                (color(fg, 1.0), color(fg, 0.55), fg)
             },
-            None => (
-                color(th.text_bright, 1.0),
-                color(th.text_dim, 1.0),
-                (255, 255, 255),
-                default_pill_alpha,
-            ),
+            None => (color(th.text_bright, 1.0), color(th.text_dim, 1.0), (255, 255, 255)),
         };
-        Self {
-            ink,
-            ink_dim,
-            pill_rgb,
-            pill_alpha,
-            accent: None,
-            unread: color(th.accent, 1.0),
-            pill_radius: None,
-            chip_radius: None,
-        }
+        Self { ink, ink_dim, pill_rgb, focused: false, unread: color(th.accent, 1.0) }
     }
 }
 
@@ -102,25 +115,32 @@ impl StripStyle {
 /// re-resolves the press; the canvas still drives any drag that follows.
 pub(crate) type PressHandler = Rc<dyn Fn(usize, bool, &MouseDownEvent, &mut GpuiApp)>;
 
-/// One tab of a strip: its title and the physical-px rects the canvas laid
-/// it out at (the tab and its × button).
+/// A press on the strip's "+" New tab button.
+pub(crate) type NewTabHandler = Rc<dyn Fn(&mut GpuiApp)>;
+
+/// One tab of a strip: its title, its glyph kind, and the physical-px rects
+/// the strip layout handed it (the tab and its × button).
 pub(crate) struct StripTab {
     pub title: String,
     pub unread: bool,
     /// Pinned tabs keep their full title but draw a pin ring before it and
     /// no × — they can't be closed until unpinned.
     pub pinned: bool,
+    /// A webview tab wears a globe glyph; a terminal tab a terminal glyph.
+    pub webview: bool,
     pub tab: LayoutRect,
     pub close: LayoutRect,
 }
 
-/// The strip box for `bar` (physical px, converted with `inv`) holding the
-/// tabs: active/hover pills, titles clipped short of ×, unread dots, and the
-/// × with its hover chip. Returns the absolutely positioned, clipped box so
-/// the caller can append controls of its own (the flyover's window buttons)
-/// before mounting it.
+/// The strip box for `layout` (physical px, converted with `inv`): the mock's
+/// chips, glyphs, titles, × buttons, hairlines and "+" button, all at the rects
+/// [`crate::workspace::tile_strip_layout`] — or its flyover mirror — hands the
+/// canvas mouse path as well, so painted and hit-tested geometry cannot
+/// disagree. Returns the absolutely positioned, clipped box so the caller can
+/// append controls of its own (the flyover's window buttons) before mounting
+/// it.
 pub(crate) fn tab_strip(
-    bar: &LayoutRect,
+    layout: &workspace::StripLayout,
     inv: f32,
     tabs: &[StripTab],
     active: usize,
@@ -128,7 +148,9 @@ pub(crate) fn tab_strip(
     style: &StripStyle,
     close_icon: &str,
     on_press: PressHandler,
+    on_new_tab: NewTabHandler,
 ) -> gpui::Div {
+    let bar = &layout.bar;
     let mut strip_el = div()
         .absolute()
         .left(px(bar.x * inv))
@@ -136,15 +158,29 @@ pub(crate) fn tab_strip(
         .w(px(bar.w * inv))
         .h(px(bar.h * inv))
         .overflow_hidden();
+    // Rects relative to the strip box, in logical px.
+    let rel = |r: &LayoutRect| ((r.x - bar.x) * inv, (r.y - bar.y) * inv, r.w * inv, r.h * inv);
+
+    // A hairline between adjacent tabs — and between the last tab and the "+".
+    for sep in &layout.separators {
+        let (sx, sy, sw, sh) = rel(sep);
+        strip_el = strip_el.child(
+            div()
+                .absolute()
+                .left(px(sx))
+                .top(px(sy))
+                .w(px(sw))
+                .h(px(sh))
+                .bg(color(style.pill_rgb, SEP_ALPHA)),
+        );
+    }
 
     for (ti, tab) in tabs.iter().enumerate() {
         let is_active = ti == active;
-        // Pinned tabs render no ×, so their close rect must not eat the
-        // pill hover either — a press there selects the tab.
+        // Pinned tabs render no ×, so their close rect must not eat the chip
+        // hover either — a press there selects the tab.
         let close_hov = !tab.pinned && hov(&tab.close);
         let tab_hov = hov(&tab.tab) && !close_hov;
-        // Rects relative to the strip box, in logical px.
-        let rel = |r: &LayoutRect| ((r.x - bar.x) * inv, (r.y - bar.y) * inv, r.w * inv, r.h * inv);
         let (tx, ty, tw, tth) = rel(&tab.tab);
         let (cx_, cy_, cw, ch) = rel(&tab.close);
 
@@ -160,48 +196,56 @@ pub(crate) fn tab_strip(
                 press(ti, false, ev, app)
             });
 
-        // Pill: the active tab's (accent when the pane is focused, glass
-        // otherwise), or a half-strength preview on hover.
+        // The chip: the active tab's — the mock's .07 fill with a .10 border
+        // while its tile is focused, .04 and no border while it is not — or
+        // the faint preview an inactive tab shows on hover (no border, and it
+        // reserves no width).
         if is_active || tab_hov {
-            let pill_h = (tth - 2.0 * PILL_INSET).max(0.0);
-            let mut pill = div()
-                .absolute()
-                .left(px(PILL_INSET))
-                .top(px(PILL_INSET))
-                .w(px((tw - 2.0 * PILL_INSET).max(0.0)))
-                .h(px(pill_h))
-                .rounded(px(style.pill_radius.unwrap_or(pill_h / 2.0)));
-            pill = match (is_active, style.accent) {
-                (true, Some(accent)) => pill.bg(accent),
-                (true, None) => glass(
-                    pill,
-                    color(style.pill_rgb, style.pill_alpha),
-                    color_alpha(style.ink, 0.18),
-                ),
-                _ => glass(
-                    pill,
-                    color(style.pill_rgb, style.pill_alpha * 0.55),
-                    color_alpha(style.ink, 0.10),
-                ),
+            let alpha = if is_active {
+                if style.focused { CHIP_FILL } else { CHIP_FILL_DIM }
+            } else {
+                CHIP_FILL_HOVER
             };
-            tab_el = tab_el.child(pill);
+            let mut chip = div()
+                .absolute()
+                .left(px(0.0))
+                .top(px(0.0))
+                .w(px(tw))
+                .h(px(tth))
+                .rounded(px(CHIP_RADIUS))
+                .bg(color(style.pill_rgb, alpha));
+            if is_active && style.focused {
+                chip = chip.border_1().border_color(color(style.pill_rgb, CHIP_BORDER));
+            }
+            tab_el = tab_el.child(chip);
         }
 
-        // Title (with the unread dot before it), clipped short of ×.
+        // The title row: glyph, pin ring, unread dot, then the title, clipped
+        // short of the × on an active chip.
         let text = if tab.title.is_empty() { "shell".to_string() } else { tab.title.clone() };
-        let text_color = match (is_active, style.accent) {
-            (true, Some(_)) => color(ON_ACCENT_INK, 1.0),
-            (true, None) => style.ink,
-            _ => style.ink_dim,
-        };
-        let mut text_left = TEXT_PAD;
-        // Pin ring: a hollow dot in the dim ink so it reads apart from the
-        // filled accent unread dot that may follow it.
+        let text_color = if is_active && style.focused { style.ink } else { style.ink_dim };
+        let icon_path = if tab.webview { ICON_GLOBE } else { ICON_TERMINAL };
+        let mut x = if is_active { CHIP_PAD_L } else { TAB_PAD_H };
+        tab_el = tab_el.child(
+            div()
+                .absolute()
+                .left(px(x))
+                .top(px((tth - GLYPH) / 2.0))
+                .w(px(GLYPH))
+                .h(px(GLYPH))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(icon(icon_path, px(GLYPH * inv), style.ink_dim)),
+        );
+        x += GLYPH + CHIP_GAP;
+        // Pin ring: a hollow dot in the tab's own ink so it reads apart from
+        // the filled accent unread dot that may follow it.
         if tab.pinned {
             tab_el = tab_el.child(
                 div()
                     .absolute()
-                    .left(px(text_left))
+                    .left(px(x))
                     .top(px(((tth - DOT) / 2.0).round()))
                     .w(px(DOT))
                     .h(px(DOT))
@@ -209,52 +253,55 @@ pub(crate) fn tab_strip(
                     .border_1()
                     .border_color(text_color),
             );
-            text_left += DOT + DOT_GAP;
+            x += DOT + DOT_GAP;
         }
         if tab.unread {
             tab_el = tab_el.child(
                 div()
                     .absolute()
-                    .left(px(text_left))
+                    .left(px(x))
                     .top(px(((tth - DOT) / 2.0).round()))
                     .w(px(DOT))
                     .h(px(DOT))
                     .rounded(px(DOT / 2.0))
                     .bg(style.unread),
             );
-            text_left += DOT + DOT_GAP;
+            x += DOT + DOT_GAP;
         }
+        // An active chip keeps its × area clear; an inactive tab's title runs
+        // to its padding (its × appears only on hover, over the title).
+        let text_right = if is_active && !tab.pinned {
+            (tw - CHIP_PAD_R - CLOSE_AREA).max(0.0)
+        } else {
+            (tw - TAB_PAD_H).max(0.0)
+        };
         tab_el = tab_el.child(
             div()
                 .absolute()
-                .left(px(text_left))
+                .left(px(x))
                 .top(px(0.0))
                 .h(px(tth))
-                .w(px(if tab.pinned {
-                    // No × to clip short of: the title runs to the pill's edge.
-                    (tw - text_left - TEXT_PAD).max(0.0)
-                } else {
-                    (cx_ - tx - text_left).max(0.0)
-                }))
+                .w(px((text_right - x).max(0.0)))
                 .overflow_hidden()
                 .whitespace_nowrap()
                 .flex()
                 .items_center()
+                .text_size(px(TITLE_SIZE))
                 .text_color(text_color)
                 .child(text),
         );
 
         // A pinned tab has no ×: its close rect stays in the canvas hit list
         // but presses there fall through to the tab (`close_active_tab`
-        // refuses pinned tabs regardless).
-        if tab.pinned {
+        // refuses pinned tabs regardless). Any other tab shows its × while it
+        // is active or hovered — so an inactive tab can still be closed.
+        if tab.pinned || !(is_active || close_hov || tab_hov) {
             strip_el = strip_el.child(tab_el);
             continue;
         }
 
         // × and its hover chip. Its press wins over the tab's: the inner
         // listener runs first and stops propagation.
-        let chip_h = (ch - 2.0 * CHIP_INSET).max(0.0);
         let press = on_press.clone();
         tab_el = tab_el.child(
             div()
@@ -270,12 +317,12 @@ pub(crate) fn tab_strip(
                     d.child(
                         div()
                             .absolute()
-                            .left(px(CHIP_INSET))
-                            .top(px(CHIP_INSET))
-                            .w(px((cw - 2.0 * CHIP_INSET).max(0.0)))
-                            .h(px(chip_h))
-                            .rounded(px(style.chip_radius.unwrap_or(chip_h / 2.0)))
-                            .bg(color(style.pill_rgb, (style.pill_alpha * 2.0).min(1.0))),
+                            .left(px(0.0))
+                            .top(px(0.0))
+                            .w(px(cw))
+                            .h(px(ch))
+                            .rounded(px(CHIP_RADIUS))
+                            .bg(color(style.pill_rgb, CLOSE_CHIP)),
                     )
                 })
                 .child(
@@ -289,13 +336,50 @@ pub(crate) fn tab_strip(
                         .justify_center()
                         .child(icon(
                             close_icon,
-                            px(12.0 * inv),
+                            px(GLYPH * inv),
                             if close_hov { style.ink } else { style.ink_dim },
                         )),
                 ),
         );
 
         strip_el = strip_el.child(tab_el);
+    }
+
+    // The "+" New tab button, after the final separator. Its press stops
+    // propagation like the tabs' so the canvas path never re-resolves it.
+    if let Some(plus) = layout.new_tab {
+        let (plus_x, plus_y, plus_w, plus_h) = rel(&plus);
+        let plus_hov = hov(&plus);
+        let go = on_new_tab.clone();
+        strip_el = strip_el.child(
+            div()
+                .absolute()
+                .left(px(plus_x))
+                .top(px(plus_y))
+                .w(px(plus_w))
+                .h(px(plus_h))
+                .rounded(px(CHIP_RADIUS))
+                .when(plus_hov, |d| d.bg(color(style.pill_rgb, CHIP_FILL_HOVER)))
+                .on_mouse_down(MouseButton::Left, move |_ev: &MouseDownEvent, _win: &mut Window, app: &mut GpuiApp| {
+                    app.stop_propagation();
+                    go(app)
+                })
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(0.0))
+                        .top(px(0.0))
+                        .size_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(icon(
+                            ICON_PLUS,
+                            px(NEW_TAB_GLYPH * inv),
+                            if plus_hov { style.ink } else { style.ink_dim },
+                        )),
+                ),
+        );
     }
     strip_el
 }
@@ -323,7 +407,7 @@ impl App {
         let axis_map: HashMap<u64, Option<workspace::Dir>> =
             workspace::tile_collapse_axis(&ws.root).into_iter().collect();
 
-        let base = StripStyle::from_scheme(th, 0.13);
+        let base = StripStyle::from_scheme(th);
         let accent = color(crate::theme::accent_color(), 1.0);
 
         // Hover in physical px, like the canvas: none while dragging or
@@ -417,21 +501,28 @@ impl App {
             }
             let focused = ws.focused_tile == *id;
             let strip = workspace::tab_strip_rect(area, rect, scale, sidebar_w);
-            let bar = workspace::tile_tab_bar(&strip, scale);
-            let n = tile.tabs.len();
+            // One layout for this strip: the painters below read its rects, and
+            // so does every hit-test on the canvas mouse path.
+            let titles: Vec<String> = tile.tabs.iter().map(|t| t.title()).collect();
+            let layout =
+                workspace::tile_strip_layout(&strip, &titles, tile.active, scale, has_caret);
+            let bar = layout.bar;
             let tabs: Vec<StripTab> = tile
                 .tabs
                 .iter()
                 .enumerate()
-                .map(|(ti, tab)| StripTab {
-                    title: tab.title(),
-                    unread: tab.unread,
-                    pinned: tab.pinned,
-                    tab: workspace::tile_tab_rect(&strip, ti, n, scale, has_caret),
-                    close: workspace::tile_tab_close_rect(&strip, ti, n, scale, has_caret),
+                .filter_map(|(ti, tab)| {
+                    Some(StripTab {
+                        title: tab.title(),
+                        unread: tab.unread,
+                        pinned: tab.pinned,
+                        webview: tab.kind() == workspace::TabKind::Webview,
+                        tab: *layout.tabs.get(ti)?,
+                        close: *layout.closes.get(ti)?,
+                    })
                 })
                 .collect();
-            let style = StripStyle { accent: focused.then_some(accent), ..base.clone() };
+            let style = StripStyle { focused, ..base.clone() };
             let press_entity = entity.clone();
             let on_press: PressHandler = Rc::new(move |ti, close, ev, app| {
                 app.stop_propagation();
@@ -443,8 +534,19 @@ impl App {
                     });
                 }
             });
+            // The "+": focus this tile first, then take the standard New-tab
+            // path, so the button and the ⌘T binding land in the same place.
+            let new_entity = entity.clone();
+            let on_new_tab: NewTabHandler = Rc::new(move |app| {
+                if let Some(entity) = new_entity.upgrade() {
+                    entity.update(app, |this, cx| {
+                        this.new_tab_in_tile(tile_id);
+                        cx.notify();
+                    });
+                }
+            });
             let mut strip_el = tab_strip(
-                &bar,
+                &layout,
                 inv,
                 &tabs,
                 tile.active,
@@ -452,6 +554,7 @@ impl App {
                 &style,
                 &cx.global::<Theme>().icons.x(),
                 on_press,
+                on_new_tab,
             );
             // The collapse caret: a standard svg chevron now (was canvas-
             // painted). The press target stays the same square, hover keeps
@@ -511,11 +614,4 @@ impl App {
     }
 }
 
-/// The canvas `glass` treatment: a fill with a half-pixel rim.
-fn glass(d: gpui::Div, fill: Hsla, rim: Hsla) -> gpui::Div {
-    d.bg(fill).border(px(0.5)).border_color(rim)
-}
 
-fn color_alpha(c: Hsla, a: f32) -> Hsla {
-    Hsla { a, ..c }
-}

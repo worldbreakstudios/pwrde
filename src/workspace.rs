@@ -677,8 +677,10 @@ const HEADER_CHIP_GAP: f32 = 4.0;
 /// the folders card is hidden — the mock leaves 16px of air after the green
 /// light; with the chip's glyph ~2px inside its square this gives 14px.
 const SHOW_FOLDERS_GAP: f32 = 12.0;
-/// Height of the horizontal tab strip atop each tile.
-const TILE_TAB_H: f32 = 28.0;
+/// Height of the horizontal tab strip atop each tile: the mock's 6px top
+/// padding + 30px tab row + 4px bottom padding. No fill of its own — the
+/// strip sits on the terminal ground.
+const TILE_TAB_H: f32 = 40.0;
 /// Gap between tile cards; doubles as the divider drag handle (hit tests
 /// inflate it, so a slim gap still drags fine).
 const TILE_GAP: f32 = 3.0;
@@ -688,7 +690,8 @@ const TILE_GAP: f32 = 3.0;
 /// gpui layout (edge insets track live window resizes; a computed w/h from
 /// the last-painted surface size would lag).
 pub const AREA_PAD: f32 = TILE_GAP;
-const TILE_TAB_MAX_W: f32 = 180.0;
+/// Widest a tab may be (the mock's cap for both states).
+const TILE_TAB_MAX_W: f32 = 240.0;
 
 // ─── GANTRY two-part sidebar region ─────────────────────────────────────
 //
@@ -1067,7 +1070,7 @@ pub enum TrafficLightSpot {
     /// The top-left tile's tab strip once the sidebar collapses.
     CollapsedTile,
     /// A maximized flyover panel's tab strip, which fills the window from
-    /// (0, 0) and cedes its left end to the lights (`flyover_tab_rect`).
+    /// (0, 0) and cedes its left end to the lights (`flyover_strip_layout`).
     MaximizedFlyover,
 }
 
@@ -1491,7 +1494,7 @@ fn sidebar_row_rect_at(
 /// The delete-section button hit region at the right edge of a section-header
 /// row (`header` = its [`sidebar_row_rect`]). Painting and hit-testing both
 /// derive it from the header rect so they never disagree; mirrors
-/// [`tile_tab_close_rect`]'s sizing.
+/// the strip's × sizing.
 pub fn section_delete_rect(header: &LayoutRect, scale: f32) -> LayoutRect {
     let s = (16.0 * scale).round();
     let pad = (6.0 * scale).round();
@@ -2114,52 +2117,279 @@ pub fn tile_caret_rect(rect: &LayoutRect, scale: f32) -> LayoutRect {
     LayoutRect { x: bar.x + (bar.w - side).max(0.0), y: bar.y, w: side, h: side }
 }
 
-/// Rect of tab `i` of `n` in a tile's strip.
-///
-/// When `has_caret` is `true` (the tile has a parent split and therefore
-/// shows a collapse caret button), the caret square at the right end of the
-/// strip is excluded from the available width so tabs never overlap it.
-pub fn tile_tab_rect(rect: &LayoutRect, i: usize, n: usize, scale: f32, has_caret: bool) -> LayoutRect {
-    let bar = tile_tab_bar(rect, scale);
-    let caret_w = if has_caret { (TILE_TAB_H * scale).round() } else { 0.0 };
-    let avail_w = (bar.w - caret_w).max(0.0);
-    let w = (avail_w / n.max(1) as f32).min((TILE_TAB_MAX_W * scale).round()).round();
-    LayoutRect { x: bar.x + i as f32 * w, y: bar.y, w, h: bar.h }
+// ── The mock's strip layout: one computation per strip ──────────────────────
+//
+// The strip is a 40px bar (6px of top padding, a 30px tab row, 4px below)
+// with 10px of padding at each end. Tabs run left to right: the active one is
+// a chip (fill .07 over the scheme ink, 1px border .10, radius 8, 10/8 inner
+// padding, icon + title + ×), an inactive one is bare content (6px padding,
+// icon, title). A 1×14 hairline sits between neighbours and before the "+"
+// button, with 10px of air on each side — 21px between tab edges. Layout math
+// cannot measure text, so widths come from the per-character estimate below;
+// when a strip runs out of room the whole run — tabs, separators and the "+"
+// — shrinks proportionally so nothing ever crosses the caret or the flyover's
+// window buttons. These functions are the single authority every strip
+// painter and hit-tester reads.
+
+/// Height of one tab row inside the bar (the mock's 30px chips).
+pub const TILE_TAB_ROW_H: f32 = 30.0;
+/// Padding above the tab row inside the bar.
+const TILE_TAB_PAD_TOP: f32 = 6.0;
+/// Padding at each end of the bar.
+const TILE_TAB_PAD_X: f32 = 10.0;
+
+/// Horizontal padding inside an inactive tab.
+const TAB_PAD_H: f32 = 6.0;
+/// Side of a tab's icon.
+const TAB_ICON: f32 = 14.0;
+/// Gap between a tab's children (icon, title, unread dot, ×).
+const TAB_STRIP_GAP: f32 = 8.0;
+/// Estimated advance of one title character — layout math cannot measure.
+/// Sized to the strip's monospace face at 12.5px (0.6em, plus a little air)
+/// so a title with room to spare is never clipped.
+const TAB_CHAR_W: f32 = 7.7;
+/// Narrowest an inactive tab may be.
+const TAB_MIN_W: f32 = 60.0;
+/// Narrowest / widest an active chip may be (the mock's 180..=240).
+const TAB_ACTIVE_MIN_W: f32 = 180.0;
+/// The × glyph, and its inset from the chip's right edge.
+const TAB_CLOSE_W: f32 = 14.0;
+const TAB_CLOSE_PAD_R: f32 = 8.0;
+/// The separator hairline and the air on each side of it.
+const TAB_SEP_W: f32 = 1.0;
+const TAB_SEP_H: f32 = 14.0;
+const TAB_SEP_MARGIN: f32 = 10.0;
+/// The "+" New tab button: a 15px glyph with 4px of padding each side.
+const TILE_NEW_TAB_W: f32 = 23.0;
+
+/// The full geometry of one tab strip: the single authority every painter and
+/// hit-tester reads, so the bar, the chips, the separators, the "+" button and
+/// the caret can never disagree.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StripLayout {
+    /// The bar: the tile's (or panel's) full width, `TILE_TAB_H` tall.
+    pub bar: LayoutRect,
+    /// The 30px tab row, vertically centred in the bar by its padding.
+    pub row: LayoutRect,
+    /// Per-tab rects, left to right (index-aligned with `closes`).
+    pub tabs: Vec<LayoutRect>,
+    /// The × rect inside each tab's right edge. A pinned tab paints none;
+    /// every other tab reveals it on hover.
+    pub closes: Vec<LayoutRect>,
+    /// Hairlines: one between every adjacent tab pair, then one before the
+    /// "+" button.
+    pub separators: Vec<LayoutRect>,
+    /// The "+" New tab button, when the strip has one.
+    pub new_tab: Option<LayoutRect>,
+    /// The collapse caret at a tile strip's right end.
+    pub caret: Option<LayoutRect>,
 }
 
-/// Nearest insertion gap (`0..=n`) for pointer x over a tile's tab strip.
-/// Left half of a tab resolves to the gap before it, right half to the gap
-/// after — used for same-tile reorders so the drop lands where the line shows.
-pub fn tile_tab_insert_gap(rect: &LayoutRect, px: f32, n: usize, scale: f32, has_caret: bool) -> usize {
-    let t0 = tile_tab_rect(rect, 0, n, scale, has_caret);
-    if t0.w <= 0.0 {
+/// Estimated width (logical px) of an *inactive* tab titled `title`.
+///
+/// Layout math cannot measure a text run, so the title is estimated at `TAB_CHAR_W`
+/// per character; an empty title reads as "shell", which is what the tab
+/// shows in its place. Clamped to `TAB_MIN_W..=TILE_TAB_MAX_W`.
+pub fn tab_width_estimate(title: &str) -> f32 {
+    let title = if title.is_empty() { "shell" } else { title };
+    let text = title.chars().count() as f32 * TAB_CHAR_W;
+    (TAB_PAD_H * 2.0 + TAB_ICON + TAB_STRIP_GAP + text).clamp(TAB_MIN_W, TILE_TAB_MAX_W)
+}
+
+/// Estimated width (logical px) of the *active* chip titled `title`: the
+/// inactive estimate plus room for its × and the chip's wider 10/8 inner
+/// padding (6px more than a bare tab's 6/6), clamped to 180..=240.
+pub fn tab_active_width(title: &str) -> f32 {
+    (tab_width_estimate(title) + TAB_STRIP_GAP + TAB_CLOSE_W + 6.0)
+        .clamp(TAB_ACTIVE_MIN_W, TILE_TAB_MAX_W)
+}
+
+/// Lay one strip's run out between `left` and `right` (physical px).
+fn lay_out_strip(
+    bar: LayoutRect,
+    titles: &[String],
+    active: Option<usize>,
+    scale: f32,
+    left: f32,
+    right: f32,
+    plus: bool,
+    caret: Option<LayoutRect>,
+) -> StripLayout {
+    let row = LayoutRect {
+        x: bar.x,
+        y: bar.y + (TILE_TAB_PAD_TOP * scale).round(),
+        w: bar.w,
+        h: (TILE_TAB_ROW_H * scale).round(),
+    };
+    let cy = row.y + row.h / 2.0;
+    let n = titles.len();
+    let sep_w = (TAB_SEP_W * scale).round().max(1.0);
+    let sep_h = (TAB_SEP_H * scale).round();
+    let close_w = (TAB_CLOSE_W * scale).round();
+    let close_pad = (TAB_CLOSE_PAD_R * scale).round();
+
+    let mut widths: Vec<f32> = titles
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let logical =
+                if active == Some(i) { tab_active_width(t) } else { tab_width_estimate(t) };
+            // Nothing may exceed the mock's widest chip.
+            (logical * scale).round().min((TILE_TAB_MAX_W * scale).round())
+        })
+        .collect();
+
+    // One separator between every adjacent pair, plus one before the "+".
+    let sep_count = if n == 0 { 0 } else { n - 1 + usize::from(plus) };
+    let mut margin = (TAB_SEP_MARGIN * scale).round();
+    let mut plus_w = (TILE_NEW_TAB_W * scale).round();
+    let avail = (right - left).max(0.0);
+    let needed = widths.iter().sum::<f32>()
+        + (sep_w + 2.0 * margin) * sep_count as f32
+        + if plus { plus_w } else { 0.0 };
+    // Proportional shrink, so a crowded strip stays clear of the caret (or
+    // the flyover's window buttons) instead of running under them. Flooring
+    // keeps the rounded widths from creeping back over `right`.
+    if needed > avail && needed > 0.0 {
+        // Rounding each width down loses up to a pixel, so leave that much
+        // slack before the shrink factor; scaling the whole gap (not just its
+        // margin) keeps the hairline spacing on the same factor.
+        let slack = (n + sep_count + 2) as f32;
+        let f = ((avail - slack).max(0.0) / needed).clamp(0.0, 1.0);
+        for w in widths.iter_mut() {
+            *w = (*w * f).floor().max(0.0);
+        }
+        margin = (((sep_w + 2.0 * margin) * f - sep_w).max(0.0)) / 2.0;
+        plus_w = (plus_w * f).floor().max(0.0);
+    }
+
+    let mut tabs = Vec::with_capacity(n);
+    let mut closes = Vec::with_capacity(n);
+    let mut separators = Vec::with_capacity(sep_count);
+    let mut x = left;
+    for (i, w) in widths.iter().enumerate() {
+        // Flooring the scaled widths can still leave a few pixels over; each
+        // tab (and then the "+") is clipped to the room in front of it so the
+        // run can never cross `right` and nothing ever overlaps.
+        let w = w.min((right - x).max(0.0)).max(0.0);
+        let tab = LayoutRect { x, y: row.y, w, h: row.h };
+        let cw = close_w.min(w);
+        let close = LayoutRect {
+            x: (tab.x + w - close_pad - cw).max(tab.x),
+            y: (cy - cw / 2.0).round(),
+            w: cw,
+            h: cw,
+        };
+        tabs.push(tab);
+        closes.push(close);
+        x = tab.x + w;
+        if i + 1 < n || plus {
+            let sep = LayoutRect {
+                x: (x + margin).min(right),
+                y: (cy - sep_h / 2.0).round(),
+                w: sep_w,
+                h: sep_h,
+            };
+            separators.push(sep);
+            x = sep.x + sep_w + margin;
+        }
+    }
+    // The "+" keeps its full width; if what is left of `right` cannot hold it,
+    // it simply is not painted (the strip drops to tabs only).
+    let new_tab = (plus && x + plus_w <= right).then(|| LayoutRect { x, y: row.y, w: plus_w, h: row.h });
+    StripLayout { bar, row, tabs, closes, separators, new_tab, caret }
+}
+
+/// Full strip layout of one tile's tab bar.
+///
+/// `strip` is the rect every strip consumer already uses — a tile rect run
+/// through [`tab_strip_rect`] (the collapsed-sidebar inset) — `titles` the tab
+/// titles in order and `active` the index of the tile's active tab. A tile
+/// with a parent split shows a caret at the bar's right end (`has_caret`),
+/// which the run never crosses.
+pub fn tile_strip_layout(
+    strip: &LayoutRect,
+    titles: &[String],
+    active: usize,
+    scale: f32,
+    has_caret: bool,
+) -> StripLayout {
+    let bar = tile_tab_bar(strip, scale);
+    let pad = (TILE_TAB_PAD_X * scale).round();
+    let caret = if has_caret { Some(tile_caret_rect(strip, scale)) } else { None };
+    let left = bar.x + pad;
+    let right = caret.map_or(bar.x + bar.w - pad, |c| c.x.max(left));
+    let active = (active < titles.len()).then_some(active);
+    lay_out_strip(bar, titles, active, scale, left, right, true, caret)
+}
+
+/// Full strip layout of the flyover panel's tab bar (mirrors
+/// [`tile_strip_layout`], with the window buttons in place of the caret).
+///
+/// A maximized panel owns the window's top-left corner, so its run starts
+/// past the native traffic lights instead of at the bar's padding.
+pub fn flyover_strip_layout(
+    panel: &LayoutRect,
+    titles: &[String],
+    active: usize,
+    scale: f32,
+    maximized: bool,
+) -> StripLayout {
+    let bar = flyover_tab_bar(panel, scale);
+    let pad = (TILE_TAB_PAD_X * scale).round();
+    let left = if maximized {
+        (bar.x + (TRAFFIC_LIGHT_SAFE_W * scale).round()).max(bar.x + pad)
+    } else {
+        bar.x + pad
+    };
+    let right = (bar.x + bar.w - flyover_buttons_w(panel, scale) - pad).max(left);
+    let active = (active < titles.len()).then_some(active);
+    lay_out_strip(bar, titles, active, scale, left, right, true, None)
+}
+
+/// x of gap `gap` (`0..=n`) of a strip — the boundary between tabs `gap-1`
+/// and `gap`, where the drop line lands.
+fn strip_boundary(layout: &StripLayout, gap: usize) -> f32 {
+    let n = layout.tabs.len();
+    if n == 0 {
+        return layout.row.x;
+    }
+    if gap == 0 {
+        return layout.tabs[0].x;
+    }
+    if gap >= n {
+        return layout.tabs[n - 1].x + layout.tabs[n - 1].w;
+    }
+    let before = layout.tabs[gap - 1];
+    let after = layout.tabs[gap];
+    (before.x + before.w + after.x) / 2.0
+}
+
+/// Nearest insertion gap (`0..=n`) for pointer x over a strip layout: every
+/// gap sits on a tab boundary, so a press resolves to whichever side is
+/// nearer — exactly where the drop line shows.
+pub fn strip_insert_gap(layout: &StripLayout, px: f32) -> usize {
+    let n = layout.tabs.len();
+    if n == 0 {
         return 0;
     }
-    ((((px - t0.x) / t0.w + 0.5).floor().max(0.0)) as usize).min(n)
-}
-
-/// Thin vertical insertion-line rect at gap `gap` (`0..=n`) of a tile's strip.
-pub fn tile_tab_insert_line(rect: &LayoutRect, gap: usize, n: usize, scale: f32, has_caret: bool) -> LayoutRect {
-    let line_w = (2.0 * scale).max(1.0);
-    let tr = tile_tab_rect(rect, gap.min(n.saturating_sub(1)), n, scale, has_caret);
-    let x = if gap >= n { tr.x + tr.w } else { tr.x };
-    LayoutRect { x: x - line_w / 2.0, y: tr.y, w: line_w, h: tr.h }
-}
-
-/// The close-button hit region at the right edge of tab `i` of `n`.
-///
-/// `has_caret` is forwarded to `tile_tab_rect` so the close button position
-/// stays consistent with the tab's actual position.
-pub fn tile_tab_close_rect(rect: &LayoutRect, i: usize, n: usize, scale: f32, has_caret: bool) -> LayoutRect {
-    let tr = tile_tab_rect(rect, i, n, scale, has_caret);
-    let s = (16.0 * scale).round();
-    let pad = (6.0 * scale).round();
-    LayoutRect {
-        x: tr.x + tr.w - s - pad,
-        y: (tr.y + (tr.h - s) / 2.0).round(),
-        w: s,
-        h: s,
+    let mut best = 0;
+    let mut best_d = f32::INFINITY;
+    for gap in 0..=n {
+        let d = (px - strip_boundary(layout, gap)).abs();
+        if d < best_d {
+            best_d = d;
+            best = gap;
+        }
     }
+    best
+}
+
+/// Thin vertical insertion line at gap `gap` (`0..=n`) of a strip.
+pub fn strip_insert_line(layout: &StripLayout, gap: usize, scale: f32) -> LayoutRect {
+    let w = (2.0 * scale).max(1.0);
+    let x = strip_boundary(layout, gap.min(layout.tabs.len()));
+    LayoutRect { x: x - w / 2.0, y: layout.row.y, w, h: layout.row.h }
 }
 
 // ── Flyover panel layout ─────────────────────────────────────────────────────
@@ -2223,49 +2453,6 @@ pub fn flyover_content(rect: &LayoutRect, scale: f32) -> LayoutRect {
 /// the minimize/maximize buttons — two square slots, one bar-height each.
 fn flyover_buttons_w(rect: &LayoutRect, scale: f32) -> f32 {
     2.0 * flyover_tab_bar(rect, scale).h
-}
-
-/// Rect of tab `i` of `n` in the flyover tab strip (mirrors `tile_tab_rect`,
-/// no caret button so no `has_caret` parameter). Tabs share the bar minus
-/// the window-button strip at the right; a `maximized` panel owns the
-/// window's top-left corner, so the strip cedes its left end to the native
-/// traffic lights like a collapsed-sidebar tile does.
-pub fn flyover_tab_rect(
-    rect: &LayoutRect,
-    i: usize,
-    n: usize,
-    scale: f32,
-    maximized: bool,
-) -> LayoutRect {
-    let bar = flyover_tab_bar(rect, scale);
-    let cede = if maximized {
-        (TRAFFIC_LIGHT_SAFE_W * scale).round().clamp(0.0, bar.w)
-    } else {
-        0.0
-    };
-    let avail = (bar.w - cede - flyover_buttons_w(rect, scale)).max(0.0);
-    let w = (avail / n.max(1) as f32).min((TILE_TAB_MAX_W * scale).round()).round();
-    LayoutRect { x: bar.x + cede + i as f32 * w, y: bar.y, w, h: bar.h }
-}
-
-/// Rect of the × close button inside flyover tab `i` (mirrors
-/// `tile_tab_close_rect`).
-pub fn flyover_tab_close_rect(
-    rect: &LayoutRect,
-    i: usize,
-    n: usize,
-    scale: f32,
-    maximized: bool,
-) -> LayoutRect {
-    let tr = flyover_tab_rect(rect, i, n, scale, maximized);
-    let s = (16.0 * scale).round();
-    let pad = (6.0 * scale).round();
-    LayoutRect {
-        x: tr.x + tr.w - s - pad,
-        y: (tr.y + (tr.h - s) / 2.0).round(),
-        w: s,
-        h: s,
-    }
 }
 
 /// The minimize (−) button: second-from-right square in the flyover tab bar.
@@ -2383,63 +2570,6 @@ mod flyover_tests {
         assert_eq!(y + 6.0, bar.y + bar.h / 2.0);
     }
 
-    /// A maximized panel's first tab clears the native traffic lights.
-    #[test]
-    fn flyover_maximized_tabs_clear_traffic_lights() {
-        let panel = flyover_rect(1000, 800, 1.0, 1.0, 0.3, true);
-        let t0 = flyover_tab_rect(&panel, 0, 2, 1.0, true);
-        assert_eq!(t0.x, TRAFFIC_LIGHT_SAFE_W);
-        // Un-maximized panels keep their tabs at the bar's left edge.
-        let normal = flyover_rect(1000, 800, 1.0, 1.0, 0.3, false);
-        let n0 = flyover_tab_rect(&normal, 0, 2, 1.0, false);
-        assert_eq!(n0.x, normal.x);
-    }
-
-    /// The window buttons sit inside the bar's right edge, minimize left of
-    /// maximize, and tabs never overlap them.
-    #[test]
-    fn flyover_buttons_and_tabs_share_the_bar() {
-        let panel = flyover_rect(1000, 800, 1.0, 1.0, FLYOVER_DEFAULT_FRAC, false);
-        let bar = flyover_tab_bar(&panel, 1.0);
-        let min = flyover_minimize_rect(&panel, 1.0);
-        let max = flyover_maximize_rect(&panel, 1.0);
-        assert_eq!(max.x + max.w, bar.x + bar.w);
-        assert_eq!(min.x + min.w, max.x);
-        let n = 3;
-        let last = flyover_tab_rect(&panel, n - 1, n, 1.0, false);
-        assert!(last.x + last.w <= min.x + 0.5);
-    }
-
-    /// The close button sits inside its tab.
-    #[test]
-    fn flyover_tab_close_rect_inside_tab() {
-        let panel = flyover_rect(1000, 800, 1.0, 1.0, FLYOVER_DEFAULT_FRAC, false);
-        for n in 1..=4 {
-            for i in 0..n {
-                let tr = flyover_tab_rect(&panel, i, n, 1.0, false);
-                let close = flyover_tab_close_rect(&panel, i, n, 1.0, false);
-                assert!(close.x >= tr.x && close.x + close.w <= tr.x + tr.w + 0.5);
-                assert!(close.y >= tr.y && close.y + close.h <= tr.y + tr.h + 0.5);
-            }
-        }
-    }
-
-    /// Tab rects are evenly divided and don't exceed TILE_TAB_MAX_W.
-    #[test]
-    fn flyover_tab_rect_layout() {
-        let panel = flyover_rect(1000, 800, 1.0, 1.0, FLYOVER_DEFAULT_FRAC, false);
-        let t0 = flyover_tab_rect(&panel, 0, 3, 1.0, false);
-        let t1 = flyover_tab_rect(&panel, 1, 3, 1.0, false);
-        let t2 = flyover_tab_rect(&panel, 2, 3, 1.0, false);
-        // All tabs same width.
-        assert_eq!(t0.w, t1.w);
-        assert_eq!(t1.w, t2.w);
-        // Tabs are laid out left-to-right.
-        assert!(t1.x > t0.x);
-        assert!(t2.x > t1.x);
-        // Width doesn't exceed cap.
-        assert!(t0.w <= TILE_TAB_MAX_W);
-    }
 }
 
 /// Maps each tile id to the [`Dir`] of its parent split, or `None` if the
@@ -2677,63 +2807,6 @@ mod tests {
         let ws = Workspace::new("g".into(), Tile::empty(7), None);
         assert_eq!(ws.primary_tile, 7);
         assert_eq!(ws.focused_tile, 7);
-    }
-
-    #[test]
-    fn tab_close_rect_sits_inside_its_tab() {
-        let rect = LayoutRect { x: 100.0, y: 50.0, w: 900.0, h: 600.0 };
-        for scale in [1.0, 2.0] {
-            for n in [1, 3, 8] {
-                for i in 0..n {
-                    for has_caret in [false, true] {
-                        let tr = tile_tab_rect(&rect, i, n, scale, has_caret);
-                        let close = tile_tab_close_rect(&rect, i, n, scale, has_caret);
-                        assert!(close.x >= tr.x && close.x + close.w <= tr.x + tr.w);
-                        assert!(close.y >= tr.y && close.y + close.h <= tr.y + tr.h);
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn tab_insert_gap_resolves_to_nearest_boundary() {
-        let rect = LayoutRect { x: 100.0, y: 50.0, w: 900.0, h: 600.0 };
-        for scale in [1.0, 2.0] {
-            for has_caret in [false, true] {
-                let n = 3;
-                let t0 = tile_tab_rect(&rect, 0, n, scale, has_caret);
-                // Left half of a tab → gap before it; right half → gap after.
-                for i in 0..n {
-                    let left = t0.x + i as f32 * t0.w + t0.w * 0.25;
-                    let right = t0.x + i as f32 * t0.w + t0.w * 0.75;
-                    assert_eq!(tile_tab_insert_gap(&rect, left, n, scale, has_caret), i);
-                    assert_eq!(tile_tab_insert_gap(&rect, right, n, scale, has_caret), i + 1);
-                }
-                // Clamped at both ends, even past the strip.
-                assert_eq!(tile_tab_insert_gap(&rect, t0.x - 50.0, n, scale, has_caret), 0);
-                assert_eq!(
-                    tile_tab_insert_gap(&rect, t0.x + 100.0 * t0.w, n, scale, has_caret),
-                    n
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn tab_insert_line_sits_on_gap_boundaries() {
-        let rect = LayoutRect { x: 100.0, y: 50.0, w: 900.0, h: 600.0 };
-        let (scale, n, has_caret) = (2.0, 3, true);
-        let t0 = tile_tab_rect(&rect, 0, n, scale, has_caret);
-        for gap in 0..=n {
-            let line = tile_tab_insert_line(&rect, gap, n, scale, has_caret);
-            // Centered on the boundary between tabs gap-1 and gap.
-            let boundary = t0.x + gap as f32 * t0.w;
-            assert!((line.x + line.w / 2.0 - boundary).abs() < 0.51);
-            // Spans the tab height, no more.
-            assert_eq!(line.y, t0.y);
-            assert_eq!(line.h, t0.h);
-        }
     }
 
     fn tab_with_attention(unread: bool, seconds: u64) -> Tab {
@@ -3994,29 +4067,6 @@ mod tests {
     }
 
     #[test]
-    fn caret_rect_right_aligned_and_tabs_avoid_it() {
-        let rect = LayoutRect { x: 100.0, y: 50.0, w: 900.0, h: 600.0 };
-        for scale in [1.0, 2.0] {
-            let bar = tile_tab_bar(&rect, scale);
-            let caret = tile_caret_rect(&rect, scale);
-            // Right-aligned square inside the bar.
-            assert_eq!(caret.x + caret.w, bar.x + bar.w);
-            assert!(caret.y >= bar.y && caret.y + caret.h <= bar.y + bar.h);
-            // Tabs start at the bar's left edge either way; with a caret the
-            // last tab must end at or before the caret square.
-            for n in [1, 2, 4] {
-                let first = tile_tab_rect(&rect, 0, n, scale, true);
-                assert_eq!(first.x, bar.x);
-                let last = tile_tab_rect(&rect, n - 1, n, scale, true);
-                assert!(last.x + last.w <= caret.x + 1.0);
-                // Close button stays inside its tab.
-                let close = tile_tab_close_rect(&rect, n - 1, n, scale, true);
-                assert!(close.x >= last.x && close.x + close.w <= last.x + last.w);
-            }
-        }
-    }
-
-    #[test]
     fn tile_collapse_axis_maps_parent_dirs() {
         let node = split(
             Dir::Row,
@@ -4088,4 +4138,205 @@ mod tests {
         assert!(advanced.x >= pane.x && advanced.x + advanced.w <= pane.x + pane.w);
     }
 
+}
+
+#[cfg(test)]
+mod strip_layout_tests {
+    use super::*;
+
+    /// Independent consistency check over a strip: every painted segment
+    /// starts exactly where the previous one ended, the run is strictly
+    /// ordered, and nothing reaches past the caret.
+    fn left_of_the_caret_is_painted(l: &StripLayout) -> bool {
+        let mut segs: Vec<LayoutRect> = Vec::new();
+        for i in 0..l.tabs.len() {
+            segs.push(l.tabs[i]);
+            if i < l.separators.len() {
+                segs.push(l.separators[i]);
+            }
+        }
+        if let Some(p) = l.new_tab {
+            segs.push(p);
+        }
+        let limit = l.caret.map_or(l.bar.x + l.bar.w, |c| c.x);
+        segs.iter()
+            .all(|s| s.x >= l.bar.x && s.x + s.w <= limit + 0.51)
+            && segs.windows(2).all(|w| w[1].x >= w[0].x + w[0].w)
+    }
+
+    fn tile(titles: &[&str], active: usize, scale: f32, has_caret: bool) -> StripLayout {
+        let rect = LayoutRect { x: 100.0, y: 50.0, w: 1200.0, h: 700.0 };
+        let titles: Vec<String> = titles.iter().map(|s| s.to_string()).collect();
+        tile_strip_layout(&rect, &titles, active, scale, has_caret)
+    }
+
+    /// The bar is the mock's 40px: 6 + 30 + 4, the row where the controls go.
+    #[test]
+    fn bar_is_40_px_tall_with_a_centred_30_px_row() {
+        let rect = LayoutRect { x: 100.0, y: 50.0, w: 900.0, h: 600.0 };
+        let titles = vec!["shell".to_string()];
+        for scale in [1.0, 2.0] {
+            let l = tile_strip_layout(&rect, &titles, 0, scale, false);
+            assert_eq!(l.bar.y, rect.y);
+            assert_eq!(l.bar.h, (TILE_TAB_H * scale).round());
+            assert_eq!((l.bar.h, l.row.h), ((40.0 * scale).round(), (30.0 * scale).round()));
+            // 6px above the row, 4px below it.
+            assert_eq!(l.row.y - l.bar.y, (6.0 * scale).round());
+            assert_eq!(l.bar.y + l.bar.h - (l.row.y + l.row.h), (4.0 * scale).round());
+            // A row-height control is vertically centred on the row.
+            let plus = l.new_tab.unwrap();
+            assert_eq!(plus.y + plus.h / 2.0, l.row.y + l.row.h / 2.0);
+            assert_eq!(l.separators[0].y + l.separators[0].h / 2.0, l.row.y + l.row.h / 2.0);
+        }
+    }
+
+    /// Inactive widths track the title length; the active chip adds room for
+    /// its × and floors at 180, both states capping at 240.
+    #[test]
+    fn tab_widths_estimate_the_title() {
+        assert_eq!(tab_width_estimate(""), tab_width_estimate("shell"));
+        // 6+6 padding + 14 icon + 8 gap, then the per-character estimate.
+        assert_eq!(tab_width_estimate("abcdefghij"), 12.0 + 14.0 + 8.0 + 10.0 * TAB_CHAR_W);
+        assert!(tab_width_estimate("abcdefghij") > tab_width_estimate("abc"));
+        assert_eq!(tab_width_estimate("ab"), 60.0);
+        assert_eq!(tab_width_estimate(&"x".repeat(60)), 240.0);
+        assert_eq!(tab_active_width("zsh"), 180.0);
+        assert_eq!(tab_active_width(&"x".repeat(60)), 240.0);
+        // A mid-length title lands between the clamps: its estimate plus the
+        // 8px gap, 14px × and 6px of extra chip padding.
+        let mid = "x".repeat(20);
+        assert_eq!(tab_active_width(&mid), tab_width_estimate(&mid) + 28.0);
+        assert!(tab_active_width(&mid) > 180.0 && tab_active_width(&mid) < 240.0);
+    }
+
+    /// Separators sit between the tabs and before the "+", 10px off each
+    /// edge, so neighbouring tabs keep 21px between them.
+    #[test]
+    fn separators_and_the_plus_follow_the_tabs() {
+        let l = tile(&["a", "bb", "ccc"], 0, 1.0, false);
+        assert_eq!(l.tabs.len(), 3);
+        assert_eq!(l.separators.len(), 3);
+        assert_eq!(l.tabs[0].x, 110.0);
+        assert_eq!((l.tabs[0].w, l.tabs[0].h), (180.0, 30.0));
+        for i in 0..2 {
+            let sep = l.separators[i];
+            assert_eq!((sep.w, sep.h), (1.0, 14.0));
+            assert_eq!(sep.x, l.tabs[i].x + l.tabs[i].w + 10.0);
+            assert_eq!(l.tabs[i + 1].x, sep.x + sep.w + 10.0);
+        }
+        assert_eq!(l.tabs[1].x - (l.tabs[0].x + l.tabs[0].w), 21.0);
+        // "+" rides after the final separator, row-height.
+        let sep = l.separators[2];
+        let plus = l.new_tab.unwrap();
+        assert_eq!(sep.x, l.tabs[2].x + l.tabs[2].w + 10.0);
+        assert_eq!(plus.x, sep.x + sep.w + 10.0);
+        assert_eq!((plus.w, plus.h), (23.0, 30.0));
+    }
+
+    /// The × always sits inside its tab, at any scale and tab count.
+    #[test]
+    fn close_rect_lies_inside_its_tab() {
+        let rect = LayoutRect { x: 100.0, y: 50.0, w: 700.0, h: 600.0 };
+        for scale in [1.0, 2.0] {
+            for n in [1usize, 2, 5, 12] {
+                let titles: Vec<String> = (0..n).map(|i| format!("tab {i}")).collect();
+                for active in [0usize, n - 1] {
+                    let l = tile_strip_layout(&rect, &titles, active, scale, true);
+                    for i in 0..n {
+                        let t = l.tabs[i];
+                        let c = l.closes[i];
+                        assert!(c.x >= t.x && c.x + c.w <= t.x + t.w + 0.51);
+                        assert!(c.y >= t.y && c.y + c.h <= t.y + t.h + 0.51);
+                    }
+                }
+            }
+        }
+    }
+
+    /// A crowded strip shrinks proportionally: nothing crosses the caret and
+    /// no tab overlaps its neighbour, at any scale.
+    #[test]
+    fn overflow_shrinks_left_of_the_caret_without_overlaps() {
+        let rect = LayoutRect { x: 100.0, y: 50.0, w: 700.0, h: 500.0 };
+        for scale in [1.0, 2.0] {
+            let titles: Vec<String> = (0..12).map(|i| format!("session{i}")).collect();
+            let l = tile_strip_layout(&rect, &titles, 0, scale, true);
+            let caret = l.caret.unwrap();
+            for i in 0..l.tabs.len() {
+                assert!(l.tabs[i].w > 0.0);
+                if i > 0 {
+                    let prev = l.tabs[i - 1];
+                    assert!(l.tabs[i].x >= prev.x + prev.w - 0.01);
+                }
+            }
+            // Shrunk, but never away: the strip's geometry stays real.
+            assert!((30.0 * scale).round() <= l.tabs[0].w);
+            assert!(l.tabs[0].w < (TAB_ACTIVE_MIN_W * scale).round());
+            // Everything it paints fits in the room in front of the caret.
+            let last = l.tabs[l.tabs.len() - 1];
+            let sep = *l.separators.last().unwrap();
+            let plus = l.new_tab.unwrap();
+            for r in [last, sep, plus] {
+                assert!(r.x + r.w <= caret.x + 0.51);
+            }
+            // The shrunken margin still leaves the "+" clear of the hairline.
+            assert!(plus.x >= sep.x + sep.w);
+            assert!((plus.x - (sep.x + sep.w)) <= 10.0 * scale + 0.51);
+            assert!(left_of_the_caret_is_painted(&l));
+        }
+    }
+
+    /// The caret is the bar's right end, and a root leaf has none.
+    #[test]
+    fn caret_is_right_aligned_and_the_run_stops_before_it() {
+        let l = tile(&["a", "bb", "ccc", "d"], 0, 1.0, true);
+        let caret = l.caret.unwrap();
+        assert_eq!(caret.x + caret.w, l.bar.x + l.bar.w);
+        assert_eq!((caret.y, caret.h), (l.bar.y, l.bar.h));
+        let plus = l.new_tab.unwrap();
+        assert!(plus.x + plus.w <= caret.x + 0.01);
+        assert!(tile(&["a"], 0, 1.0, false).caret.is_none());
+    }
+
+    /// The drag gap resolves to the nearer boundary, and its line sits there.
+    #[test]
+    fn insert_gap_picks_the_nearer_side() {
+        let l = tile(&["a", "bb", "ccc"], 0, 1.0, false);
+        let t0 = l.tabs[0];
+        assert_eq!(strip_insert_gap(&l, t0.x - 50.0), 0);
+        assert_eq!(strip_insert_gap(&l, t0.x + t0.w * 0.25), 0);
+        assert_eq!(strip_insert_gap(&l, t0.x + t0.w * 0.75), 1);
+        assert_eq!(strip_insert_gap(&l, l.tabs[2].x + l.tabs[2].w * 0.75), 3);
+        assert_eq!(strip_insert_gap(&l, l.tabs[2].x + l.tabs[2].w + 200.0), 3);
+        for gap in 0..=3 {
+            let line = strip_insert_line(&l, gap, 1.0);
+            assert_eq!((line.y, line.h), (l.row.y, l.row.h));
+            let boundary = match gap {
+                0 => l.tabs[0].x,
+                3 => l.tabs[2].x + l.tabs[2].w,
+                g => (l.tabs[g - 1].x + l.tabs[g - 1].w + l.tabs[g].x) / 2.0,
+            };
+            assert!((line.x + line.w / 2.0 - boundary).abs() < 0.01);
+        }
+    }
+
+    /// The flyover strip mirrors the tile one: window buttons instead of a
+    /// caret, and a maximized panel cedes its left end to the traffic lights.
+    #[test]
+    fn flyover_strip_clears_the_buttons_and_the_lights() {
+        let panel = flyover_rect(1000, 800, 1.0, 1.0, FLYOVER_DEFAULT_FRAC, false);
+        let titles: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        let l = flyover_strip_layout(&panel, &titles, 1, 1.0, false);
+        assert_eq!(l.tabs[0].x, panel.x + 10.0);
+        assert_eq!(l.separators.len(), 3);
+        assert!(l.caret.is_none());
+        let plus = l.new_tab.unwrap();
+        assert!(plus.x + plus.w <= flyover_minimize_rect(&panel, 1.0).x - 10.0 + 0.01);
+        // A maximized panel spans the window from (0, 0); its run starts at
+        // the traffic-light safe span instead of the bar's padding.
+        let full = flyover_rect(1000, 800, 1.0, 1.0, 0.3, true);
+        let max = flyover_strip_layout(&full, &titles, 1, 1.0, true);
+        assert_eq!(max.tabs[0].x, TRAFFIC_LIGHT_SAFE_W);
+        assert!(max.new_tab.unwrap().x > max.tabs[2].x);
+    }
 }

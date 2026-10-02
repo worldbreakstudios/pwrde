@@ -794,17 +794,28 @@ impl Renderer {
                     continue;
                 }
 
-                // The strip's pixels — pills, titles, × buttons, unread dots
-                // — are an element tree now (`tile_ui`). The canvas keeps
-                // only the hit rects: the close rect after its tab so
-                // reverse iteration (topmost wins) resolves × over the tab.
+                // The strip's pixels — chips, glyphs, titles, × buttons,
+                // hairlines, the "+" — are an element tree now (`tile_ui`),
+                // laid out by `workspace::tile_strip_layout`. The canvas keeps
+                // only the hit rects from that same layout: the close rect
+                // after its tab so reverse iteration (topmost wins) resolves
+                // × over the tab.
                 let strip = workspace::tab_strip_rect(area, rect, self.scale, sidebar_w);
+                let titles: Vec<String> = tile.tabs.iter().map(|t| t.title()).collect();
+                let layout = workspace::tile_strip_layout(
+                    &strip,
+                    &titles,
+                    tile.active,
+                    self.scale,
+                    has_caret,
+                );
                 for ti in 0..tile.tabs.len() {
-                    let tr = workspace::tile_tab_rect(&strip, ti, tile.tabs.len(), self.scale, has_caret);
-                    let close =
-                        workspace::tile_tab_close_rect(&strip, ti, tile.tabs.len(), self.scale, has_caret);
-                    hot.push(tr);
-                    hot.push(close);
+                    if let (Some(tr), Some(close)) =
+                        (layout.tabs.get(ti), layout.closes.get(ti))
+                    {
+                        hot.push(*tr);
+                        hot.push(*close);
+                    }
                 }
             }
 
@@ -910,7 +921,6 @@ impl Renderer {
 
         let tab_bar = crate::workspace::flyover_tab_bar(panel_rect, scale);
         let content = crate::workspace::flyover_content(panel_rect, scale);
-        let n = tabs.len();
 
         let mut quads: Vec<Quad> = Vec::new();
         let mut fg_quads: Vec<Quad> = Vec::new();
@@ -928,18 +938,20 @@ impl Renderer {
         };
         quads.push(self.px_rect(&border, pane_divider.0, pane_divider.1 * 0.5, 0.0));
 
-        // Tab hit rects: the strip's pixels (pills, titles, × buttons, unread
-        // dots) are element-tree tabs from `flyover_ui` now, so the canvas
-        // emits only the rects the mouse path still resolves clicks on —
-        // same `workspace::flyover_tab_rect` / `flyover_tab_close_rect`
-        // geometry the element tree renders at.
-        for (i, _tab) in tabs.iter().enumerate() {
-            let tr = crate::workspace::flyover_tab_rect(panel_rect, i, n, scale, maximized);
-            let close = crate::workspace::flyover_tab_close_rect(panel_rect, i, n, scale, maximized);
+        // Tab hit rects: the strip's pixels (chips, glyphs, titles, ×
+        // buttons, hairlines, the "+") are element-tree tabs from
+        // `flyover_ui` now, so the canvas emits only the rects the mouse path
+        // still resolves clicks on — the same
+        // `workspace::flyover_strip_layout` geometry the element tree renders
+        // at.
+        let titles: Vec<String> = tabs.iter().map(|t| t.title()).collect();
+        let layout =
+            crate::workspace::flyover_strip_layout(panel_rect, &titles, active, scale, maximized);
+        for (tr, close) in layout.tabs.iter().zip(layout.closes.iter()) {
             // Close after its tab so reverse iteration (topmost wins)
             // resolves × over the tab it sits in.
-            hot.push(tr);
-            hot.push(close);
+            hot.push(*tr);
+            hot.push(*close);
         }
 
         // Minimize / maximize hit rects at the bar's right edge. Their
@@ -1293,7 +1305,9 @@ mod tests {
         let renderer = Renderer::new(scale, 18.0, 1600, 1000);
         let panel = crate::workspace::flyover_rect(1600, 1000, scale, 1.0, 0.35, false);
         let tabs = [crate::workspace::Tab::new(crate::term::Session::placeholder())];
-        let close = crate::workspace::flyover_tab_close_rect(&panel, 0, 1, scale, false);
+        let titles: Vec<String> = tabs.iter().map(|t| t.title()).collect();
+        let close =
+            crate::workspace::flyover_strip_layout(&panel, &titles, 0, scale, false).closes[0];
         let cursor = Some((close.x + close.w / 2.0, close.y + close.h / 2.0));
 
         let mut hot = Vec::new();
@@ -1335,7 +1349,9 @@ mod tests {
         let renderer = Renderer::new(scale, 18.0, 1600, 1000);
         let panel = crate::workspace::flyover_rect(1600, 1000, scale, 1.0, 0.35, false);
         let tabs = [crate::workspace::Tab::new(crate::term::Session::placeholder())];
-        let close = crate::workspace::flyover_tab_close_rect(&panel, 0, 1, scale, false);
+        let titles: Vec<String> = tabs.iter().map(|t| t.title()).collect();
+        let close =
+            crate::workspace::flyover_strip_layout(&panel, &titles, 0, scale, false).closes[0];
 
         let mut hot = Vec::new();
         renderer
