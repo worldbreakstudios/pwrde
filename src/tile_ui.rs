@@ -27,8 +27,9 @@
 //! The group's **primary pane** (`Workspace::primary_tile`, always the root's
 //! left leaf — see `Workspace::normalize_primary`) has no tabs: its bar is a
 //! title row ([`primary_title_row`]) — the terminal glyph and the pane's
-//! title at weight 500, no chip, ×, "+" or caret — over the info bar
-//! (`infobar_ui`).
+//! title at weight 500, no chip, × or "+", plus the same collapse caret
+//! every pane in a split has — over the info bar (`infobar_ui`). Collapsed,
+//! it is the bare sideways strip any `Row` pane becomes.
 //!
 //! Still canvas-painted, deliberately: the card divider, the side-strip hover
 //! fill, and the drag-and-drop hints — all of which sit *around* the strip
@@ -418,9 +419,11 @@ pub(crate) fn tab_strip(
 
 /// The primary pane's title row, in place of a tab strip: the strip's
 /// terminal glyph and the pane `title` (weight 500, ellipsis-truncated),
-/// centred together on the bare ground — no chip, ×, "+" or caret. `bar` and `row` are
+/// centred together on the bare ground — no chip, × or "+" (the caller adds
+/// the collapse caret). `bar` and `row` are
 /// [`crate::workspace::primary_title_row`]'s rects in physical px (converted
-/// with `inv`), so the collapsed-sidebar inset carries over from the strip.
+/// with `inv`), so the collapsed-sidebar inset carries over from the strip
+/// and the row stops short of the caret.
 pub(crate) fn primary_title_row(
     bar: &LayoutRect,
     row: &LayoutRect,
@@ -537,7 +540,13 @@ impl App {
             // whole bare card is one press target that expands it.
             if axis == Some(workspace::Dir::Row) && collapsing {
                 if tile.collapsed {
-                    let cr = workspace::tile_caret_rect(rect, scale);
+                    let mut cr = workspace::tile_caret_rect(rect, scale);
+                    // With the sidebar hidden the strip in the window's
+                    // top-left corner sits under the traffic lights: its
+                    // caret drops one row to clear them.
+                    if workspace::tab_strip_rect(area, rect, scale, sidebar_w).x > rect.x {
+                        cr.y += cr.h;
+                    }
                     let entity = entity.clone();
                     let badge = tile
                         .tabs
@@ -595,16 +604,22 @@ impl App {
             let strip = workspace::tab_strip_rect(area, rect, scale, sidebar_w);
             // The primary pane: a title row instead of tabs. A press on it
             // focuses the pane; the info bar under it is `infobar_ui`'s.
+            // (A primary collapsing along a column — only possible for the
+            // frame before normalize lifts it back to the left — draws
+            // nothing, like the sideways strip mid-animation.)
             if ws.is_primary(*id) {
-                let (bar, row) = workspace::primary_title_row(&strip, scale);
+                if collapsing {
+                    continue;
+                }
+                let (bar, row) = workspace::primary_title_row(&strip, scale, has_caret);
                 let title = tile.active_tab().map(|t| t.title()).unwrap_or_default();
                 let style = StripStyle { focused, ..base.clone() };
-                let entity = entity.clone();
-                layer = layer.child(primary_title_row(&bar, &row, inv, title, &style).on_mouse_down(
+                let press_entity = entity.clone();
+                let mut title_el = primary_title_row(&bar, &row, inv, title, &style).on_mouse_down(
                     MouseButton::Left,
                     move |ev: &MouseDownEvent, _win: &mut Window, app: &mut GpuiApp| {
                         app.stop_propagation();
-                        if let Some(entity) = entity.upgrade() {
+                        if let Some(entity) = press_entity.upgrade() {
                             entity.update(app, |this, cx| {
                                 this.note_pointer(ev);
                                 this.press_primary_header();
@@ -612,7 +627,40 @@ impl App {
                             });
                         }
                     },
-                ));
+                );
+                // The same collapse caret a tab strip ends in, at the same
+                // rect; the title row stops short of it.
+                if has_caret {
+                    let cr = workspace::tile_caret_rect(rect, scale);
+                    let entity = entity.clone();
+                    title_el = title_el.child(
+                        div()
+                            .absolute()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .left(px((cr.x - bar.x) * inv))
+                            .top(px((cr.y - bar.y) * inv))
+                            .w(px(cr.w * inv))
+                            .h(px(cr.h * inv))
+                            .child(icon(
+                                cx.global::<Theme>().icons.chevron_down(),
+                                px(14.0 * ui * inv),
+                                if hov(&cr) { style.ink } else { style.ink_dim },
+                            ))
+                            .on_mouse_down(MouseButton::Left, move |ev: &MouseDownEvent, _win: &mut Window, app: &mut GpuiApp| {
+                                app.stop_propagation();
+                                if let Some(entity) = entity.upgrade() {
+                                    entity.update(app, |this, cx| {
+                                        this.note_pointer(ev);
+                                        this.press_tile_caret(tile_id, ev.click_count);
+                                        cx.notify();
+                                    });
+                                }
+                            }),
+                    );
+                }
+                layer = layer.child(title_el);
                 continue;
             }
             // One layout for this strip: the painters below read its rects, and

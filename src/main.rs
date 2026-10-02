@@ -2138,8 +2138,7 @@ impl App {
         let mut others = Vec::new();
         let mut any_expanded = false;
         for t in ws.root.tiles() {
-            // The primary pane never folds, so it is not one of the "others".
-            if t.id != focused && !ws.is_primary(t.id) {
+            if t.id != focused {
                 others.push(t.id);
                 any_expanded |= !t.collapsed;
             }
@@ -2147,13 +2146,14 @@ impl App {
         if others.is_empty() {
             return;
         }
-        for id in others {
-            self.set_collapsed(id, any_expanded);
-        }
         // Focus mode means the focused pane is the one on screen — make sure
-        // it isn't itself collapsed when everything else folds away.
+        // it isn't itself collapsed when everything else folds away (first,
+        // so the others are never the last expanded pane).
         if any_expanded {
             self.set_collapsed(focused, false);
+        }
+        for id in others {
+            self.set_collapsed(id, any_expanded);
         }
         self.request_redraw();
     }
@@ -2179,8 +2179,9 @@ impl App {
     /// expanding restores the previous arrangement.
     fn set_collapsed(&mut self, id: u64, collapsed: bool) {
         let ws = &mut self.workspaces[self.active];
-        // The primary pane never folds.
-        if collapsed && ws.is_primary(id) {
+        // The last expanded pane stays open: with every pane folded there
+        // would be nothing on screen to type into.
+        if collapsed && !ws.root.tiles().iter().any(|t| t.id != id && !t.collapsed) {
             return;
         }
         let Some(tile) = ws.root.find_tile_mut(id) else { return };
@@ -3536,8 +3537,16 @@ impl App {
             // The primary pane holds exactly one tab: its header (title row
             // and info bar) is no landing zone, and below it only the edge
             // bands — which open a new tile — are offered.
+            // A collapsed (or mid-animation) primary is a bare strip with
+            // neither: no landing zone at all.
             let primary = ws.is_primary(*id);
-            if primary && py < workspace::tile_content_for(rect, scale, true).y {
+            if primary
+                && (py < workspace::tile_content_for(rect, scale, true).y
+                    || ws
+                        .root
+                        .find_tile(*id)
+                        .is_some_and(|t| t.collapsed || t.collapse_anim > 0.0))
+            {
                 return None;
             }
             let strip = workspace::tab_strip_rect(area, rect, scale, self.sidebar_w());
@@ -4533,8 +4542,14 @@ impl App {
             let ws = &mut self.workspaces[self.active];
             // A sideways-collapsed strip has no usable tab bar: any click
             // expands and focuses it.
+            // (A primary still animating open has no header yet either —
+            // `tile_ui` / `infobar_ui` skip it — so it takes the same path.)
+            let primary = ws.is_primary(*id);
             if axis == Some(Dir::Row)
-                && ws.root.find_tile(*id).is_some_and(|t| t.collapsed)
+                && ws
+                    .root
+                    .find_tile(*id)
+                    .is_some_and(|t| t.collapsed || (primary && t.collapse_anim > 0.0))
             {
                 // Element-owned too (`tile_ui`); kept for a press that slips
                 // past the element (it never should).
@@ -4542,9 +4557,15 @@ impl App {
                 return;
             }
             // The primary pane's header — its title row and info bar — has
-            // no tabs, caret or "+": a press there only focuses the pane and
-            // never reaches the terminal as a report or a selection.
-            if ws.is_primary(*id) && py < workspace::tile_content_for(rect, scale, true).y {
+            // no tabs or "+": a press there toggles collapse on the caret
+            // and otherwise only focuses the pane, never reaching the
+            // terminal as a report or a selection.
+            if primary && py < workspace::tile_content_for(rect, scale, true).y {
+                if axis.is_some() && workspace::tile_caret_rect(rect, scale).contains(px, py) {
+                    // Element-owned too (`tile_ui`).
+                    self.press_tile_caret(*id, click_count);
+                    return;
+                }
                 self.press_primary_header();
                 return;
             }

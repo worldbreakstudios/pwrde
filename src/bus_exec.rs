@@ -498,6 +498,7 @@ impl App {
                                 "id": t.id,
                                 "focused": t.id == w.focused_tile,
                                 "primary": w.is_primary(t.id),
+                                "collapsed": t.collapsed,
                                 "tabs": tabs,
                             })
                         })
