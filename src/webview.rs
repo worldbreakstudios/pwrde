@@ -44,10 +44,15 @@ if(document.readyState==='loading')addEventListener('DOMContentLoaded',post);els
 addEventListener('load',post)}";
 
 /// Favicon fetch limits: response bytes, wall-clock seconds, and the edge the
-/// decoded icon is scaled down to (the strip paints it at 14 logical px).
+/// decoded icon is resampled to (the strip paints it at 14 logical px, so
+/// this is 1:1 on a 2x display and an exact halving on 1x).
 pub const FAVICON_MAX_BYTES: usize = 512 * 1024;
 const FAVICON_TIMEOUT_SECS: &str = "5";
-const FAVICON_EDGE: u32 = 64;
+const FAVICON_EDGE: u32 = 28;
+/// The edge a transparent mark is drawn at inside that disc (the mock's 10px
+/// mark in a 14px disc).
+const FAVICON_INSET_EDGE: u32 = 20;
+const FAVICON_MARK_ALPHA: f32 = 0.9;
 /// The discs a transparent favicon is flattened onto (the mock's `#f2f2f7`,
 /// and a dark one for an icon whose mean luma is above the threshold).
 const FAVICON_DISC_LIGHT: [u8; 3] = [0xf2, 0xf2, 0xf7];
@@ -96,8 +101,8 @@ pub fn favicon_request(report: &str) -> Option<(String, String)> {
     Some((origin.to_string(), icon))
 }
 
-/// Decode fetched icon bytes to `(width, height, RGBA8 pixels)`, scaled down
-/// to at most [`FAVICON_EDGE`] a side. Anything the `image` crate cannot read
+/// Decode fetched icon bytes to `(width, height, RGBA8 pixels)`: always an
+/// opaque [`FAVICON_EDGE`] square ready for the strip's circular clip. Anything the `image` crate cannot read
 /// (SVG, HTML error pages, truncated files) is `None`.
 fn decode_favicon(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
     // A favicon-sized allocation cap: the header is the page's to forge.
@@ -110,21 +115,41 @@ fn decode_favicon(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
     if decoded.width() == 0 || decoded.height() == 0 {
         return None;
     }
-    let decoded = if decoded.width() > FAVICON_EDGE || decoded.height() > FAVICON_EDGE {
-        decoded.thumbnail(FAVICON_EDGE, FAVICON_EDGE)
-    } else {
-        decoded
-    };
+    // Flatten at full size first (resampling straight alpha fringes the
+    // edges), then resample once, here, with a proper filter: the strip then
+    // paints the icon 1:1 on a 2x display instead of minifying it bilinearly.
     let mut rgba = decoded.to_rgba8();
-    flatten_on_disc(&mut rgba);
-    Some((rgba.width(), rgba.height(), rgba.into_raw()))
+    let (disc, transparent) = flatten_on_disc(&mut rgba);
+    // A mark with transparency sits inset on its disc, as in the mock; an
+    // opaque icon fills the circle.
+    let inner = if transparent { FAVICON_INSET_EDGE } else { FAVICON_EDGE };
+    let fit = inner as f32 / rgba.width().max(rgba.height()) as f32;
+    let (w, h) = (
+        ((rgba.width() as f32 * fit).round() as u32).clamp(1, inner),
+        ((rgba.height() as f32 * fit).round() as u32).clamp(1, inner),
+    );
+    let scaled = image::imageops::resize(&rgba, w, h, image::imageops::FilterType::Lanczos3);
+    let mut canvas = image::RgbaImage::from_pixel(
+        FAVICON_EDGE,
+        FAVICON_EDGE,
+        image::Rgba([disc[0], disc[1], disc[2], 255]),
+    );
+    image::imageops::replace(
+        &mut canvas,
+        &scaled,
+        ((FAVICON_EDGE - w) / 2) as i64,
+        ((FAVICON_EDGE - h) / 2) as i64,
+    );
+    Some((FAVICON_EDGE, FAVICON_EDGE, canvas.into_raw()))
 }
 
 /// Flatten a transparent icon onto the disc it reads against — the mock's
 /// light disc, or a dark one under a light icon (GitHub serves a white mark
 /// to a dark-mode page) — so the glyph shows on any ground. The strip clips
-/// the result to a circle; an opaque icon comes through unchanged.
-fn flatten_on_disc(rgba: &mut image::RgbaImage) {
+/// the result to a circle; an opaque icon comes through unchanged. Returns
+/// the disc colour and whether the icon is a transparent mark (mean alpha
+/// under [`FAVICON_MARK_ALPHA`]; a rounded-corner tile still counts as opaque).
+fn flatten_on_disc(rgba: &mut image::RgbaImage) -> ([u8; 3], bool) {
     let (mut luma, mut weight) = (0.0f32, 0.0f32);
     for px in rgba.pixels() {
         let a = px[3] as f32 / 255.0;
@@ -140,6 +165,8 @@ fn flatten_on_disc(rgba: &mut image::RgbaImage) {
         }
         px[3] = 255;
     }
+    let pixels = (rgba.width() * rgba.height()).max(1) as f32;
+    (disc, weight / pixels < FAVICON_MARK_ALPHA)
 }
 
 /// Download and decode one favicon. Blocking — background threads only. The
@@ -608,15 +635,26 @@ mod tests {
             bytes.into_inner()
         };
         let (w, h, rgba) = decode_favicon(&encode(16)).unwrap();
-        assert_eq!((w, h, rgba.len()), (16, 16, 16 * 16 * 4));
+        assert_eq!((w, h, rgba.len()), (FAVICON_EDGE, FAVICON_EDGE, 28 * 28 * 4));
         assert_eq!(&rgba[..4], &[10, 20, 30, 255]);
         let (w, h, rgba) = decode_favicon(&encode(256)).unwrap();
-        assert_eq!((w, h, rgba.len()), (FAVICON_EDGE, FAVICON_EDGE, 64 * 64 * 4));
+        assert_eq!((w, h, rgba.len()), (FAVICON_EDGE, FAVICON_EDGE, 28 * 28 * 4));
+        // A transparent mark is inset: the canvas corner is bare disc.
+        let mut mark = image::RgbaImage::from_pixel(32, 32, image::Rgba([0, 0, 0, 0]));
+        for (x, y, px) in mark.enumerate_pixels_mut() {
+            if (8..24).contains(&x) && (8..24).contains(&y) {
+                *px = image::Rgba([0, 0, 0, 255]);
+            }
+        }
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        mark.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        let (_, _, rgba) = decode_favicon(&bytes.into_inner()).unwrap();
+        assert_eq!(&rgba[..4], &[0xf2, 0xf2, 0xf7, 255]);
         // Transparency is flattened: a light mark gets the dark disc, a dark
         // one the light disc.
         let mut white = image::RgbaImage::from_pixel(2, 1, image::Rgba([255, 255, 255, 255]));
         white.put_pixel(1, 0, image::Rgba([0, 0, 0, 0]));
-        flatten_on_disc(&mut white);
+        assert_eq!(flatten_on_disc(&mut white), ([0x1c, 0x1c, 0x1e], true));
         assert_eq!(white.get_pixel(1, 0).0, [0x1c, 0x1c, 0x1e, 255]);
         let mut black = image::RgbaImage::from_pixel(2, 1, image::Rgba([0, 0, 0, 255]));
         black.put_pixel(1, 0, image::Rgba([0, 0, 0, 0]));
