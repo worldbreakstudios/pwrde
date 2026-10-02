@@ -679,7 +679,7 @@ impl Renderer {
         // Which axis each tile would collapse along (its parent split's dir);
         // `None` = root leaf, which shows no caret and cannot collapse.
         let collapse_axis_map: std::collections::HashMap<u64, Option<workspace::Dir>> =
-            workspace::tile_collapse_axis(&ws.root).into_iter().collect();
+            ws.collapse_axes().into_iter().collect();
 
         // ── Sidebar chrome (identical geometry on every page) ──────────
         // The window gradient is painted by `main.rs` before these quads;
@@ -741,8 +741,15 @@ impl Renderer {
                 // goes with the card: an unfocused pane would otherwise be a
                 // stray hairline floating on the ground.
                 if !collapsing && is_focused {
-                    let divider =
-                        LayoutRect { x: rect.x, y: bar.y + bar.h - hair, w: rect.w, h: hair };
+                    // The primary pane's header runs on through its info
+                    // bar, so its rule sits under that instead.
+                    let header = workspace::tile_header_h(self.scale, ws.is_primary(*id));
+                    let divider = LayoutRect {
+                        x: rect.x,
+                        y: (bar.y + header - hair).min(rect.y + rect.h - hair),
+                        w: rect.w,
+                        h: hair,
+                    };
                     bg_quads.push(self.px_rect(&divider, pane_divider.0, pane_divider.1, 0.0));
                 }
                 if side_strip {
@@ -765,7 +772,7 @@ impl Renderer {
                 let side_strip = axis == Some(workspace::Dir::Row) && collapsing;
                 // Collapsed (or mid-animation) panes paint no terminal
                 // content — the card is just its tab strip.
-                let content = workspace::tile_content(rect, self.scale);
+                let content = workspace::tile_content_for(rect, self.scale, ws.is_primary(*id));
                 let origin = self.content_origin(&content);
                 if !collapsing
                     && let Some(session) = tile.tabs.get(tile.active).and_then(|t| t.session())
@@ -790,7 +797,9 @@ impl Renderer {
                 // A sideways strip has no room for the strip's labels: only
                 // the caret shows. A stacked collapse keeps its tab labels
                 // (clicking one focuses + expands).
-                if side_strip {
+                // The primary pane has a title row and an info bar instead of
+                // tabs (`tile_ui`, `infobar_ui`): nothing in it is a tab hit.
+                if side_strip || ws.is_primary(*id) {
                     continue;
                 }
 
