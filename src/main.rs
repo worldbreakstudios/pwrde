@@ -5430,8 +5430,14 @@ impl App {
     /// the workspace groups on the Sessions page.
     fn cycle_sidebar_tab(&mut self, delta: isize) {
         if let Page::Sessions = self.page {
-            let i = pages::cycle(self.active, self.workspaces.len(), delta);
-            self.switch_workspace(i);
+            // Step along the rows the sidebar actually shows (pinned run, plain
+            // groups, snoozed run, folder-filtered, collapsed sections folded
+            // away) not the raw workspace order, so
+            // the selection lands on the row next to the one it left.
+            let rows = self.sidebar_rows();
+            if let Some(next) = workspace::cycle_sidebar_active(&rows, self.active, delta) {
+                self.switch_workspace(next);
+            }
         }
     }
 
