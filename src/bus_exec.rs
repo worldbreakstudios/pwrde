@@ -201,8 +201,17 @@ impl App {
                 }
                 let number = match window.as_deref() {
                     None | Some("main") => main_window_number(),
-                    Some("settings") => settings_window_number(),
-                    Some(other) => Err(format!("screenshot: unknown window {other:?} (main|settings)")),
+                    Some("settings") => titled_window_number(
+                        "Settings",
+                        "the Settings window is not open (pwrde-cli page settings opens it)",
+                    ),
+                    Some("popover") => titled_window_number(
+                        crate::webview_popover_window::WINDOW_TITLE,
+                        "no webview popover is open (pwrde-cli action find_in_page opens Tools)",
+                    ),
+                    Some(other) => {
+                        Err(format!("screenshot: unknown window {other:?} (main|settings|popover)"))
+                    },
                 };
                 let number = match number {
                     Ok(n) => n,
@@ -1021,7 +1030,9 @@ fn resize_main_window(_width: f32, _height: f32) -> Result<(), String> {
 }
 
 /// The app's main `NSWindow`: `NSApp.mainWindow`, else the largest window
-/// (the palette window is a separate, smaller window).
+/// (the palette window is a separate, smaller window). An open webview
+/// popover is key — and so AppKit's "main" — while it is up; it is told apart
+/// by its title and never taken for the main window.
 #[cfg(target_os = "macos")]
 unsafe fn main_ns_window() -> Result<*mut objc::runtime::Object, String> {
     use objc::runtime::{Class, Object};
@@ -1029,7 +1040,7 @@ unsafe fn main_ns_window() -> Result<*mut objc::runtime::Object, String> {
     let cls = Class::get("NSApplication").ok_or("NSApplication class missing")?;
     let app: *mut Object = msg_send![cls, sharedApplication];
     let main: *mut Object = msg_send![app, mainWindow];
-    if !main.is_null() {
+    if !main.is_null() && !is_webview_popover(main) {
         return Ok(main);
     }
     let windows: *mut Object = msg_send![app, windows];
@@ -1046,7 +1057,7 @@ unsafe fn main_ns_window() -> Result<*mut objc::runtime::Object, String> {
         }
         let r: R = msg_send![w, frame];
         let area = r.w * r.h;
-        if area > best.1 {
+        if area > best.1 && !is_webview_popover(w) {
             best = (w, area);
         }
     }
@@ -1057,10 +1068,30 @@ unsafe fn main_ns_window() -> Result<*mut objc::runtime::Object, String> {
     }
 }
 
-/// The Settings window's `NSWindow.windowNumber`, found by its title among
-/// our windows (the bus dispatcher has no gpui context to ask the handle).
+/// Whether `window` is the webview popover window, by its (hidden) title.
 #[cfg(target_os = "macos")]
-fn settings_window_number() -> Result<i64, String> {
+fn is_webview_popover(window: *mut objc::runtime::Object) -> bool {
+    use objc::runtime::Object;
+    use objc::{msg_send, sel, sel_impl};
+    unsafe {
+        let title: *mut Object = msg_send![window, title];
+        if title.is_null() {
+            return false;
+        }
+        let utf8: *const std::os::raw::c_char = msg_send![title, UTF8String];
+        !utf8.is_null()
+            && std::ffi::CStr::from_ptr(utf8).to_str()
+                == Ok(crate::webview_popover_window::WINDOW_TITLE)
+    }
+}
+
+/// The `NSWindow.windowNumber` of our window titled `title` (the Settings
+/// window, or the webview popover's hidden title), found among our windows
+/// (the bus dispatcher has no gpui context to ask the handle); `missing` is
+/// the error when none is open.
+#[cfg(target_os = "macos")]
+fn titled_window_number(title: &str, missing: &str) -> Result<i64, String> {
+    let wanted = title;
     use objc::runtime::{Class, Object};
     use objc::{msg_send, sel, sel_impl};
     unsafe {
@@ -1078,17 +1109,17 @@ fn settings_window_number() -> Result<i64, String> {
             if utf8.is_null() {
                 continue;
             }
-            if std::ffi::CStr::from_ptr(utf8).to_str() == Ok("Settings") {
+            if std::ffi::CStr::from_ptr(utf8).to_str() == Ok(wanted) {
                 let number: i64 = msg_send![w, windowNumber];
                 return Ok(number);
             }
         }
     }
-    Err("the Settings window is not open (pwrde-cli page settings opens it)".into())
+    Err(missing.into())
 }
 
 #[cfg(not(target_os = "macos"))]
-fn settings_window_number() -> Result<i64, String> {
+fn titled_window_number(_title: &str, _missing: &str) -> Result<i64, String> {
     Err("screenshots are macOS-only".into())
 }
 

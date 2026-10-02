@@ -203,8 +203,8 @@ pub fn command_specs() -> Vec<CommandSpec> {
         },
         CommandSpec {
             name: "screenshot",
-            args: "[path] [--clipboard] [--window main|settings]",
-            help: "Capture the main window (or --window settings) to a PNG file (default: a temp path) or, with --clipboard, the pasteboard",
+            args: "[path] [--clipboard] [--window main|settings|popover]",
+            help: "Capture the main window (or --window settings / popover — the Settings window, the open webview popover) to a PNG file (default: a temp path) or, with --clipboard, the pasteboard",
             read_only: false,
         },
         CommandSpec {
