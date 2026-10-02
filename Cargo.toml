@@ -6,7 +6,7 @@ default-run = "pwrde"
 
 [dependencies]
 # Backdrop impression images for the liquid-glass overlays (same 0.25 line gpui uses).
-image = { version = "0.25", default-features = false }
+image = { version = "0.25", default-features = false, features = ["ico", "png"] }
 glyphon = "0.12.0"
 wgpu = "30.0.0"
 winit = "0.30.13"

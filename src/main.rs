@@ -105,6 +105,10 @@ const GIT_CTX_POLL: std::time::Duration = std::time::Duration::from_secs(6);
 /// window after a restart in which restored shpool tabs would otherwise read
 /// "wezterm", and it costs nothing once every pane has been named.
 const PROC_TITLE_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+/// Favicon fetches allowed in flight at once, and decoded icons kept in
+/// memory — a page chooses the icon URLs it reports, so both are bounded.
+const MAX_FAVICON_FETCHES: usize = 8;
+const MAX_FAVICON_CACHE: usize = 256;
 /// How often already-named title-less panes are re-resolved, so a tab follows
 /// the program running in it. Much slower than the first-name poll: a pane
 /// whose shell never sets a title stays in this sweep for the life of the app,
@@ -373,6 +377,14 @@ struct App {
     webview_find_for: Option<u64>,
     /// Expanded site-information or browser-tools panel.
     webview_panel: Option<webview_ui::Panel>,
+    /// Each live webview's last reported `(page origin, icon URL)`; absent
+    /// while a page has no usable icon. Runtime-only, never persisted.
+    webview_favicons: std::collections::HashMap<u64, (String, String)>,
+    /// Fetched favicons by icon URL: `None` while the background fetch is in
+    /// flight or after it failed — either way the tab keeps its globe.
+    favicon_cache: std::collections::HashMap<String, Option<std::sync::Arc<gpui::RenderImage>>>,
+    /// Favicon fetches currently running (see [`MAX_FAVICON_FETCHES`]).
+    favicon_fetches: usize,
     /// Sidebar width when expanded, logical px (user-resizable).
     sidebar_expanded_w: f32,
     /// Whether the sidebar is collapsed (⌘S toggle). Session-only, like the
@@ -1070,6 +1082,51 @@ impl App {
         false
     }
 
+    /// The decoded favicon for webview `id`, if its page reported one and the
+    /// fetch has landed; `None` leaves the tab strip on the globe glyph.
+    pub(crate) fn webview_favicon(&self, id: Option<u64>) -> Option<std::sync::Arc<gpui::RenderImage>> {
+        let (_, icon) = self.webview_favicons.get(&id?)?;
+        self.favicon_cache.get(icon)?.clone()
+    }
+
+    /// Record webview `id`'s reported icon (`None` clears it) and start a
+    /// background fetch the first time an icon URL is seen. Returns whether
+    /// the tab's glyph may have changed.
+    fn set_webview_favicon(&mut self, id: u64, icon: Option<(String, String)>) -> bool {
+        let Some((origin, url)) = icon else {
+            return self.webview_favicons.remove(&id).is_some();
+        };
+        if !self.webview_tab_exists(id) {
+            return false;
+        }
+        if !self.favicon_cache.contains_key(&url) {
+            // A page controls what it reports: bound the fetches in flight and
+            // the cache, dropping icons no live tab shows once it fills.
+            if self.favicon_fetches >= MAX_FAVICON_FETCHES {
+                return self.webview_favicons.remove(&id).is_some();
+            }
+            if self.favicon_cache.len() >= MAX_FAVICON_CACHE {
+                let shown: std::collections::HashSet<&String> =
+                    self.webview_favicons.values().map(|(_, url)| url).collect();
+                self.favicon_cache.retain(|url, _| shown.contains(url));
+            }
+            self.favicon_cache.insert(url.clone(), None);
+            self.favicon_fetches += 1;
+            let events_tx = self.events_tx.clone();
+            let fetch = url.clone();
+            std::thread::spawn(move || {
+                let image = webview::fetch_favicon(&fetch).map(std::sync::Arc::new);
+                let _ = events_tx.send(TermEvent::FaviconLoaded { url: fetch, image });
+            });
+        }
+        let next = (origin, url);
+        if self.webview_favicons.get(&id) == Some(&next) {
+            return false;
+        }
+        self.webview_favicons.insert(id, next);
+        true
+    }
+
     fn set_webview_title(&mut self, id: u64, title: String) -> bool {
         for workspace in &mut self.workspaces {
             for tile in workspace.root.tiles_mut() {
@@ -1155,6 +1212,7 @@ impl App {
         if self.webview_panel.as_ref().is_some_and(|panel| !live.contains(&panel.id())) {
             self.webview_panel = None;
         }
+        self.webview_favicons.retain(|id, _| live.contains(id));
         let obscured = self.page != Page::Sessions
             || self.modal_overlay_open()
             || self.flyover_anim > 0.0
@@ -5552,6 +5610,16 @@ impl App {
                     redraw = true;
                 },
                 TermEvent::WebviewNavigated { id, url } => {
+                    // A load that ended on another site without reporting an
+                    // icon of its own must not keep the previous site's.
+                    if self
+                        .webview_favicons
+                        .get(&id)
+                        .is_some_and(|(origin, _)| webview::origin(&url) != Some(origin.as_str()))
+                    {
+                        self.webview_favicons.remove(&id);
+                        redraw = true;
+                    }
                     if crate::bus::validate_webview_url(&url).is_ok()
                         && self.set_webview_url(id, url)
                     {
@@ -5580,6 +5648,22 @@ impl App {
                 },
                 TermEvent::WebviewTitleChanged { id, title } => {
                     if self.set_webview_title(id, title) {
+                        redraw = true;
+                    }
+                },
+                TermEvent::WebviewFaviconChanged { id, origin, icon } => {
+                    if self.set_webview_favicon(id, icon.map(|icon| (origin, icon))) {
+                        redraw = true;
+                    }
+                },
+                TermEvent::FaviconLoaded { url, image } => {
+                    self.favicon_fetches = self.favicon_fetches.saturating_sub(1);
+                    // A failed fetch is forgotten, so the globe stays until
+                    // the page's next load reports the icon and retries it.
+                    if image.is_none() {
+                        self.favicon_cache.remove(&url);
+                    } else if let Some(slot) = self.favicon_cache.get_mut(&url) {
+                        *slot = image;
                         redraw = true;
                     }
                 },
@@ -7312,6 +7396,9 @@ fn main() {
                             input
                         }),
                         webview_address_for: None,
+                        webview_favicons: std::collections::HashMap::new(),
+                        favicon_cache: std::collections::HashMap::new(),
+                        favicon_fetches: 0,
                         webview_find: cx.new(|cx| {
                             let mut input = crate::ui::Input::new(cx);
                             input.set_bare(true);

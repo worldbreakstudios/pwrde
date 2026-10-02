@@ -71,6 +71,13 @@ pub enum TermEvent {
     /// The native view's document title changed (empty while a new document
     /// loads); folded into the owning tab so its strip label tracks `<title>`.
     WebviewTitleChanged { id: u64, title: String },
+    /// A webview page reported its favicon on load: the page's `origin` and
+    /// the validated icon URL to fetch (`None` for a page with no usable icon,
+    /// which clears the tab's glyph back to the globe).
+    WebviewFaviconChanged { id: u64, origin: String, icon: Option<String> },
+    /// A background favicon fetch for `url` finished; `None` when it failed
+    /// or could not be decoded, so tabs showing it keep the globe.
+    FaviconLoaded { url: String, image: Option<Arc<gpui::RenderImage>> },
     /// Pointer focus entered a native child view; keep the owning tile as the
     /// workspace focus target for tab and address-bar actions.
     WebviewFocused { id: u64 },

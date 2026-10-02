@@ -74,6 +74,7 @@ impl App {
                     unread: tab.unread,
                     pinned: tab.pinned,
                     webview: tab.kind() == workspace::TabKind::Webview,
+                    favicon: self.webview_favicon(tab.webview_id()),
                     tab: *layout.tabs.get(i)?,
                     close: *layout.closes.get(i)?,
                 })

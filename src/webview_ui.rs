@@ -1,13 +1,25 @@
 //! GPUI-owned browser chrome for native Wry child views.
+//!
+//! The toolbar follows the GANTRY Workspace mock: a 48px bar on the pane
+//! ground (8px above and below 32px controls, 10px at the sides, 8px between
+//! them) over a hairline — a nav capsule (back, forward, reload as bare 26px
+//! cells), a centred address pill capped at 420px, and a round More button
+//! that opens the tools panel. All three are the foreground at .07, with the
+//! tab strip's inks. The address pill carries the lock / info glyph that
+//! toggles the site panel at its left edge, and shows the bare host at rest;
+//! a press on the focused pane's pill swaps in the editable full URL. The
+//! mock's Annotate and Share-with-agent controls are deliberately not built.
 
 use gpui::{
     AnyElement, App as GpuiApp, ClickEvent, Context, Focusable, InteractiveElement, IntoElement,
-    ParentElement, Styled, Window, div, prelude::FluentBuilder, px,
+    ParentElement, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
 };
 
 use crate::App;
+use crate::renderer::color;
+use crate::tile_ui::StripStyle;
 use crate::ui::theme::Theme;
-use crate::ui::assets::{ICON_ELLIPSIS_VERTICAL, ICON_INFO, ICON_LOCK, ICON_REFRESH};
+use crate::ui::assets::{ICON_ELLIPSIS, ICON_INFO, ICON_LOCK, ICON_REFRESH};
 use crate::ui::icon;
 use crate::ui::{AlertDialog, AlertDialogFooter, Button, ButtonSize, ButtonVariant};
 
@@ -55,13 +67,51 @@ struct ChromePlacement {
     toolbar_hidden: bool,
 }
 
+/// The toolbar's controls — nav capsule, address pill, More — share one
+/// height and are full pills of the foreground at the mock's .07.
+const PILL_H: f32 = 32.0;
+const PILL_FILL: f32 = 0.07;
+/// A nav capsule cell, and the lock / info cell inside the address pill.
+const NAV_CELL: f32 = 26.0;
+const SITE_CELL: f32 = 22.0;
+/// The mock's control ink (`#c9c9ce`) and its dim while there is no history
+/// to move through (`#5c5c62`), as shares of the strip ink.
+const NAV_ENABLED: f32 = 0.8;
+const NAV_DISABLED: f32 = 0.33;
+
+/// What the address pill shows at rest: the URL's authority, without scheme,
+/// path, query or fragment.
 fn host(url: &str) -> String {
     url.split_once("://")
         .map_or(url, |(_, rest)| rest)
-        .split('/')
+        .split(['/', '?', '#'])
         .next()
         .unwrap_or(url)
         .to_string()
+}
+
+/// One bare cell of the nav capsule: a centred icon in the control ink,
+/// dimmed while disabled. The caller attaches the click.
+fn nav_cell(
+    id: String,
+    path: impl Into<gpui::SharedString>,
+    size: f32,
+    enabled: bool,
+    strip: &StripStyle,
+) -> gpui::Stateful<gpui::Div> {
+    let ink = strip.ink.opacity(if enabled { NAV_ENABLED } else { NAV_DISABLED });
+    let hover = strip.ink.opacity(PILL_FILL);
+    div()
+        .id(gpui::SharedString::from(id))
+        .flex_shrink_0()
+        .w(px(NAV_CELL))
+        .h(px(NAV_CELL))
+        .rounded(px(NAV_CELL / 2.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .when(enabled, |cell| cell.cursor_pointer().hover(move |cell| cell.bg(hover)))
+        .child(icon(path, px(size), ink))
 }
 
 impl App {
@@ -297,6 +347,16 @@ impl App {
         let theme = Theme::of(cx).clone();
         let entity = cx.entity().downgrade();
         let scale = self.scale();
+        // The tab strip's inks and the pane ground it sits on, so the bar
+        // reads as one surface with the strip above it on any palette.
+        let strip = StripStyle::from_scheme(crate::theme::current());
+        let ground =
+            color(crate::term_theme::resolved(crate::theme::dark_active()).colors.bg, 1.0);
+        // Fills and the address text take the strip's ink too: the chrome
+        // foreground can be the wrong polarity for a chosen terminal scheme.
+        let pill = strip.ink.opacity(PILL_FILL);
+        self.webview_address
+            .update(cx, |input, _cx| input.set_text_color(Some(strip.ink)));
         let mut layer = div().absolute().left(px(0.0)).top(px(0.0)).size_full();
 
         for placement in placements {
@@ -328,96 +388,186 @@ impl App {
                 });
             }
 
-            let back_entity = entity.clone();
-            let back = Button::new(format!("webview-back-{id}"))
-                .variant(ButtonVariant::Ghost)
-                .size(ButtonSize::IconSm)
-                .disabled(!placement.can_go_back)
-                .child(icon(theme.icons.chevron_left(), px(14.0), theme.foreground))
-                .on_click(move |_event, _window, app| {
-                    if let Some(entity) = back_entity.upgrade() {
-                        entity.update(app, |this, _cx| {
-                            let result = this.webviews.go_back(id);
-                            this.webview_error(result);
-                        });
-                    }
-                });
-            let forward_entity = entity.clone();
-            let forward = Button::new(format!("webview-forward-{id}"))
-                .variant(ButtonVariant::Ghost)
-                .size(ButtonSize::IconSm)
-                .disabled(!placement.can_go_forward)
-                .child(icon(theme.icons.chevron_right(), px(14.0), theme.foreground))
-                .on_click(move |_event, _window, app| {
-                    if let Some(entity) = forward_entity.upgrade() {
-                        entity.update(app, |this, _cx| {
-                            let result = this.webviews.go_forward(id);
-                            this.webview_error(result);
-                        });
-                    }
-                });
-            let reload_entity = entity.clone();
-            let reload = Button::new(format!("webview-reload-{id}"))
-                .variant(ButtonVariant::Ghost)
-                .size(ButtonSize::IconSm)
-                .child(icon(ICON_REFRESH, px(14.0), theme.foreground))
-                .on_click(move |_event, _window, app| {
-                    if let Some(entity) = reload_entity.upgrade() {
-                        entity.update(app, |this, _cx| {
-                            let result = this.webviews.reload(id);
-                            this.webview_error(result);
-                        });
-                    }
-                });
-            let site_entity = entity.clone();
-            let site = Button::new(format!("webview-site-{id}"))
-                .variant(ButtonVariant::Ghost)
-                .size(ButtonSize::IconSm)
-                .child(if placement.url.starts_with("https://") {
-                    icon(ICON_LOCK, px(14.0), theme.foreground)
-                } else {
-                    icon(ICON_INFO, px(14.0), theme.foreground)
-                })
-                .on_click(move |_event, _window, app| {
-                    if let Some(entity) = site_entity.upgrade() {
-                        entity.update(app, |this, _cx| this.toggle_webview_site_panel(id));
-                    }
-                });
-            let tools_entity = entity.clone();
-            let tools = Button::new(format!("webview-tools-{id}"))
-                .variant(ButtonVariant::Ghost)
-                .size(ButtonSize::IconSm)
-                .child(icon(ICON_ELLIPSIS_VERTICAL, px(14.0), theme.foreground))
-                .on_click(move |_event, _window, app| {
-                    if let Some(entity) = tools_entity.upgrade() {
-                        entity.update(app, |this, _cx| this.toggle_webview_tools_panel(id));
-                    }
-                });
-
-            let address = div()
-                .flex_1()
-                .min_w(px(40.0))
-                .h(px(30.0))
-                .rounded(px(8.0))
-                .bg(theme.foreground.opacity(0.06))
-                .border_1()
-                .border_color(theme.border)
-                .px(px(9.0))
-                .flex()
-                .items_center()
-                .overflow_hidden()
-                .text_size(px(12.5))
-                .text_color(theme.foreground)
-                .child(if placement.focused {
-                    self.webview_address.clone().into_any_element()
-                } else {
-                    div()
-                        .whitespace_nowrap()
-                        .child(placement.url.clone())
-                        .into_any_element()
-                });
+            // Only the focused pane's field can be mid-edit; every other pane,
+            // and the focused one at rest, shows the bare host.
+            let editing =
+                placement.focused && address_focused && self.webview_address_for == Some(id);
 
             if !placement.toolbar_hidden {
+                let back_entity = entity.clone();
+                let back = nav_cell(
+                    format!("webview-back-{id}"),
+                    theme.icons.chevron_left(),
+                    15.0,
+                    placement.can_go_back,
+                    &strip,
+                )
+                .when(placement.can_go_back, |cell| {
+                    cell.on_click(move |_event: &ClickEvent, _window, app| {
+                        if let Some(entity) = back_entity.upgrade() {
+                            entity.update(app, |this, _cx| {
+                                let result = this.webviews.go_back(id);
+                                this.webview_error(result);
+                            });
+                        }
+                    })
+                });
+                let forward_entity = entity.clone();
+                let forward = nav_cell(
+                    format!("webview-forward-{id}"),
+                    theme.icons.chevron_right(),
+                    15.0,
+                    placement.can_go_forward,
+                    &strip,
+                )
+                .when(placement.can_go_forward, |cell| {
+                    cell.on_click(move |_event: &ClickEvent, _window, app| {
+                        if let Some(entity) = forward_entity.upgrade() {
+                            entity.update(app, |this, _cx| {
+                                let result = this.webviews.go_forward(id);
+                                this.webview_error(result);
+                            });
+                        }
+                    })
+                });
+                let reload_entity = entity.clone();
+                let reload =
+                    nav_cell(format!("webview-reload-{id}"), ICON_REFRESH, 14.0, true, &strip)
+                        .on_click(move |_event: &ClickEvent, _window, app| {
+                            if let Some(entity) = reload_entity.upgrade() {
+                                entity.update(app, |this, _cx| {
+                                    let result = this.webviews.reload(id);
+                                    this.webview_error(result);
+                                });
+                            }
+                        });
+                // The nav capsule: one pill around three bare 26px cells.
+                let nav = div()
+                    .flex_shrink_0()
+                    .h(px(PILL_H))
+                    .rounded(px(PILL_H / 2.0))
+                    .bg(pill)
+                    .px(px(6.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(2.0))
+                    .child(back)
+                    .child(forward)
+                    .child(reload);
+
+                // The lock / info glyph at the pill's left edge toggles the
+                // site panel; the rest of the pill starts an edit.
+                let site_entity = entity.clone();
+                let site = div()
+                    .id(gpui::SharedString::from(format!("webview-site-{id}")))
+                    .flex_shrink_0()
+                    .w(px(SITE_CELL))
+                    .h(px(SITE_CELL))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .child(icon(
+                        if placement.url.starts_with("https://") { ICON_LOCK } else { ICON_INFO },
+                        px(13.0),
+                        strip.ink_dim,
+                    ))
+                    .on_click(move |_event: &ClickEvent, _window, app| {
+                        if let Some(entity) = site_entity.upgrade() {
+                            entity.update(app, |this, _cx| this.toggle_webview_site_panel(id));
+                        }
+                    });
+                let field = if editing {
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .overflow_hidden()
+                        .child(self.webview_address.clone())
+                } else {
+                    // The trailing pad mirrors the glyph cell, so the host
+                    // stays centred in the pill rather than in what is left.
+                    let edit_entity = entity.clone();
+                    let focused = placement.focused;
+                    let url = placement.url.clone();
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .h_full()
+                        .pr(px(SITE_CELL))
+                        .overflow_hidden()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor(gpui::CursorStyle::IBeam)
+                        .child(div().max_w_full().truncate().child(host(&placement.url)))
+                        .on_mouse_down(
+                            gpui::MouseButton::Left,
+                            move |_event, window, app: &mut GpuiApp| {
+                                // A press on an unfocused pane only focuses
+                                // it (the bar's own handler): the native view
+                                // takes key focus on that switch, so an edit
+                                // begun in the same press would type into the
+                                // page.
+                                if !focused {
+                                    return;
+                                }
+                                if let Some(entity) = edit_entity.upgrade() {
+                                    entity.update(app, |this, cx| {
+                                        this.webview_address_for = Some(id);
+                                        let url = url.clone();
+                                        this.webview_address
+                                            .update(cx, |input, cx| input.set_text(url, cx));
+                                        let handle = this.webview_address.read(cx).focus_handle(cx);
+                                        window.focus(&handle, cx);
+                                        this.request_redraw();
+                                    });
+                                }
+                            },
+                        )
+                };
+                let address = div()
+                    .flex_1()
+                    .min_w(px(40.0))
+                    .flex()
+                    .justify_center()
+                    .child(
+                        div()
+                            .w_full()
+                            .max_w(px(420.0))
+                            .h(px(PILL_H))
+                            .rounded(px(PILL_H / 2.0))
+                            .bg(pill)
+                            .px(px(5.0))
+                            .flex()
+                            .items_center()
+                            .overflow_hidden()
+                            .text_size(px(12.5))
+                            .text_color(strip.ink)
+                            .child(site)
+                            .child(field),
+                    );
+
+                let tools_entity = entity.clone();
+                let tools = div()
+                    .id(gpui::SharedString::from(format!("webview-tools-{id}")))
+                    .flex_shrink_0()
+                    .w(px(PILL_H))
+                    .h(px(PILL_H))
+                    .rounded(px(PILL_H / 2.0))
+                    .bg(pill)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(move |cell| cell.bg(strip.ink.opacity(2.0 * PILL_FILL)))
+                    .child(icon(ICON_ELLIPSIS, px(15.0), strip.ink.opacity(NAV_ENABLED)))
+                    .on_click(move |_event: &ClickEvent, _window, app| {
+                        if let Some(entity) = tools_entity.upgrade() {
+                            entity.update(app, |this, _cx| this.toggle_webview_tools_panel(id));
+                        }
+                    });
+
+                // The bar sits straight on the pane ground, a hairline under it.
                 let toolbar_entity = entity.clone();
                 let toolbar = div()
                     .absolute()
@@ -427,13 +577,13 @@ impl App {
                     .w(px(width))
                     .h(px(toolbar_height))
                     .overflow_hidden()
-                    .px(px(5.0))
+                    .px(px(10.0))
                     .flex()
                     .items_center()
-                    .gap(px(2.0))
-                    .bg(theme.card)
+                    .gap(px(8.0))
+                    .bg(ground)
                     .border_b_1()
-                    .border_color(theme.border)
+                    .border_color(strip.ink.opacity(0.06))
                     .font_family(crate::renderer::FONT_FAMILY)
                     .on_mouse_down(
                         gpui::MouseButton::Left,
@@ -443,10 +593,7 @@ impl App {
                             }
                         },
                     )
-                    .child(back)
-                    .child(forward)
-                    .child(reload)
-                    .child(site)
+                    .child(nav)
                     .child(address)
                     .child(tools);
                 layer = layer.child(toolbar);
@@ -825,5 +972,10 @@ mod tests {
     #[test]
     fn host_strips_scheme_and_path() {
         assert_eq!(host("https://example.com/docs"), "example.com");
+        assert_eq!(host("https://github.com"), "github.com");
+        assert_eq!(host("http://localhost:3000/a?b=c"), "localhost:3000");
+        assert_eq!(host("https://example.com?q=1"), "example.com");
+        assert_eq!(host("https://example.com#top"), "example.com");
+        assert_eq!(host("example.com/docs"), "example.com");
     }
 }

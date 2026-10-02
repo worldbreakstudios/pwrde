@@ -12,7 +12,9 @@
 //! Local additions: [`Input::set_text_size`] overrides the 14px type size so
 //! a bare field can sit inside a sidebar row at the row's text size, and
 //! [`Input::set_font_family`] pins a face (used by the Settings → Appearance
-//! hex fields, which must render monospace).
+//! hex fields, which must render monospace), and [`Input::set_text_color`]
+//! overrides the theme foreground (the webview address pill sits on the
+//! terminal ground, whose ink may not be the chrome theme's).
 
 use std::ops::Range;
 
@@ -60,6 +62,9 @@ pub struct Input {
     /// Local addition: pin the shaped line's font family instead of the
     /// face inherited from the surrounding element tree.
     font_family: Option<SharedString>,
+    /// Local addition: ink for the text and caret instead of the theme
+    /// foreground, for a bare field on a ground the chrome theme doesn't own.
+    text_color: Option<gpui::Hsla>,
     selected_range: Range<usize>,
     selection_reversed: bool,
     marked_range: Option<Range<usize>>,
@@ -78,6 +83,7 @@ impl Input {
             bare: false,
             text_size: None,
             font_family: None,
+            text_color: None,
             selected_range: 0..0,
             selection_reversed: false,
             marked_range: None,
@@ -132,6 +138,12 @@ impl Input {
     /// shown.
     pub fn set_font_family(&mut self, family: Option<impl Into<SharedString>>) {
         self.font_family = family.map(Into::into);
+    }
+
+    /// Local addition: paint the text and caret in `color` instead of the
+    /// theme foreground (`None` restores it). Does not notify.
+    pub fn set_text_color(&mut self, color: Option<gpui::Hsla>) {
+        self.text_color = color;
     }
 
     pub fn text(&self) -> &str {
@@ -608,7 +620,7 @@ impl Element for TextElement {
                         point(bounds.left() + cursor_pos, bounds.top()),
                         size(px(1.), bounds.bottom() - bounds.top()),
                     ),
-                    theme.foreground,
+                    input.text_color.unwrap_or(theme.foreground),
                 )),
             )
         } else {
@@ -713,7 +725,7 @@ impl Render for Input {
             .w_full()
             .text_size(self.text_size.unwrap_or(px(14.)))
             .line_height(px(20.))
-            .text_color(theme.foreground)
+            .text_color(self.text_color.unwrap_or(theme.foreground))
             .when(!self.bare, |el| {
                 el.h(px(36.))
                     .rounded(theme.radius_md())
