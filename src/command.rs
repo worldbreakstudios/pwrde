@@ -699,6 +699,12 @@ pub fn action_group(action: Action) -> &'static str {
         | Action::CloseTab
         | Action::TogglePinTab
         | Action::ToggleWebviewToolbar
+        | Action::FindInPage
+        | Action::OpenInBrowser
+        | Action::CopyLink
+        | Action::PrintPage
+        | Action::DeveloperTools
+        | Action::SiteInfo
         | Action::ToggleCollapse
         | Action::ToggleFocusOthers => "Tiles",
         Action::PrevTile
@@ -751,6 +757,12 @@ pub fn action_icon(action: Action) -> &'static str {
         Action::CloseTab => ICON_SQUARE_X,
         Action::TogglePinTab => ICON_PIN,
         Action::ToggleWebviewToolbar => ICON_PANEL_TOP,
+        Action::FindInPage => ICON_SEARCH,
+        Action::OpenInBrowser => ICON_EXTERNAL_LINK,
+        Action::CopyLink => ICON_COPY,
+        Action::PrintPage => ICON_PRINTER,
+        Action::DeveloperTools => ICON_CODE,
+        Action::SiteInfo => ICON_LOCK,
         Action::ToggleCollapse => ICON_CHEVRON_UP,
         Action::ToggleFocusOthers => ICON_CIRCLE_DOT,
         Action::PrevTile => ICON_CHEVRON_LEFT,

@@ -228,6 +228,41 @@ const ICONS: &[(&str, &[u8])] = &[
         "icons/ellipsis-vertical.svg",
         br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="1"/><circle cx="12" cy="19" r="1"/><circle cx="12" cy="5" r="1"/></svg>"##,
     ),
+    // Webview popover rows (the GANTRY mock's own drawings): cookies,
+    // permissions, certificate, clear data, open externally, print,
+    // developer tools and send-to-agent. `currentColor` so `svg()` tints.
+    (
+        "icons/circle-ellipsis.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M8 12h.01M12 12h.01M16 12h.01"/></svg>"##,
+    ),
+    (
+        "icons/shield.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>"##,
+    ),
+    (
+        "icons/file.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>"##,
+    ),
+    (
+        "icons/trash.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/></svg>"##,
+    ),
+    (
+        "icons/external-link.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg>"##,
+    ),
+    (
+        "icons/printer.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9V2h12v7"/><rect x="6" y="14" width="12" height="8"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/></svg>"##,
+    ),
+    (
+        "icons/code.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m16 18 6-6-6-6"/><path d="m8 6-6 6 6 6"/></svg>"##,
+    ),
+    (
+        "icons/pen-line.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 1 1 3 3L7 19l-4 1 1-4Z"/></svg>"##,
+    ),
     // ── Sidebar chrome icons (Lucide, ISC) ───────────────────────────
     // The folders card and the sessions-list header: folder rows, the pin
     // caption, the new-folder / hide-folders / show-folders / focus chips
@@ -503,6 +538,16 @@ pub const ICON_REFRESH: &str = "icons/refresh.svg";
 pub const ICON_LOCK: &str = "icons/lock.svg";
 pub const ICON_INFO: &str = "icons/info.svg";
 pub const ICON_ELLIPSIS_VERTICAL: &str = "icons/ellipsis-vertical.svg";
+
+/// Webview popover row icons (see the table above).
+pub const ICON_CIRCLE_ELLIPSIS: &str = "icons/circle-ellipsis.svg";
+pub const ICON_SHIELD: &str = "icons/shield.svg";
+pub const ICON_FILE: &str = "icons/file.svg";
+pub const ICON_TRASH: &str = "icons/trash.svg";
+pub const ICON_EXTERNAL_LINK: &str = "icons/external-link.svg";
+pub const ICON_PRINTER: &str = "icons/printer.svg";
+pub const ICON_CODE: &str = "icons/code.svg";
+pub const ICON_PEN_LINE: &str = "icons/pen-line.svg";
 
 /// Sidebar chrome icons (see the table above).
 pub const ICON_FOLDER: &str = "icons/folder.svg";

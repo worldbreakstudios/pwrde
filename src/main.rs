@@ -68,6 +68,7 @@ mod theme;
 #[allow(dead_code)]
 mod ui;
 mod webview;
+mod webview_popover_window;
 mod webview_ui;
 mod workspace;
 
@@ -372,11 +373,20 @@ struct App {
     /// One live address field is mounted in the focused webview toolbar.
     webview_address: gpui::Entity<crate::ui::Input>,
     webview_address_for: Option<u64>,
-    /// Find-in-page replaces the address field while active.
+    /// The Tools popover's find-in-page field, and the webview it is
+    /// claimed for (⌘F or a press on it) while it holds the keyboard.
     webview_find: gpui::Entity<crate::ui::Input>,
     webview_find_for: Option<u64>,
-    /// Expanded site-information or browser-tools panel.
+    /// The open Site or Tools popover. The source of truth: the pump
+    /// reconciles `webview_popover_window` against it every tick.
     webview_panel: Option<webview_ui::Panel>,
+    /// The popover just dismissed by its window losing key status, so the
+    /// same press landing on its toggle does not reopen it.
+    webview_panel_dismissed: Option<(webview_ui::PanelKind, u64, std::time::Instant)>,
+    /// The open popover window and where the pump put it.
+    webview_popover_window:
+        Option<gpui::WindowHandle<crate::webview_popover_window::WebviewPopoverWindow>>,
+    webview_popover_placed: Option<crate::webview_popover_window::Placed>,
     /// Each live webview's last reported `(page origin, icon URL)`; absent
     /// while a page has no usable icon. Runtime-only, never persisted.
     webview_favicons: std::collections::HashMap<u64, (String, String)>,
@@ -1234,9 +1244,8 @@ impl App {
                 if content.w < 1.0 || content.h < 1.0 {
                     continue;
                 }
-                let panel_h = webview_ui::panel_height(self.webview_panel.as_ref(), id);
                 let toolbar_h = if tab.toolbar_hidden() { 0.0 } else { webview::TOOLBAR_H };
-                let bounds = webview::child_bounds(content, self.scale(), toolbar_h, panel_h);
+                let bounds = webview::child_bounds(content, self.scale(), toolbar_h);
                 placements.push(webview::Placement { id, url: url.to_string(), bounds });
                 if tile_id == ws.focused_tile {
                     focus = Some(id);
@@ -4818,6 +4827,12 @@ impl App {
             self.handle_picker_key(ev);
             return;
         }
+        // A popover that never became key (opened over the bus while another
+        // app was frontmost) still closes on ⎋ pressed in the main window.
+        if self.webview_panel.is_some() && ev.keystroke.key == "escape" {
+            self.close_webview_panel();
+            return;
+        }
         // Browser chrome fields own plain typing and their Enter/Escape
         // semantics; no keystroke from them should leak into a terminal.
         if self.webview_input_focused(window, cx) {
@@ -5332,6 +5347,13 @@ impl App {
                 self.persist_snapshot();
                 self.request_redraw();
             },
+            // The focused webview tab's tools; a no-op on a terminal tab.
+            Action::FindInPage
+            | Action::OpenInBrowser
+            | Action::CopyLink
+            | Action::PrintPage
+            | Action::DeveloperTools
+            | Action::SiteInfo => return self.run_webview_action(action),
             Action::PrevTile => self.cycle_tile(-1),
             Action::NextTile => self.cycle_tile(1),
             Action::PrevTab => self.cycle_tab(-1),
@@ -7407,6 +7429,9 @@ fn main() {
                         }),
                         webview_find_for: None,
                         webview_panel: None,
+                        webview_panel_dismissed: None,
+                        webview_popover_window: None,
+                        webview_popover_placed: None,
                         sidebar_expanded_w: workspace::SIDEBAR_DEFAULT_W,
                         sidebar_collapsed: false,
                         folders_open: settings::get_bool("sidebar.folders", true),
@@ -7703,6 +7728,14 @@ fn main() {
                                     }
                                 },
                                 (false, None) => {},
+                            }
+                            // And the webview popover window, against
+                            // `webview_panel` and its anchor in the main window.
+                            {
+                                let app_entity = app.clone();
+                                let _ = cx.update(|cx| {
+                                    crate::webview_popover_window::reconcile(&app_entity, cx, redraw)
+                                });
                             }
                             // Reconcile the Settings window the same way.
                             match (want_settings, settings) {

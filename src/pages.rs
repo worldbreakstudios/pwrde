@@ -96,6 +96,12 @@ pub enum Action {
     TogglePin,
     TogglePinTab,
     ToggleWebviewToolbar,
+    FindInPage,
+    OpenInBrowser,
+    CopyLink,
+    PrintPage,
+    DeveloperTools,
+    SiteInfo,
     Quit,
     PrevTile,
     NextTile,
@@ -130,7 +136,7 @@ pub enum Action {
 
 impl Action {
     /// Keyboard-page row order.
-    pub const ALL: [Action; 43] = [
+    pub const ALL: [Action; 49] = [
         Action::SplitRight,
         Action::SplitDown,
         Action::NewTab,
@@ -144,6 +150,12 @@ impl Action {
         Action::TogglePin,
     Action::TogglePinTab,
     Action::ToggleWebviewToolbar,
+        Action::FindInPage,
+        Action::OpenInBrowser,
+        Action::CopyLink,
+        Action::PrintPage,
+        Action::DeveloperTools,
+        Action::SiteInfo,
         Action::Quit,
         Action::PrevTile,
         Action::NextTile,
@@ -195,6 +207,12 @@ impl Action {
             | Action::NewSection
             | Action::PrevTab
             | Action::NextTab
+            | Action::FindInPage
+            | Action::OpenInBrowser
+            | Action::CopyLink
+            | Action::PrintPage
+            | Action::DeveloperTools
+            | Action::SiteInfo
             => "Tabs & sessions",
             Action::NextTile | Action::PrevTile => "Focus",
             // Moving focus between tiles and sidebar tabs.
@@ -226,6 +244,12 @@ impl Action {
             Action::TogglePin => "toggle_pin",
             Action::TogglePinTab => "toggle_pin_tab",
             Action::ToggleWebviewToolbar => "toggle_title_bar",
+            Action::FindInPage => "find_in_page",
+            Action::OpenInBrowser => "open_in_browser",
+            Action::CopyLink => "copy_link",
+            Action::PrintPage => "print_page",
+            Action::DeveloperTools => "developer_tools",
+            Action::SiteInfo => "site_info",
             Action::Quit => "quit",
             Action::PrevTile => "prev_tile",
             Action::NextTile => "next_tile",
@@ -274,6 +298,12 @@ impl Action {
             Action::TogglePin => "Pin/unpin group",
             Action::TogglePinTab => "Pin / unpin tab",
             Action::ToggleWebviewToolbar => "Show / hide title bar",
+            Action::FindInPage => "Find in page…",
+            Action::OpenInBrowser => "Open in default browser",
+            Action::CopyLink => "Copy link",
+            Action::PrintPage => "Print…",
+            Action::DeveloperTools => "Developer tools",
+            Action::SiteInfo => "Site information",
             Action::Quit => "Quit",
             Action::PrevTile => "Focus previous tile",
             Action::NextTile => "Focus next tile",
@@ -331,6 +361,17 @@ impl Action {
             // ⌥⌘P / ⌥⌘T; the tab's right-click menu is the primary entry.
             Action::TogglePinTab => (false, true, false, "p"),
             Action::ToggleWebviewToolbar => (false, true, false, "t"),
+            // The focused webview tab's tools (no-ops on a terminal tab); the
+            // chords are the browser conventions the Tools popover shows.
+            Action::FindInPage => (false, false, false, "f"),
+            Action::OpenInBrowser => (true, false, false, "o"),
+            Action::CopyLink => (true, false, false, "c"),
+            // ⌃⌘P: ⌘P is the command palette, ⇧⌘P pins the group and ⌥⌘P
+            // pins the tab (and is the global palette hotkey).
+            Action::PrintPage => (false, false, true, "p"),
+            Action::DeveloperTools => (false, true, false, "i"),
+            // ⌃⌘I toggles the Site popover (the address pill's lock glyph).
+            Action::SiteInfo => (false, false, true, "i"),
             Action::Quit => (false, false, false, "q"),
             Action::PrevTile => (false, false, false, "["),
             Action::NextTile => (false, false, false, "]"),
@@ -937,6 +978,31 @@ mod tests {
         let b = Action::ToggleFocusOthers.default_binding();
         assert!(b.shift, "ToggleFocusOthers should require shift");
         assert_eq!(b.key, "f", "ToggleFocusOthers key should be 'f'");
+    }
+
+    #[test]
+    fn webview_tool_actions_bind_browser_chords() {
+        let chord = |action: Action| action.default_binding().display();
+        assert_eq!(chord(Action::FindInPage), "⌘F");
+        assert_eq!(chord(Action::OpenInBrowser), "⇧⌘O");
+        assert_eq!(chord(Action::CopyLink), "⇧⌘C");
+        // Not ⌘P (palette), ⇧⌘P (pin group) or ⌥⌘P (pin tab / global palette).
+        assert_eq!(chord(Action::PrintPage), "⌃⌘P");
+        assert_eq!(chord(Action::DeveloperTools), "⌥⌘I");
+        assert_eq!(chord(Action::SiteInfo), "⌃⌘I");
+        for action in [
+            Action::FindInPage,
+            Action::OpenInBrowser,
+            Action::CopyLink,
+            Action::PrintPage,
+            Action::DeveloperTools,
+            Action::SiteInfo,
+        ] {
+            assert_eq!(Action::from_name(action.name()), Some(action));
+            assert_eq!(action.keyboard_group(), "Tabs & sessions");
+        }
+        // ⇧⌘C is copy-link only: plain ⌘C still resolves to Copy.
+        assert_ne!(Action::CopyLink.default_binding(), Action::Copy.default_binding());
     }
 
     #[test]
