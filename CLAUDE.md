@@ -10,15 +10,25 @@ The top-level pages (see `pages.rs`) are **Sessions** (the terminal workspace), 
 
 ## Commands
 
-- `cargo run --release` — build and run the app. Debug builds also work (deps are compiled at `-O2` even in dev, so it stays usable).
+- `cargo run --release` — build and run the app. Debug builds also work (deps are compiled at `-O2` even in dev, so it stays usable). Webview tabs also need the `pwrde-helper` bin, which `cargo run` alone does not build: run `cargo build` (every bin) first, with the same profile — see "Chromium (CEF)" below.
 - `pwrde-cli <subcommand>` — drive a running app over the command bus (`pwrde-cli --help`). **Use the `/pwrde-cli` project skill (`.claude/skills/pwrde-cli/SKILL.md`) to verify changes against the real app** — dev-build launch, socket resolution, the command cheat-sheet, and the screenshot + `state` verification loop.
 - `cargo test` — run all tests. Tests are inline `#[cfg(test)]` modules in `src/*.rs`; there is no `tests/` directory.
 - `cargo test <name>` — run a single test or filter by substring.
-- `scripts/make-app.sh` — assemble `target/release/Pwrde.app` (requires `cargo build --release` first). Ad-hoc signed by default; with `PWRDE_SIGN_IDENTITY` + `PWRDE_TEAM_ID` + `PWRDE_PROVISION_PROFILE` it produces a Developer ID build signed with `scripts/pwrde.entitlements.in`, whose restricted `web-browser.public-key-credential` entitlement (Apple grants it per team) is what lets webview tabs use passkeys. The bundle also registers `http`/`https` (Alternate rank), and URLs handed to the app open as webview tabs (`TermEvent::OpenUrl`).
+- `scripts/make-app.sh` — assemble `target/release/Pwrde.app` (requires `cargo build --release` first). It bundles Chromium: `Contents/Frameworks/Chromium Embedded Framework.framework` (from `$CEF_PATH`, else the copy the build downloaded) and the five helper apps CEF launches subprocesses from (`Pwrde Helper.app` and its ` (GPU)` / ` (Renderer)` / ` (Plugin)` / ` (Alerts)` siblings, each an `Info.plist` plus a copy of `target/release/pwrde-helper`), and signs inside-out — the framework's libraries, the framework, each helper, then the app. Ad-hoc signed by default; with `PWRDE_SIGN_IDENTITY` + `PWRDE_TEAM_ID` + `PWRDE_PROVISION_PROFILE` it produces a Developer ID build under the hardened runtime: helpers get the JIT entitlements Chromium needs, the app is signed with `scripts/pwrde.entitlements.in`, whose restricted `web-browser.public-key-credential` entitlement (Apple grants it per team) is the one a browser needs for platform passkeys — kept from the WKWebView days because it is an app entitlement, though whether CEF's Chromium uses it is unverified. The bundle also registers `http`/`https` (Alternate rank), and URLs handed to the app open as webview tabs (`TermEvent::OpenUrl`).
 - `scripts/deploy.sh` — pull main, build, bundle, install to `/Applications`, and install `pwrde-cli` onto PATH (`$PWRDE_CLI_DIR`, else `~/.cargo/bin`, else `/usr/local/bin`). Refuses to run off the `main` branch.
 
 Builds compile through **sccache** (`.cargo/config.toml` sets `rustc-wrapper`), so a fresh worktree's first build pulls the gpui dependency tree from cache instead of recompiling it. sccache must be installed (`brew install sccache`) or cargo fails with "could not execute process `sccache`".
 
+### Chromium (CEF)
+
+Webview tabs render with Chromium through the `cef` crate (cef-rs), which needs the **CEF binary distribution** (~320 MB unpacked: the framework, headers, and the C++ wrapper its build script compiles with `cmake` + `ninja` — `brew install cmake ninja`). cef-rs resolves it from `CEF_PATH`:
+
+- **Recommended:** `export CEF_PATH=~/.local/share/cef` in your shell profile. If the directory has no distribution for the crate's CEF version, the first `cargo build` downloads and unpacks one into `$CEF_PATH/<cef version>/cef_macos_<arch>/` and every worktree and profile then shares it. `cargo install export-cef-dir && export-cef-dir --force ~/.local/share/cef` (cef-rs's own tool) fetches the same thing ahead of time, as a flat directory `CEF_PATH` may also point at.
+- **Without `CEF_PATH`** the build script downloads the distribution into cargo's `OUT_DIR` — once per profile per worktree, and gone after `cargo clean`.
+
+At run time `src/cef_app.rs` finds the framework and the helper itself. In `Pwrde.app` they are in `Contents/Frameworks`. For a bare `target/<profile>/pwrde` it uses the distribution the build used (`CEF_PATH` from the environment, else the path baked in at build time) and assembles a stand-in bundle at `target/<profile>/pwrde-cef/Pwrde.app` — a clone of the framework plus the helper apps wrapping `target/<profile>/pwrde-helper` — so `cargo build && cargo run` is enough; no .app needed. If the helper is missing or CEF cannot start, the app still launches and a webview tab reports why in a toast.
+
+`scripts/privacy-usage.plist` holds the privacy usage strings pages can trigger (Bluetooth — any passkey sign-in page probes it — camera, microphone). macOS **aborts** a process that touches one of those services without its string, so a new service a page can reach needs a key there: `build.rs` embeds the file in the bare `pwrde` binary (`__TEXT,__info_plist`, for `cargo run`) and `scripts/make-app.sh` merges it into the bundle's `Info.plist`.
 ## Architecture
 
 **The README's "Architecture" section is stale.** It describes the original winit + wgpu + glyphon design. The code has since been ported to **gpui** (Zed's UI framework), which is now the sole windowing + rendering layer. `winit`/`wgpu`/`glyphon` still appear in `Cargo.toml` and in port-note comments but are not used by any code. Trust the module doc comments (`//!` headers in each `src/*.rs` file) over the README diagram.
@@ -26,6 +36,7 @@ Builds compile through **sccache** (`.cargo/config.toml` sets `rustc-wrapper`), 
 ### Dependency pinning constraints
 
 - `wezterm-term` (VT emulation/grid) and `termwiz` (cell/color model) are git dependencies on the wezterm repo and **must be at the same rev** so cell types line up.
+- `cef` is pinned to an exact crate version (`=154.3.0`, CEF 154.0.32): the bindings, the framework `scripts/make-app.sh` bundles and the one `pwrde-helper` loads must all be that build. Bumping it means a new CEF distribution in `CEF_PATH`.
 - `gpui` and `gpui_platform` are pinned to the same zed repo rev. `gpui_platform`'s `font-kit` feature is **required** — without it gpui falls back to `NoopTextSystem` and no glyphs render (quads still do), which is a confusing failure mode.
 
 ### Threading model (per terminal session)

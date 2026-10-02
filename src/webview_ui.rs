@@ -1,4 +1,4 @@
-//! GPUI-owned browser chrome for native Wry child views.
+//! GPUI-owned browser chrome for the native Chromium (CEF) child views.
 //!
 //! The toolbar follows the GANTRY Workspace mock: a 48px bar on the pane
 //! ground (8px above and below 32px controls, 10px at the sides, 8px between
@@ -937,7 +937,12 @@ impl App {
         let id = panel.id();
         let (width, height) = card_size(panel.kind());
         let body = match panel {
-            Panel::Site { cookies, .. } => self.site_card(id, &cookies, &theme, &entity),
+            Panel::Site { cookies, .. } => {
+                // Chromium counts asynchronously: prefer a count that landed
+                // since the popover opened.
+                let cookies = self.webviews.cookies_seen(id).map(Ok).unwrap_or(cookies);
+                self.site_card(id, &cookies, &theme, &entity)
+            },
             Panel::Tools { .. } => self.tools_card(id, &theme, &entity, window, cx),
         };
         body.w(px(width))

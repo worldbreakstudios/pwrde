@@ -57,7 +57,7 @@ pub enum TermEvent {
     /// `git.open_pr_in_webview` setting is on. The worker thread cannot touch
     /// `App`, so the URL comes back here and the main thread opens the tab.
     OpenPrUrl { url: String },
-    /// A Wry top-level navigation committed; folded into the owning tab on
+    /// A webview's top-level page finished loading; folded into the owning tab on
     /// the main thread so its address, title, and persisted URL stay current.
     WebviewNavigated { id: u64, url: String },
     /// A webview tab's profile `url_command` finished on a background thread
