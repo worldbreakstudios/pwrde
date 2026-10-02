@@ -1049,6 +1049,32 @@ fn sessions_header_chips_at(
 }
 
 
+/// The group `⌘⇧↑/↓` (prev/next sidebar tab) should activate: the row
+/// `delta` steps away along `rows`, the sidebar's visible order — pins
+/// head the list, snoozed groups trail it, and a folder filter or a
+/// collapsed section contributes no rows at all. `None` when the sidebar
+/// shows no group. An `active` the filter hides is off-screen rather
+/// than missing, so stepping enters the list at the end nearest the
+/// direction pressed instead of landing on a hidden workspace index.
+pub fn cycle_sidebar_active(rows: &[SidebarRow], active: usize, delta: isize) -> Option<usize> {
+    if rows.is_empty() {
+        return None;
+    }
+    let next = match active_row_index(rows, active) {
+        Some(i) => crate::pages::cycle(i, rows.len(), delta),
+        None if delta < 0 => rows.len() - 1,
+        None => 0,
+    };
+    Some(rows[next].ws_idx)
+}
+
+/// Whether a throttled input may act now: the elapsed time since the last
+/// accepted one must have reached `interval`. Pure, so the gate the app
+/// applies to a wall-clock [`std::time::Instant`] is testable on its own.
+pub fn throttle_ready(elapsed: std::time::Duration, interval: std::time::Duration) -> bool {
+    elapsed >= interval
+}
+
 /// Flat sessions rows for the GANTRY list: one [`SidebarRow`] per group
 /// — no section headers — for the groups `filter` admits. `None` (All
 /// sessions) admits every group in `workspaces` order, regardless of any
@@ -3501,6 +3527,78 @@ mod tests {
         assert!(sidebar_rows_filtered(&workspaces, &sections, Some(99), false, false).is_empty());
     }
 
+    /// ⌘⇧↑/↓ walks the visible rows: the pinned run first, then plain
+    /// groups, then snoozed ones; a folder filter narrows the walk to
+    /// that folder's members, and a collapsed Pinned/Snoozed section drops
+    /// out of it entirely. Wrapping at both ends.
+    #[test]
+    fn cycle_sidebar_active_follows_visible_row_order() {
+        let mut pinned = ws("pinned", None);
+        pinned.pinned = true;
+        let mut snoozed = ws("snoozed", None);
+        snoozed.snoozed = true;
+        let mut pinned_in_folder = ws("pinned-folder", Some(7));
+        pinned_in_folder.pinned = true;
+        let workspaces = vec![
+            ws("a", None),   // 0
+            pinned,          // 1
+            ws("b", Some(7)), // 2
+            snoozed,         // 3
+            pinned_in_folder, // 4
+        ];
+        let sections = vec![sec(7, false)];
+        let ws_idxs = |rows: Vec<SidebarRow>| rows.iter().map(|r| r.ws_idx).collect::<Vec<_>>();
+
+        // Pinned run heads the list, snoozed run trails it.
+        let rows = sidebar_rows_filtered(&workspaces, &sections, None, false, false);
+        assert_eq!(ws_idxs(rows.clone()), vec![1, 4, 0, 2, 3]);
+
+        // Down from the first pinned row steps through the pinned run.
+        assert_eq!(cycle_sidebar_active(&rows, 1, 1), Some(4));
+        // Down from the last plain row lands on the snoozed one, not past it.
+        assert_eq!(cycle_sidebar_active(&rows, 2, 1), Some(3));
+        // Wrapping at both ends.
+        assert_eq!(cycle_sidebar_active(&rows, 3, 1), Some(1));
+        assert_eq!(cycle_sidebar_active(&rows, 1, -1), Some(3));
+
+        // A folder filter walks that folder's visible members only.
+        let in_folder = sidebar_rows_filtered(&workspaces, &sections, Some(7), false, false);
+        assert_eq!(ws_idxs(in_folder.clone()), vec![4, 2]);
+        assert_eq!(cycle_sidebar_active(&in_folder, 4, 1), Some(2));
+        assert_eq!(cycle_sidebar_active(&in_folder, 2, -1), Some(4));
+
+        // A collapsed Snoozed section leaves the walk without it.
+        let no_snooze = sidebar_rows_filtered(&workspaces, &sections, None, false, true);
+        assert_eq!(ws_idxs(no_snooze.clone()), vec![1, 4, 0, 2]);
+        assert_eq!(cycle_sidebar_active(&no_snooze, 2, 1), Some(1));
+
+        // A collapsed Pinned run leaves the walk without it, snoozed included.
+        let no_pins = sidebar_rows_filtered(&workspaces, &sections, None, true, false);
+        assert_eq!(ws_idxs(no_pins.clone()), vec![0, 2, 3]);
+        assert_eq!(cycle_sidebar_active(&no_pins, 3, 1), Some(0));
+
+        // An active group the filter hides is off-screen: stepping enters the
+        // visible list at the end nearest the direction pressed.
+        let none = sidebar_rows_filtered(&workspaces, &sections, Some(99), false, false);
+        assert!(cycle_sidebar_active(&none, 1, 1).is_none());
+        assert!(cycle_sidebar_active(&rows, 3, 1).is_some());
+        assert_eq!(cycle_sidebar_active(&in_folder, 0, 1), Some(4));
+        assert_eq!(cycle_sidebar_active(&in_folder, 0, -1), Some(2));
+    }
+
+    /// The ⌘⇧↑/↓ throttle drops a repeat arriving inside the window and
+    /// accepts the first press after it: 49ms is too soon, 50ms is the
+    /// boundary, 51ms goes through.
+    #[test]
+    fn throttle_ready_gates_repeats_at_the_boundary() {
+        let interval = std::time::Duration::from_millis(50);
+        assert!(!throttle_ready(std::time::Duration::from_millis(49), interval));
+        assert!(throttle_ready(std::time::Duration::from_millis(50), interval));
+        assert!(throttle_ready(std::time::Duration::from_millis(51), interval));
+        // A startup backdated by one full window is ready immediately.
+        assert!(throttle_ready(interval, interval));
+    }
+
     #[test]
     fn normalize_sets_anchor_to_following_group() {
         let mut member = ws("m", Some(1));
@@ -4730,3 +4828,4 @@ mod strip_layout_tests {
         assert!(max.new_tab.unwrap().x > max.tabs[2].x);
     }
 }
+
