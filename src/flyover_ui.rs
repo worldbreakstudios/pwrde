@@ -1,12 +1,13 @@
 //! The in-window flyover panel's tab strip as a gpui element tree.
 //!
-//! The strip's pixels (pills, titles, × buttons, unread dots, the minimize /
-//! maximize buttons) used to be quads and labels from
-//! `Renderer::flyover_overlay`. They ride [`crate::tile_ui::tab_strip`] now,
-//! at the very rects `workspace::flyover_tab_rect` / `flyover_tab_close_rect`
-//! / `flyover_minimize_rect` / `flyover_maximize_rect` hand the canvas mouse
-//! path, which still resolves every click, drag and resize. The card, its
-//! borders, the divider and the terminal content stay on the canvas.
+//! The strip wears the same mock as every tile's: the shared
+//! [`crate::tile_ui::tab_strip`] paints it at the very rects
+//! `workspace::flyover_strip_layout` hands both the element tree and the canvas
+//! mouse path, which still resolves every click, drag and resize. The panel is
+//! focused whenever it is up, so its active chip is always the mock's
+//! full-strength one. The minimize / maximize buttons ride the bar's right
+//! edge, past the strip's own "+" New tab button. The card, its borders, the
+//! divider and the terminal content stay on the canvas.
 //!
 use std::rc::Rc;
 
@@ -19,15 +20,16 @@ use crate::App;
 use crate::ui::assets::{ICON_MAXIMIZE, ICON_MINIMIZE};
 use crate::ui::icon;
 use crate::renderer::color;
-use crate::tile_ui::{PressHandler, StripStyle, StripTab, tab_strip};
+use crate::tile_ui::{NewTabHandler, PressHandler, StripStyle, StripTab, tab_strip};
 use crate::ui::theme::Theme;
 use crate::workspace::{self, LayoutRect};
 
 /// Inset of a window button's hover chip.
 const CHIP_INSET: f32 = 3.0;
-/// The flyover's pill and chip radii (the canvas used 7 and 4).
-const PILL_RADIUS: f32 = 7.0;
+/// The window buttons' hover chip radius, and the faint mock white it is
+/// filled with (the same chip the strip's own "+" shows on hover).
 const CHIP_RADIUS: f32 = 4.0;
+const CHIP_ALPHA: f32 = 0.07;
 
 impl App {
     /// The flyover strip while the panel shows in this window, or an empty
@@ -41,15 +43,11 @@ impl App {
         let scale = self.scale();
         let inv = 1.0 / scale;
         let panel = self.flyover_rect_now();
-        let bar = workspace::flyover_tab_bar(&panel, scale);
-        let n = self.flyover_tabs.len();
         let maximized = self.flyover_maximized;
 
-        let style = StripStyle {
-            pill_radius: Some(PILL_RADIUS),
-            chip_radius: Some(CHIP_RADIUS),
-            ..StripStyle::from_scheme(th, 0.09)
-        };
+        // The panel owns focus whenever it is up, so its active chip is the
+        // mock's full-strength one.
+        let style = StripStyle { focused: true, ..StripStyle::from_scheme(th) };
         let modal = self.modal_overlay_open();
         let cur = if matches!(self.drag, crate::Drag::None) && !modal {
             Some((self.cursor.0 as f32, self.cursor.1 as f32))
@@ -60,16 +58,25 @@ impl App {
         let font = crate::renderer::chrome_font();
         let entity = cx.entity().downgrade();
 
+        // One layout for this strip: the element tree paints at its rects and
+        // the canvas mouse path hit-tests the same ones.
+        let titles: Vec<String> = self.flyover_tabs.iter().map(|t| t.title()).collect();
+        let layout =
+            workspace::flyover_strip_layout(&panel, &titles, self.flyover_active, scale, maximized);
+        let bar = layout.bar;
         let tabs: Vec<StripTab> = self
             .flyover_tabs
             .iter()
             .enumerate()
-            .map(|(i, tab)| StripTab {
-                title: tab.title(),
-                unread: tab.unread,
-                pinned: tab.pinned,
-                tab: workspace::flyover_tab_rect(&panel, i, n, scale, maximized),
-                close: workspace::flyover_tab_close_rect(&panel, i, n, scale, maximized),
+            .filter_map(|(i, tab)| {
+                Some(StripTab {
+                    title: tab.title(),
+                    unread: tab.unread,
+                    pinned: tab.pinned,
+                    webview: tab.kind() == workspace::TabKind::Webview,
+                    tab: *layout.tabs.get(i)?,
+                    close: *layout.closes.get(i)?,
+                })
             })
             .collect();
         let press_entity = entity.clone();
@@ -83,8 +90,18 @@ impl App {
                 });
             }
         });
+        // The "+" takes the flyover's own New-tab path.
+        let new_entity = entity.clone();
+        let on_new_tab: NewTabHandler = Rc::new(move |app| {
+            if let Some(entity) = new_entity.upgrade() {
+                entity.update(app, |this, cx| {
+                    this.new_flyover_tab();
+                    cx.notify();
+                });
+            }
+        });
         let mut strip_el = tab_strip(
-            &bar,
+            &layout,
             inv,
             &tabs,
             self.flyover_active,
@@ -92,6 +109,7 @@ impl App {
             &style,
             &cx.global::<Theme>().icons.x(),
             on_press,
+            on_new_tab,
         );
 
         // Minimize / maximize buttons at the bar's right edge — not while a
@@ -143,7 +161,7 @@ impl App {
                                     .w(px((rect.w * inv - 2.0 * CHIP_INSET).max(0.0)))
                                     .h(px((rect.h * inv - 2.0 * CHIP_INSET).max(0.0)))
                                     .rounded(px(CHIP_RADIUS))
-                                    .bg(color(style.pill_rgb, (style.pill_alpha * 2.0).min(1.0))),
+                                    .bg(color(style.pill_rgb, CHIP_ALPHA)),
                             )
                         })
                         .child(

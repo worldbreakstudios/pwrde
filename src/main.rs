@@ -1716,6 +1716,13 @@ impl App {
         self.persist_snapshot();
     }
 
+    /// The strip's "+" button: focus tile `id`, then take the very path
+    /// `Action::NewTab` takes, so the button and the ⌘T binding agree.
+    pub(crate) fn new_tab_in_tile(&mut self, id: u64) {
+        self.workspaces[self.active].focused_tile = id;
+        self.new_tab();
+    }
+
     fn new_tab(&mut self) {
         let session = self.spawn_session();
         let ws = &mut self.workspaces[self.active];
@@ -2622,8 +2629,17 @@ impl App {
                 if n == 0 {
                     return;
                 }
-                let t0 = workspace::tile_tab_rect(&strip, 0, n, scale, has_caret);
-                let ti = ((((px - t0.x).max(0.0)) / t0.w).floor() as usize).min(n - 1);
+                // The same layout the strip paints: the menu lands on the tab
+                // under the pointer, not on an equal-division guess.
+                let titles: Vec<String> = tile.tabs.iter().map(|t| t.title()).collect();
+                let layout =
+                    workspace::tile_strip_layout(&strip, &titles, tile.active, scale, has_caret);
+                let ti = layout
+                    .tabs
+                    .iter()
+                    .position(|t| px < t.x + t.w)
+                    .unwrap_or(n - 1)
+                    .min(n - 1);
                 let tab = &tile.tabs[ti];
                 let mut items = vec![
                     context_menu::MenuItem {
@@ -2992,6 +3008,14 @@ impl App {
         self.flyover_focused = true;
         self.sync_layout();
         self.request_redraw();
+    }
+
+    /// The flyover strip's "+" button: a new flyover tab in the active
+    /// group's cwd, exactly what the picker path does once it has a
+    /// directory.
+    pub(crate) fn new_flyover_tab(&mut self) {
+        let cwd = self.workspaces.get(self.active).and_then(|ws| ws.cwd.clone());
+        self.spawn_flyover_tab(cwd);
     }
 
     /// Toggle the flyover panel open/closed. The panel is an in-window overlay
@@ -3368,14 +3392,24 @@ impl App {
             let bar = workspace::tile_tab_bar(&strip, scale);
             if bar.contains(px, py) {
                 let has_caret = axes.iter().any(|(tid, a)| tid == id && a.is_some());
-                let n = ws.root.find_tile(*id).map_or(1, |t| t.tabs.len()).max(1);
+                // The same layout the strip paints, so the drop index lands
+                // where the insertion line shows.
+                let (titles, active) = ws
+                    .root
+                    .find_tile(*id)
+                    .map(|t| {
+                        (t.tabs.iter().map(|t| t.title()).collect::<Vec<String>>(), t.active)
+                    })
+                    .unwrap_or_default();
+                let n = titles.len();
+                let layout = workspace::tile_strip_layout(&strip, &titles, active, scale, has_caret);
                 // Same-tile reorder resolves to the nearest gap (matching the
                 // insertion-line preview); cross-tile keeps the hovered cell.
                 let index = if src_tile == *id {
-                    workspace::tile_tab_insert_gap(&strip, px, n, scale, has_caret)
+                    workspace::strip_insert_gap(&layout, px)
                 } else {
-                    let t0 = workspace::tile_tab_rect(&strip, 0, n, scale, has_caret);
-                    ((((px - t0.x).max(0.0)) / t0.w).floor() as usize).min(n)
+                    // Past the last tab appends, as the equal-width strip did.
+                    layout.tabs.iter().position(|t| px < t.x + t.w).unwrap_or(n)
                 };
                 return Some(DropTarget::TabBar { tile: *id, index });
             }
@@ -3740,8 +3774,16 @@ impl App {
                         let axes = workspace::tile_collapse_axis(&wsp.root);
                         let has_caret =
                             axes.iter().any(|(tid, a)| *tid == tile && a.is_some());
-                        let n = wsp.root.find_tile(tile).map_or(1, |t| t.tabs.len()).max(1);
-                        workspace::tile_tab_insert_line(&strip, index, n, scale, has_caret)
+                        let (titles, active) = wsp
+                            .root
+                            .find_tile(tile)
+                            .map(|t| {
+                                (t.tabs.iter().map(|t| t.title()).collect::<Vec<String>>(), t.active)
+                            })
+                            .unwrap_or_default();
+                        let layout =
+                            workspace::tile_strip_layout(&strip, &titles, active, scale, has_caret);
+                        workspace::strip_insert_line(&layout, index, scale)
                     },
                     DropTarget::TabBar { .. } => workspace::tile_tab_bar(
                         &workspace::tab_strip_rect(area, &rect, scale, self.sidebar_w()),
@@ -4191,11 +4233,28 @@ impl App {
                     // (`flyover_ui`) that stop the press first; the bar's
                     // empty run still selects the nearest tab from here.
                     let maxed = self.flyover_maximized;
-                    let tab_rect = workspace::flyover_tab_rect(&panel, 0, n.max(1), scale, maxed);
-                    let ti = ((((px - tab_rect.x).max(0.0)) / tab_rect.w).floor() as usize)
+                    let titles: Vec<String> =
+                        self.flyover_tabs.iter().map(|t| t.title()).collect();
+                    let layout = workspace::flyover_strip_layout(
+                        &panel,
+                        &titles,
+                        self.flyover_active,
+                        scale,
+                        maxed,
+                    );
+                    // The "+" button: a new flyover tab (an element target
+                    // too, but the canvas path must agree).
+                    if layout.new_tab.is_some_and(|p| p.contains(px, py)) {
+                        self.new_flyover_tab();
+                        return;
+                    }
+                    let ti = layout
+                        .tabs
+                        .iter()
+                        .position(|t| px < t.x + t.w)
+                        .unwrap_or(n.saturating_sub(1))
                         .min(n.saturating_sub(1));
-                    let close =
-                        workspace::flyover_tab_close_rect(&panel, ti, n, scale, maxed).contains(px, py);
+                    let close = layout.closes.get(ti).is_some_and(|c| c.contains(px, py));
                     self.press_flyover_tab(ti, close);
                 } else {
                     // Click in content area: focus the panel, then either
@@ -4322,18 +4381,35 @@ impl App {
                     self.press_tile_caret(*id, click_count);
                     return;
                 }
+                // One layout for this strip, exactly as the element tree
+                // paints it, so the canvas path resolves the same rects.
+                let (titles, active) = ws
+                    .root
+                    .find_tile(*id)
+                    .map(|t| {
+                        (t.tabs.iter().map(|t| t.title()).collect::<Vec<String>>(), t.active)
+                    })
+                    .unwrap_or_default();
+                let n = titles.len();
+                let layout = workspace::tile_strip_layout(&strip, &titles, active, scale, has_caret);
+                // The "+" button: focus this tile and open a tab in it (also
+                // an element target; the canvas path agrees).
+                if layout.new_tab.is_some_and(|p| p.contains(px, py)) {
+                    self.new_tab_in_tile(*id);
+                    return;
+                }
                 // The tabs themselves are element click targets (`tile_ui`)
                 // that stop the press before it reaches here; what still
                 // lands on the canvas is the bar's empty run past the last
                 // tab, which selects the nearest tab as it always did.
-                if let Some(tile) = ws.root.find_tile(*id) {
-                    let n = tile.tabs.len();
-                    let t0 = workspace::tile_tab_rect(&strip, 0, n.max(1), scale, has_caret);
-                    let ti =
-                        ((((px - t0.x).max(0.0)) / t0.w).floor() as usize).min(n.saturating_sub(1));
-                    let close = n > 0
-                        && workspace::tile_tab_close_rect(&strip, ti, n, scale, has_caret)
-                            .contains(px, py);
+                if n > 0 {
+                    let ti = layout
+                        .tabs
+                        .iter()
+                        .position(|t| px < t.x + t.w)
+                        .unwrap_or(n - 1)
+                        .min(n - 1);
+                    let close = layout.closes.get(ti).is_some_and(|c| c.contains(px, py));
                     self.press_tile_tab(*id, ti, close, click_count);
                 }
             } else {
