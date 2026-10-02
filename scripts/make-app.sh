@@ -193,6 +193,17 @@ cat > "${APP_DIR}/Contents/Info.plist" <<PLIST
 	<true/>
 	<key>NSSupportsAutomaticGraphicsSwitching</key>
 	<true/>
+	<!-- Chromium reaches these on a page's behalf (a passkey sign-in lists
+	     paired Bluetooth devices); without a usage string macOS kills the
+	     app outright instead of prompting. -->
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>Web pages in ${APP_NAME} can use Bluetooth security keys and devices.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>Web pages in ${APP_NAME} can use the camera when you allow it.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Web pages in ${APP_NAME} can use the microphone when you allow it.</string>
+	<key>NSLocationUsageDescription</key>
+	<string>Web pages in ${APP_NAME} can use your location when you allow it.</string>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.developer-tools</string>
 	<key>CFBundleDocumentTypes</key>
