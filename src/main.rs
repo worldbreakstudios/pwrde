@@ -2667,8 +2667,8 @@ impl App {
 
     /// Right-click opens a native context menu on what is under the cursor.
     /// A sidebar session row offers "Mark as unread" (re-dots its primary
-    /// pane's active tab, the one the row's dot mirrors) and pin / unpin
-    /// group; a tile tab offers "Mark as unread", pin / unpin tab, and — for
+    /// pane's active tab, the one the row's dot mirrors), pin / unpin and
+    /// snooze group, and "Close session" (the close-group confirm); a tile tab offers "Mark as unread", pin / unpin tab, and — for
     /// a webview — hide / show its title bar. Never changes focus. The hit is
     /// resolved here; the menu itself is shown by [`App::show_context_menu`].
     fn on_right_mouse_down(&mut self, window: &Window, cx: &mut Context<Self>) {
@@ -2725,6 +2725,13 @@ impl App {
                     },
                     context_menu::MenuItem {
                         title: if ws.snoozed { "Unsnooze group" } else { "Snooze group" }.into(),
+                        enabled: true,
+                        separator_after: true,
+                    },
+                    // The primary pane has no × of its own, so the row's
+                    // menu is where a session is closed with the mouse.
+                    context_menu::MenuItem {
+                        title: "Close session".into(),
                         enabled: true,
                         separator_after: false,
                     },
@@ -2852,6 +2859,16 @@ impl App {
                         if w.snoozed {
                             w.pinned = false;
                         }
+                    },
+                    // Through the same confirm dialog as ⌘⇧W.
+                    3 => {
+                        let primary_tile = w.primary_tile;
+                        self.confirm = Some(ConfirmClose {
+                            text: "Closing this session closes all of its panes.".into(),
+                            action: ConfirmAction::CloseGroup { primary_tile },
+                        });
+                        self.request_redraw();
+                        return;
                     },
                     _ => return,
                 }
