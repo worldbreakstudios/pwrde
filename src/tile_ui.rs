@@ -24,6 +24,12 @@
 //! in the tree's z-order (under the sidebar and the modals) instead of in the
 //! canvas's hand-kept paint order.
 //!
+//! The group's **primary pane** (`Workspace::primary_tile`, always the root's
+//! left leaf — see `Workspace::normalize_primary`) has no tabs: its bar is a
+//! title row ([`primary_title_row`]) — the terminal glyph and the pane's
+//! title at weight 500, no chip, ×, "+" or caret — over the info bar
+//! (`infobar_ui`).
+//!
 //! Still canvas-painted, deliberately: the card divider, the side-strip hover
 //! fill, and the drag-and-drop hints — all of which sit *around* the strip
 //! rather than in it. The collapse caret is the same standard `svg` chevron it
@@ -34,8 +40,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, App as GpuiApp, Context, Hsla, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, ParentElement, RenderImage, Styled, Window, div, px,
+    AnyElement, App as GpuiApp, Context, FontWeight, Hsla, InteractiveElement, IntoElement,
+    MouseButton, MouseDownEvent, ParentElement, RenderImage, Styled, Window, div, px,
     prelude::FluentBuilder as _,
 };
 
@@ -410,6 +416,64 @@ pub(crate) fn tab_strip(
     strip_el
 }
 
+/// The primary pane's title row, in place of a tab strip: the strip's
+/// terminal glyph and the pane `title` (weight 500, ellipsis-truncated),
+/// centred together on the bare ground — no chip, ×, "+" or caret. `bar` and `row` are
+/// [`crate::workspace::primary_title_row`]'s rects in physical px (converted
+/// with `inv`), so the collapsed-sidebar inset carries over from the strip.
+pub(crate) fn primary_title_row(
+    bar: &LayoutRect,
+    row: &LayoutRect,
+    inv: f32,
+    title: String,
+    style: &StripStyle,
+) -> gpui::Div {
+    let ui = workspace::chrome_ui_scale();
+    let glyph = GLYPH * ui;
+    let text = if title.is_empty() { "shell".to_string() } else { title };
+    div()
+        .absolute()
+        .left(px(bar.x * inv))
+        .top(px(bar.y * inv))
+        .w(px(bar.w * inv))
+        .h(px(bar.h * inv))
+        .overflow_hidden()
+        .child(
+            div()
+                .absolute()
+                .left(px((row.x - bar.x) * inv))
+                .top(px((row.y - bar.y) * inv))
+                .w(px(row.w * inv))
+                .h(px(row.h * inv))
+                .overflow_hidden()
+                .flex()
+                .items_center()
+                .justify_center()
+                .gap(px(CHIP_GAP * ui))
+                .child(
+                    div()
+                        .flex_none()
+                        .w(px(glyph))
+                        .h(px(glyph))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(icon(ICON_TERMINAL, px(glyph * inv), style.ink_dim)),
+                )
+                .child(
+                    div()
+                        .min_w(px(0.0))
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .text_size(px(TITLE_SIZE * ui))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(if style.focused { style.ink } else { style.ink_dim })
+                        .child(text),
+                ),
+        )
+}
+
 impl App {
     /// Every tile's tab strip, or an empty element off the Sessions page.
     pub fn render_tile_chrome(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -433,7 +497,7 @@ impl App {
         let sidebar_w = self.sidebar_w();
         let (tiles, _) = workspace::layout_tiles(&ws.root, area, scale);
         let axis_map: HashMap<u64, Option<workspace::Dir>> =
-            workspace::tile_collapse_axis(&ws.root).into_iter().collect();
+            ws.collapse_axes().into_iter().collect();
 
         let base = StripStyle::from_scheme(th);
         let accent = color(crate::theme::accent_color(), 1.0);
@@ -529,6 +593,28 @@ impl App {
             }
             let focused = ws.focused_tile == *id;
             let strip = workspace::tab_strip_rect(area, rect, scale, sidebar_w);
+            // The primary pane: a title row instead of tabs. A press on it
+            // focuses the pane; the info bar under it is `infobar_ui`'s.
+            if ws.is_primary(*id) {
+                let (bar, row) = workspace::primary_title_row(&strip, scale);
+                let title = tile.active_tab().map(|t| t.title()).unwrap_or_default();
+                let style = StripStyle { focused, ..base.clone() };
+                let entity = entity.clone();
+                layer = layer.child(primary_title_row(&bar, &row, inv, title, &style).on_mouse_down(
+                    MouseButton::Left,
+                    move |ev: &MouseDownEvent, _win: &mut Window, app: &mut GpuiApp| {
+                        app.stop_propagation();
+                        if let Some(entity) = entity.upgrade() {
+                            entity.update(app, |this, cx| {
+                                this.note_pointer(ev);
+                                this.press_primary_header();
+                                cx.notify();
+                            });
+                        }
+                    },
+                ));
+                continue;
+            }
             // One layout for this strip: the painters below read its rects, and
             // so does every hit-test on the canvas mouse path.
             let titles: Vec<String> = tile.tabs.iter().map(|t| t.title()).collect();

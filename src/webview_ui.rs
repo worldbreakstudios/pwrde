@@ -620,7 +620,7 @@ impl App {
                 Some(ChromePlacement {
                     id,
                     url,
-                    rect: crate::workspace::tile_content(&rect, scale),
+                    rect: crate::workspace::tile_content_for(&rect, scale, workspace.is_primary(tile_id)),
                     focused: tile_id == workspace.focused_tile,
                     can_go_back: state.as_ref().is_some_and(|state| state.can_go_back),
                     can_go_forward: state.as_ref().is_some_and(|state| state.can_go_forward),
