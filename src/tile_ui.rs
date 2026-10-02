@@ -2,7 +2,10 @@
 //! here, and — through [`tab_strip`] — the flyover panel's in `flyover_ui`.
 //!
 //! The mock: a 40px bar (6px of padding, a 30px tab row, 4px below) with no
-//! fill of its own, sitting on the terminal ground. The active tab is a chip —
+//! fill of its own, sitting on the terminal ground. Those — and every size
+//! below — are the figures at the default chrome text size: the whole strip,
+//! bar height included, scales with `appearance.font_size` through
+//! [`crate::workspace::chrome_ui_scale`], the factor the sidebar uses. The active tab is a chip —
 //! an 8px-rounded card of the mock's white at .07 with a .10 border (dimmed to
 //! .04 with no border while its tile is unfocused) — holding a 14px glyph (a
 //! terminal, or for a web tab the page's favicon clipped to a disc, the globe
@@ -43,6 +46,9 @@ use crate::ui::icon;
 use crate::ui::theme::Theme;
 use crate::workspace::{self, LayoutRect};
 
+/// Sizes at the default chrome text size; [`tab_strip`] multiplies each by
+/// [`crate::workspace::chrome_ui_scale`].
+///
 /// The chip: radius 8, 10px of padding on the left, 8px on the right, and 8px
 /// between its children.
 const CHIP_RADIUS: f32 = 8.0;
@@ -167,6 +173,14 @@ pub(crate) fn tab_strip(
         .overflow_hidden();
     // Rects relative to the strip box, in logical px.
     let rel = |r: &LayoutRect| ((r.x - bar.x) * inv, (r.y - bar.y) * inv, r.w * inv, r.h * inv);
+    // The strip's own sizes are written at the default chrome text size and
+    // scale by the same factor the layout's rects were computed with, so the
+    // type, glyphs and paddings stay centred in the scaled row.
+    let ui = workspace::chrome_ui_scale();
+    let (chip_radius, chip_gap) = (CHIP_RADIUS * ui, CHIP_GAP * ui);
+    let (chip_pad_l, chip_pad_r, tab_pad_h) = (CHIP_PAD_L * ui, CHIP_PAD_R * ui, TAB_PAD_H * ui);
+    let (glyph, new_tab_glyph, title_size) = (GLYPH * ui, NEW_TAB_GLYPH * ui, TITLE_SIZE * ui);
+    let (close_area, dot, dot_gap) = (CLOSE_AREA * ui, DOT * ui, DOT_GAP * ui);
 
     // A hairline between adjacent tabs — and between the last tab and the "+".
     for sep in &layout.separators {
@@ -219,7 +233,7 @@ pub(crate) fn tab_strip(
                 .top(px(0.0))
                 .w(px(tw))
                 .h(px(tth))
-                .rounded(px(CHIP_RADIUS))
+                .rounded(px(chip_radius))
                 .bg(color(style.pill_rgb, alpha));
             if is_active && style.focused {
                 chip = chip.border_1().border_color(color(style.pill_rgb, CHIP_BORDER));
@@ -232,25 +246,25 @@ pub(crate) fn tab_strip(
         let text = if tab.title.is_empty() { "shell".to_string() } else { tab.title.clone() };
         let text_color = if is_active && style.focused { style.ink } else { style.ink_dim };
         let icon_path = if tab.webview { ICON_GLOBE } else { ICON_TERMINAL };
-        let mut x = if is_active { CHIP_PAD_L } else { TAB_PAD_H };
+        let mut x = if is_active { chip_pad_l } else { tab_pad_h };
         tab_el = tab_el.child(
             div()
                 .absolute()
                 .left(px(x))
-                .top(px((tth - GLYPH) / 2.0))
-                .w(px(GLYPH))
-                .h(px(GLYPH))
+                .top(px((tth - glyph) / 2.0))
+                .w(px(glyph))
+                .h(px(glyph))
                 .flex()
                 .items_center()
                 .justify_center()
                 .map(|slot| match tab.favicon.clone().filter(|_| tab.webview) {
                     Some(favicon) => slot.child(
-                        gpui::img(favicon).w(px(GLYPH)).h(px(GLYPH)).rounded(px(GLYPH / 2.0)),
+                        gpui::img(favicon).w(px(glyph)).h(px(glyph)).rounded(px(glyph / 2.0)),
                     ),
-                    None => slot.child(icon(icon_path, px(GLYPH * inv), style.ink_dim)),
+                    None => slot.child(icon(icon_path, px(glyph * inv), style.ink_dim)),
                 }),
         );
-        x += GLYPH + CHIP_GAP;
+        x += glyph + chip_gap;
         // Pin ring: a hollow dot in the tab's own ink so it reads apart from
         // the filled accent unread dot that may follow it.
         if tab.pinned {
@@ -258,34 +272,34 @@ pub(crate) fn tab_strip(
                 div()
                     .absolute()
                     .left(px(x))
-                    .top(px(((tth - DOT) / 2.0).round()))
-                    .w(px(DOT))
-                    .h(px(DOT))
-                    .rounded(px(DOT / 2.0))
+                    .top(px(((tth - dot) / 2.0).round()))
+                    .w(px(dot))
+                    .h(px(dot))
+                    .rounded(px(dot / 2.0))
                     .border_1()
                     .border_color(text_color),
             );
-            x += DOT + DOT_GAP;
+            x += dot + dot_gap;
         }
         if tab.unread {
             tab_el = tab_el.child(
                 div()
                     .absolute()
                     .left(px(x))
-                    .top(px(((tth - DOT) / 2.0).round()))
-                    .w(px(DOT))
-                    .h(px(DOT))
-                    .rounded(px(DOT / 2.0))
+                    .top(px(((tth - dot) / 2.0).round()))
+                    .w(px(dot))
+                    .h(px(dot))
+                    .rounded(px(dot / 2.0))
                     .bg(style.unread),
             );
-            x += DOT + DOT_GAP;
+            x += dot + dot_gap;
         }
         // An active chip keeps its × area clear; an inactive tab's title runs
         // to its padding (its × appears only on hover, over the title).
         let text_right = if is_active && !tab.pinned {
-            (tw - CHIP_PAD_R - CLOSE_AREA).max(0.0)
+            (tw - chip_pad_r - close_area).max(0.0)
         } else {
-            (tw - TAB_PAD_H).max(0.0)
+            (tw - tab_pad_h).max(0.0)
         };
         tab_el = tab_el.child(
             div()
@@ -298,7 +312,7 @@ pub(crate) fn tab_strip(
                 .whitespace_nowrap()
                 .flex()
                 .items_center()
-                .text_size(px(TITLE_SIZE))
+                .text_size(px(title_size))
                 .text_color(text_color)
                 .child(text),
         );
@@ -333,7 +347,7 @@ pub(crate) fn tab_strip(
                             .top(px(0.0))
                             .w(px(cw))
                             .h(px(ch))
-                            .rounded(px(CHIP_RADIUS))
+                            .rounded(px(chip_radius))
                             .bg(color(style.pill_rgb, CLOSE_CHIP)),
                     )
                 })
@@ -348,7 +362,7 @@ pub(crate) fn tab_strip(
                         .justify_center()
                         .child(icon(
                             close_icon,
-                            px(GLYPH * inv),
+                            px(glyph * inv),
                             if close_hov { style.ink } else { style.ink_dim },
                         )),
                 ),
@@ -370,7 +384,7 @@ pub(crate) fn tab_strip(
                 .top(px(plus_y))
                 .w(px(plus_w))
                 .h(px(plus_h))
-                .rounded(px(CHIP_RADIUS))
+                .rounded(px(chip_radius))
                 .when(plus_hov, |d| d.bg(color(style.pill_rgb, CHIP_FILL_HOVER)))
                 .on_mouse_down(MouseButton::Left, move |_ev: &MouseDownEvent, _win: &mut Window, app: &mut GpuiApp| {
                     app.stop_propagation();
@@ -387,7 +401,7 @@ pub(crate) fn tab_strip(
                         .justify_center()
                         .child(icon(
                             ICON_PLUS,
-                            px(NEW_TAB_GLYPH * inv),
+                            px(new_tab_glyph * inv),
                             if plus_hov { style.ink } else { style.ink_dim },
                         )),
                 ),
@@ -412,6 +426,8 @@ impl App {
         let th = crate::theme::current();
         let scale = self.scale();
         let inv = 1.0 / scale;
+        // The caret and its badge scale with the strip (`tab_strip`).
+        let ui = workspace::chrome_ui_scale();
         let ws = &self.workspaces[self.active];
         let area = self.area();
         let sidebar_w = self.sidebar_w();
@@ -466,9 +482,9 @@ impl App {
                         .then(|| {
                             div()
                                 .absolute()
-                                .top(px(3.0))
-                                .right(px(3.0))
-                                .size(px(6.0))
+                                .top(px(3.0 * ui))
+                                .right(px(3.0 * ui))
+                                .size(px(DOT * ui))
                                 .rounded_full()
                                 .bg(accent)
                                 .into_any_element()
@@ -492,7 +508,7 @@ impl App {
                                     .justify_center()
                                     .child(icon(
                                         cx.global::<Theme>().icons.chevron_right(),
-                                        px(14.0 * inv),
+                                        px(14.0 * ui * inv),
                                         base.ink_dim,
                                     ))
                                     .children(badge),
@@ -581,9 +597,9 @@ impl App {
                     || {
                         div()
                             .absolute()
-                            .top(px(3.0))
-                            .right(px(3.0))
-                            .size(px(6.0))
+                            .top(px(3.0 * ui))
+                            .right(px(3.0 * ui))
+                            .size(px(DOT * ui))
                             .rounded_full()
                             .bg(accent)
                             .into_any_element()
@@ -605,7 +621,7 @@ impl App {
                             } else {
                                 cx.global::<Theme>().icons.chevron_down()
                             },
-                            px(14.0 * inv),
+                            px(14.0 * ui * inv),
                             if hov(&cr) { style.ink } else { style.ink_dim },
                         ))
                         .children(badge)

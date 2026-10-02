@@ -9,6 +9,12 @@
 //! toggles the site panel at its left edge, and shows the bare host at rest;
 //! a press on the focused pane's pill swaps in the editable full URL. The
 //! mock's Annotate and Share-with-agent controls are deliberately not built.
+//!
+//! Those sizes are the figures at the default chrome text size. The bar's
+//! height ([`crate::webview::toolbar_h`]) and everything painted in it scale
+//! with `appearance.font_size` through [`crate::workspace::chrome_ui_scale`]
+//! — the factor the tab strips and the sidebar use. The Site and Tools panels
+//! hang under the scaled bar; their contents keep their own sizes.
 
 use gpui::{
     AnyElement, App as GpuiApp, ClickEvent, Context, Focusable, InteractiveElement, IntoElement,
@@ -68,7 +74,9 @@ struct ChromePlacement {
 }
 
 /// The toolbar's controls — nav capsule, address pill, More — share one
-/// height and are full pills of the foreground at the mock's .07.
+/// height and are full pills of the foreground at the mock's .07. Sizes here
+/// are at the default chrome text size; the painter multiplies by the chrome
+/// factor.
 const PILL_H: f32 = 32.0;
 const PILL_FILL: f32 = 0.07;
 /// A nav capsule cell, and the lock / info cell inside the address pill.
@@ -91,11 +99,13 @@ fn host(url: &str) -> String {
 }
 
 /// One bare cell of the nav capsule: a centred icon in the control ink,
-/// dimmed while disabled. The caller attaches the click.
+/// dimmed while disabled. `size` is the icon's and `ui` the chrome factor the
+/// cell and icon scale by. The caller attaches the click.
 fn nav_cell(
     id: String,
     path: impl Into<gpui::SharedString>,
     size: f32,
+    ui: f32,
     enabled: bool,
     strip: &StripStyle,
 ) -> gpui::Stateful<gpui::Div> {
@@ -104,14 +114,14 @@ fn nav_cell(
     div()
         .id(gpui::SharedString::from(id))
         .flex_shrink_0()
-        .w(px(NAV_CELL))
-        .h(px(NAV_CELL))
-        .rounded(px(NAV_CELL / 2.0))
+        .w(px(NAV_CELL * ui))
+        .h(px(NAV_CELL * ui))
+        .rounded(px(NAV_CELL * ui / 2.0))
         .flex()
         .items_center()
         .justify_center()
         .when(enabled, |cell| cell.cursor_pointer().hover(move |cell| cell.bg(hover)))
-        .child(icon(path, px(size), ink))
+        .child(icon(path, px(size * ui), ink))
 }
 
 impl App {
@@ -355,8 +365,18 @@ impl App {
         // Fills and the address text take the strip's ink too: the chrome
         // foreground can be the wrong polarity for a chosen terminal scheme.
         let pill = strip.ink.opacity(PILL_FILL);
-        self.webview_address
-            .update(cx, |input, _cx| input.set_text_color(Some(strip.ink)));
+        // One factor for the bar's height and everything in it, so the
+        // controls stay centred in the scaled bar.
+        let ui = crate::workspace::chrome_ui_scale();
+        let pill_h = PILL_H * ui;
+        let site_cell = SITE_CELL * ui;
+        let text_size = 12.5 * ui;
+        // Size set here rather than with the text, so a live text-size
+        // change reaches a field that is already mounted.
+        self.webview_address.update(cx, |input, _cx| {
+            input.set_text_color(Some(strip.ink));
+            input.set_text_size(Some(px(text_size)));
+        });
         let mut layer = div().absolute().left(px(0.0)).top(px(0.0)).size_full();
 
         for placement in placements {
@@ -368,7 +388,7 @@ impl App {
             let toolbar_height = if placement.toolbar_hidden {
                 0.0
             } else {
-                crate::webview::TOOLBAR_H.min(height.max(0.0))
+                crate::webview::toolbar_h().min(height.max(0.0))
             };
             let address_focused = self
                 .webview_address
@@ -382,10 +402,7 @@ impl App {
             {
                 self.webview_address_for = Some(id);
                 let url = placement.url.clone();
-                self.webview_address.update(cx, |input, cx| {
-                    input.set_text_size(Some(px(12.5)));
-                    input.set_text(url, cx);
-                });
+                self.webview_address.update(cx, |input, cx| input.set_text(url, cx));
             }
 
             // Only the focused pane's field can be mid-edit; every other pane,
@@ -399,6 +416,7 @@ impl App {
                     format!("webview-back-{id}"),
                     theme.icons.chevron_left(),
                     15.0,
+                    ui,
                     placement.can_go_back,
                     &strip,
                 )
@@ -417,6 +435,7 @@ impl App {
                     format!("webview-forward-{id}"),
                     theme.icons.chevron_right(),
                     15.0,
+                    ui,
                     placement.can_go_forward,
                     &strip,
                 )
@@ -432,7 +451,7 @@ impl App {
                 });
                 let reload_entity = entity.clone();
                 let reload =
-                    nav_cell(format!("webview-reload-{id}"), ICON_REFRESH, 14.0, true, &strip)
+                    nav_cell(format!("webview-reload-{id}"), ICON_REFRESH, 14.0, ui, true, &strip)
                         .on_click(move |_event: &ClickEvent, _window, app| {
                             if let Some(entity) = reload_entity.upgrade() {
                                 entity.update(app, |this, _cx| {
@@ -444,13 +463,13 @@ impl App {
                 // The nav capsule: one pill around three bare 26px cells.
                 let nav = div()
                     .flex_shrink_0()
-                    .h(px(PILL_H))
-                    .rounded(px(PILL_H / 2.0))
+                    .h(px(pill_h))
+                    .rounded(px(pill_h / 2.0))
                     .bg(pill)
-                    .px(px(6.0))
+                    .px(px(6.0 * ui))
                     .flex()
                     .items_center()
-                    .gap(px(2.0))
+                    .gap(px(2.0 * ui))
                     .child(back)
                     .child(forward)
                     .child(reload);
@@ -461,15 +480,15 @@ impl App {
                 let site = div()
                     .id(gpui::SharedString::from(format!("webview-site-{id}")))
                     .flex_shrink_0()
-                    .w(px(SITE_CELL))
-                    .h(px(SITE_CELL))
+                    .w(px(site_cell))
+                    .h(px(site_cell))
                     .flex()
                     .items_center()
                     .justify_center()
                     .cursor_pointer()
                     .child(icon(
                         if placement.url.starts_with("https://") { ICON_LOCK } else { ICON_INFO },
-                        px(13.0),
+                        px(13.0 * ui),
                         strip.ink_dim,
                     ))
                     .on_click(move |_event: &ClickEvent, _window, app| {
@@ -493,7 +512,7 @@ impl App {
                         .flex_1()
                         .min_w(px(0.0))
                         .h_full()
-                        .pr(px(SITE_CELL))
+                        .pr(px(site_cell))
                         .overflow_hidden()
                         .flex()
                         .items_center()
@@ -527,21 +546,21 @@ impl App {
                 };
                 let address = div()
                     .flex_1()
-                    .min_w(px(40.0))
+                    .min_w(px(40.0 * ui))
                     .flex()
                     .justify_center()
                     .child(
                         div()
                             .w_full()
-                            .max_w(px(420.0))
-                            .h(px(PILL_H))
-                            .rounded(px(PILL_H / 2.0))
+                            .max_w(px(420.0 * ui))
+                            .h(px(pill_h))
+                            .rounded(px(pill_h / 2.0))
                             .bg(pill)
-                            .px(px(5.0))
+                            .px(px(5.0 * ui))
                             .flex()
                             .items_center()
                             .overflow_hidden()
-                            .text_size(px(12.5))
+                            .text_size(px(text_size))
                             .text_color(strip.ink)
                             .child(site)
                             .child(field),
@@ -551,16 +570,16 @@ impl App {
                 let tools = div()
                     .id(gpui::SharedString::from(format!("webview-tools-{id}")))
                     .flex_shrink_0()
-                    .w(px(PILL_H))
-                    .h(px(PILL_H))
-                    .rounded(px(PILL_H / 2.0))
+                    .w(px(pill_h))
+                    .h(px(pill_h))
+                    .rounded(px(pill_h / 2.0))
                     .bg(pill)
                     .flex()
                     .items_center()
                     .justify_center()
                     .cursor_pointer()
                     .hover(move |cell| cell.bg(strip.ink.opacity(2.0 * PILL_FILL)))
-                    .child(icon(ICON_ELLIPSIS, px(15.0), strip.ink.opacity(NAV_ENABLED)))
+                    .child(icon(ICON_ELLIPSIS, px(15.0 * ui), strip.ink.opacity(NAV_ENABLED)))
                     .on_click(move |_event: &ClickEvent, _window, app| {
                         if let Some(entity) = tools_entity.upgrade() {
                             entity.update(app, |this, _cx| this.toggle_webview_tools_panel(id));
@@ -577,10 +596,10 @@ impl App {
                     .w(px(width))
                     .h(px(toolbar_height))
                     .overflow_hidden()
-                    .px(px(10.0))
+                    .px(px(10.0 * ui))
                     .flex()
                     .items_center()
-                    .gap(px(8.0))
+                    .gap(px(8.0 * ui))
                     .bg(ground)
                     .border_b_1()
                     .border_color(strip.ink.opacity(0.06))
