@@ -48,8 +48,6 @@ raw-window-handle = "0.6"
 # the module no-ops on other platforms.
 global-hotkey = "0.8"
 serde = { version = "1", features = ["derive"] }
-# Native child webviews for webview tabs (WebViewBuilder::build_as_child).
-wry = { version = "0.56.1", features = ["devtools"] }
 serde_json = "1"
 dirs = "6"
 rusqlite = { version = "0.32", features = ["bundled"] }
@@ -63,6 +61,12 @@ unicode-segmentation = "1"
 # the whole graph resolves to ONE gpui — otherwise gpui's Window/App types would
 # not unify across the crate boundary and nothing would compile.
 gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "f3ba893bd6a996ab0699266ba774b5bbb7f0ca1c" }
+# Chromium for webview tabs, rendered off-screen (see `src/webview_cef.rs`).
+# The build script downloads the matching CEF binary distribution into the
+# target dir (or `$CEF_PATH`) and needs cmake + ninja for the C++ wrapper.
+# No default features: `build-util` is cef-rs's own bundler, which
+# `scripts/make-app.sh` replaces.
+cef = { version = "154", default-features = false, features = ["sandbox"] }
 
 # objc 0.2's msg_send! probes `feature = "cargo-clippy"` inside its expansion,
 # which rustc's check-cfg would flag at every call site. Registering the value
@@ -89,3 +93,9 @@ path = "src/main.rs"
 [[bin]]
 name = "pwrde-cli"
 path = "src/bin/pwrde-cli.rs"
+
+# CEF subprocess (renderer / GPU / utility) entry point; bundled as the
+# `Pwrde Helper*.app`s by `scripts/make-app.sh`.
+[[bin]]
+name = "pwrde-helper"
+path = "src/bin/pwrde-helper.rs"

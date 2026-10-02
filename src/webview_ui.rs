@@ -1,4 +1,4 @@
-//! GPUI-owned browser chrome for native Wry child views.
+//! GPUI-owned browser chrome over the web tabs' off-screen Chromium pages.
 //!
 //! The toolbar follows the GANTRY Workspace mock: a 48px bar on the pane
 //! ground (8px above and below 32px controls, 10px at the sides, 8px between
@@ -20,9 +20,10 @@
 //! header, cookies / permissions / certificate rows, clear data) centred under
 //! the address pill, and Tools (find field, zoom stepper, open in browser,
 //! copy link, print, developer tools, send to agent, clear data) hanging from
-//! the More button's right edge. A native child view paints over everything
-//! this window draws, so the cards live in their own chrome-less window
-//! (`webview_popover_window`) and never reflow the page; this file owns the
+//! the More button's right edge. The cards live in their own chrome-less
+//! window (`webview_popover_window`) — a holdover from when the page was a
+//! native child view that painted over everything this window drew — and
+//! never reflow the page; this file owns the
 //! model (`App::webview_panel`), the cards' element trees
 //! (`App::webview_popover_card`), their fixed sizes and the pure anchor
 //! geometry ([`anchor_rect`]), which shares the toolbar's layout constants.
@@ -496,7 +497,7 @@ impl App {
 
     fn confirm_clear_webview_data(&mut self, id: u64) {
         self.confirm = Some(crate::ConfirmClose {
-            text: "Clear cookies, cache, local storage, and other website data for all webviews?"
+            text: "Clear cookies and cache for all webviews, and this site's stored data?"
                 .into(),
             action: crate::ConfirmAction::ClearWebviewData { id },
         });
@@ -816,9 +817,9 @@ impl App {
                             gpui::MouseButton::Left,
                             move |_event, window, app: &mut GpuiApp| {
                                 // A press on an unfocused pane only focuses
-                                // it (the bar's own handler): the native view
-                                // takes key focus on that switch, so an edit
-                                // begun in the same press would type into the
+                                // it (the bar's own handler): the page takes
+                                // key focus on that switch, so an edit begun
+                                // in the same press would type into the
                                 // page.
                                 if !focused {
                                     return;
@@ -937,7 +938,16 @@ impl App {
         let id = panel.id();
         let (width, height) = card_size(panel.kind());
         let body = match panel {
-            Panel::Site { cookies, .. } => self.site_card(id, &cookies, &theme, &entity),
+            Panel::Site { cookies, .. } => {
+                // The count is a cache Chromium refreshes in the background:
+                // read it live, so the figure taken when the popover opened
+                // is replaced as soon as the fresh one lands.
+                let cookies = match self.webview_tab_url(id) {
+                    Some(url) => self.webviews.cookie_count(id, &url),
+                    None => cookies,
+                };
+                self.site_card(id, &cookies, &theme, &entity)
+            },
             Panel::Tools { .. } => self.tools_card(id, &theme, &entity, window, cx),
         };
         body.w(px(width))

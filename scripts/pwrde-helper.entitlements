@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Entitlements for the CEF helper bundles (Pwrde Helper*.app), which run
+  Chromium's renderer, GPU and utility processes. make-app.sh signs every
+  helper with these in both the ad-hoc and the Developer ID path. None of
+  them is restricted, so no provisioning profile is involved; they only
+  matter under the hardened runtime, which a Developer ID build turns on.
+-->
+<plist version="1.0">
+<dict>
+	<!-- V8 compiles JavaScript and WebAssembly to machine code at run time. -->
+	<key>com.apple.security.cs.allow-jit</key>
+	<true/>
+	<key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+	<true/>
+	<!-- Helpers load the CEF framework's libraries (ANGLE, SwiftShader). -->
+	<key>com.apple.security.cs.disable-library-validation</key>
+	<true/>
+</dict>
+</plist>

@@ -1,11 +1,13 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  Entitlements template for a Developer ID build of Pwrde.app. make-app.sh
-  substitutes @TEAM_ID@ / @BUNDLE_ID@ and signs with the result only when
-  PWRDE_SIGN_IDENTITY and PWRDE_PROVISION_PROFILE are set; ad-hoc builds
-  get no entitlements at all, because macOS SIGKILLs an ad-hoc binary that
-  claims the restricted web-browser entitlement below.
+  Entitlements template for the *main* executable of a Developer ID build of
+  Pwrde.app. make-app.sh substitutes @TEAM_ID@ / @BUNDLE_ID@ and signs the app
+  with the result only when PWRDE_SIGN_IDENTITY, PWRDE_TEAM_ID and
+  PWRDE_PROVISION_PROFILE are all set; ad-hoc builds get no entitlements at
+  all, because macOS SIGKILLs an ad-hoc binary that claims the restricted
+  web-browser entitlement below. The CEF helper bundles are signed with
+  pwrde-helper.entitlements instead.
 -->
 <plist version="1.0">
 <dict>
@@ -15,10 +17,13 @@
 	<key>com.apple.developer.team-identifier</key>
 	<string>@TEAM_ID@</string>
 	<!--
-	  Lets the embedded WKWebView use the platform authenticator (Touch ID /
-	  iCloud Keychain passkeys) for WebAuthn on any site. Granted by Apple per
-	  team through https://developer.apple.com/contact/request/macos-browsers-passkeys/
+	  Apple's browser passkey entitlement, granted per team through
+	  https://developer.apple.com/contact/request/macos-browsers-passkeys/
 	  (macOS 13.3+) and delivered as a managed capability in the profile.
+	  It was requested for the WKWebView web tabs, where it let WebKit use the
+	  platform authenticator (Touch ID / iCloud Keychain passkeys). Web tabs
+	  are Chromium (CEF) now, so that WebKit path no longer applies; whether
+	  Chromium's own passkey support works in this embedding is untested.
 	-->
 	<key>com.apple.developer.web-browser.public-key-credential</key>
 	<true/>

@@ -57,8 +57,9 @@ pub enum TermEvent {
     /// `git.open_pr_in_webview` setting is on. The worker thread cannot touch
     /// `App`, so the URL comes back here and the main thread opens the tab.
     OpenPrUrl { url: String },
-    /// A Wry top-level navigation committed; folded into the owning tab on
-    /// the main thread so its address, title, and persisted URL stay current.
+    /// A web tab's top-level address changed (a navigation committed, or the
+    /// page rewrote its URL); folded into the owning tab on the main thread
+    /// so its address, title, and persisted URL stay current.
     WebviewNavigated { id: u64, url: String },
     /// A webview tab's profile `url_command` finished on a background thread
     /// and its first non-empty stdout line resolved to `url`; folded into the
@@ -68,8 +69,8 @@ pub enum TermEvent {
     /// the tab stays on its fallback page and `message` is shown as a
     /// dismissable status note if the tab is still open.
     WebviewUrlFailed { id: u64, message: String },
-    /// The native view's document title changed (empty while a new document
-    /// loads); folded into the owning tab so its strip label tracks `<title>`.
+    /// The page's document title changed; folded into the owning tab so its
+    /// strip label tracks `<title>`.
     WebviewTitleChanged { id: u64, title: String },
     /// A webview page reported its favicon on load: the page's `origin` and
     /// the validated icon URL to fetch (`None` for a page with no usable icon,
@@ -78,9 +79,14 @@ pub enum TermEvent {
     /// A background favicon fetch for `url` finished; `None` when it failed
     /// or could not be decoded, so tabs showing it keep the globe.
     FaviconLoaded { url: String, image: Option<Arc<gpui::RenderImage>> },
-    /// Pointer focus entered a native child view; keep the owning tile as the
-    /// workspace focus target for tab and address-bar actions.
+    /// A mouse button went down in a web tab's page; keep the owning tile as
+    /// the workspace focus target for tab and address-bar actions.
     WebviewFocused { id: u64 },
+    /// Web tab `id` has something new to show — Chromium painted a frame, the
+    /// page asked for another cursor, its back / forward state or cookie
+    /// count moved. Coalesced per tab until the next paint consumes it, so an
+    /// idle page costs no redraws.
+    WebviewFrame { id: u64 },
     /// A background `git_context::fetch` finished for `cwd`. The blocking git
     /// and `gh` calls must never run on the main thread, so the aggregate
     /// comes back here and is folded into `App::git_contexts`.

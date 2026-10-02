@@ -1,47 +1,43 @@
-//! Main-thread lifecycle for native Wry child views.
+//! Main-thread lifecycle of web tabs: one off-screen Chromium page per tab.
 //!
-//! Also the favicon plumbing for web tabs: the initialization script posts
-//! each page's icon link over IPC ([`favicon_request`] validates it into a
-//! [`TermEvent::WebviewFaviconChanged`]), and [`fetch_favicon`] — called from a
-//! background thread only — downloads and decodes it for the tab strips.
+//! [`Manager::sync`] reconciles the pages with the tab model — creating a
+//! page for a newly visible tab, resizing, hiding (`was_hidden`) and closing
+//! them — and the rest of [`Manager`] is what the browser chrome drives:
+//! navigation, zoom, find, print, DevTools, cookies. The engine itself lives
+//! in [`crate::webview_cef`]; nothing here calls CEF directly.
+//!
+//! Chromium renders each page off-screen. [`Manager::page_images`] turns the
+//! frames that changed into `RenderImage`s the terminal `Element` paints at
+//! the placement's bounds ([`child_bounds`]), and the pointer / key methods
+//! forward gpui input to the page under the pointer or with focus.
+//!
+//! Also the favicon plumbing for web tabs: Chromium reports each page's icon
+//! links ([`favicon_choice`] picks one, [`favicon_request`] validates it into
+//! a [`TermEvent::WebviewFaviconChanged`]), and [`fetch_favicon`] — called
+//! from a background thread only — downloads and decodes it for the tab
+//! strips.
 
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
+use std::sync::Arc;
 use std::sync::mpsc::Sender;
 
 use gpui::{RenderImage, Window};
-use wry::dpi::{PhysicalPosition, PhysicalSize};
-use wry::{PageLoadEvent, Rect, WebView, WebViewBuilder};
 
 use crate::term::TermEvent;
+use crate::webview_cef::{self as engine, Button, EditCommand, Host, Mods};
 use crate::workspace::LayoutRect;
 
-/// Browser chrome is GPUI-owned; the native child starts below it. This is
-/// the toolbar's height at the default chrome text size — the live height is
+/// Browser chrome is GPUI-owned; the page starts below it. This is the
+/// toolbar's height at the default chrome text size — the live height is
 /// [`toolbar_h`].
 pub const TOOLBAR_H: f32 = 48.0;
 
-/// Safari's own user agent for the native child views. WKWebView's default
-/// carries no `Version/` or `Safari/` product token, so sites like Google
-/// treat it as an unknown legacy browser and serve their fallback layouts.
-/// It must stay a *Safari* string rather than a Chrome one: the engine really
-/// is WebKit, and Google's sign-in refuses ("This browser or app may not be
-/// secure") when the advertised browser and the engine's fingerprint disagree.
-pub const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
-AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15";
-
-/// IPC prefix of the favicon report: `<prefix><icon href>\n<page URL>`.
-const FAVICON_IPC: &str = "pwrde:favicon:";
-/// Posted from the top frame once the document has parsed and again on load
-/// (sites that inject their icon link late): the first non-SVG
-/// `link[rel~="icon"]` href — empty when the page names none — and the page's
-/// own URL, which [`favicon_request`] falls back to `<origin>/favicon.ico` on.
-const INIT_SCRIPT: &str = "addEventListener('pointerdown',()=>window.ipc.postMessage('pwrde:webview-focus'),true);\
-if(window.top===window){const post=()=>{const l=[...document.querySelectorAll('link[rel~=\"icon\"]')]\
-.find(l=>l.href&&!/svg/i.test(l.type)&&!/\\.svg([?#]|$)/i.test(l.href));\
-window.ipc.postMessage('pwrde:favicon:'+(l?l.href:'')+'\\n'+location.href)};\
-if(document.readyState==='loading')addEventListener('DOMContentLoaded',post);else post();\
-addEventListener('load',post)}";
+/// The user agent the favicon fetcher presents: the reduced Chrome string
+/// the pages themselves see from the engine, so an icon host answers curl as
+/// it would the tab.
+const FETCH_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
+AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36";
 
 /// Favicon fetch limits: response bytes, wall-clock seconds, and the edge the
 /// decoded icon is resampled to (the strip paints it at 14 logical px, so
@@ -85,7 +81,22 @@ pub fn favicon_fetchable(url: &str) -> bool {
         && origin(url).is_some()
 }
 
-/// Parse a favicon IPC report (the body after [`FAVICON_IPC`]) into the page's
+/// The icon to ask for among the links a page declared (Chromium's
+/// `on_favicon_urlchange` list, in document order): the first one the fetcher
+/// accepts that is not an SVG, which the decoder cannot read. Empty when
+/// there is none, which [`favicon_request`] turns into `/favicon.ico`.
+pub fn favicon_choice(icons: &[String]) -> &str {
+    icons
+        .iter()
+        .map(String::as_str)
+        .find(|href| {
+            let path = href.split(['?', '#']).next().unwrap_or(href);
+            favicon_fetchable(href) && !path.to_ascii_lowercase().ends_with(".svg")
+        })
+        .unwrap_or("")
+}
+
+/// Parse a favicon report (`<icon href>\n<page URL>`) into the page's
 /// origin and the icon URL to fetch: the page's own link when it is fetchable,
 /// else `<origin>/favicon.ico`. `None` when the page itself is not http(s)
 /// (a blank or internal page), which clears the tab's icon.
@@ -181,7 +192,7 @@ pub fn fetch_favicon(url: &str) -> Option<RenderImage> {
     let mut child = std::process::Command::new("/usr/bin/curl")
         .args(["-q", "-gsfL", "--max-time", FAVICON_TIMEOUT_SECS, "--max-filesize", &max])
         .args(["--max-redirs", "5", "--proto", "=http,https", "--proto-redir", "=http,https"])
-        .args(["-A", USER_AGENT, "--", url])
+        .args(["-A", FETCH_USER_AGENT, "--", url])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -217,7 +228,7 @@ pub fn normalize_input(value: &str) -> Result<String, String> {
 /// Logical height of the browser toolbar: [`TOOLBAR_H`] scaled with
 /// `appearance.font_size` by the factor the tab strips and the sidebar use
 /// ([`crate::workspace::chrome_ui_scale`]). `webview_ui` paints the bar this
-/// tall and `sync_webviews` reserves the same height above the native view.
+/// tall and `sync_webviews` reserves the same height above the page.
 pub fn toolbar_h() -> f32 {
     toolbar_h_at(crate::workspace::chrome_ui_scale())
 }
@@ -227,7 +238,7 @@ fn toolbar_h_at(ui: f32) -> f32 {
     TOOLBAR_H * ui
 }
 
-/// Convert the tile content rect (physical pixels) into the child-view rect,
+/// Convert the tile content rect (physical pixels) into the page rect,
 /// reserving logical pixels for the browser toolbar (`0.0` when the tab hides
 /// its title bar). The Site / Tools popovers are their own window and reserve
 /// nothing: the page fills the tile below the bar whether or not one is open.
@@ -249,10 +260,12 @@ pub struct Placement {
 }
 
 struct Entry {
-    view: WebView,
+    host: Host,
     bounds: LayoutRect,
     visible: bool,
-    zoom: f64,
+    /// The last frame Chromium painted, as gpui paints it, and its size in
+    /// device pixels.
+    image: Option<(Arc<RenderImage>, u32, u32)>,
 }
 
 #[derive(Clone, Debug)]
@@ -262,15 +275,45 @@ pub struct BrowserState {
     pub zoom_percent: u16,
 }
 
+/// One visible page for the terminal `Element` to paint: `image` is
+/// `w`×`h` device pixels and goes 1:1 at the top-left of `bounds` (physical
+/// pixels), clipped to it.
+pub struct PageImage {
+    pub bounds: LayoutRect,
+    pub image: Arc<RenderImage>,
+    pub w: u32,
+    pub h: u32,
+}
+
+/// A gpui image over one BGRA frame. gpui's `RenderImage` frames are BGRA
+/// already (see `renderer::render_image`), and the page is opaque, so
+/// Chromium's buffer goes in as is.
+fn page_image(w: u32, h: u32, bgra: Vec<u8>) -> Option<RenderImage> {
+    let buffer = image::RgbaImage::from_raw(w, h, bgra)?;
+    Some(RenderImage::new(vec![image::Frame::new(buffer)]))
+}
+
 #[derive(Default)]
 pub struct Manager {
     entries: HashMap<u64, Entry>,
     failed: HashSet<u64>,
     focused: Option<u64>,
+    /// Display scale the visible pages were last laid out at.
+    scale: f32,
+    events: Option<Sender<TermEvent>>,
+    /// The page a mouse button went down in and the buttons still down
+    /// there: it owns the pointer until the last of them comes back up — a
+    /// drag selection may leave the page.
+    pressed: Option<(u64, Vec<Button>)>,
+    /// The page the pointer was last over, owed a leave event.
+    hovered: Option<u64>,
+    /// Replaced or orphaned frame images whose gpui textures are still to be
+    /// dropped ([`Manager::take_retired`]).
+    retired: Vec<Arc<RenderImage>>,
 }
 
 impl Manager {
-    /// Reconcile native views with the tab model. `live` includes webviews in
+    /// Reconcile pages with the tab model. `live` includes webviews in
     /// every group; `placements` contains only views visible in this frame.
     pub fn sync(
         &mut self,
@@ -281,12 +324,18 @@ impl Manager {
         events: &Sender<TermEvent>,
     ) -> Option<String> {
         let mut first_error = None;
+        let scale = window.scale_factor();
+        let rescaled = scale != self.scale;
+        self.scale = scale;
+        self.events.get_or_insert_with(|| events.clone());
         let visible: HashSet<u64> = placements.iter().map(|p| p.id).collect();
+        let retired = &mut self.retired;
         self.entries.retain(|id, entry| {
             if live.contains(id) {
                 true
             } else {
-                let _ = entry.view.focus_parent();
+                entry.host.close();
+                retired.extend(entry.image.take().map(|(image, ..)| image));
                 false
             }
         });
@@ -301,67 +350,48 @@ impl Manager {
         self.failed
             .retain(|id| live.contains(id) && visible.contains(id));
 
+        // Before the page is hidden, while it still takes input.
+        if self.captor().is_some_and(|id| !visible.contains(&id)) {
+            self.release_pointer();
+        }
         for (id, entry) in &mut self.entries {
             if !visible.contains(id) && entry.visible {
-                let _ = entry.view.focus_parent();
-                let _ = entry.view.set_visible(false);
+                entry.host.set_focus(false);
+                entry.host.set_hidden(true);
                 entry.visible = false;
             }
+        }
+        if self.hovered.is_some_and(|id| !visible.contains(&id)) {
+            self.hovered = None;
         }
 
         for placement in placements {
             if let Some(entry) = self.entries.get_mut(&placement.id) {
-                if entry.bounds != placement.bounds {
-                    let _ = entry.view.set_bounds(wry_rect(&placement.bounds));
+                if entry.bounds != placement.bounds || rescaled {
+                    entry.host.resize(engine::view_size(placement.bounds, scale), scale);
                     entry.bounds = placement.bounds;
                 }
                 if !entry.visible {
-                    let _ = entry.view.set_visible(true);
+                    entry.host.set_hidden(false);
                     entry.visible = true;
                 }
             } else if !self.failed.contains(&placement.id) {
-                let id = placement.id;
-                let load_events = events.clone();
-                let focus_events = events.clone();
-                let title_events = events.clone();
-                let icon_events = events.clone();
-                match WebViewBuilder::new()
-                    .with_url(&placement.url)
-                    .with_user_agent(USER_AGENT)
-                    .with_bounds(wry_rect(&placement.bounds))
-                    .with_visible(true)
-                    .with_devtools(true)
-                    .with_initialization_script(INIT_SCRIPT)
-                    .with_ipc_handler(move |request| {
-                        if request.body() == "pwrde:webview-focus" {
-                            let _ = focus_events.send(TermEvent::WebviewFocused { id });
-                        } else if let Some(report) = request.body().strip_prefix(FAVICON_IPC) {
-                            let (origin, icon) = favicon_request(report).unzip();
-                            let _ = icon_events.send(TermEvent::WebviewFaviconChanged {
-                                id,
-                                origin: origin.unwrap_or_default(),
-                                icon,
-                            });
-                        }
-                    })
-                    .with_on_page_load_handler(move |event, url| {
-                        if matches!(event, PageLoadEvent::Finished) {
-                            let _ = load_events.send(TermEvent::WebviewNavigated { id, url });
-                        }
-                    })
-                    .with_document_title_changed_handler(move |title| {
-                        let _ = title_events.send(TermEvent::WebviewTitleChanged { id, title });
-                    })
-                    .build_as_child(window)
-                {
-                    Ok(view) => {
+                match Host::create(
+                    placement.id,
+                    &placement.url,
+                    engine::view_size(placement.bounds, scale),
+                    scale,
+                    parent_view(window),
+                    events,
+                ) {
+                    Ok(host) => {
                         self.entries.insert(
                             placement.id,
                             Entry {
-                                view,
+                                host,
                                 bounds: placement.bounds,
                                 visible: true,
-                                zoom: 1.0,
+                                image: None,
                             },
                         );
                     }
@@ -378,22 +408,204 @@ impl Manager {
         let focus = focus.filter(|id| visible.contains(id));
         if focus != self.focused {
             if let Some(previous) = self.focused.and_then(|id| self.entries.get(&id)) {
-                let _ = previous.view.focus_parent();
+                previous.host.set_focus(false);
             }
             if let Some(entry) = focus.and_then(|id| self.entries.get(&id)) {
-                let _ = entry.view.focus();
+                entry.host.set_focus(true);
             }
             self.focused = focus;
         }
         first_error
     }
 
+    /// The visible pages to paint this frame. Pages whose pixels changed
+    /// since the last call get a new image; the one it replaces is retired.
+    pub fn page_images(&mut self) -> Vec<PageImage> {
+        let mut pages = Vec::new();
+        for entry in self.entries.values_mut().filter(|entry| entry.visible) {
+            if let Some((w, h, bgra)) = entry.host.take_frame()
+                && let Some(image) = page_image(w, h, bgra)
+            {
+                let old = entry.image.replace((Arc::new(image), w, h));
+                self.retired.extend(old.map(|(image, ..)| image));
+            }
+            if let Some((image, w, h)) = &entry.image {
+                pages.push(PageImage { bounds: entry.bounds, image: image.clone(), w: *w, h: *h });
+            }
+        }
+        pages
+    }
+
+    /// Images no page shows any more; the caller drops their gpui textures
+    /// (`Window::drop_image`), which needs the window this type never holds.
+    pub fn take_retired(&mut self) -> Vec<Arc<RenderImage>> {
+        std::mem::take(&mut self.retired)
+    }
+
+    /// The visible page under a physical-pixel window point.
+    fn page_at(&self, x: f32, y: f32) -> Option<u64> {
+        self.entries
+            .iter()
+            .find(|(_, entry)| entry.visible && engine::in_bounds(entry.bounds, x, y))
+            .map(|(id, _)| *id)
+    }
+
+    /// The page that has the keyboard: the focused tile's visible web tab.
+    pub fn focused(&self) -> Option<u64> {
+        self.focused
+    }
+
+    /// Whether a page holds the pointer because a button went down in it.
+    pub fn pointer_captured(&self) -> bool {
+        self.pressed.is_some()
+    }
+
+    /// The cursor the page under the point asks for (the capturing page's
+    /// during a drag).
+    pub fn cursor_at(&self, x: f32, y: f32) -> Option<gpui::CursorStyle> {
+        let id = self.captor().or_else(|| self.page_at(x, y))?;
+        self.entries.get(&id)?.host.cursor()
+    }
+
+    /// The page holding the pointer, if a button is down in one.
+    fn captor(&self) -> Option<u64> {
+        self.pressed.as_ref().map(|(id, _)| *id)
+    }
+
+    /// Give the capturing page the release of every button it still holds
+    /// (it is going away or being hidden mid-press, so the real release will
+    /// not reach it) and drop the capture.
+    fn release_pointer(&mut self) {
+        let Some((id, held)) = self.pressed.take() else { return };
+        if let Some(entry) = self.entries.get(&id) {
+            for button in held {
+                entry.host.mouse_button(0, 0, 0, button, true, 1);
+            }
+        }
+    }
+
+    fn point(&self, entry: &Entry, x: f32, y: f32) -> (i32, i32) {
+        engine::page_point(entry.bounds, self.scale, x, y)
+    }
+
+    /// Pointer motion at a physical-pixel window point: to the page holding
+    /// the pointer, else the one under it; a page the pointer just left gets
+    /// its leave event. True when a page took the move.
+    pub fn pointer_move(&mut self, x: f32, y: f32, mods: Mods) -> bool {
+        let held = self.pressed.as_ref().and_then(|(_, held)| held.first().copied());
+        let target = self.captor().or_else(|| self.page_at(x, y));
+        let flags = engine::event_flags(mods, held);
+        if self.hovered != target {
+            if let Some(entry) = self.hovered.and_then(|id| self.entries.get(&id)) {
+                let (px, py) = self.point(entry, x, y);
+                entry.host.mouse_move(px, py, flags, true);
+            }
+            self.hovered = target;
+        }
+        let Some(entry) = target.and_then(|id| self.entries.get(&id)) else { return false };
+        let (px, py) = self.point(entry, x, y);
+        entry.host.mouse_move(px, py, flags, false);
+        true
+    }
+
+    /// A button press at a window point. When it lands in a page the page
+    /// gets it, captures the pointer, and reports itself focused
+    /// ([`TermEvent::WebviewFocused`]); returns that page's id.
+    pub fn pointer_down(
+        &mut self,
+        x: f32,
+        y: f32,
+        button: Button,
+        clicks: usize,
+        mods: Mods,
+    ) -> Option<u64> {
+        // A second button while one is held goes to the page holding the first.
+        let id = self.captor().or_else(|| self.page_at(x, y))?;
+        let entry = self.entries.get(&id)?;
+        let (px, py) = self.point(entry, x, y);
+        entry.host.mouse_button(px, py, engine::event_flags(mods, Some(button)), button, false, clicks);
+        let held = &mut self.pressed.get_or_insert_with(|| (id, Vec::new())).1;
+        if !held.contains(&button) {
+            held.push(button);
+        }
+        if let Some(events) = &self.events {
+            let _ = events.send(TermEvent::WebviewFocused { id });
+        }
+        Some(id)
+    }
+
+    /// The release of a button that went down in a page. False when no page
+    /// holds that button, so the caller handles the release itself.
+    pub fn pointer_up(&mut self, x: f32, y: f32, button: Button, mods: Mods) -> bool {
+        let Some((id, held)) = &mut self.pressed else { return false };
+        let Some(at) = held.iter().position(|held| *held == button) else { return false };
+        held.remove(at);
+        let id = *id;
+        if held.is_empty() {
+            self.pressed = None;
+        }
+        if let Some(entry) = self.entries.get(&id) {
+            let (px, py) = self.point(entry, x, y);
+            entry.host.mouse_button(px, py, engine::event_flags(mods, None), button, true, 1);
+        }
+        true
+    }
+
+    /// A wheel / trackpad scroll over a page. `lines` for wheel notches,
+    /// otherwise the deltas are logical pixels.
+    pub fn wheel(&mut self, x: f32, y: f32, lines: bool, dx: f32, dy: f32, mods: Mods) -> bool {
+        let Some(entry) = self.page_at(x, y).and_then(|id| self.entries.get(&id)) else {
+            return false;
+        };
+        let (px, py) = self.point(entry, x, y);
+        let precise = if lines { 0 } else { engine::FLAG_PRECISION_SCROLL };
+        let flags = engine::event_flags(mods, None) | precise;
+        entry.host.mouse_wheel(px, py, flags, engine::wheel_delta(lines, dx, dy));
+        true
+    }
+
+    /// A key-down for the focused page: the ⌘ editing chords run as frame
+    /// commands, everything else is forwarded as key and character events.
+    pub fn key_down(&self, id: u64, key: &str, key_char: Option<&str>, mods: Mods, repeat: bool) {
+        let Some(entry) = self.entries.get(&id) else { return };
+        if let Some(command) = engine::edit_command(key, mods) {
+            entry.host.edit(command);
+            return;
+        }
+        entry.host.key_down(&engine::key_down_plan(key, key_char, mods, repeat));
+    }
+
+    pub fn key_up(&self, id: u64, key: &str, mods: Mods) {
+        if let (Some(entry), Some(codes)) = (self.entries.get(&id), engine::key_codes(key)) {
+            entry.host.key_up(codes, engine::event_flags(mods, None) | engine::implied_shift(key));
+        }
+    }
+
+    /// Run an editing command (copy, paste, …) in page `id`.
+    pub fn edit(&self, id: u64, command: EditCommand) {
+        if let Some(entry) = self.entries.get(&id) {
+            entry.host.edit(command);
+        }
+    }
+
+    /// Close every page and shut the engine down. Run on quit, and again —
+    /// as a no-op — when the manager drops.
+    pub fn shutdown(&mut self) {
+        for (_, entry) in self.entries.drain() {
+            entry.host.close();
+        }
+        self.focused = None;
+        self.pressed = None;
+        self.hovered = None;
+        engine::shutdown();
+    }
+
     pub fn state(&self, id: u64) -> Option<BrowserState> {
         let entry = self.entries.get(&id)?;
         Some(BrowserState {
-            can_go_back: entry.view.can_go_back().unwrap_or(false),
-            can_go_forward: entry.view.can_go_forward().unwrap_or(false),
-            zoom_percent: (entry.zoom * 100.0).round() as u16,
+            can_go_back: entry.host.can_go_back(),
+            can_go_forward: entry.host.can_go_forward(),
+            zoom_percent: (entry.host.zoom() * 100.0).round() as u16,
         })
     }
 
@@ -403,121 +615,104 @@ impl Manager {
             .ok_or_else(|| "webview is not ready yet".into())
     }
 
-    fn entry_mut(&mut self, id: u64) -> Result<&mut Entry, String> {
-        self.entries
-            .get_mut(&id)
-            .ok_or_else(|| "webview is not ready yet".into())
-    }
-
     pub fn navigate(&self, id: u64, url: &str) -> Result<(), String> {
-        self.entry(id)?
-            .view
-            .load_url(url)
-            .map_err(|e| format!("navigate: {e}"))
+        self.entry(id)?.host.navigate(url)
     }
 
     pub fn reload(&self, id: u64) -> Result<(), String> {
-        self.entry(id)?
-            .view
-            .reload()
-            .map_err(|e| format!("reload: {e}"))
+        self.entry(id)?.host.reload();
+        Ok(())
     }
 
     pub fn go_back(&self, id: u64) -> Result<(), String> {
-        self.entry(id)?
-            .view
-            .go_back()
-            .map_err(|e| format!("back: {e}"))
+        self.entry(id)?.host.go_back();
+        Ok(())
     }
 
     pub fn go_forward(&self, id: u64) -> Result<(), String> {
-        self.entry(id)?
-            .view
-            .go_forward()
-            .map_err(|e| format!("forward: {e}"))
+        self.entry(id)?.host.go_forward();
+        Ok(())
     }
 
     pub fn set_zoom(&mut self, id: u64, zoom: f64) -> Result<u16, String> {
-        let entry = self.entry_mut(id)?;
+        let entry = self.entry(id)?;
         let zoom = zoom.clamp(0.5, 3.0);
-        entry.view.zoom(zoom).map_err(|e| format!("zoom: {e}"))?;
-        entry.zoom = zoom;
+        entry.host.set_zoom(zoom).map_err(|e| format!("zoom: {e}"))?;
         Ok((zoom * 100.0).round() as u16)
     }
 
     pub fn zoom(&mut self, id: u64, delta: f64) -> Result<u16, String> {
-        let current = self.entry(id)?.zoom;
+        // From the page's live zoom, rounded to the stepper's whole percent.
+        let current = (self.entry(id)?.host.zoom() * 100.0).round() / 100.0;
         self.set_zoom(id, current + delta)
     }
 
     pub fn print(&self, id: u64) -> Result<(), String> {
-        self.entry(id)?
-            .view
-            .print()
-            .map_err(|e| format!("print: {e}"))
+        self.entry(id)?.host.print().map_err(|e| format!("print: {e}"))
     }
 
     pub fn open_devtools(&self, id: u64) -> Result<(), String> {
-        self.entry(id)?.view.open_devtools();
-        Ok(())
-    }
-
-    pub fn cookie_count(&self, id: u64, url: &str) -> Result<usize, String> {
         self.entry(id)?
-            .view
-            .cookies_for_url(url)
-            .map(|cookies| cookies.len())
-            .map_err(|e| format!("cookies: {e}"))
+            .host
+            .open_devtools()
+            .map_err(|e| format!("developer tools: {e}"))
     }
 
+    /// The number of cookies `url` is sent. Answered from a cache Chromium
+    /// refreshes in the background (the main thread never waits on it): a
+    /// changed count arrives as a redraw, by which time this returns it.
+    pub fn cookie_count(&self, id: u64, url: &str) -> Result<usize, String> {
+        self.entry(id)?;
+        let events = self.events.as_ref().ok_or("webview is not ready yet")?;
+        engine::cookie_count(url, id, events).map_err(|e| format!("cookies: {e}"))
+    }
+
+    /// Clear cookies and the HTTP cache for every web tab, and the stored
+    /// data (local storage, IndexedDB, …) of the site tab `id` is showing.
     pub fn clear_browsing_data(&self, id: u64) -> Result<(), String> {
         self.entry(id)?
-            .view
-            .clear_all_browsing_data()
+            .host
+            .clear_browsing_data()
             .map_err(|e| format!("clear browsing data: {e}"))
     }
 
     pub fn find(&self, id: u64, query: &str) -> Result<(), String> {
-        let query = serde_json::to_string(query).map_err(|e| e.to_string())?;
         self.entry(id)?
-            .view
-            .evaluate_script(&format!("window.find({query}, false, false, true)"))
+            .host
+            .find(query)
             .map_err(|e| format!("find in page: {e}"))
     }
 
     pub fn focus(&self, id: u64) {
         if let Some(entry) = self.entries.get(&id) {
-            let _ = entry.view.focus();
+            entry.host.set_focus(true);
         }
     }
 }
 
-fn wry_rect(rect: &LayoutRect) -> Rect {
-    Rect {
-        position: PhysicalPosition::new(rect.x.round() as i32, rect.y.round() as i32).into(),
-        size: PhysicalSize::new(
-            rect.w.max(1.0).round() as u32,
-            rect.h.max(1.0).round() as u32,
-        )
-        .into(),
+/// Closing the window releases the app view — and this with it — before
+/// gpui's quit observers run, so the engine is shut down here too.
+impl Drop for Manager {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// The gpui window's `NSView`, which Chromium parents its dialogs to; null
+/// (the main screen, no parent) when the handle is unavailable.
+fn parent_view(window: &Window) -> *mut std::os::raw::c_void {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    // Explicit trait call: gpui's `Window` has an inherent `window_handle()`.
+    match HasWindowHandle::window_handle(window).map(|handle| handle.as_raw()) {
+        Ok(RawWindowHandle::AppKit(appkit)) => appkit.ns_view.as_ptr(),
+        _ => std::ptr::null_mut(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn wry_bounds_round_and_never_collapse_to_zero() {
-        let rect = wry_rect(&LayoutRect {
-            x: 10.6,
-            y: 20.4,
-            w: 0.0,
-            h: 30.6,
-        });
-        assert_eq!(rect.position, PhysicalPosition::new(11, 20).into());
-        assert_eq!(rect.size, PhysicalSize::new(1, 31).into());
-    }
 
     #[test]
     fn child_bounds_reserve_scaled_browser_chrome() {
@@ -541,7 +736,7 @@ mod tests {
         assert_eq!(tiny.h, 1.0);
     }
 
-    /// The toolbar follows the chrome text size, and the native view starts
+    /// The toolbar follows the chrome text size, and the page starts
     /// exactly below the scaled bar at any display scale.
     #[test]
     fn toolbar_height_scales_with_the_chrome_factor() {
@@ -569,7 +764,7 @@ mod tests {
         for scale in [0.5, 1.0, 2.0, 3.5] {
             let bounds = child_bounds(content, scale, 0.0);
             // Independent invariant: a hidden toolbar reserves nothing, so the
-            // child view covers the content rect exactly.
+            // page covers the content rect exactly.
             assert_eq!(bounds.x, content.x);
             assert_eq!(bounds.y, content.y);
             assert_eq!(bounds.w, content.w);
@@ -590,7 +785,7 @@ mod tests {
         assert_eq!(bounds.y, TOOLBAR_H);
         assert_eq!(bounds.h, content.h - TOOLBAR_H);
         // On a tile shorter than the bar the reserve is clamped so the child
-        // keeps 1px and the child view always ends at the content's bottom edge.
+        // keeps 1px and the page always ends at the content's bottom edge.
         let short = LayoutRect {
             x: 0.0,
             y: 0.0,
@@ -649,11 +844,23 @@ mod tests {
     }
 
     #[test]
-    fn init_script_reports_focus_and_favicon() {
-        assert!(INIT_SCRIPT.contains("'pwrde:webview-focus'"));
-        assert!(INIT_SCRIPT.contains(&format!("'{FAVICON_IPC}'")));
-        assert!(INIT_SCRIPT.contains(r#"link[rel~="icon"]"#));
-        assert!(INIT_SCRIPT.contains(r"'\n'"));
+    fn favicon_choice_skips_svg_and_unfetchable_links() {
+        let icons = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            favicon_choice(&icons(&["https://a.test/i.svg", "https://a.test/i.png"])),
+            "https://a.test/i.png"
+        );
+        assert_eq!(
+            favicon_choice(&icons(&["https://a.test/I.SVG?v=2", "data:image/png;base64,AA"])),
+            ""
+        );
+        assert_eq!(favicon_choice(&icons(&["https://a.test/favicon.ico"])), "https://a.test/favicon.ico");
+        assert_eq!(favicon_choice(&[]), "");
+        // The choice feeds `favicon_request`, whose fallback covers "none".
+        assert_eq!(
+            favicon_request(&format!("{}\nhttps://a.test/x", favicon_choice(&[]))),
+            Some(("https://a.test".into(), "https://a.test/favicon.ico".into()))
+        );
     }
 
     #[test]
@@ -696,13 +903,19 @@ mod tests {
     }
 
     #[test]
-    fn user_agent_is_safari_not_chrome() {
-        // Google's sign-in refuses a Chrome UA on a WebKit engine, while the
-        // WKWebView default (no Version/ or Safari/ token) gets legacy layouts.
-        assert!(USER_AGENT.contains(" Version/"));
-        assert!(USER_AGENT.contains(" Safari/"));
-        assert!(USER_AGENT.contains("AppleWebKit/605"));
-        assert!(!USER_AGENT.contains("Chrome/"));
+    fn fetcher_presents_as_the_engine() {
+        // The pages run in Chromium; the icon fetch says so too.
+        assert!(FETCH_USER_AGENT.contains(" Chrome/"));
+        assert!(FETCH_USER_AGENT.contains("AppleWebKit/537.36"));
+        assert!(!FETCH_USER_AGENT.contains(" Version/"));
+    }
+
+    #[test]
+    fn page_image_takes_a_whole_bgra_frame_only() {
+        let image = page_image(2, 3, vec![7; 2 * 3 * 4]).unwrap();
+        let size = image.size(0);
+        assert_eq!((size.width.0, size.height.0), (2, 3));
+        assert!(page_image(2, 3, vec![7; 5]).is_none());
     }
 
     #[test]

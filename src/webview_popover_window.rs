@@ -1,10 +1,13 @@
 //! The webview Site / Tools popovers' own window.
 //!
-//! A webview tab is a native child `NSView` painted over the app's surface,
-//! so a popover drawn in the main window would sit *under* the page it is
-//! meant to float over. Like the command palette (`palette_window`), the
-//! popover is therefore a real, separate window: chrome-less, transparent,
-//! exactly the card's size, opened under the control it hangs from.
+//! Like the command palette (`palette_window`), the popover is a real,
+//! separate window: chrome-less, transparent, exactly the card's size, opened
+//! under the control it hangs from. That design dates from when a webview
+//! tab was a native child `NSView` painted over the app's surface, where a
+//! popover drawn in the main window would have sat *under* the page. The
+//! page is now an off-screen Chromium frame painted by the main window
+//! itself (`webview_cef`), so nothing forces the separate window any more;
+//! it is kept for its dismissal semantics (below).
 //!
 //! The popover *state* stays on [`App`] (`webview_panel` is the source of
 //! truth; `webview_find` is the find field); this view only renders

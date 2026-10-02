@@ -68,6 +68,7 @@ mod theme;
 #[allow(dead_code)]
 mod ui;
 mod webview;
+mod webview_cef;
 mod webview_popover_window;
 mod webview_ui;
 mod workspace;
@@ -78,7 +79,7 @@ use std::time::{Duration, SystemTime};
 use gpui::{
     canvas, div, px, App as GpuiApp, AppContext, Application, Bounds, Context, CursorStyle,
     FocusHandle, Focusable,
-    InteractiveElement, IntoElement, KeyDownEvent, Keystroke, Modifiers, MouseButton,
+    InteractiveElement, IntoElement, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, MouseButton,
     ModifiersChangedEvent, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
     Point, QuitMode, Render, ShapedLine,
     Size, Styled, TextAlign, TextRun, Window, WindowBounds, WindowOptions,
@@ -206,7 +207,7 @@ enum ConfirmAction {
     /// by primary tile id at confirm time so group reordering while the
     /// dialog is up can't misdirect the close.
     CloseGroup { primary_tile: u64 },
-    /// Clear the shared Wry website-data store after an explicit warning.
+    /// Clear the web tabs' shared Chromium profile data after an explicit warning.
     ClearWebviewData { id: u64 },
 }
 
@@ -366,7 +367,7 @@ struct App {
     next_session_id: u64,
     next_tile_id: u64,
     next_webview_id: u64,
-    /// Native child views stay on the foreground thread with the gpui window.
+    /// The web tabs' off-screen Chromium pages; main thread only, like CEF.
     webviews: webview::Manager,
     /// In-app New webview URL prompt, sharing the command palette input.
     webview_prompt: Option<WebviewPrompt>,
@@ -1212,7 +1213,85 @@ impl App {
         self.request_redraw();
     }
 
-    /// Keep Wry child views aligned with the visible active webview tabs.
+    /// The page that takes the keyboard: the focused tile's web tab, while
+    /// its page is on screen (`Manager::sync` tracks exactly that).
+    fn web_key_target(&self) -> Option<u64> {
+        let id = self.webviews.focused()?;
+        (self.page == Page::Sessions && self.focused_webview_id() == Some(id)).then_some(id)
+    }
+
+    /// Whether the pointer is free to act on a web page: no app drag or
+    /// resize is armed and no mouse-tracking TUI holds a button.
+    fn web_pointer_free(&self) -> bool {
+        matches!(self.drag, Drag::None) && self.resize_hover.is_none() && self.mouse_report.is_none()
+    }
+
+    /// A button press at the cursor: into the web page under it, if any. The
+    /// page then holds the pointer until the release, and the keyboard moves
+    /// off any chrome field so typing reaches the page. False when no page
+    /// is there and the app's own press handling should run.
+    fn web_pointer_down(
+        &mut self,
+        button: webview_cef::Button,
+        clicks: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.web_pointer_free() {
+            return false;
+        }
+        let (x, y) = (self.cursor.0 as f32, self.cursor.1 as f32);
+        let mods = web_mods(&self.modifiers);
+        if self.webviews.pointer_down(x, y, button, clicks, mods).is_none() {
+            return false;
+        }
+        // As on any other click: an open section rename commits rather than
+        // swallowing what is typed into the page next.
+        if self.editing_section.is_some() {
+            self.commit_section_rename();
+        }
+        window.focus(&self.focus_handle, cx);
+        self.request_redraw();
+        true
+    }
+
+    /// A wheel event at a logical window point: scrolls the web page under
+    /// it. False when there is none.
+    fn web_wheel(&mut self, ev: &gpui::ScrollWheelEvent) -> bool {
+        if !self.web_pointer_free() {
+            return false;
+        }
+        let s = self.scale();
+        let (x, y) = (f32::from(ev.position.x) * s, f32::from(ev.position.y) * s);
+        let (lines, dx, dy) = match ev.delta {
+            gpui::ScrollDelta::Lines(p) => (true, p.x, p.y),
+            gpui::ScrollDelta::Pixels(p) => (false, f32::from(p.x), f32::from(p.y)),
+        };
+        self.webviews.wheel(x, y, lines, dx, dy, web_mods(&ev.modifiers))
+    }
+
+    /// Key-up for the focused web page (key-downs are routed in
+    /// [`Self::on_key_down`]). Nothing is sent while a chrome field, a modal,
+    /// the flyover, Flow or a section rename owns the keyboard — the page
+    /// never saw those key-downs and must not learn what was typed — nor for
+    /// a ⌘ chord, which the app's bindings or a frame command consumed.
+    fn on_key_up(&mut self, ev: &KeyUpEvent, window: &Window, cx: &Context<Self>) {
+        if ev.keystroke.modifiers.platform
+            || self.modal_overlay_open()
+            || self.webview_input_focused(window, cx)
+            || (self.flyover_open && self.flyover_focused)
+            || self.flow_editor_focused(window, cx)
+            || self.editing_section.is_some()
+        {
+            return;
+        }
+        if let Some(id) = self.web_key_target() {
+            self.webviews.key_up(id, &ev.keystroke.key, web_mods(&ev.keystroke.modifiers));
+        }
+    }
+
+    /// Keep the off-screen Chromium pages aligned with the visible active
+    /// webview tabs.
     fn sync_webviews(&mut self, window: &Window) {
         let live: std::collections::HashSet<u64> = self
             .workspaces
@@ -2378,6 +2457,11 @@ impl App {
     /// ⌘V: clipboard → focused terminal (bracketed-paste aware).
     /// Copy the active selection's text to the system clipboard.
     fn copy(&mut self) {
+        // A focused web page copies its own selection.
+        if let Some(id) = self.web_key_target() {
+            self.webviews.edit(id, webview_cef::EditCommand::Copy);
+            return;
+        }
         let ws = &self.workspaces[self.active];
         let Some(tab) = ws.focused().and_then(|t| t.active_tab()) else { return };
         let Some(text) = tab.session().and_then(Session::selected_text) else { return };
@@ -2387,6 +2471,11 @@ impl App {
     }
 
     fn paste(&mut self) {
+        // Into a focused web page: Chromium reads the clipboard itself.
+        if let Some(id) = self.web_key_target() {
+            self.webviews.edit(id, webview_cef::EditCommand::Paste);
+            return;
+        }
         let Ok(mut clipboard) = arboard::Clipboard::new() else { return };
         let ws = &self.workspaces[self.active];
         let Some(tab) = ws.focused().and_then(|t| t.active_tab()) else { return };
@@ -2820,7 +2909,7 @@ impl App {
                     },
                     2 => {
                         let hidden = !t.tabs[tab].toolbar_hidden();
-                        // Terminal tabs never got this item; the child view's
+                        // Terminal tabs never got this item; the page's
                         // bounds re-sync before the next paint.
                         if !t.tabs[tab].set_toolbar_hidden(hidden) {
                             return;
@@ -4891,6 +4980,28 @@ impl App {
             self.request_redraw();
             return;
         }
+        // A focused web tab's page takes the keyboard. ⌘ chords the bindings
+        // table claims (and ⌘1–9) stay the app's — copy and paste reach the
+        // page through their actions — and every other key, chord or not,
+        // goes to Chromium.
+        if let Some(id) = self.web_key_target() {
+            let keystroke = &ev.keystroke;
+            let digit = keystroke.key.chars().next().and_then(|c| c.to_digit(10));
+            if keystroke.modifiers.platform
+                && (pages::match_action(keystroke).is_some() || digit.is_some_and(|d| d >= 1))
+            {
+                self.handle_shortcut(ev);
+                return;
+            }
+            self.webviews.key_down(
+                id,
+                &keystroke.key,
+                keystroke.key_char.as_deref(),
+                web_mods(&keystroke.modifiers),
+                ev.is_held,
+            );
+            return;
+        }
         // ⌘ shortcuts take priority over passing bytes to the shell.
         if ev.keystroke.modifiers.platform {
             self.handle_shortcut(ev);
@@ -5244,6 +5355,8 @@ impl App {
                 for (_, mut backend) in self.flow_backends.drain() {
                     backend.shutdown();
                 }
+                // Chromium flushes its profile and reaps its helpers.
+                self.webviews.shutdown();
                 std::process::exit(0);
             }
             Action::CommandPalette => self.toggle_command_root(),
@@ -5341,8 +5454,8 @@ impl App {
                 let Some(hidden) = tile.tabs.get(ti).map(|tab| !tab.toolbar_hidden()) else {
                     return false;
                 };
-                // A terminal tab has no title bar: report the no-op. The child
-                // view's bounds re-sync before the next paint.
+                // A terminal tab has no title bar: report the no-op. The
+                // page's bounds re-sync before the next paint.
                 if !tile.tabs[ti].set_toolbar_hidden(hidden) {
                     return false;
                 }
@@ -5652,7 +5765,7 @@ impl App {
                     }
                 },
                 TermEvent::WebviewUrlResolved { id, url } => {
-                    // The native view may not exist yet: sync builds it from
+                    // The page may not exist yet: sync builds it from
                     // the model URL on the next frame, so a missing-view error
                     // here is fine as long as the model URL is updated. A tab
                     // closed before the command returned is a no-op.
@@ -5697,6 +5810,13 @@ impl App {
                     // the in-app ⌘P does.
                     self.toggle_command_root();
                     redraw = true;
+                },
+                // The page painted (or its cursor / nav state moved): the
+                // next paint picks the frame up from the manager.
+                TermEvent::WebviewFrame { id } => {
+                    if self.webview_tab_exists(id) {
+                        redraw = true;
+                    }
                 },
                 TermEvent::WebviewFocused { id } => {
                     let tile = self.workspaces[self.active].root.tiles().iter().find_map(|tile| {
@@ -6320,6 +6440,9 @@ impl Render for App {
                 app.on_key_down(ev, window, cx);
                 cx.notify();
             }))
+            .on_key_up(cx.listener(|app, ev: &KeyUpEvent, window, cx| {
+                app.on_key_up(ev, window, cx);
+            }))
             .on_mouse_move(cx.listener(|app, ev: &MouseMoveEvent, window, cx| {
                 app.cursor = (f64::from(ev.position.x), f64::from(ev.position.y));
                 // Scale logical → physical for internal geometry.
@@ -6338,7 +6461,9 @@ impl Render for App {
                     let s = app.scale() as f64;
                     app.cursor = (f64::from(ev.position.x) * s, f64::from(ev.position.y) * s);
                     app.modifiers = ev.modifiers;
-                    app.on_mouse_down(window, ev.click_count, cx);
+                    if !app.web_pointer_down(webview_cef::Button::Left, ev.click_count, window, cx) {
+                        app.on_mouse_down(window, ev.click_count, cx);
+                    }
                     cx.notify();
                 }),
             )
@@ -6348,17 +6473,21 @@ impl Render for App {
                     let s = app.scale() as f64;
                     app.cursor = (f64::from(ev.position.x) * s, f64::from(ev.position.y) * s);
                     app.modifiers = ev.modifiers;
-                    app.on_right_mouse_down(window, cx);
+                    if !app.web_pointer_down(webview_cef::Button::Right, ev.click_count, window, cx) {
+                        app.on_right_mouse_down(window, cx);
+                    }
                     cx.notify();
                 }),
             )
             .on_mouse_down(
                 MouseButton::Middle,
-                cx.listener(|app, ev: &MouseDownEvent, _window, cx| {
+                cx.listener(|app, ev: &MouseDownEvent, window, cx| {
                     let s = app.scale() as f64;
                     app.cursor = (f64::from(ev.position.x) * s, f64::from(ev.position.y) * s);
                     app.modifiers = ev.modifiers;
-                    app.on_middle_mouse_down();
+                    if !app.web_pointer_down(webview_cef::Button::Middle, ev.click_count, window, cx) {
+                        app.on_middle_mouse_down();
+                    }
                     cx.notify();
                 }),
             )
@@ -6392,7 +6521,9 @@ impl Render for App {
                 }),
             )
             .on_scroll_wheel(cx.listener(|app, ev: &gpui::ScrollWheelEvent, _win, cx| {
-                app.on_scroll(ev.delta, app.renderer.cell_height);
+                if !app.web_wheel(ev) {
+                    app.on_scroll(ev.delta, app.renderer.cell_height);
+                }
                 cx.notify();
             }))
             .child(
@@ -6413,6 +6544,51 @@ impl Render for App {
                         // gpui scopes `window.on_mouse_event` listeners to the
                         // frame they are registered in, so re-registering on every
                         // paint never stacks them.
+                        // Web pages take the pointer from the same capture
+                        // phase: moves go to the page under the pointer (or
+                        // the one holding a button, wherever the pointer is
+                        // — a drag selection leaves the page), and the
+                        // release of a button pressed in a page goes back to
+                        // it. Only captured events stop propagating, so the
+                        // app's own hover tracking keeps running.
+                        let web_view = view.clone();
+                        window.on_mouse_event(move |ev: &MouseMoveEvent, phase, _window, cx| {
+                            if phase != gpui::DispatchPhase::Capture {
+                                return;
+                            }
+                            web_view.update(cx, |app, cx| {
+                                let captured = app.webviews.pointer_captured();
+                                if !captured && !app.web_pointer_free() {
+                                    return;
+                                }
+                                let s = app.scale();
+                                let (x, y) = (f32::from(ev.position.x) * s, f32::from(ev.position.y) * s);
+                                app.webviews.pointer_move(x, y, web_mods(&ev.modifiers));
+                                if captured {
+                                    cx.stop_propagation();
+                                }
+                            });
+                        });
+                        let web_view = view.clone();
+                        window.on_mouse_event(move |ev: &MouseUpEvent, phase, _window, cx| {
+                            if phase != gpui::DispatchPhase::Capture {
+                                return;
+                            }
+                            let button = match ev.button {
+                                MouseButton::Left => webview_cef::Button::Left,
+                                MouseButton::Right => webview_cef::Button::Right,
+                                MouseButton::Middle => webview_cef::Button::Middle,
+                                _ => return,
+                            };
+                            web_view.update(cx, |app, cx| {
+                                let s = app.scale();
+                                let (x, y) = (f32::from(ev.position.x) * s, f32::from(ev.position.y) * s);
+                                if app.webviews.pointer_up(x, y, button, web_mods(&ev.modifiers)) {
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }
+                            });
+                        });
                         let drag_view = view.clone();
                         window.on_mouse_event(move |ev: &MouseMoveEvent, phase, window, cx| {
                             if phase != gpui::DispatchPhase::Capture {
@@ -6470,8 +6646,8 @@ impl Render for App {
             // Tile tab strips: pixels on the element tree, clipped per
             // strip; clicks and drags still resolve on the canvas rects.
             .child(self.render_tile_chrome(cx))
-            // Browser chrome sits in the strip reserved above each native
-            // child webview and remains GPUI-owned for consistent controls.
+            // Browser chrome sits in the strip reserved above each web
+            // page and remains GPUI-owned for consistent controls.
             .child(self.render_webview_chrome(window, cx))
             // Flyover tab strip: same pixels-on-elements split (`flyover_ui`).
             .child(self.render_flyover_chrome(cx))
@@ -6788,6 +6964,22 @@ impl App {
         if resize_hover.is_none() && self.image_hover.is_some() {
             window.set_window_cursor_style(CursorStyle::PointingHand);
         }
+        // A web page under the pointer (or holding it mid-drag) picks its own
+        // cursor: the hand over a link, the I-beam over text.
+        if resize_hover.is_none()
+            && !overlay_open
+            && matches!(self.drag, Drag::None)
+            && let Some(style) =
+                self.webviews.cursor_at(self.cursor.0 as f32, self.cursor.1 as f32)
+        {
+            window.set_window_cursor_style(style);
+        }
+        // Web tab pages: frames Chromium painted since the last paint become
+        // new images, and the textures of the ones they replace are released.
+        let web_pages = self.webviews.page_images();
+        for old in self.webviews.take_retired() {
+            let _ = window.drop_image(old);
+        }
 
         let origin = bounds.origin;
         let inv = 1.0 / scale; // physical px → logical px for gpui coords.
@@ -6901,6 +7093,9 @@ impl App {
                     let _ = shaped.paint(p, chrome_line_height, TextAlign::Left, None, window, cx);
                 });
             }
+
+            // 4.2) web tab pages, each under its GPUI toolbar.
+            paint_web_pages(window, origin, inv, &web_pages);
 
             // 4.5) flyover terminal panel — above the workspace chrome,
             // below the modal overlays and their scrim.
@@ -7089,6 +7284,47 @@ fn paint_pane_images(
             0,
             false,
         );
+    }
+}
+
+/// Paint each visible web page's frame. The image is Chromium's device-pixel
+/// buffer, so it goes 1:1 at the placement's top-left and is clipped to the
+/// placement — the buffer is rounded up to whole logical pixels and may
+/// overhang it by a device pixel.
+fn paint_web_pages(
+    window: &mut Window,
+    origin: Point<Pixels>,
+    inv: f32,
+    pages: &[webview::PageImage],
+) {
+    for page in pages {
+        let at = Point::new(origin.x + px(page.bounds.x * inv), origin.y + px(page.bounds.y * inv));
+        let bounds = Bounds {
+            origin: at,
+            size: Size::new(px(page.bounds.w * inv), px(page.bounds.h * inv)),
+        };
+        let image_bounds = Bounds {
+            origin: at,
+            size: Size::new(px(page.w as f32 * inv), px(page.h as f32 * inv)),
+        };
+        let _ = window.paint_image(
+            bounds,
+            image_bounds,
+            gpui::Corners::all(px(0.0)),
+            std::sync::Arc::clone(&page.image),
+            0,
+            false,
+        );
+    }
+}
+
+/// gpui's modifier state as the web engine's.
+fn web_mods(modifiers: &Modifiers) -> webview_cef::Mods {
+    webview_cef::Mods {
+        shift: modifiers.shift,
+        control: modifiers.control,
+        alt: modifiers.alt,
+        command: modifiers.platform,
     }
 }
 
@@ -7646,12 +7882,29 @@ fn main() {
                     // Drain PTY wakeups on the foreground executor: poll the
                     // mpsc channel and notify when a redraw is needed. This
                     // preserves the old coalescing (begin_frame per paint).
+                    // Chromium is shut down in order on quit, so its profile
+                    // is flushed and its helper processes exit with us. This
+                    // hook only runs while the view is alive; closing the
+                    // window releases it first, and `webview::Manager`'s
+                    // `Drop` does the same shutdown then.
+                    cx.on_app_quit(|app: &mut App, _cx| {
+                        app.webviews.shutdown();
+                        async {}
+                    })
+                    .detach();
+
                     let handle = cx.entity().downgrade();
                     cx.spawn(async move |_this, cx| {
                         loop {
                             cx.background_executor()
                                 .timer(Duration::from_millis(16))
                                 .await;
+                            // Chromium's message loop is pumped from here —
+                            // gpui owns the run loop — on top of the wakeups
+                            // CEF schedules itself (`webview_cef::pump`).
+                            // Outside `app.update`: its callbacks only touch
+                            // the event channel and their own state.
+                            crate::webview_cef::pump();
                             let Some(app) = handle.upgrade() else { break };
                             let (redraw, want_palette, palette, want_settings, settings, activate_settings, (pending_keys, main)) =
                                 app.update(cx, |app: &mut App, cx| {
