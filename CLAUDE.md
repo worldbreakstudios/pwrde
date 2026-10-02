@@ -27,6 +27,8 @@ Webview tabs render with Chromium through the `cef` crate (cef-rs), which needs 
 - **Without `CEF_PATH`** the build script downloads the distribution into cargo's `OUT_DIR` — once per profile per worktree, and gone after `cargo clean`.
 
 At run time `src/cef_app.rs` finds the framework and the helper itself. In `Pwrde.app` they are in `Contents/Frameworks`. For a bare `target/<profile>/pwrde` it uses the distribution the build used (`CEF_PATH` from the environment, else the path baked in at build time) and assembles a stand-in bundle at `target/<profile>/pwrde-cef/Pwrde.app` — a clone of the framework plus the helper apps wrapping `target/<profile>/pwrde-helper` — so `cargo build && cargo run` is enough; no .app needed. If the helper is missing or CEF cannot start, the app still launches and a webview tab reports why in a toast.
+
+`scripts/privacy-usage.plist` holds the privacy usage strings pages can trigger (Bluetooth — any passkey sign-in page probes it — camera, microphone). macOS **aborts** a process that touches one of those services without its string, so a new service a page can reach needs a key there: `build.rs` embeds the file in the bare `pwrde` binary (`__TEXT,__info_plist`, for `cargo run`) and `scripts/make-app.sh` merges it into the bundle's `Info.plist`.
 ## Architecture
 
 **The README's "Architecture" section is stale.** It describes the original winit + wgpu + glyphon design. The code has since been ported to **gpui** (Zed's UI framework), which is now the sole windowing + rendering layer. `winit`/`wgpu`/`glyphon` still appear in `Cargo.toml` and in port-note comments but are not used by any code. Trust the module doc comments (`//!` headers in each `src/*.rs` file) over the README diagram.

@@ -226,6 +226,9 @@ cat > "${APP_DIR}/Contents/Info.plist" <<PLIST
 </dict>
 </plist>
 PLIST
+# The privacy usage strings web tabs need (Bluetooth for passkeys, camera,
+# microphone): macOS aborts the app, rather than denying, when one is missing.
+/usr/libexec/PlistBuddy -c "Merge scripts/privacy-usage.plist" "${APP_DIR}/Contents/Info.plist"
 
 echo "APPL????" > "${APP_DIR}/Contents/PkgInfo"
 

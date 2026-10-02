@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  The privacy usage strings Chromium's web tabs need. macOS aborts a process
+  that touches a protected service without the matching string (it does not
+  just deny), so every service a page can reach must be listed: Bluetooth for
+  passkeys on a nearby phone (any WebAuthn sign-in page probes it), camera and
+  microphone for getUserMedia. scripts/make-app.sh merges this into the
+  bundle's Info.plist; build.rs embeds it in the bare `pwrde` binary so
+  `cargo run` is covered too.
+-->
+<plist version="1.0">
+<dict>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>A web page in a pwrde tab wants to use Bluetooth, for example to sign in with a passkey on a nearby device.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>A web page in a pwrde tab wants to use the camera.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>A web page in a pwrde tab wants to use the microphone.</string>
+</dict>
+</plist>
