@@ -101,6 +101,12 @@ const DRAG_THRESHOLD: f64 = 6.0;
 /// walks entries that have actually aged out; a tick with nothing stale hands
 /// the worker slot straight back.
 const GIT_CTX_POLL: std::time::Duration = std::time::Duration::from_secs(6);
+/// Minimum gap between two ⌘⇧↑/↓ sidebar steps. The key repeats while it is
+/// held, and the repeat rate is far faster than a person can read the moving
+/// selection, so a short hold walks the whole sidebar before the finger lifts.
+/// This is a *leading-edge* throttle: the first press in a burst always steps,
+/// and every later press inside the window is dropped.
+const SIDEBAR_CYCLE_THROTTLE: std::time::Duration = std::time::Duration::from_millis(50);
 /// How often panes that still have *no name at all* — no emulator title and no
 /// process-derived one — are looked up. Short, because this is exactly the
 /// window after a restart in which restored shpool tabs would otherwise read
@@ -356,6 +362,10 @@ struct App {
     /// tree that changes under us (commits, dirty counts), so a group the user
     /// never leaves still has to be topped up on a timer.
     git_ctx_polled_at: std::time::Instant,
+    /// When ⌘⇧↑/↓ last advanced the sidebar selection, throttled by
+    /// [`SIDEBAR_CYCLE_THROTTLE`] so a held key cannot walk every row at the
+    /// system key-repeat rate.
+    sidebar_cycle_at: std::time::Instant,
     /// True while the process-title sweep is alive, so the throttle can never
     /// stack `ps` sweeps on top of each other.
     proc_title_busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -5429,7 +5439,12 @@ impl App {
     /// ⌘⇧↑/↓: step through the sidebar's tabs, wrapping at both ends —
     /// the workspace groups on the Sessions page.
     fn cycle_sidebar_tab(&mut self, delta: isize) {
-        if let Page::Sessions = self.page {
+        if let Page::Sessions = self.page
+            // Leading-edge throttle on the key-repeat burst only; the first
+            // press always lands (the field is backdated at startup).
+            && workspace::throttle_ready(self.sidebar_cycle_at.elapsed(), SIDEBAR_CYCLE_THROTTLE)
+        {
+            self.sidebar_cycle_at = std::time::Instant::now();
             // Step along the rows the sidebar actually shows (pinned run, plain
             // groups, snoozed run, folder-filtered, collapsed sections folded
             // away) not the raw workspace order, so
@@ -7405,6 +7420,11 @@ fn main() {
                         // which is exactly when the user is looking at them.
                         git_ctx_polled_at: std::time::Instant::now()
                             .checked_sub(GIT_CTX_POLL)
+                            .unwrap_or_else(std::time::Instant::now),
+                        // Backdated a full throttle window so the very first
+                        // ⌘⇧↑/↓ press is never swallowed as a repeat.
+                        sidebar_cycle_at: std::time::Instant::now()
+                            .checked_sub(SIDEBAR_CYCLE_THROTTLE)
                             .unwrap_or_else(std::time::Instant::now),
                         proc_title_busy: std::sync::Arc::new(
                             std::sync::atomic::AtomicBool::new(false),

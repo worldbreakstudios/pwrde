@@ -1050,6 +1050,13 @@ pub fn cycle_sidebar_active(rows: &[SidebarRow], active: usize, delta: isize) ->
     Some(rows[next].ws_idx)
 }
 
+/// Whether a throttled input may act now: the elapsed time since the last
+/// accepted one must have reached `interval`. Pure, so the gate the app
+/// applies to a wall-clock [`std::time::Instant`] is testable on its own.
+pub fn throttle_ready(elapsed: std::time::Duration, interval: std::time::Duration) -> bool {
+    elapsed >= interval
+}
+
 /// Flat sessions rows for the GANTRY list: one [`SidebarRow`] per group
 /// — no section headers — for the groups `filter` admits. `None` (All
 /// sessions) admits every group in `workspaces` order, regardless of any
@@ -3552,6 +3559,19 @@ mod tests {
         assert!(cycle_sidebar_active(&rows, 3, 1).is_some());
         assert_eq!(cycle_sidebar_active(&in_folder, 0, 1), Some(4));
         assert_eq!(cycle_sidebar_active(&in_folder, 0, -1), Some(2));
+    }
+
+    /// The ⌘⇧↑/↓ throttle drops a repeat arriving inside the window and
+    /// accepts the first press after it: 49ms is too soon, 50ms is the
+    /// boundary, 51ms goes through.
+    #[test]
+    fn throttle_ready_gates_repeats_at_the_boundary() {
+        let interval = std::time::Duration::from_millis(50);
+        assert!(!throttle_ready(std::time::Duration::from_millis(49), interval));
+        assert!(throttle_ready(std::time::Duration::from_millis(50), interval));
+        assert!(throttle_ready(std::time::Duration::from_millis(51), interval));
+        // A startup backdated by one full window is ready immediately.
+        assert!(throttle_ready(interval, interval));
     }
 
     #[test]
