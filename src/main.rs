@@ -418,8 +418,10 @@ struct App {
     /// the other end of the list.
     snoozed_collapsed: bool,
     /// The spot the native traffic lights were last positioned for
-    /// (`workspace::traffic_light_spot`); `render` re-syncs on change.
-    traffic_lights_for: Option<workspace::TrafficLightSpot>,
+    /// (`workspace::traffic_light_spot`) and the chrome factor then — the
+    /// strip they centre on follows the text size; `render` re-syncs on
+    /// change of either.
+    traffic_lights_for: Option<(workspace::TrafficLightSpot, f32)>,
     modifiers: Modifiers,
     title: String,
     cursor: (f64, f64),
@@ -1244,7 +1246,7 @@ impl App {
                 if content.w < 1.0 || content.h < 1.0 {
                     continue;
                 }
-                let toolbar_h = if tab.toolbar_hidden() { 0.0 } else { webview::TOOLBAR_H };
+                let toolbar_h = if tab.toolbar_hidden() { 0.0 } else { webview::toolbar_h() };
                 let bounds = webview::child_bounds(content, self.scale(), toolbar_h);
                 placements.push(webview::Placement { id, url: url.to_string(), bounds });
                 if tile_id == ws.focused_tile {
@@ -6279,10 +6281,11 @@ impl Render for App {
             && !self.flyover_tabs.is_empty()
             && self.flyover_maximized;
         let spot = workspace::traffic_light_spot(self.sidebar_collapsed, flyover_maxed);
-        if self.traffic_lights_for != Some(spot) {
+        let lights = (spot, workspace::chrome_ui_scale());
+        if self.traffic_lights_for != Some(lights) {
             let (x, y) = workspace::traffic_light_origin(spot);
             window.set_traffic_light_position(gpui::point(px(x), px(y)));
-            self.traffic_lights_for = Some(spot);
+            self.traffic_lights_for = Some(lights);
         }
         self.sync_save_focus(window, cx);
         // Shared modal search field: a freshly opened modal claims it (clear,

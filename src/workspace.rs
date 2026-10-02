@@ -23,7 +23,8 @@
 //! Each `Tile` carries `collapsed: bool` (target state) and
 //! `collapse_anim: f32` (0.0 = fully expanded .. 1.0 = fully collapsed).
 //! A tile collapses *along its parent split's axis*: in a `Column` split it
-//! shrinks to the tab-bar height (`TILE_TAB_H`); in a `Row` split it shrinks
+//! shrinks to the tab-bar height (`tab_bar_h` — `TILE_TAB_H` scaled by the
+//! chrome text size); in a `Row` split it shrinks
 //! to a narrow vertical strip of the same width. The split `ratio` is never
 //! modified — siblings absorb freed space and the prior arrangement is
 //! restored exactly on expand.
@@ -626,35 +627,37 @@ const TAB_H: f32 = 28.0;
 /// `tab_rect`'s Settings rows keep [`TAB_H`].
 pub const CARD_H: f32 = 68.0;
 
-/// Ceiling on the sidebar's text-size factor.
+/// Ceiling on the chrome's text-size factor — the sidebar rows, the tab
+/// strips and the webview toolbar all scale by the one capped value.
 ///
-/// The sidebar does not scroll yet — [`crate::sidebar_ui::clipped_row_layer`]
-/// clips the row stack to the panel — so every point a row grows is a point of
-/// group list that becomes unreachable, and only the first nine groups have a
-/// ⌘-number fallback. `appearance.font_size` goes to 40 (≈2.7×), which would
-/// leave about five rows visible; capping here keeps the setting useful without
-/// letting it hide groups the user has no other way to reach. Lift the cap when
-/// the scroll pass lands.
-const MAX_ROW_FONT_SCALE: f32 = 1.5;
+/// `appearance.font_size` goes to 40 (≈2.7×). Uncapped, that would leave about
+/// five sidebar rows on screen and hand a 108px tab bar plus a 130px webview
+/// toolbar to every tile; capping keeps the setting useful without letting the
+/// chrome crowd out the content it frames.
+const MAX_CHROME_UI_SCALE: f32 = 1.5;
 
-/// The live app-text-size factor the sidebar scales by, capped.
+/// The live app-text-size factor the chrome scales by, capped: the sidebar
+/// rows, the tile and flyover tab strips (bar height included) and the
+/// webview toolbar.
 ///
-/// The rows are an element tree ([`crate::sidebar_ui`]) whose type scales with
-/// the `appearance.font_size` setting, so a fixed row height would clip that
-/// type at the larger sizes. This is the module's one read of global state; the
-/// height formulas below stay pure so they remain testable at any size.
+/// Those surfaces are element trees whose type scales with the
+/// `appearance.font_size` setting, so a fixed row or bar height would clip
+/// that type at the larger sizes. This is the module's one read of global
+/// state; the height and strip formulas stay pure — they take the factor as an
+/// argument (the `*_at` functions) — so they remain testable at any size, and
+/// the same-named wrappers without the suffix pass this value in.
 ///
-/// `sidebar_ui` reads its type scale from here too, rather than going straight
-/// to [`crate::renderer::chrome_font_scale`] — one factor, so the rows and the
-/// text inside them can never scale apart.
-pub fn row_font_scale() -> f32 {
-    cap_row_font_scale(crate::renderer::chrome_font_scale())
+/// `sidebar_ui`, `tile_ui` and `webview_ui` read their type scale from here
+/// too, rather than going straight to [`crate::renderer::chrome_font_scale`] —
+/// one factor, so the geometry and the text inside it can never scale apart.
+pub fn chrome_ui_scale() -> f32 {
+    cap_chrome_ui_scale(crate::renderer::chrome_font_scale())
 }
 
-/// [`MAX_ROW_FONT_SCALE`] applied to `f`. Pure, so the cap itself is pinned by
-/// a test rather than only reachable through the live setting.
-fn cap_row_font_scale(f: f32) -> f32 {
-    f.min(MAX_ROW_FONT_SCALE)
+/// [`MAX_CHROME_UI_SCALE`] applied to `f`. Pure, so the cap itself is pinned
+/// by a test rather than only reachable through the live setting.
+fn cap_chrome_ui_scale(f: f32) -> f32 {
+    f.min(MAX_CHROME_UI_SCALE)
 }
 
 /// Height of a sidebar session row at `font_scale`, in logical px. Pure, so
@@ -679,8 +682,17 @@ const HEADER_CHIP_GAP: f32 = 4.0;
 const SHOW_FOLDERS_GAP: f32 = 12.0;
 /// Height of the horizontal tab strip atop each tile: the mock's 6px top
 /// padding + 30px tab row + 4px bottom padding. No fill of its own — the
-/// strip sits on the terminal ground.
+/// strip sits on the terminal ground. This is the height at the default
+/// chrome text size; the live bar is [`tab_bar_h`].
 const TILE_TAB_H: f32 = 40.0;
+
+/// Height (physical px) of a tab bar at display `scale` and chrome factor
+/// `ui` ([`chrome_ui_scale`]). Every consumer of the bar — the strip, the
+/// content below it, a collapsed tile's extent, the caret square — reads this
+/// one formula.
+fn tab_bar_h(scale: f32, ui: f32) -> f32 {
+    (TILE_TAB_H * ui * scale).round()
+}
 /// Gap between tile cards; doubles as the divider drag handle (hit tests
 /// inflate it, so a slim gap still drags fine).
 const TILE_GAP: f32 = 3.0;
@@ -958,9 +970,16 @@ pub fn folders_footer_rect(card: &LayoutRect, scale: f32) -> LayoutRect {
 /// The folders card's header chips, right-aligned in its header strip:
 /// `(hide_folders, new_folder)`.
 pub fn folders_header_chips(card: &LayoutRect, scale: f32) -> (LayoutRect, LayoutRect) {
-    let side = (HEADER_CHIP * scale).round();
-    let gap = (HEADER_CHIP_GAP * scale).round();
-    let y = card.y + (((FOLDERS_HEADER_H - HEADER_CHIP) / 2.0) * scale).round();
+    folders_header_chips_at(card, scale, chrome_ui_scale())
+}
+
+/// [`folders_header_chips`] at chrome factor `ui`: the chips and their gap
+/// grow with it, centred in the header strip, whose height stays tied to the
+/// native traffic lights.
+fn folders_header_chips_at(card: &LayoutRect, scale: f32, ui: f32) -> (LayoutRect, LayoutRect) {
+    let side = (HEADER_CHIP * ui * scale).round();
+    let gap = (HEADER_CHIP_GAP * ui * scale).round();
+    let y = card.y + (((FOLDERS_HEADER_H - HEADER_CHIP * ui) / 2.0) * scale).round();
     let right = card.x + card.w - (REGION_PAD * scale).round();
     let new = LayoutRect { x: right - side, y, w: side, h: side };
     let hide = LayoutRect { x: new.x - gap - side, y, w: side, h: side };
@@ -984,9 +1003,20 @@ pub struct SessionsHeaderChips {
 const HEADER_CHIP_INSET: f32 = 2.0;
 
 pub fn sessions_header_chips(list: &LayoutRect, folders_open: bool, scale: f32) -> SessionsHeaderChips {
-    let side = (HEADER_CHIP * scale).round().min(list.w.max(0.0));
-    let gap = (HEADER_CHIP_GAP * scale).round();
-    let y = list.y + (((SESSIONS_HEADER_H - HEADER_CHIP) / 2.0) * scale).round();
+    sessions_header_chips_at(list, folders_open, scale, chrome_ui_scale())
+}
+
+/// [`sessions_header_chips`] at chrome factor `ui` (see
+/// [`folders_header_chips_at`]).
+fn sessions_header_chips_at(
+    list: &LayoutRect,
+    folders_open: bool,
+    scale: f32,
+    ui: f32,
+) -> SessionsHeaderChips {
+    let side = (HEADER_CHIP * ui * scale).round().min(list.w.max(0.0));
+    let gap = (HEADER_CHIP_GAP * ui * scale).round();
+    let y = list.y + (((SESSIONS_HEADER_H - HEADER_CHIP * ui) / 2.0) * scale).round();
     let right = list.x + list.w - (HEADER_CHIP_INSET * scale).round();
     let gear = LayoutRect { x: right - side, y, w: side, h: side };
     let plus = LayoutRect { x: gear.x - gap - side, y, w: side, h: side };
@@ -1087,14 +1117,21 @@ pub fn traffic_light_spot(sidebar_collapsed: bool, flyover_maximized: bool) -> T
 }
 
 /// The traffic lights' origin for `spot`. Over a tab strip the lights sit
-/// centered on that 28px strip — at the tile gap for the collapsed sidebar
-/// (essentially macOS's default spot), flush with the window top for the
-/// maximized flyover whose strip starts at y = 0.
+/// centered on that strip (whose height follows the chrome text size) — at
+/// the tile gap for the collapsed sidebar (essentially macOS's default spot),
+/// flush with the window top for the maximized flyover whose strip starts at
+/// y = 0.
 pub fn traffic_light_origin(spot: TrafficLightSpot) -> (f32, f32) {
+    traffic_light_origin_at(spot, chrome_ui_scale())
+}
+
+/// [`traffic_light_origin`] at chrome factor `ui`.
+fn traffic_light_origin_at(spot: TrafficLightSpot, ui: f32) -> (f32, f32) {
+    let bar = TILE_TAB_H * ui;
     match spot {
         TrafficLightSpot::Sidebar => (TRAFFIC_LIGHT_ORIGIN, TRAFFIC_LIGHT_ORIGIN),
-        TrafficLightSpot::CollapsedTile => (AREA_PAD + 9.0, AREA_PAD + (TILE_TAB_H - 12.0) / 2.0),
-        TrafficLightSpot::MaximizedFlyover => (AREA_PAD + 9.0, (TILE_TAB_H - 12.0) / 2.0),
+        TrafficLightSpot::CollapsedTile => (AREA_PAD + 9.0, AREA_PAD + (bar - 12.0) / 2.0),
+        TrafficLightSpot::MaximizedFlyover => (AREA_PAD + 9.0, (bar - 12.0) / 2.0),
     }
 }
 
@@ -1114,11 +1151,16 @@ pub const TRAFFIC_LIGHT_END: f32 = TRAFFIC_LIGHT_ORIGIN + 2.0 * 23.0 + 14.0;
 /// span of the top-left tile's tab strip, plus the sliver of padding above.
 /// The native buttons float over it and handle their own clicks.
 pub fn collapsed_drag_zone(scale: f32) -> LayoutRect {
+    collapsed_drag_zone_at(scale, chrome_ui_scale())
+}
+
+/// [`collapsed_drag_zone`] at chrome factor `ui`.
+fn collapsed_drag_zone_at(scale: f32, ui: f32) -> LayoutRect {
     LayoutRect {
         x: 0.0,
         y: 0.0,
         w: (TRAFFIC_LIGHT_SAFE_W * scale).round(),
-        h: ((AREA_PAD + TILE_TAB_H) * scale).round(),
+        h: ((AREA_PAD + TILE_TAB_H * ui) * scale).round(),
     }
 }
 
@@ -1134,10 +1176,17 @@ pub const SHOW_SESSIONS_GAP: f32 = 4.0;
 /// span, vertically centred on the top-left tile's tab strip, which
 /// [`COLLAPSED_STRIP_INSET`] pushes clear of it.
 pub fn show_sessions_button(scale: f32) -> LayoutRect {
+    show_sessions_button_at(scale, chrome_ui_scale())
+}
+
+/// [`show_sessions_button`] at chrome factor `ui`: the button keeps its size
+/// (it pairs with the native traffic lights) and stays centred on the scaled
+/// strip.
+fn show_sessions_button_at(scale: f32, ui: f32) -> LayoutRect {
     let side = (SHOW_SESSIONS_BTN * scale).round();
     LayoutRect {
         x: ((TRAFFIC_LIGHT_END + SHOW_SESSIONS_GAP) * scale).round(),
-        y: ((AREA_PAD + (TILE_TAB_H - SHOW_SESSIONS_BTN) / 2.0) * scale).round(),
+        y: ((AREA_PAD + (TILE_TAB_H * ui - SHOW_SESSIONS_BTN) / 2.0) * scale).round(),
         w: side,
         h: side,
     }
@@ -1190,7 +1239,7 @@ pub fn empty_state_hint(width: u32, height: u32, scale: f32, sidebar_w: f32) -> 
 /// [`sidebar_row_rect`] instead — this flat-index helper is for the pages
 /// whose sidebar is a uniform stack.
 pub fn tab_rect(index: usize, scale: f32, list: &LayoutRect) -> LayoutRect {
-    tab_rect_at(index, scale, row_font_scale(), list)
+    tab_rect_at(index, scale, chrome_ui_scale(), list)
 }
 
 /// [`tab_rect`] at an explicit text-size factor. Pure, so the tests can pin the
@@ -1314,7 +1363,7 @@ pub fn snoozed_caption_rect(
     let n_snoozed = snoozed_run(rows, workspaces);
     let n_pinned = pinned_run(rows, workspaces);
     let n_ordinary = rows.len() - n_snoozed;
-    let h = (sidebar_row_h(row_font_scale()) * scale).round();
+    let h = (sidebar_row_h(chrome_ui_scale()) * scale).round();
     let mut y = list.y + (SESSIONS_HEADER_H * scale).round();
     if pinned_section {
         y += (PINNED_CAPTION_H * scale).round();
@@ -1369,7 +1418,7 @@ pub fn pinned_divider_rect(
     }
     let cap = pinned_caption_rect(scale, list);
     let n_pinned = pinned_run(rows, workspaces);
-    let h = (sidebar_row_h(row_font_scale()) * scale).round();
+    let h = (sidebar_row_h(chrome_ui_scale()) * scale).round();
     let gap = (PINNED_SECTION_GAP * scale).round();
     let inset = (12.0 * scale).round();
     LayoutRect {
@@ -1446,7 +1495,7 @@ pub fn sidebar_row_rect(
     scale: f32,
     list: &LayoutRect,
 ) -> LayoutRect {
-    sidebar_row_rect_at(rows, index, workspaces, pinned_section, scale, row_font_scale(), list)
+    sidebar_row_rect_at(rows, index, workspaces, pinned_section, scale, chrome_ui_scale(), list)
 }
 
 /// [`sidebar_row_rect`] at an explicit text-size factor. Pure, so the tests can
@@ -1825,10 +1874,22 @@ pub fn layout_tiles(
     rect: LayoutRect,
     scale: f32,
 ) -> (Vec<(u64, LayoutRect)>, Vec<Divider>) {
+    layout_tiles_at(node, rect, scale, chrome_ui_scale())
+}
+
+/// [`layout_tiles`] at chrome factor `ui`, which sets the extent a collapsed
+/// tile keeps (its tab bar).
+fn layout_tiles_at(
+    node: &Node,
+    rect: LayoutRect,
+    scale: f32,
+    ui: f32,
+) -> (Vec<(u64, LayoutRect)>, Vec<Divider>) {
     let mut tiles = Vec::new();
     let mut dividers = Vec::new();
     let gap = (TILE_GAP * scale).round();
-    walk(node, rect, gap, scale, &mut Vec::new(), &mut tiles, &mut dividers);
+    let bar_h = tab_bar_h(scale, ui);
+    walk(node, rect, gap, bar_h, &mut Vec::new(), &mut tiles, &mut dividers);
     (tiles, dividers)
 }
 
@@ -1858,13 +1919,14 @@ pub fn fully_collapsed(node: &Node) -> bool {
 
 /// Extent a fully-collapsed subtree occupies along `axis`: a leaf keeps just
 /// its tab-bar height (or an equally narrow strip when collapsing sideways);
-/// splits stack extents along the axis and take the max across it.
-fn collapsed_extent(node: &Node, axis: Dir, scale: f32, gap: f32) -> f32 {
+/// splits stack extents along the axis and take the max across it. `bar_h`
+/// is the tab-bar height in physical px ([`tab_bar_h`]).
+fn collapsed_extent(node: &Node, axis: Dir, bar_h: f32, gap: f32) -> f32 {
     match node {
-        Node::Leaf(_) => (TILE_TAB_H * scale).round(),
+        Node::Leaf(_) => bar_h,
         Node::Split { dir, a, b, .. } => {
-            let ea = collapsed_extent(a, axis, scale, gap);
-            let eb = collapsed_extent(b, axis, scale, gap);
+            let ea = collapsed_extent(a, axis, bar_h, gap);
+            let eb = collapsed_extent(b, axis, bar_h, gap);
             if *dir == axis { ea + gap + eb } else { ea.max(eb) }
         },
     }
@@ -1882,7 +1944,7 @@ fn split_rects_collapsed(
     a: &Node,
     b: &Node,
     gap: f32,
-    scale: f32,
+    bar_h: f32,
 ) -> (LayoutRect, LayoutRect, LayoutRect) {
     let fa = collapse_factor(a);
     let fb = collapse_factor(b);
@@ -1898,10 +1960,10 @@ fn split_rects_collapsed(
     // The more-collapsed side is sized to its target; the other side takes
     // the remainder, so freed space always flows to the expanded panes.
     let (ea, eb) = if fa >= fb {
-        let ea = lerp(nat_a, collapsed_extent(a, dir, scale, gap), fa).round();
+        let ea = lerp(nat_a, collapsed_extent(a, dir, bar_h, gap), fa).round();
         (ea, total - ea - gap)
     } else {
-        let eb = lerp(nat_b, collapsed_extent(b, dir, scale, gap), fb).round();
+        let eb = lerp(nat_b, collapsed_extent(b, dir, bar_h, gap), fb).round();
         (total - eb - gap, eb)
     };
     match dir {
@@ -2035,7 +2097,7 @@ fn walk(
     node: &Node,
     rect: LayoutRect,
     gap: f32,
-    scale: f32,
+    bar_h: f32,
     path: &mut Vec<u8>,
     tiles: &mut Vec<(u64, LayoutRect)>,
     dividers: &mut Vec<Divider>,
@@ -2043,16 +2105,16 @@ fn walk(
     match node {
         Node::Leaf(t) => tiles.push((t.id, rect)),
         Node::Split { dir, ratio, a, b } => {
-            let (ra, rb, div) = split_rects_collapsed(&rect, *dir, *ratio, a, b, gap, scale);
+            let (ra, rb, div) = split_rects_collapsed(&rect, *dir, *ratio, a, b, gap, bar_h);
             // A collapsed edge has a fixed extent — no divider to drag.
             if !fully_collapsed(a) && !fully_collapsed(b) {
                 dividers.push(Divider { path: path.clone(), rect: div, dir: *dir });
             }
             path.push(0);
-            walk(a, ra, gap, scale, path, tiles, dividers);
+            walk(a, ra, gap, bar_h, path, tiles, dividers);
             path.pop();
             path.push(1);
-            walk(b, rb, gap, scale, path, tiles, dividers);
+            walk(b, rb, gap, bar_h, path, tiles, dividers);
             path.pop();
         },
     }
@@ -2080,11 +2142,12 @@ fn split_rects(rect: &LayoutRect, dir: Dir, ratio: f32, gap: f32) -> (LayoutRect
 /// The rect of the subtree at `path` (for divider dragging).
 pub fn rect_at_path(node: &Node, rect: LayoutRect, path: &[u8], scale: f32) -> LayoutRect {
     let gap = (TILE_GAP * scale).round();
+    let bar_h = tab_bar_h(scale, chrome_ui_scale());
     let mut node = node;
     let mut rect = rect;
     for step in path {
         if let Node::Split { dir, ratio, a, b } = node {
-            let (ra, rb, _) = split_rects_collapsed(&rect, *dir, *ratio, a, b, gap, scale);
+            let (ra, rb, _) = split_rects_collapsed(&rect, *dir, *ratio, a, b, gap, bar_h);
             if *step == 0 {
                 node = a;
                 rect = ra;
@@ -2097,23 +2160,40 @@ pub fn rect_at_path(node: &Node, rect: LayoutRect, path: &[u8], scale: f32) -> L
     rect
 }
 
-/// The tab strip across the top of a tile.
+/// The tab strip across the top of a tile, its height following the chrome
+/// text size.
 pub fn tile_tab_bar(rect: &LayoutRect, scale: f32) -> LayoutRect {
-    LayoutRect { h: (TILE_TAB_H * scale).round(), ..*rect }
+    tile_tab_bar_at(rect, scale, chrome_ui_scale())
+}
+
+/// [`tile_tab_bar`] at chrome factor `ui`.
+fn tile_tab_bar_at(rect: &LayoutRect, scale: f32, ui: f32) -> LayoutRect {
+    LayoutRect { h: tab_bar_h(scale, ui), ..*rect }
 }
 
 /// The terminal content region of a tile (below the tab strip).
 pub fn tile_content(rect: &LayoutRect, scale: f32) -> LayoutRect {
-    let bar = (TILE_TAB_H * scale).round();
+    tile_content_at(rect, scale, chrome_ui_scale())
+}
+
+/// [`tile_content`] at chrome factor `ui`: it starts exactly where
+/// [`tile_tab_bar_at`] ends.
+fn tile_content_at(rect: &LayoutRect, scale: f32, ui: f32) -> LayoutRect {
+    let bar = tab_bar_h(scale, ui);
     LayoutRect { y: rect.y + bar, h: (rect.h - bar).max(0.0), ..*rect }
 }
 
 /// A square caret button at the RIGHT edge of a tile's tab bar.
-/// Side length = `TILE_TAB_H * scale`. Present only when the tile has a
+/// Side length = the bar's height. Present only when the tile has a
 /// parent split (i.e. `tile_collapse_axis` returns `Some`).
 pub fn tile_caret_rect(rect: &LayoutRect, scale: f32) -> LayoutRect {
-    let bar = tile_tab_bar(rect, scale);
-    let side = (TILE_TAB_H * scale).round();
+    tile_caret_rect_at(rect, scale, chrome_ui_scale())
+}
+
+/// [`tile_caret_rect`] at chrome factor `ui`.
+fn tile_caret_rect_at(rect: &LayoutRect, scale: f32, ui: f32) -> LayoutRect {
+    let bar = tile_tab_bar_at(rect, scale, ui);
+    let side = bar.h;
     LayoutRect { x: bar.x + (bar.w - side).max(0.0), y: bar.y, w: side, h: side }
 }
 
@@ -2130,6 +2210,11 @@ pub fn tile_caret_rect(rect: &LayoutRect, scale: f32) -> LayoutRect {
 // — shrinks proportionally so nothing ever crosses the caret or the flyover's
 // window buttons. These functions are the single authority every strip
 // painter and hit-tester reads.
+//
+// Every figure here is at the default chrome text size. The whole strip — bar
+// and row heights, paddings, width estimates, separators, ×, "+" and caret —
+// scales by the chrome factor (`chrome_ui_scale`, from `appearance.font_size`),
+// which the `*_at` functions take as `ui` and fold into the display scale.
 
 /// Height of one tab row inside the bar (the mock's 30px chips).
 pub const TILE_TAB_ROW_H: f32 = 30.0;
@@ -2167,9 +2252,10 @@ const TILE_NEW_TAB_W: f32 = 23.0;
 /// the caret can never disagree.
 #[derive(Clone, Debug, PartialEq)]
 pub struct StripLayout {
-    /// The bar: the tile's (or panel's) full width, `TILE_TAB_H` tall.
+    /// The bar: the tile's (or panel's) full width, [`tab_bar_h`] tall.
     pub bar: LayoutRect,
-    /// The 30px tab row, vertically centred in the bar by its padding.
+    /// The tab row (30px at the default text size), vertically centred in
+    /// the bar by its padding.
     pub row: LayoutRect,
     /// Per-tab rects, left to right (index-aligned with `closes`).
     pub tabs: Vec<LayoutRect>,
@@ -2204,7 +2290,8 @@ pub fn tab_active_width(title: &str) -> f32 {
         .clamp(TAB_ACTIVE_MIN_W, TILE_TAB_MAX_W)
 }
 
-/// Lay one strip's run out between `left` and `right` (physical px).
+/// Lay one strip's run out between `left` and `right` (physical px). `scale`
+/// is physical px per strip unit: the display scale times the chrome factor.
 fn lay_out_strip(
     bar: LayoutRect,
     titles: &[String],
@@ -2314,13 +2401,26 @@ pub fn tile_strip_layout(
     scale: f32,
     has_caret: bool,
 ) -> StripLayout {
-    let bar = tile_tab_bar(strip, scale);
-    let pad = (TILE_TAB_PAD_X * scale).round();
-    let caret = if has_caret { Some(tile_caret_rect(strip, scale)) } else { None };
+    tile_strip_layout_at(strip, titles, active, scale, chrome_ui_scale(), has_caret)
+}
+
+/// [`tile_strip_layout`] at chrome factor `ui`.
+fn tile_strip_layout_at(
+    strip: &LayoutRect,
+    titles: &[String],
+    active: usize,
+    scale: f32,
+    ui: f32,
+    has_caret: bool,
+) -> StripLayout {
+    let s = scale * ui;
+    let bar = tile_tab_bar_at(strip, scale, ui);
+    let pad = (TILE_TAB_PAD_X * s).round();
+    let caret = if has_caret { Some(tile_caret_rect_at(strip, scale, ui)) } else { None };
     let left = bar.x + pad;
     let right = caret.map_or(bar.x + bar.w - pad, |c| c.x.max(left));
     let active = (active < titles.len()).then_some(active);
-    lay_out_strip(bar, titles, active, scale, left, right, true, caret)
+    lay_out_strip(bar, titles, active, s, left, right, true, caret)
 }
 
 /// Full strip layout of the flyover panel's tab bar (mirrors
@@ -2335,16 +2435,31 @@ pub fn flyover_strip_layout(
     scale: f32,
     maximized: bool,
 ) -> StripLayout {
-    let bar = flyover_tab_bar(panel, scale);
-    let pad = (TILE_TAB_PAD_X * scale).round();
+    flyover_strip_layout_at(panel, titles, active, scale, chrome_ui_scale(), maximized)
+}
+
+/// [`flyover_strip_layout`] at chrome factor `ui`. The traffic-light span is
+/// native and does not scale with it.
+fn flyover_strip_layout_at(
+    panel: &LayoutRect,
+    titles: &[String],
+    active: usize,
+    scale: f32,
+    ui: f32,
+    maximized: bool,
+) -> StripLayout {
+    let s = scale * ui;
+    let bar = flyover_tab_bar_at(panel, scale, ui);
+    let pad = (TILE_TAB_PAD_X * s).round();
     let left = if maximized {
         (bar.x + (TRAFFIC_LIGHT_SAFE_W * scale).round()).max(bar.x + pad)
     } else {
         bar.x + pad
     };
-    let right = (bar.x + bar.w - flyover_buttons_w(panel, scale) - pad).max(left);
+    // The minimize / maximize buttons: two square slots, one bar-height each.
+    let right = (bar.x + bar.w - 2.0 * bar.h - pad).max(left);
     let active = (active < titles.len()).then_some(active);
-    lay_out_strip(bar, titles, active, scale, left, right, true, None)
+    lay_out_strip(bar, titles, active, s, left, right, true, None)
 }
 
 /// x of gap `gap` (`0..=n`) of a strip — the boundary between tabs `gap-1`
@@ -2440,19 +2555,23 @@ pub fn flyover_rect(
 
 /// Tab-bar strip at the top of the flyover panel (mirrors `tile_tab_bar`).
 pub fn flyover_tab_bar(rect: &LayoutRect, scale: f32) -> LayoutRect {
-    LayoutRect { h: (TILE_TAB_H * scale).round(), ..*rect }
+    flyover_tab_bar_at(rect, scale, chrome_ui_scale())
+}
+
+/// [`flyover_tab_bar`] at chrome factor `ui`.
+fn flyover_tab_bar_at(rect: &LayoutRect, scale: f32, ui: f32) -> LayoutRect {
+    LayoutRect { h: tab_bar_h(scale, ui), ..*rect }
 }
 
 /// Terminal content region of the flyover panel (below the tab strip).
 pub fn flyover_content(rect: &LayoutRect, scale: f32) -> LayoutRect {
-    let bar = (TILE_TAB_H * scale).round();
-    LayoutRect { y: rect.y + bar, h: (rect.h - bar).max(0.0), ..*rect }
+    flyover_content_at(rect, scale, chrome_ui_scale())
 }
 
-/// Width (physical px) reserved at the right end of the flyover tab bar for
-/// the minimize/maximize buttons — two square slots, one bar-height each.
-fn flyover_buttons_w(rect: &LayoutRect, scale: f32) -> f32 {
-    2.0 * flyover_tab_bar(rect, scale).h
+/// [`flyover_content`] at chrome factor `ui`.
+fn flyover_content_at(rect: &LayoutRect, scale: f32, ui: f32) -> LayoutRect {
+    let bar = tab_bar_h(scale, ui);
+    LayoutRect { y: rect.y + bar, h: (rect.h - bar).max(0.0), ..*rect }
 }
 
 /// The minimize (−) button: second-from-right square in the flyover tab bar.
@@ -3231,15 +3350,15 @@ mod tests {
 
         // The live factor is capped, so a large text size can never hide more
         // of the un-scrollable row stack than the cap allows.
-        assert!(row_font_scale() <= MAX_ROW_FONT_SCALE);
+        assert!(chrome_ui_scale() <= MAX_CHROME_UI_SCALE);
         // Below the cap the setting passes through untouched; above it, it
         // stops. `appearance.font_size` reaches 40px (≈2.7×), which without
         // this would leave about five rows in a 900pt window.
-        assert_eq!(cap_row_font_scale(1.0), 1.0);
-        assert_eq!(cap_row_font_scale(1.2), 1.2);
-        assert_eq!(cap_row_font_scale(MAX_ROW_FONT_SCALE), MAX_ROW_FONT_SCALE);
-        assert_eq!(cap_row_font_scale(2.7), MAX_ROW_FONT_SCALE);
-        assert_eq!(cap_row_font_scale(40.0 / 15.0), MAX_ROW_FONT_SCALE);
+        assert_eq!(cap_chrome_ui_scale(1.0), 1.0);
+        assert_eq!(cap_chrome_ui_scale(1.2), 1.2);
+        assert_eq!(cap_chrome_ui_scale(MAX_CHROME_UI_SCALE), MAX_CHROME_UI_SCALE);
+        assert_eq!(cap_chrome_ui_scale(2.7), MAX_CHROME_UI_SCALE);
+        assert_eq!(cap_chrome_ui_scale(40.0 / 15.0), MAX_CHROME_UI_SCALE);
     }
 
     // --- (gantry) two-part sidebar region ---
@@ -3546,6 +3665,33 @@ mod tests {
             assert!(r.x + r.w <= area.x);
             assert!(r.x >= list.x);
         }
+    }
+
+    /// The header chips grow with the chrome factor and stay centred inside
+    /// the fixed header strip, up to the cap.
+    #[test]
+    fn header_chips_scale_with_the_chrome_factor() {
+        let scale = 2.0;
+        let list = sessions_list_rect(SIDEBAR_DEFAULT_W, FOLDERS_CARD_W, false, 1000, scale);
+        let band = (SESSIONS_HEADER_H * scale).round();
+        for ui in [1.25, MAX_CHROME_UI_SCALE] {
+            let side = (HEADER_CHIP * ui * scale).round();
+            let chips = sessions_header_chips_at(&list, false, scale, ui);
+            let show = chips.show_folders.unwrap();
+            for c in [show, chips.focus, chips.plus, chips.gear] {
+                assert_eq!((c.w, c.h), (side, side));
+                assert!((c.y - list.y - (band - side) / 2.0).abs() <= 1.0);
+                assert!(c.y >= list.y && c.y + c.h <= list.y + band);
+            }
+            assert!(chips.focus.x + side < chips.plus.x && chips.plus.x + side < chips.gear.x);
+            let (hide, new) = folders_header_chips_at(&list, scale, ui);
+            assert_eq!((hide.w, new.w), (side, side));
+            assert!(hide.x + side < new.x);
+        }
+        assert_eq!(
+            sessions_header_chips_at(&list, false, scale, 1.0),
+            sessions_header_chips(&list, false, scale)
+        );
     }
 
     /// The sessions-list header carries the chips: focus / ＋ / gear
@@ -3933,6 +4079,27 @@ mod tests {
 
     const AREA: LayoutRect = LayoutRect { x: 0.0, y: 0.0, w: 1200.0, h: 800.0 };
 
+    /// A collapsed pane keeps the *scaled* tab bar: at a larger chrome text
+    /// size the bar is taller, and the sibling gives up exactly that much.
+    #[test]
+    fn collapsed_pane_extent_follows_the_chrome_factor() {
+        let scale = 2.0;
+        let gap = (TILE_GAP * scale).round();
+        let node = split(Dir::Column, 0.5, leaf(1, false), leaf(2, true));
+        for (ui, bar) in [(1.0, 80.0), (1.25, 100.0), (MAX_CHROME_UI_SCALE, 120.0)] {
+            let (tiles, _) = layout_tiles_at(&node, AREA, scale, ui);
+            let a = rect_of(&tiles, 1);
+            let b = rect_of(&tiles, 2);
+            assert_eq!(b.h, bar);
+            assert_eq!(b.h, tile_tab_bar_at(&b, scale, ui).h);
+            assert_eq!(a.h, AREA.h - gap - bar);
+        }
+        // Sideways, the strip is as wide as the bar is tall.
+        let node = split(Dir::Row, 0.5, leaf(1, false), leaf(2, true));
+        let (tiles, _) = layout_tiles_at(&node, AREA, scale, 1.25);
+        assert_eq!(rect_of(&tiles, 2).w, 100.0);
+    }
+
     #[test]
     fn collapsed_column_pane_shrinks_to_tab_bar() {
         let scale = 2.0;
@@ -4317,6 +4484,143 @@ mod strip_layout_tests {
                 g => (l.tabs[g - 1].x + l.tabs[g - 1].w + l.tabs[g].x) / 2.0,
             };
             assert!((line.x + line.w / 2.0 - boundary).abs() < 0.01);
+        }
+    }
+
+    /// The wrappers pass the live factor, and the default is the mock: at
+    /// factor 1.0 the `_at` layout is the unscaled one, pixel for pixel.
+    #[test]
+    fn factor_one_is_the_unscaled_strip() {
+        let rect = LayoutRect { x: 100.0, y: 50.0, w: 900.0, h: 600.0 };
+        let titles: Vec<String> = ["zsh", "cargo build", "x"].iter().map(|s| s.to_string()).collect();
+        for scale in [1.0, 2.0] {
+            let l = tile_strip_layout_at(&rect, &titles, 1, scale, 1.0, true);
+            assert_eq!(l.bar.h, (40.0 * scale).round());
+            assert_eq!(l.row.h, (30.0 * scale).round());
+            assert_eq!(l.tabs[0].x, rect.x + (10.0 * scale).round());
+            assert_eq!(l.tabs[1].w, (180.0 * scale).round());
+            assert_eq!(l.tabs[2].w, (60.0 * scale).round());
+            assert_eq!(l.closes[1].w, (14.0 * scale).round());
+            assert_eq!(l.separators[0].h, (14.0 * scale).round());
+            assert_eq!(l.new_tab.unwrap().w, (23.0 * scale).round());
+            assert_eq!(tile_content_at(&rect, scale, 1.0).y, rect.y + (40.0 * scale).round());
+        }
+    }
+
+    /// At a larger chrome text size the whole strip scales by the one factor:
+    /// the bar and row heights, the paddings, the width estimates, the
+    /// separators, the ×, the "+" and the caret — and the content starts
+    /// exactly below the scaled bar.
+    #[test]
+    fn strip_scales_with_the_chrome_factor() {
+        let rect = LayoutRect { x: 100.0, y: 50.0, w: 1200.0, h: 700.0 };
+        let titles: Vec<String> = ["zsh", "ab", "x"].iter().map(|s| s.to_string()).collect();
+        for scale in [1.0, 2.0] {
+            let ui = 1.25;
+            let s = scale * ui;
+            let l = tile_strip_layout_at(&rect, &titles, 0, scale, ui, true);
+            // 40 → 50, 30 → 37.5, with the mock's 6px / 4px paddings scaled.
+            assert_eq!(l.bar.h, (50.0 * scale).round());
+            assert_eq!(l.row.h, (37.5 * scale).round());
+            assert_eq!(l.row.y - l.bar.y, (7.5 * scale).round());
+            assert_eq!(l.tabs[0].x, rect.x + (12.5 * scale).round());
+            // Active chip 180 → 225, inactive minimum 60 → 75.
+            assert_eq!(l.tabs[0].w, (225.0 * scale).round());
+            assert_eq!(l.tabs[1].w, (75.0 * scale).round());
+            // × 14 → 17.5, hairline 14 → 17.5 tall with 10 → 12.5 of air,
+            // "+" 23 → 28.75.
+            assert_eq!(l.closes[0].w, (TAB_CLOSE_W * s).round());
+            assert_eq!(l.separators[0].h, (TAB_SEP_H * s).round());
+            assert_eq!(l.separators[0].x - (l.tabs[0].x + l.tabs[0].w), (TAB_SEP_MARGIN * s).round());
+            assert_eq!(l.new_tab.unwrap().w, (TILE_NEW_TAB_W * s).round());
+            // Controls stay centred on the scaled row.
+            let cy = l.row.y + l.row.h / 2.0;
+            assert_eq!(l.new_tab.unwrap().y + l.new_tab.unwrap().h / 2.0, cy);
+            assert!((l.closes[0].y + l.closes[0].h / 2.0 - cy).abs() <= 0.5);
+            // The caret is a bar-height square at the right end.
+            let caret = l.caret.unwrap();
+            assert_eq!((caret.w, caret.h), (l.bar.h, l.bar.h));
+            assert_eq!(caret, tile_caret_rect_at(&rect, scale, ui));
+            assert!(left_of_the_caret_is_painted(&l));
+            // Content begins exactly where the bar ends.
+            let content = tile_content_at(&rect, scale, ui);
+            assert_eq!(content.y, l.bar.y + l.bar.h);
+            assert_eq!(content.h, rect.h - l.bar.h);
+        }
+    }
+
+    /// The width estimate tracks the text size: a title's tab is `ui` times
+    /// as wide (until the scaled 240 cap), so a larger face is not clipped.
+    #[test]
+    fn tab_width_estimates_scale_with_the_chrome_factor() {
+        let rect = LayoutRect { x: 0.0, y: 0.0, w: 2000.0, h: 700.0 };
+        let titles = vec!["x".to_string(), "abcdefghijklmnop".to_string(), "y".repeat(80)];
+        let base = tile_strip_layout_at(&rect, &titles, 0, 1.0, 1.0, false);
+        let big = tile_strip_layout_at(&rect, &titles, 0, 1.0, 1.25, false);
+        assert_eq!(big.tabs[1].w, (tab_width_estimate(&titles[1]) * 1.25).round());
+        assert!(big.tabs[1].w > base.tabs[1].w);
+        assert_eq!(base.tabs[2].w, TILE_TAB_MAX_W);
+        assert_eq!(big.tabs[2].w, TILE_TAB_MAX_W * 1.25);
+    }
+
+    /// At the cap (1.5×) the bar is 60px and everything still fits in order.
+    #[test]
+    fn strip_at_the_factor_cap() {
+        let ui = cap_chrome_ui_scale(40.0 / 15.0);
+        assert_eq!(ui, MAX_CHROME_UI_SCALE);
+        let rect = LayoutRect { x: 100.0, y: 50.0, w: 500.0, h: 700.0 };
+        let titles: Vec<String> = (0..6).map(|i| format!("session-{i}")).collect();
+        for scale in [1.0, 2.0] {
+            let l = tile_strip_layout_at(&rect, &titles, 2, scale, ui, true);
+            assert_eq!(l.bar.h, (60.0 * scale).round());
+            assert_eq!(l.row.h, (45.0 * scale).round());
+            assert_eq!(l.row.y - l.bar.y, (9.0 * scale).round());
+            assert_eq!(l.bar.y + l.bar.h - (l.row.y + l.row.h), (6.0 * scale).round());
+            assert!(left_of_the_caret_is_painted(&l));
+            assert_eq!(tile_content_at(&rect, scale, ui).y, rect.y + (60.0 * scale).round());
+        }
+    }
+
+    /// The flyover's bar, content and window buttons follow the factor too;
+    /// the native traffic-light span a maximized panel cedes does not.
+    #[test]
+    fn flyover_strip_scales_with_the_chrome_factor() {
+        let panel = flyover_rect(1000, 800, 1.0, 1.0, FLYOVER_DEFAULT_FRAC, false);
+        let titles: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        for (ui, bar) in [(1.25, 50.0), (MAX_CHROME_UI_SCALE, 60.0)] {
+            let l = flyover_strip_layout_at(&panel, &titles, 1, 1.0, ui, false);
+            assert_eq!(l.bar, flyover_tab_bar_at(&panel, 1.0, ui));
+            assert_eq!(l.bar.h, bar);
+            assert_eq!(l.tabs[0].x, panel.x + (10.0 * ui).round());
+            let content = flyover_content_at(&panel, 1.0, ui);
+            assert_eq!(content.y, panel.y + bar);
+            assert_eq!(content.h, panel.h - bar);
+            // The run stops short of the two bar-height window buttons.
+            let plus = l.new_tab.unwrap();
+            assert!(plus.x + plus.w <= panel.x + panel.w - 2.0 * bar - (10.0 * ui).round() + 0.01);
+            let full = flyover_rect(1000, 800, 1.0, 1.0, 0.3, true);
+            let max = flyover_strip_layout_at(&full, &titles, 1, 1.0, ui, true);
+            assert_eq!(max.tabs[0].x, TRAFFIC_LIGHT_SAFE_W);
+        }
+    }
+
+    /// What floats over the top-left tile's strip stays centred on the scaled
+    /// bar: the traffic lights, the "Show sessions" button, the drag zone.
+    #[test]
+    fn strip_corner_chrome_centres_on_the_scaled_bar() {
+        use TrafficLightSpot::*;
+        assert_eq!(traffic_light_origin_at(CollapsedTile, 1.0), (AREA_PAD + 9.0, AREA_PAD + 14.0));
+        assert_eq!(traffic_light_origin_at(MaximizedFlyover, 1.0).1, 14.0);
+        assert_eq!(traffic_light_origin_at(Sidebar, 1.25), traffic_light_origin_at(Sidebar, 1.0));
+        for ui in [1.25, MAX_CHROME_UI_SCALE] {
+            let bar = TILE_TAB_H * ui;
+            // 12px lights, centred.
+            assert_eq!(traffic_light_origin_at(CollapsedTile, ui).1 + 6.0, AREA_PAD + bar / 2.0);
+            assert_eq!(traffic_light_origin_at(MaximizedFlyover, ui).1 + 6.0, bar / 2.0);
+            let btn = show_sessions_button_at(1.0, ui);
+            assert_eq!(btn.h, SHOW_SESSIONS_BTN);
+            assert!((btn.y + btn.h / 2.0 - (AREA_PAD + bar / 2.0)).abs() <= 0.5);
+            assert_eq!(collapsed_drag_zone_at(2.0, ui).h, ((AREA_PAD + bar) * 2.0).round());
         }
     }
 

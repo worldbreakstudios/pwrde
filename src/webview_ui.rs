@@ -10,6 +10,12 @@
 //! a press on the focused pane's pill swaps in the editable full URL. The
 //! mock's Annotate and Share-with-agent controls are deliberately not built.
 //!
+//! Those sizes are the figures at the default chrome text size. The bar's
+//! height ([`crate::webview::toolbar_h`]) and everything painted in it scale
+//! with `appearance.font_size` through [`crate::workspace::chrome_ui_scale`]
+//! — the factor the tab strips and the sidebar use. The Site and Tools popovers
+//! hang under the scaled bar; their contents keep their own sizes.
+//!
 //! The two popovers are floating cards, also to the mock: Site (connection
 //! header, cookies / permissions / certificate rows, clear data) centred under
 //! the address pill, and Tools (find field, zoom stepper, open in browser,
@@ -89,7 +95,9 @@ struct ChromePlacement {
 }
 
 /// The toolbar's controls — nav capsule, address pill, More — share one
-/// height and are full pills of the foreground at the mock's .07.
+/// height and are full pills of the foreground at the mock's .07. Sizes here
+/// are at the default chrome text size; the painter multiplies by the chrome
+/// factor.
 const PILL_H: f32 = 32.0;
 const PILL_FILL: f32 = 0.07;
 /// A nav capsule cell, and the lock / info cell inside the address pill.
@@ -170,24 +178,31 @@ pub(crate) fn card_size(kind: PanelKind) -> (f32, f32) {
 /// button for Tools — in the same logical window coordinates as `content`
 /// (a webview tile's content rect). With the title bar hidden there is no
 /// control, so the anchor collapses to a zero-height rect on the content's
-/// top edge and the card hangs from there.
-pub(crate) fn anchor_rect(kind: PanelKind, content: LayoutRect, toolbar_hidden: bool) -> LayoutRect {
-    let more_x = content.x + content.w - BAR_PAD_X - PILL_H;
+/// top edge and the card hangs from there. `ui` is the chrome factor the bar
+/// is painted at.
+pub(crate) fn anchor_rect(
+    kind: PanelKind,
+    content: LayoutRect,
+    toolbar_hidden: bool,
+    ui: f32,
+) -> LayoutRect {
+    let pill_h = PILL_H * ui;
+    let more_x = content.x + content.w - BAR_PAD_X * ui - pill_h;
     let (x, w) = match kind {
-        PanelKind::Tools => (more_x, PILL_H),
+        PanelKind::Tools => (more_x, pill_h),
         PanelKind::Site => {
-            let nav_w = 2.0 * NAV_PAD_X + 3.0 * NAV_CELL + 2.0 * NAV_GAP;
-            let left = content.x + BAR_PAD_X + nav_w + BAR_GAP;
-            let slot = (more_x - BAR_GAP - left).max(ADDRESS_MIN_W);
-            let pill = slot.min(ADDRESS_MAX_W);
+            let nav_w = (2.0 * NAV_PAD_X + 3.0 * NAV_CELL + 2.0 * NAV_GAP) * ui;
+            let left = content.x + (BAR_PAD_X + BAR_GAP) * ui + nav_w;
+            let slot = (more_x - BAR_GAP * ui - left).max(ADDRESS_MIN_W * ui);
+            let pill = slot.min(ADDRESS_MAX_W * ui);
             (left + (slot - pill) / 2.0, pill)
         },
     };
     if toolbar_hidden {
         LayoutRect { x, y: content.y, w, h: 0.0 }
     } else {
-        let y = content.y + (crate::webview::TOOLBAR_H - PILL_H) / 2.0;
-        LayoutRect { x, y, w, h: PILL_H }
+        let y = content.y + (crate::webview::TOOLBAR_H * ui - pill_h) / 2.0;
+        LayoutRect { x, y, w, h: pill_h }
     }
 }
 
@@ -233,11 +248,13 @@ fn unavailable(feature: &str) -> String {
     format!("{feature} is not available yet")
 }
 /// One bare cell of the nav capsule: a centred icon in the control ink,
-/// dimmed while disabled. The caller attaches the click.
+/// dimmed while disabled. `size` is the icon's and `ui` the chrome factor the
+/// cell and icon scale by. The caller attaches the click.
 fn nav_cell(
     id: String,
     path: impl Into<gpui::SharedString>,
     size: f32,
+    ui: f32,
     enabled: bool,
     strip: &StripStyle,
 ) -> gpui::Stateful<gpui::Div> {
@@ -246,14 +263,14 @@ fn nav_cell(
     div()
         .id(gpui::SharedString::from(id))
         .flex_shrink_0()
-        .w(px(NAV_CELL))
-        .h(px(NAV_CELL))
-        .rounded(px(NAV_CELL / 2.0))
+        .w(px(NAV_CELL * ui))
+        .h(px(NAV_CELL * ui))
+        .rounded(px(NAV_CELL * ui / 2.0))
         .flex()
         .items_center()
         .justify_center()
         .when(enabled, |cell| cell.cursor_pointer().hover(move |cell| cell.bg(hover)))
-        .child(icon(path, px(size), ink))
+        .child(icon(path, px(size * ui), ink))
 }
 
 impl App {
@@ -378,7 +395,12 @@ impl App {
             h: placement.rect.h / scale,
         };
         let kind = panel.kind();
-        Some((kind, panel.id(), anchor_rect(kind, content, placement.toolbar_hidden)))
+        Some((kind, panel.id(), anchor_rect(
+                kind,
+                content,
+                placement.toolbar_hidden,
+                crate::workspace::chrome_ui_scale(),
+            )))
     }
 
     /// The webview actions (`Action::FindInPage` … `Action::DeveloperTools`)
@@ -629,8 +651,18 @@ impl App {
         // Fills and the address text take the strip's ink too: the chrome
         // foreground can be the wrong polarity for a chosen terminal scheme.
         let pill = strip.ink.opacity(PILL_FILL);
-        self.webview_address
-            .update(cx, |input, _cx| input.set_text_color(Some(strip.ink)));
+        // One factor for the bar's height and everything in it, so the
+        // controls stay centred in the scaled bar.
+        let ui = crate::workspace::chrome_ui_scale();
+        let pill_h = PILL_H * ui;
+        let site_cell = SITE_CELL * ui;
+        let text_size = 12.5 * ui;
+        // Size set here rather than with the text, so a live text-size
+        // change reaches a field that is already mounted.
+        self.webview_address.update(cx, |input, _cx| {
+            input.set_text_color(Some(strip.ink));
+            input.set_text_size(Some(px(text_size)));
+        });
         let mut layer = div().absolute().left(px(0.0)).top(px(0.0)).size_full();
 
         for placement in placements {
@@ -642,7 +674,7 @@ impl App {
             let toolbar_height = if placement.toolbar_hidden {
                 0.0
             } else {
-                crate::webview::TOOLBAR_H.min(height.max(0.0))
+                crate::webview::toolbar_h().min(height.max(0.0))
             };
             let address_focused = self
                 .webview_address
@@ -656,10 +688,7 @@ impl App {
             {
                 self.webview_address_for = Some(id);
                 let url = placement.url.clone();
-                self.webview_address.update(cx, |input, cx| {
-                    input.set_text_size(Some(px(12.5)));
-                    input.set_text(url, cx);
-                });
+                self.webview_address.update(cx, |input, cx| input.set_text(url, cx));
             }
 
             // Only the focused pane's field can be mid-edit; every other pane,
@@ -673,6 +702,7 @@ impl App {
                     format!("webview-back-{id}"),
                     theme.icons.chevron_left(),
                     15.0,
+                    ui,
                     placement.can_go_back,
                     &strip,
                 )
@@ -691,6 +721,7 @@ impl App {
                     format!("webview-forward-{id}"),
                     theme.icons.chevron_right(),
                     15.0,
+                    ui,
                     placement.can_go_forward,
                     &strip,
                 )
@@ -706,7 +737,7 @@ impl App {
                 });
                 let reload_entity = entity.clone();
                 let reload =
-                    nav_cell(format!("webview-reload-{id}"), ICON_REFRESH, 14.0, true, &strip)
+                    nav_cell(format!("webview-reload-{id}"), ICON_REFRESH, 14.0, ui, true, &strip)
                         .on_click(move |_event: &ClickEvent, _window, app| {
                             if let Some(entity) = reload_entity.upgrade() {
                                 entity.update(app, |this, _cx| {
@@ -718,13 +749,13 @@ impl App {
                 // The nav capsule: one pill around three bare 26px cells.
                 let nav = div()
                     .flex_shrink_0()
-                    .h(px(PILL_H))
-                    .rounded(px(PILL_H / 2.0))
+                    .h(px(pill_h))
+                    .rounded(px(pill_h / 2.0))
                     .bg(pill)
-                    .px(px(NAV_PAD_X))
+                    .px(px(NAV_PAD_X * ui))
                     .flex()
                     .items_center()
-                    .gap(px(NAV_GAP))
+                    .gap(px(NAV_GAP * ui))
                     .child(back)
                     .child(forward)
                     .child(reload);
@@ -735,15 +766,15 @@ impl App {
                 let site = div()
                     .id(gpui::SharedString::from(format!("webview-site-{id}")))
                     .flex_shrink_0()
-                    .w(px(SITE_CELL))
-                    .h(px(SITE_CELL))
+                    .w(px(site_cell))
+                    .h(px(site_cell))
                     .flex()
                     .items_center()
                     .justify_center()
                     .cursor_pointer()
                     .child(icon(
                         if placement.url.starts_with("https://") { ICON_LOCK } else { ICON_INFO },
-                        px(13.0),
+                        px(13.0 * ui),
                         strip.ink_dim,
                     ))
                     // On the press, not the click: the press is what takes
@@ -774,7 +805,7 @@ impl App {
                         .flex_1()
                         .min_w(px(0.0))
                         .h_full()
-                        .pr(px(SITE_CELL))
+                        .pr(px(site_cell))
                         .overflow_hidden()
                         .flex()
                         .items_center()
@@ -808,21 +839,21 @@ impl App {
                 };
                 let address = div()
                     .flex_1()
-                    .min_w(px(ADDRESS_MIN_W))
+                    .min_w(px(ADDRESS_MIN_W * ui))
                     .flex()
                     .justify_center()
                     .child(
                         div()
                             .w_full()
-                            .max_w(px(ADDRESS_MAX_W))
-                            .h(px(PILL_H))
-                            .rounded(px(PILL_H / 2.0))
+                            .max_w(px(ADDRESS_MAX_W * ui))
+                            .h(px(pill_h))
+                            .rounded(px(pill_h / 2.0))
                             .bg(pill)
-                            .px(px(5.0))
+                            .px(px(5.0 * ui))
                             .flex()
                             .items_center()
                             .overflow_hidden()
-                            .text_size(px(12.5))
+                            .text_size(px(text_size))
                             .text_color(strip.ink)
                             .child(site)
                             .child(field),
@@ -834,16 +865,16 @@ impl App {
                 let tools = div()
                     .id(gpui::SharedString::from(format!("webview-tools-{id}")))
                     .flex_shrink_0()
-                    .w(px(PILL_H))
-                    .h(px(PILL_H))
-                    .rounded(px(PILL_H / 2.0))
+                    .w(px(pill_h))
+                    .h(px(pill_h))
+                    .rounded(px(pill_h / 2.0))
                     .bg(if tools_open { strip.ink.opacity(2.0 * PILL_FILL) } else { pill })
                     .flex()
                     .items_center()
                     .justify_center()
                     .cursor_pointer()
                     .hover(move |cell| cell.bg(strip.ink.opacity(2.0 * PILL_FILL)))
-                    .child(icon(ICON_ELLIPSIS, px(15.0), strip.ink.opacity(NAV_ENABLED)))
+                    .child(icon(ICON_ELLIPSIS, px(15.0 * ui), strip.ink.opacity(NAV_ENABLED)))
                     .on_mouse_down(
                         gpui::MouseButton::Left,
                         move |_event, _window, app: &mut GpuiApp| {
@@ -865,10 +896,10 @@ impl App {
                     .w(px(width))
                     .h(px(toolbar_height))
                     .overflow_hidden()
-                    .px(px(BAR_PAD_X))
+                    .px(px(BAR_PAD_X * ui))
                     .flex()
                     .items_center()
-                    .gap(px(BAR_GAP))
+                    .gap(px(BAR_GAP * ui))
                     .bg(ground)
                     .border_b_1()
                     .border_color(strip.ink.opacity(0.06))
@@ -1399,7 +1430,7 @@ mod tests {
     fn tools_anchor_is_the_more_button() {
         // 10px in from the content's right edge, centred in the 48px bar.
         assert_eq!(
-            anchor_rect(PanelKind::Tools, content(), false),
+            anchor_rect(PanelKind::Tools, content(), false, 1.0),
             LayoutRect { x: 1058.0, y: 58.0, w: 32.0, h: 32.0 }
         );
     }
@@ -1409,20 +1440,20 @@ mod tests {
         // The slot runs from the nav capsule (10 + 94 + 8) to 8px short of
         // More: 212..1050. The pill caps at 420 and centres in it.
         assert_eq!(
-            anchor_rect(PanelKind::Site, content(), false),
+            anchor_rect(PanelKind::Site, content(), false, 1.0),
             LayoutRect { x: 421.0, y: 58.0, w: 420.0, h: 32.0 }
         );
         // A narrow tile: the pill fills its 138px slot.
         let narrow = LayoutRect { w: 300.0, ..content() };
         assert_eq!(
-            anchor_rect(PanelKind::Site, narrow, false),
+            anchor_rect(PanelKind::Site, narrow, false, 1.0),
             LayoutRect { x: 212.0, y: 58.0, w: 138.0, h: 32.0 }
         );
     }
 
     #[test]
     fn a_hidden_title_bar_anchors_on_the_contents_top_edge() {
-        let anchor = anchor_rect(PanelKind::Tools, content(), true);
+        let anchor = anchor_rect(PanelKind::Tools, content(), true, 1.0);
         assert_eq!(anchor, LayoutRect { x: 1058.0, y: 50.0, w: 32.0, h: 0.0 });
     }
 

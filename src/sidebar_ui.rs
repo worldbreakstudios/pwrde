@@ -53,7 +53,8 @@ pub(crate) const ROW_RADIUS: f32 = 9.0;
 /// Side of the PR-state icon on a row's first line (mock: 11px, tinted
 /// with the PR palette below).
 const STATUS_ICON: f32 = 12.0;
-/// Side of the SVG glyph inside a header chip (mock: 17px chips).
+/// Side of the SVG glyph inside a header chip (mock: 17px chips), at the
+/// default chrome text size — it grows with the chip.
 const HEADER_ICON: f32 = 17.0;
 /// Placeholder text of the Settings window's search box; `main.rs` reads it
 /// when it builds the rcn `Input`.
@@ -67,7 +68,7 @@ pub(crate) const SEARCH_SETTINGS_PLACEHOLDER: &str = "Search settings";
 /// the same factor in [`crate::workspace`], which is what keeps painting and
 /// hit-testing agreeing.
 fn font_scale() -> f32 {
-    crate::workspace::row_font_scale()
+    crate::workspace::chrome_ui_scale()
 }
 
 /// `value`, written at the default font size, scaled by [`font_scale`].
@@ -1108,7 +1109,7 @@ pub(crate) fn icon_chip(
         .when(!active && hovered, |c| {
             c.bg(theme.muted.opacity(if theme.dark { 0.5 } else { 0.7 }))
         })
-        .child(icon(path, px(HEADER_ICON), ink))
+        .child(icon(path, px(scaled(HEADER_ICON).min(rect.w)), ink))
 }
 
 /// The logical-pixel cursor the panel hovers against, or `None` when nothing
@@ -1230,7 +1231,7 @@ mod tests {
         // `font_scale` reads the live setting, so this asserts the identity the
         // literals below it are written against rather than a configured value:
         // at the default chrome font, every dimension passes through unchanged.
-        let scale = crate::workspace::row_font_scale();
+        let scale = crate::workspace::chrome_ui_scale();
         assert_eq!(font_scale(), scale);
         // Capped, because the sidebar does not scroll yet.
         assert!(font_scale() <= 1.5, "the sidebar factor must stay capped");
@@ -1241,6 +1242,6 @@ mod tests {
         // The sidebar and the layout math must agree on the factor, or rows
         // and their contents scale apart — `font_scale` delegates for exactly
         // that reason, so this pins the delegation rather than a coincidence.
-        assert_eq!(font_scale(), crate::workspace::row_font_scale());
+        assert_eq!(font_scale(), crate::workspace::chrome_ui_scale());
     }
 }
