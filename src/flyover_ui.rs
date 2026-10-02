@@ -56,6 +56,8 @@ impl App {
         };
         let hov = |r: &LayoutRect| cur.is_some_and(|(x, y)| r.contains(x, y));
         let font = crate::renderer::chrome_font();
+        // The window buttons scale with the strip they ride (`tab_strip`).
+        let ui = workspace::chrome_ui_scale();
         let entity = cx.entity().downgrade();
 
         // One layout for this strip: the element tree paints at its rects and
@@ -157,11 +159,11 @@ impl App {
                             d.child(
                                 div()
                                     .absolute()
-                                    .left(px(CHIP_INSET))
-                                    .top(px(CHIP_INSET))
-                                    .w(px((rect.w * inv - 2.0 * CHIP_INSET).max(0.0)))
-                                    .h(px((rect.h * inv - 2.0 * CHIP_INSET).max(0.0)))
-                                    .rounded(px(CHIP_RADIUS))
+                                    .left(px(CHIP_INSET * ui))
+                                    .top(px(CHIP_INSET * ui))
+                                    .w(px((rect.w * inv - 2.0 * CHIP_INSET * ui).max(0.0)))
+                                    .h(px((rect.h * inv - 2.0 * CHIP_INSET * ui).max(0.0)))
+                                    .rounded(px(CHIP_RADIUS * ui))
                                     .bg(color(style.pill_rgb, CHIP_ALPHA)),
                             )
                         })
@@ -176,7 +178,7 @@ impl App {
                                 .justify_center()
                                 .child(icon(
                                     path,
-                                    px(12.0),
+                                    px(12.0 * ui),
                                     if h { style.ink } else { style.ink_dim },
                                 )),
                         ),

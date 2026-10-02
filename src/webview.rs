@@ -16,8 +16,10 @@ use wry::{PageLoadEvent, Rect, WebView, WebViewBuilder};
 use crate::term::TermEvent;
 use crate::workspace::LayoutRect;
 
-/// Browser chrome is GPUI-owned; the native child starts below it.
-pub const TOOLBAR_H: f32 = 48.0;
+/// Browser chrome is GPUI-owned; the native child starts below it. This is
+/// the toolbar's height at the default chrome text size — the live height is
+/// [`toolbar_h`].
+const TOOLBAR_H: f32 = 48.0;
 pub const SITE_PANEL_H: f32 = 116.0;
 pub const TOOLS_PANEL_H: f32 = 250.0;
 
@@ -212,6 +214,19 @@ pub fn normalize_input(value: &str) -> Result<String, String> {
         format!("https://{value}")
     };
     crate::bus::validate_webview_url(&candidate)
+}
+
+/// Logical height of the browser toolbar: [`TOOLBAR_H`] scaled with
+/// `appearance.font_size` by the factor the tab strips and the sidebar use
+/// ([`crate::workspace::chrome_ui_scale`]). `webview_ui` paints the bar this
+/// tall and `sync_webviews` reserves the same height above the native view.
+pub fn toolbar_h() -> f32 {
+    toolbar_h_at(crate::workspace::chrome_ui_scale())
+}
+
+/// [`toolbar_h`] at chrome factor `ui`. Pure, so tests can pin it.
+fn toolbar_h_at(ui: f32) -> f32 {
+    TOOLBAR_H * ui
 }
 
 /// Convert the tile content rect (physical pixels) into the child-view rect,
@@ -526,6 +541,23 @@ mod tests {
         let tiny = child_bounds(content, 2.0, TOOLBAR_H, 10_000.0);
         assert_eq!(tiny.y, 419.0);
         assert_eq!(tiny.h, 1.0);
+    }
+
+    /// The toolbar follows the chrome text size, and the native view starts
+    /// exactly below the scaled bar at any display scale.
+    #[test]
+    fn toolbar_height_scales_with_the_chrome_factor() {
+        assert_eq!(toolbar_h_at(1.0), 48.0);
+        assert_eq!(toolbar_h_at(1.25), 60.0);
+        // The factor is capped at 1.5× (`workspace::chrome_ui_scale`).
+        assert_eq!(toolbar_h_at(1.5), 72.0);
+        let content = LayoutRect { x: 10.0, y: 20.0, w: 800.0, h: 600.0 };
+        for (ui, scale) in [(1.25, 1.0), (1.25, 2.0), (1.5, 2.0)] {
+            let bounds = child_bounds(content, scale, toolbar_h_at(ui), 0.0);
+            assert_eq!(bounds.y, content.y + TOOLBAR_H * ui * scale);
+            assert_eq!(bounds.h, content.h - TOOLBAR_H * ui * scale);
+            assert_eq!(bounds.y + bounds.h, content.y + content.h);
+        }
     }
 
     #[test]
