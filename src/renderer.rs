@@ -189,7 +189,7 @@ pub(crate) fn decode_pixels(data: &ImageDataType) -> Option<(u32, u32, Vec<u8>)>
 /// Upload-ready image for gpui: gpui's `RenderImage` frames are BGRA, so the
 /// straight-alpha RGBA this decodes to is written red/blue-swapped (exactly as
 /// `backdrop::Impression::to_render_image` does for the glass backdrop).
-fn render_image(w: u32, h: u32, rgba: &[u8]) -> RenderImage {
+pub(crate) fn render_image(w: u32, h: u32, rgba: &[u8]) -> RenderImage {
     let w = w.max(1);
     let h = h.max(1);
     let mut buf = RgbaImage::new(w, h);

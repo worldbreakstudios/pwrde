@@ -4,8 +4,9 @@
 //! The mock: a 40px bar (6px of padding, a 30px tab row, 4px below) with no
 //! fill of its own, sitting on the terminal ground. The active tab is a chip —
 //! an 8px-rounded card of the mock's white at .07 with a .10 border (dimmed to
-//! .04 with no border while its tile is unfocused) — holding a 14px terminal /
-//! globe glyph, a 12.5px title clipped short of the ×, and the × itself.
+//! .04 with no border while its tile is unfocused) — holding a 14px glyph (a
+//! terminal, or for a web tab the page's favicon clipped to a disc, the globe
+//! until one loads), a 12.5px title clipped short of the ×, and the × itself.
 //! Inactive tabs are text only; a 1×14 hairline sits 10px off each tab edge,
 //! and a "+" New tab button follows the last one.
 //!
@@ -27,10 +28,12 @@
 
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use gpui::{
     AnyElement, App as GpuiApp, Context, Hsla, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, ParentElement, Styled, Window, div, px, prelude::FluentBuilder as _,
+    MouseDownEvent, ParentElement, RenderImage, Styled, Window, div, px,
+    prelude::FluentBuilder as _,
 };
 
 use crate::App;
@@ -48,7 +51,7 @@ const CHIP_PAD_R: f32 = 8.0;
 const CHIP_GAP: f32 = 8.0;
 /// Horizontal padding inside an inactive tab.
 const TAB_PAD_H: f32 = 6.0;
-/// The tab glyph (terminal / globe) and the title's type size.
+/// The tab glyph (terminal / favicon or globe) and the title's type size.
 const GLYPH: f32 = 14.0;
 const TITLE_SIZE: f32 = 12.5;
 /// The "+" New tab glyph.
@@ -126,8 +129,12 @@ pub(crate) struct StripTab {
     /// Pinned tabs keep their full title but draw a pin ring before it and
     /// no × — they can't be closed until unpinned.
     pub pinned: bool,
-    /// A webview tab wears a globe glyph; a terminal tab a terminal glyph.
+    /// A webview tab wears its page's favicon — or a globe glyph while it
+    /// has none; a terminal tab a terminal glyph.
     pub webview: bool,
+    /// The web tab's fetched favicon (`App::webview_favicon`), painted in the
+    /// same 14px glyph slot the globe takes.
+    pub favicon: Option<Arc<RenderImage>>,
     pub tab: LayoutRect,
     pub close: LayoutRect,
 }
@@ -236,7 +243,12 @@ pub(crate) fn tab_strip(
                 .flex()
                 .items_center()
                 .justify_center()
-                .child(icon(icon_path, px(GLYPH * inv), style.ink_dim)),
+                .map(|slot| match tab.favicon.clone().filter(|_| tab.webview) {
+                    Some(favicon) => slot.child(
+                        gpui::img(favicon).w(px(GLYPH)).h(px(GLYPH)).rounded(px(GLYPH / 2.0)),
+                    ),
+                    None => slot.child(icon(icon_path, px(GLYPH * inv), style.ink_dim)),
+                }),
         );
         x += GLYPH + CHIP_GAP;
         // Pin ring: a hollow dot in the tab's own ink so it reads apart from
@@ -517,6 +529,7 @@ impl App {
                         unread: tab.unread,
                         pinned: tab.pinned,
                         webview: tab.kind() == workspace::TabKind::Webview,
+                        favicon: self.webview_favicon(tab.webview_id()),
                         tab: *layout.tabs.get(ti)?,
                         close: *layout.closes.get(ti)?,
                     })

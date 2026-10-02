@@ -1,9 +1,15 @@
 //! Main-thread lifecycle for native Wry child views.
+//!
+//! Also the favicon plumbing for web tabs: the initialization script posts
+//! each page's icon link over IPC ([`favicon_request`] validates it into a
+//! [`TermEvent::WebviewFaviconChanged`]), and [`fetch_favicon`] — called from a
+//! background thread only — downloads and decodes it for the tab strips.
 
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::sync::mpsc::Sender;
 
-use gpui::Window;
+use gpui::{RenderImage, Window};
 use wry::dpi::{PhysicalPosition, PhysicalSize};
 use wry::{PageLoadEvent, Rect, WebView, WebViewBuilder};
 
@@ -11,7 +17,7 @@ use crate::term::TermEvent;
 use crate::workspace::LayoutRect;
 
 /// Browser chrome is GPUI-owned; the native child starts below it.
-pub const TOOLBAR_H: f32 = 42.0;
+pub const TOOLBAR_H: f32 = 48.0;
 pub const SITE_PANEL_H: f32 = 116.0;
 pub const TOOLS_PANEL_H: f32 = 250.0;
 
@@ -23,6 +29,153 @@ pub const TOOLS_PANEL_H: f32 = 250.0;
 /// secure") when the advertised browser and the engine's fingerprint disagree.
 pub const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
 AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15";
+
+/// IPC prefix of the favicon report: `<prefix><icon href>\n<page URL>`.
+const FAVICON_IPC: &str = "pwrde:favicon:";
+/// Posted from the top frame once the document has parsed and again on load
+/// (sites that inject their icon link late): the first non-SVG
+/// `link[rel~="icon"]` href — empty when the page names none — and the page's
+/// own URL, which [`favicon_request`] falls back to `<origin>/favicon.ico` on.
+const INIT_SCRIPT: &str = "addEventListener('pointerdown',()=>window.ipc.postMessage('pwrde:webview-focus'),true);\
+if(window.top===window){const post=()=>{const l=[...document.querySelectorAll('link[rel~=\"icon\"]')]\
+.find(l=>l.href&&!/svg/i.test(l.type)&&!/\\.svg([?#]|$)/i.test(l.href));\
+window.ipc.postMessage('pwrde:favicon:'+(l?l.href:'')+'\\n'+location.href)};\
+if(document.readyState==='loading')addEventListener('DOMContentLoaded',post);else post();\
+addEventListener('load',post)}";
+
+/// Favicon fetch limits: response bytes, wall-clock seconds, and the edge the
+/// decoded icon is scaled down to (the strip paints it at 14 logical px).
+pub const FAVICON_MAX_BYTES: usize = 512 * 1024;
+const FAVICON_TIMEOUT_SECS: &str = "5";
+const FAVICON_EDGE: u32 = 64;
+/// The discs a transparent favicon is flattened onto (the mock's `#f2f2f7`,
+/// and a dark one for an icon whose mean luma is above the threshold).
+const FAVICON_DISC_LIGHT: [u8; 3] = [0xf2, 0xf2, 0xf7];
+const FAVICON_DISC_DARK: [u8; 3] = [0x1c, 0x1c, 0x1e];
+const FAVICON_LIGHT_LUMA: f32 = 170.0;
+/// Decoder allocation cap for one favicon, whatever its header claims.
+const FAVICON_MAX_ALLOC: u64 = 64 * 1024 * 1024;
+
+/// `scheme://authority` of an absolute http(s) URL, `None` for anything else.
+pub fn origin(url: &str) -> Option<&str> {
+    let scheme = if url.starts_with("https://") {
+        "https://".len()
+    } else if url.starts_with("http://") {
+        "http://".len()
+    } else {
+        return None;
+    };
+    let authority = url[scheme..].split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.is_empty() || authority.starts_with(':') || authority.ends_with(':') {
+        return None;
+    }
+    Some(&url[..scheme + authority.len()])
+}
+
+/// An icon URL the fetcher may be handed: absolute http(s) with a host, no
+/// whitespace or control characters, and of a sane length.
+pub fn favicon_fetchable(url: &str) -> bool {
+    url.len() <= 2048
+        && !url.chars().any(|c| c.is_whitespace() || c.is_control())
+        && origin(url).is_some()
+}
+
+/// Parse a favicon IPC report (the body after [`FAVICON_IPC`]) into the page's
+/// origin and the icon URL to fetch: the page's own link when it is fetchable,
+/// else `<origin>/favicon.ico`. `None` when the page itself is not http(s)
+/// (a blank or internal page), which clears the tab's icon.
+pub fn favicon_request(report: &str) -> Option<(String, String)> {
+    let (href, page) = report.split_once('\n')?;
+    let origin = origin(page.trim()).filter(|origin| favicon_fetchable(origin))?;
+    let href = href.trim();
+    let icon = if favicon_fetchable(href) {
+        href.to_string()
+    } else {
+        format!("{origin}/favicon.ico")
+    };
+    Some((origin.to_string(), icon))
+}
+
+/// Decode fetched icon bytes to `(width, height, RGBA8 pixels)`, scaled down
+/// to at most [`FAVICON_EDGE`] a side. Anything the `image` crate cannot read
+/// (SVG, HTML error pages, truncated files) is `None`.
+fn decode_favicon(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    // A favicon-sized allocation cap: the header is the page's to forge.
+    let mut reader =
+        image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().ok()?;
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(FAVICON_MAX_ALLOC);
+    reader.limits(limits);
+    let decoded = reader.decode().ok()?;
+    if decoded.width() == 0 || decoded.height() == 0 {
+        return None;
+    }
+    let decoded = if decoded.width() > FAVICON_EDGE || decoded.height() > FAVICON_EDGE {
+        decoded.thumbnail(FAVICON_EDGE, FAVICON_EDGE)
+    } else {
+        decoded
+    };
+    let mut rgba = decoded.to_rgba8();
+    flatten_on_disc(&mut rgba);
+    Some((rgba.width(), rgba.height(), rgba.into_raw()))
+}
+
+/// Flatten a transparent icon onto the disc it reads against — the mock's
+/// light disc, or a dark one under a light icon (GitHub serves a white mark
+/// to a dark-mode page) — so the glyph shows on any ground. The strip clips
+/// the result to a circle; an opaque icon comes through unchanged.
+fn flatten_on_disc(rgba: &mut image::RgbaImage) {
+    let (mut luma, mut weight) = (0.0f32, 0.0f32);
+    for px in rgba.pixels() {
+        let a = px[3] as f32 / 255.0;
+        luma += a * (0.299 * px[0] as f32 + 0.587 * px[1] as f32 + 0.114 * px[2] as f32);
+        weight += a;
+    }
+    let light = weight > 0.0 && luma / weight > FAVICON_LIGHT_LUMA;
+    let disc = if light { FAVICON_DISC_DARK } else { FAVICON_DISC_LIGHT };
+    for px in rgba.pixels_mut() {
+        let a = px[3] as u32;
+        for c in 0..3 {
+            px[c] = ((px[c] as u32 * a + disc[c] as u32 * (255 - a)) / 255) as u8;
+        }
+        px[3] = 255;
+    }
+}
+
+/// Download and decode one favicon. Blocking — background threads only. The
+/// URL goes to `/usr/bin/curl` as a single argv element (never a shell) with
+/// globbing and `~/.curlrc` off — the page chose the URL — and curl is held to http(s), [`FAVICON_TIMEOUT_SECS`] and [`FAVICON_MAX_BYTES`], and
+/// the read itself stops at the cap for responses that state no length.
+pub fn fetch_favicon(url: &str) -> Option<RenderImage> {
+    if !favicon_fetchable(url) {
+        return None;
+    }
+    let max = FAVICON_MAX_BYTES.to_string();
+    let mut child = std::process::Command::new("/usr/bin/curl")
+        .args(["-q", "-gsfL", "--max-time", FAVICON_TIMEOUT_SECS, "--max-filesize", &max])
+        .args(["--max-redirs", "5", "--proto", "=http,https", "--proto-redir", "=http,https"])
+        .args(["-A", USER_AGENT, "--", url])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut bytes = Vec::new();
+    let read = child
+        .stdout
+        .take()
+        .map(|out| out.take(FAVICON_MAX_BYTES as u64 + 1).read_to_end(&mut bytes));
+    let oversized = bytes.len() > FAVICON_MAX_BYTES;
+    if oversized {
+        let _ = child.kill();
+    }
+    let status = child.wait().ok()?;
+    if oversized || !status.success() || !matches!(read, Some(Ok(_))) {
+        return None;
+    }
+    let (w, h, rgba) = decode_favicon(&bytes)?;
+    Some(crate::renderer::render_image(w, h, &rgba))
+}
 
 pub fn normalize_input(value: &str) -> Result<String, String> {
     let value = value.trim();
@@ -131,18 +284,24 @@ impl Manager {
                 let load_events = events.clone();
                 let focus_events = events.clone();
                 let title_events = events.clone();
+                let icon_events = events.clone();
                 match WebViewBuilder::new()
                     .with_url(&placement.url)
                     .with_user_agent(USER_AGENT)
                     .with_bounds(wry_rect(&placement.bounds))
                     .with_visible(true)
                     .with_devtools(true)
-                    .with_initialization_script(
-                        "addEventListener('pointerdown',()=>window.ipc.postMessage('pwrde:webview-focus'),true)",
-                    )
+                    .with_initialization_script(INIT_SCRIPT)
                     .with_ipc_handler(move |request| {
                         if request.body() == "pwrde:webview-focus" {
                             let _ = focus_events.send(TermEvent::WebviewFocused { id });
+                        } else if let Some(report) = request.body().strip_prefix(FAVICON_IPC) {
+                            let (origin, icon) = favicon_request(report).unzip();
+                            let _ = icon_events.send(TermEvent::WebviewFaviconChanged {
+                                id,
+                                origin: origin.unwrap_or_default(),
+                                icon,
+                            });
                         }
                     })
                     .with_on_page_load_handler(move |event, url| {
@@ -332,9 +491,9 @@ mod tests {
             child_bounds(content, 2.0, TOOLBAR_H, SITE_PANEL_H),
             LayoutRect {
                 x: 10.0,
-                y: 336.0,
+                y: 348.0,
                 w: 500.0,
-                h: 84.0
+                h: 72.0
             }
         );
         let tiny = child_bounds(content, 2.0, TOOLBAR_H, 10_000.0);
@@ -384,6 +543,88 @@ mod tests {
         let clamped = child_bounds(short, 1.0, TOOLBAR_H, 10_000.0);
         assert_eq!(clamped.y, short.y + short.h - 1.0);
         assert_eq!(clamped.h, 1.0);
+    }
+
+    #[test]
+    fn origin_keeps_scheme_and_authority_only() {
+        assert_eq!(origin("https://github.com/a/b?c#d"), Some("https://github.com"));
+        assert_eq!(origin("http://localhost:3000"), Some("http://localhost:3000"));
+        assert_eq!(origin("https://example.com?q=1"), Some("https://example.com"));
+        assert_eq!(origin("about:blank"), None);
+        assert_eq!(origin("file:///tmp/x"), None);
+        assert_eq!(origin("https://"), None);
+        assert_eq!(origin("https://:80/"), None);
+    }
+
+    #[test]
+    fn favicon_fetchable_is_http_only_and_shell_inert() {
+        assert!(favicon_fetchable("https://example.com/favicon.ico"));
+        assert!(favicon_fetchable("http://localhost:3000/icon.png?v=2"));
+        assert!(!favicon_fetchable(""));
+        assert!(!favicon_fetchable("data:image/png;base64,AAAA"));
+        assert!(!favicon_fetchable("file:///etc/passwd"));
+        assert!(!favicon_fetchable("-o /tmp/x https://example.com"));
+        assert!(!favicon_fetchable("https://example.com/a b.ico"));
+        assert!(!favicon_fetchable("https://example.com/a\u{0}.ico"));
+        assert!(!favicon_fetchable(&format!("https://example.com/{}", "a".repeat(2048))));
+    }
+
+    #[test]
+    fn favicon_request_prefers_page_link_then_origin_fallback() {
+        assert_eq!(
+            favicon_request("https://cdn.example.com/i.png\nhttps://example.com/docs"),
+            Some(("https://example.com".into(), "https://cdn.example.com/i.png".into()))
+        );
+        // No link, or one the fetcher refuses: the origin's /favicon.ico.
+        for href in ["", "data:image/png;base64,AAAA", "blob:https://example.com/1"] {
+            assert_eq!(
+                favicon_request(&format!("{href}\nhttp://example.com:8080/a?b")),
+                Some((
+                    "http://example.com:8080".into(),
+                    "http://example.com:8080/favicon.ico".into()
+                ))
+            );
+        }
+        // A page that is not http(s) has no icon at all, whatever it claims.
+        assert_eq!(favicon_request("https://example.com/i.png\nabout:blank"), None);
+        assert_eq!(favicon_request("\nfile:///tmp/a.html"), None);
+        assert_eq!(favicon_request("no newline"), None);
+    }
+
+    #[test]
+    fn init_script_reports_focus_and_favicon() {
+        assert!(INIT_SCRIPT.contains("'pwrde:webview-focus'"));
+        assert!(INIT_SCRIPT.contains(&format!("'{FAVICON_IPC}'")));
+        assert!(INIT_SCRIPT.contains(r#"link[rel~="icon"]"#));
+        assert!(INIT_SCRIPT.contains(r"'\n'"));
+    }
+
+    #[test]
+    fn decode_favicon_scales_down_and_rejects_non_images() {
+        let encode = |edge: u32| {
+            let img = image::RgbaImage::from_pixel(edge, edge, image::Rgba([10, 20, 30, 255]));
+            let mut bytes = std::io::Cursor::new(Vec::new());
+            img.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+            bytes.into_inner()
+        };
+        let (w, h, rgba) = decode_favicon(&encode(16)).unwrap();
+        assert_eq!((w, h, rgba.len()), (16, 16, 16 * 16 * 4));
+        assert_eq!(&rgba[..4], &[10, 20, 30, 255]);
+        let (w, h, rgba) = decode_favicon(&encode(256)).unwrap();
+        assert_eq!((w, h, rgba.len()), (FAVICON_EDGE, FAVICON_EDGE, 64 * 64 * 4));
+        // Transparency is flattened: a light mark gets the dark disc, a dark
+        // one the light disc.
+        let mut white = image::RgbaImage::from_pixel(2, 1, image::Rgba([255, 255, 255, 255]));
+        white.put_pixel(1, 0, image::Rgba([0, 0, 0, 0]));
+        flatten_on_disc(&mut white);
+        assert_eq!(white.get_pixel(1, 0).0, [0x1c, 0x1c, 0x1e, 255]);
+        let mut black = image::RgbaImage::from_pixel(2, 1, image::Rgba([0, 0, 0, 255]));
+        black.put_pixel(1, 0, image::Rgba([0, 0, 0, 0]));
+        flatten_on_disc(&mut black);
+        assert_eq!(black.get_pixel(1, 0).0, [0xf2, 0xf2, 0xf7, 255]);
+        assert!(decode_favicon(b"").is_none());
+        assert!(decode_favicon(b"<svg xmlns='http://www.w3.org/2000/svg'/>").is_none());
+        assert!(decode_favicon(b"<!doctype html><title>404</title>").is_none());
     }
 
     #[test]
