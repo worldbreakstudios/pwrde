@@ -25,6 +25,7 @@
 mod backdrop;
 mod bus;
 mod bus_exec;
+mod cef_app;
 mod claude_hooks;
 mod cli_tools;
 mod command;
@@ -206,7 +207,7 @@ enum ConfirmAction {
     /// by primary tile id at confirm time so group reordering while the
     /// dialog is up can't misdirect the close.
     CloseGroup { primary_tile: u64 },
-    /// Clear the shared Wry website-data store after an explicit warning.
+    /// Clear the shared Chromium profile data after an explicit warning.
     ClearWebviewData { id: u64 },
 }
 
@@ -1212,7 +1213,7 @@ impl App {
         self.request_redraw();
     }
 
-    /// Keep Wry child views aligned with the visible active webview tabs.
+    /// Keep the Chromium child views aligned with the visible active webview tabs.
     fn sync_webviews(&mut self, window: &Window) {
         let live: std::collections::HashSet<u64> = self
             .workspaces
@@ -5244,7 +5245,14 @@ impl App {
                 for (_, mut backend) in self.flow_backends.drain() {
                     backend.shutdown();
                 }
-                std::process::exit(0);
+                // Chromium next: close the browsers. CEF's shutdown has to run
+                // outside this borrow, so the 16ms pump finishes the quit —
+                // or, should it never come round, there was no CEF to stop.
+                self.webviews.close_all();
+                if cef_app::ready().is_err() {
+                    std::process::exit(0);
+                }
+                cef_app::request_quit();
             }
             Action::CommandPalette => self.toggle_command_root(),
             Action::IncreaseFontSize => self.zoom_font(renderer::FONT_SIZE_STEP),
@@ -7321,6 +7329,20 @@ fn main() {
         crate::ui::Input::register_key_bindings(cx);
         // Initialize gpui-component (theme + text/textarea key bindings).
         gpui_component::init(cx);
+        // Chromium for webview tabs. gpui's NSApplication exists by now, which
+        // CEF needs, and no browser can be created before this returns. A
+        // failure only costs webview tabs (they report it); launch goes on.
+        cef_app::init();
+        // The last-window-closed quit: the window took the `App` entity — and
+        // with it the browsers, which `webview::Manager` closes on drop — so
+        // only CEF itself is left to shut down. gpui holds the app borrowed
+        // here, hence the variant that does not pump. (`Action::Quit` goes
+        // through the 16ms pump instead.)
+        cx.on_app_quit(|_| {
+            cef_app::shutdown_now();
+            async {}
+        })
+        .detach();
         let bounds = Bounds::centered(None, gpui::size(px(1200.0), px(720.0)), cx);
 
         // `pwrde /some/dir` from a shell: open the argv path the same way.
@@ -7652,7 +7674,20 @@ fn main() {
                             cx.background_executor()
                                 .timer(Duration::from_millis(16))
                                 .await;
+                            // `Action::Quit` finishes here, outside any gpui
+                            // borrow: wait for the browsers to close, shut
+                            // CEF down, exit.
+                            if cef_app::quit_requested() {
+                                cef_app::shutdown();
+                                std::process::exit(0);
+                            }
                             let Some(app) = handle.upgrade() else { break };
+                            // Chromium's main-thread work (CEF runs with an
+                            // external message pump). It must stay outside
+                            // `update`: on macOS it turns the native run
+                            // loop, which runs other gpui tasks. Its handlers
+                            // only send events, drained just below.
+                            cef_app::pump();
                             let (redraw, want_palette, palette, want_settings, settings, activate_settings, (pending_keys, main)) =
                                 app.update(cx, |app: &mut App, cx| {
                                     let redraw = app.drain_events();

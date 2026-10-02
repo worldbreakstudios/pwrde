@@ -15,10 +15,13 @@
 	<key>com.apple.developer.team-identifier</key>
 	<string>@TEAM_ID@</string>
 	<!--
-	  Lets the embedded WKWebView use the platform authenticator (Touch ID /
-	  iCloud Keychain passkeys) for WebAuthn on any site. Granted by Apple per
-	  team through https://developer.apple.com/contact/request/macos-browsers-passkeys/
-	  (macOS 13.3+) and delivered as a managed capability in the profile.
+	  Lets a web browser use the platform authenticator (Touch ID / iCloud
+	  Keychain passkeys) for WebAuthn on any site. Granted by Apple per team
+	  through https://developer.apple.com/contact/request/macos-browsers-passkeys/
+	  (macOS 13.3+) and delivered as a managed capability in the profile. It
+	  is an app entitlement, not a WKWebView one — Chromium asks for the same
+	  one — so it stays now that webview tabs are CEF; whether the CEF build
+	  actually reaches iCloud Keychain passkeys with it is unverified.
 	-->
 	<key>com.apple.developer.web-browser.public-key-credential</key>
 	<true/>

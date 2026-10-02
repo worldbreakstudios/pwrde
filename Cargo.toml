@@ -48,8 +48,13 @@ raw-window-handle = "0.6"
 # the module no-ops on other platforms.
 global-hotkey = "0.8"
 serde = { version = "1", features = ["derive"] }
-# Native child webviews for webview tabs (WebViewBuilder::build_as_child).
-wry = { version = "0.56.1", features = ["devtools"] }
+# Chromium for webview tabs: the Chromium Embedded Framework through cef-rs
+# (windowed child browsers under the gpui window's NSView — see
+# `src/webview.rs` and `src/cef_app.rs`). Pinned exactly: the crate version is
+# the CEF build it binds, and `pwrde-helper` must load that same framework.
+# `build-util` / `resources` are cef-rs's own bundler and resource-id tables;
+# both are disabled here (`scripts/make-app.sh` assembles the bundle).
+cef = { version = "=154.3.0", default-features = false, features = ["sandbox"] }
 serde_json = "1"
 dirs = "6"
 rusqlite = { version = "0.32", features = ["bundled"] }
@@ -89,3 +94,10 @@ path = "src/main.rs"
 [[bin]]
 name = "pwrde-cli"
 path = "src/bin/pwrde-cli.rs"
+
+# CEF's subprocess executable (renderer, GPU, utility…): loads the framework
+# and hands over to `cef::execute_process`. Bundled five times over by
+# `scripts/make-app.sh` as the `Pwrde Helper*.app` set Chromium expects.
+[[bin]]
+name = "pwrde-helper"
+path = "src/bin/pwrde-helper.rs"
