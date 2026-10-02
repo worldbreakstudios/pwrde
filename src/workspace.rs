@@ -974,16 +974,34 @@ pub fn folders_header_chips(card: &LayoutRect, scale: f32) -> (LayoutRect, Layou
 }
 
 /// [`folders_header_chips`] at chrome factor `ui`: the chips and their gap
-/// grow with it, centred in the header strip, whose height stays tied to the
-/// native traffic lights.
+/// grow with it; each chip is centred on the traffic lights' centre line
+/// inside the header strip, whose height stays tied to those lights.
 fn folders_header_chips_at(card: &LayoutRect, scale: f32, ui: f32) -> (LayoutRect, LayoutRect) {
     let side = (HEADER_CHIP * ui * scale).round();
     let gap = (HEADER_CHIP_GAP * ui * scale).round();
-    let y = card.y + (((FOLDERS_HEADER_H - HEADER_CHIP * ui) / 2.0) * scale).round();
+    let y = header_chip_y(card, FOLDERS_HEADER_H, side, scale);
     let right = card.x + card.w - (REGION_PAD * scale).round();
     let new = LayoutRect { x: right - side, y, w: side, h: side };
     let hide = LayoutRect { x: new.x - gap - side, y, w: side, h: side };
     (hide, new)
+}
+
+/// Top of a header chip square so the chip's centre rides the traffic
+/// lights' centre line, for every chip in both clusters (the folders card's
+/// pair and the sessions header's set, `show_folders` included).
+///
+/// The native lights float in ABSOLUTE window coordinates — macOS draws them
+/// [`TRAFFIC_LIGHT_ORIGIN`] from the window's own top edge (see
+/// [`traffic_light_origin_at`]) — so the line is a *window* coordinate and
+/// must not be measured from `strip.y`: both strips start [`REGION_PAD`]
+/// lower, which used to push every chip that far below the lights. `side`
+/// must already be in physical px; the result is clamped so an oversized
+/// chip still sits inside the `band_h` strip.
+fn header_chip_y(strip: &LayoutRect, band_h: f32, side: f32, scale: f32) -> f32 {
+    let light_centre = (TRAFFIC_LIGHT_ORIGIN + TRAFFIC_LIGHT_BTN_H / 2.0) * scale;
+    let band = (band_h * scale).round();
+    let y = (light_centre - side / 2.0).round();
+    y.clamp(strip.y, (strip.y + band - side).max(strip.y))
 }
 
 /// The chips in the sessions list header, all [`HEADER_CHIP`] squares
@@ -1016,7 +1034,7 @@ fn sessions_header_chips_at(
 ) -> SessionsHeaderChips {
     let side = (HEADER_CHIP * ui * scale).round().min(list.w.max(0.0));
     let gap = (HEADER_CHIP_GAP * ui * scale).round();
-    let y = list.y + (((SESSIONS_HEADER_H - HEADER_CHIP * ui) / 2.0) * scale).round();
+    let y = header_chip_y(list, SESSIONS_HEADER_H, side, scale);
     let right = list.x + list.w - (HEADER_CHIP_INSET * scale).round();
     let gear = LayoutRect { x: right - side, y, w: side, h: side };
     let plus = LayoutRect { x: gear.x - gap - side, y, w: side, h: side };
@@ -1090,6 +1108,13 @@ pub fn titlebar(scale: f32, sidebar_w: f32) -> LayoutRect {
 /// Messages puts them there rather than at macOS's default (12, 12), which
 /// now lands on the gutter.
 pub const TRAFFIC_LIGHT_ORIGIN: f32 = 20.0;
+
+/// Measured height of the native traffic-light buttons in logical px: the
+/// close button's span is y 20–34 with the origin at 20, so the lights'
+/// centre line is [`TRAFFIC_LIGHT_ORIGIN`] + half of this. The header chips
+/// ride that line rather than the centre of the 44px header strip, which
+/// sits 5–6px lower than the lights.
+pub const TRAFFIC_LIGHT_BTN_H: f32 = 14.0;
 
 /// Which surface owns the window's top-left corner, and so where the native
 /// traffic lights float.
@@ -3667,8 +3692,61 @@ mod tests {
         }
     }
 
-    /// The header chips grow with the chrome factor and stay centred inside
-    /// the fixed header strip, up to the cap.
+    /// The header chips ride the traffic lights' centre line — not the
+    /// header band's — at every chrome factor. macOS draws the lights in
+    /// absolute window coordinates, so the line is a window coordinate:
+    /// `(TRAFFIC_LIGHT_ORIGIN + TRAFFIC_LIGHT_BTN_H / 2) * scale` from the
+    /// window top, while the strips themselves start [`REGION_PAD`] lower
+    /// (asserted here, so the premise cannot silently rot). Both chip
+    /// clusters (the folders card's pair and the sessions header's set,
+    /// `show_folders` included) follow that window-relative line, and every
+    /// chip still fits inside the fixed [`TITLEBAR_H`] strip.
+    #[test]
+    fn header_chips_center_on_the_traffic_light_line() {
+        for scale in [1.0, 2.0] {
+            for ui in [1.0, 1.25, MAX_CHROME_UI_SCALE] {
+                let light_centre = (TRAFFIC_LIGHT_ORIGIN + TRAFFIC_LIGHT_BTN_H / 2.0) * scale;
+                let band = (TITLEBAR_H * scale).round();
+                let list = sessions_list_rect(SIDEBAR_DEFAULT_W, FOLDERS_CARD_W, true, 1000, scale);
+                let card = folders_card_rect(1000, FOLDERS_CARD_W, scale);
+                // The strips sit a region-pad below the window top; the
+                // lights do not, so the line must be window-relative.
+                assert_eq!(list.y, (REGION_PAD * scale).round());
+                assert_eq!(card.y, (REGION_PAD * scale).round());
+                assert!(light_centre > list.y, "the lights float above the strip top");
+                let chips = sessions_header_chips_at(&list, true, scale, ui);
+                let (hide, new) = folders_header_chips_at(&card, scale, ui);
+                for c in [chips.focus, chips.plus, chips.gear, hide, new] {
+                    assert!(
+                        (c.y + c.h / 2.0 - light_centre).abs() <= 1.0,
+                        "chip {:?} is off the traffic-light centre at scale {scale} ui {ui}",
+                        c
+                    );
+                    assert!(c.y >= list.y && c.y + c.h <= list.y + band);
+                }
+                // The card's own two chips ride the same line inside the card.
+                let band_card = (FOLDERS_HEADER_H * scale).round();
+                for c in [hide, new] {
+                    assert!(c.y >= card.y && c.y + c.h <= card.y + band_card);
+                }
+                // The left-hand chip follows the same line (it exists only
+                // while the card is hidden).
+                let open = sessions_list_rect(SIDEBAR_DEFAULT_W, FOLDERS_CARD_W, false, 1000, scale);
+                let show = sessions_header_chips_at(&open, false, scale, ui)
+                    .show_folders
+                    .expect("show-folders chip while the card is hidden");
+                assert!((show.y + show.h / 2.0 - light_centre).abs() <= 1.0);
+            }
+        }
+        // Zero offset at the default chrome factor: chip centre == light centre.
+        let list = sessions_list_rect(SIDEBAR_DEFAULT_W, FOLDERS_CARD_W, true, 1000, 2.0);
+        let chips = sessions_header_chips(&list, true, 2.0);
+        let light_centre = (TRAFFIC_LIGHT_ORIGIN + TRAFFIC_LIGHT_BTN_H / 2.0) * 2.0;
+        assert_eq!(chips.plus.y + chips.plus.h / 2.0, light_centre);
+    }
+
+    /// The header chips grow with the chrome factor, keep the traffic-light
+    /// centre line inside the fixed header strip, up to the cap.
     #[test]
     fn header_chips_scale_with_the_chrome_factor() {
         let scale = 2.0;
@@ -3680,7 +3758,10 @@ mod tests {
             let show = chips.show_folders.unwrap();
             for c in [show, chips.focus, chips.plus, chips.gear] {
                 assert_eq!((c.w, c.h), (side, side));
-                assert!((c.y - list.y - (band - side) / 2.0).abs() <= 1.0);
+                assert!(
+                    (c.y + c.h / 2.0 - (TRAFFIC_LIGHT_ORIGIN + TRAFFIC_LIGHT_BTN_H / 2.0) * scale).abs()
+                        <= 1.0
+                );
                 assert!(c.y >= list.y && c.y + c.h <= list.y + band);
             }
             assert!(chips.focus.x + side < chips.plus.x && chips.plus.x + side < chips.gear.x);
@@ -3715,6 +3796,11 @@ mod tests {
         assert_eq!(chips.focus.x + side + gap, chips.plus.x);
         assert!(chips.gear.y >= list.y);
         assert!(chips.gear.y + side <= list.y + (SESSIONS_HEADER_H * scale).round());
+        // Centred on the traffic lights (window-relative), not on the band.
+        assert_eq!(
+            chips.gear.y + side / 2.0,
+            (TRAFFIC_LIGHT_ORIGIN + TRAFFIC_LIGHT_BTN_H / 2.0) * scale
+        );
 
         let closed = sessions_list_rect(SIDEBAR_DEFAULT_W, FOLDERS_CARD_W, false, 1000, scale);
         let chips = sessions_header_chips(&closed, false, scale);
