@@ -40,6 +40,7 @@ mod gh;
 mod git;
 mod git_context;
 mod global_hotkey;
+mod infobar_ui;
 mod lfg;
 mod modal_ui;
 mod settings_ui;
@@ -1253,7 +1254,7 @@ impl App {
                 }
                 let Some(tab) = tile.active_tab() else { continue };
                 let (Some(id), Some(url)) = (tab.webview_id(), tab.url()) else { continue };
-                let content = workspace::tile_content(&rect, self.scale());
+                let content = workspace::tile_content_for(&rect, self.scale(), ws.is_primary(tile_id));
                 if content.w < 1.0 || content.h < 1.0 {
                     continue;
                 }
@@ -1372,6 +1373,9 @@ impl App {
             self.workspaces.push(ws);
         }
         self.active = 0;
+        // Layouts saved before the primary pane existed (or edited by hand)
+        // come back in shape: primary on the left, one tab in it.
+        self.normalize_primaries();
         workspace::normalize_section_anchors(&self.workspaces, &mut self.sections);
         // Load the saved folder filter (absent = all sessions), then drop
         // it if the restored sections no longer contain that id — a stale
@@ -1494,8 +1498,28 @@ impl App {
         tiles.into_iter().find(|(tid, _)| *tid == id).map(|(_, rect)| rect)
     }
 
+    /// Put every group back into primary-pane shape
+    /// ([`Workspace::normalize_primary`]): the primary tile a single-tab leaf
+    /// at the root's left, everything else on the right. Idempotent; returns
+    /// whether any group changed.
+    fn normalize_primaries(&mut self) -> bool {
+        let next = &mut self.next_tile_id;
+        let mut changed = false;
+        for ws in &mut self.workspaces {
+            changed |= ws.normalize_primary(|| {
+                let id = *next;
+                *next += 1;
+                id
+            });
+        }
+        changed
+    }
+
     /// Re-measure every visible tile and push grid sizes to the PTYs.
     fn sync_layout(&mut self) {
+        // Every tree mutation (split, tile removal, tab move, new tab, drop)
+        // ends here, so this is where the primary-pane invariant is restored.
+        self.normalize_primaries();
         workspace::normalize_section_anchors(&self.workspaces, &mut self.sections);
         self.sync_layout_impl(false);
         self.sync_flyover_layout(false);
@@ -1522,9 +1546,10 @@ impl App {
         );
         let ws = &mut self.workspaces[self.active];
         let (tiles, _) = workspace::layout_tiles(&ws.root, area, scale);
-        let axes = workspace::tile_collapse_axis(&ws.root);
+        let axes = ws.collapse_axes();
+        let primary = ws.primary_tile;
         for (id, rect) in &tiles {
-            let content = workspace::tile_content(rect, scale);
+            let content = workspace::tile_content_for(rect, scale, *id == primary);
             // `grid_size_for` subtracts 2*PANE_PAD, matching the renderer's
             // content_origin inset — so the PTY size tracks the padded render area.
             let (cols, rows) = self.renderer.grid_size_for(&content);
@@ -1893,7 +1918,7 @@ impl App {
         if click_count <= 1 {
             self.just_expanded = None;
         }
-        let has_caret = workspace::tile_collapse_axis(&self.workspaces[self.active].root)
+        let has_caret = self.workspaces[self.active].collapse_axes()
             .iter()
             .any(|(tid, axis)| *tid == id && axis.is_some());
         let ws = &mut self.workspaces[self.active];
@@ -1921,8 +1946,22 @@ impl App {
             self.request_redraw();
             return;
         }
-        self.drag = Drag::TabPress { tile: id, tab: ti, start: self.cursor };
+        // The primary pane's one tab cannot be dragged out.
+        if !self.workspaces[self.active].is_primary(id) {
+            self.drag = Drag::TabPress { tile: id, tab: ti, start: self.cursor };
+        }
         self.sync_layout();
+        self.mark_visible_read();
+        self.request_redraw();
+    }
+
+    /// A press on the primary pane's header (the title row or the info bar,
+    /// from the element tree or the canvas fallback): focus the pane.
+    pub(crate) fn press_primary_header(&mut self) {
+        let ws = &mut self.workspaces[self.active];
+        if ws.root.find_tile(ws.primary_tile).is_some() {
+            ws.focused_tile = ws.primary_tile;
+        }
         self.mark_visible_read();
         self.request_redraw();
     }
@@ -2099,7 +2138,8 @@ impl App {
         let mut others = Vec::new();
         let mut any_expanded = false;
         for t in ws.root.tiles() {
-            if t.id != focused {
+            // The primary pane never folds, so it is not one of the "others".
+            if t.id != focused && !ws.is_primary(t.id) {
                 others.push(t.id);
                 any_expanded |= !t.collapsed;
             }
@@ -2123,7 +2163,7 @@ impl App {
     fn toggle_focused_collapse(&mut self) {
         let ws = &self.workspaces[self.active];
         let id = ws.focused_tile;
-        let in_split = workspace::tile_collapse_axis(&ws.root)
+        let in_split = ws.collapse_axes()
             .iter()
             .any(|(tid, a)| *tid == id && a.is_some());
         if !in_split {
@@ -2139,6 +2179,10 @@ impl App {
     /// expanding restores the previous arrangement.
     fn set_collapsed(&mut self, id: u64, collapsed: bool) {
         let ws = &mut self.workspaces[self.active];
+        // The primary pane never folds.
+        if collapsed && ws.is_primary(id) {
+            return;
+        }
         let Some(tile) = ws.root.find_tile_mut(id) else { return };
         if tile.collapsed == collapsed {
             return;
@@ -2357,7 +2401,7 @@ impl App {
         let ws = &self.workspaces[self.active];
         let (tiles, _) = workspace::layout_tiles(&ws.root, self.area(), scale);
         let Some((id, rect)) =
-            tiles.iter().find(|(_, r)| workspace::tile_content(r, scale).contains(px, py))
+            tiles.iter().find(|(id, r)| workspace::tile_content_for(r, scale, ws.is_primary(*id)).contains(px, py))
         else {
             return;
         };
@@ -2370,7 +2414,7 @@ impl App {
         if session.app_consumes_wheel() {
             // Hand the wheel to the app (mouse report, or alternate-scroll arrow
             // keys on the alternate screen) — once per accumulated step.
-            let content = workspace::tile_content(rect, scale);
+            let content = workspace::tile_content_for(rect, scale, ws.is_primary(*id));
             let (col, row) = self.renderer.cell_at(&content, px, py).unwrap_or((0, 0));
             for _ in 0..steps.unsigned_abs() {
                 session.forward_wheel(up, col, row);
@@ -2624,8 +2668,8 @@ impl App {
 
     /// Right-click opens a native context menu on what is under the cursor.
     /// A sidebar session row offers "Mark as unread" (re-dots its primary
-    /// pane's active tab, the one the row's dot mirrors) and pin / unpin
-    /// group; a tile tab offers "Mark as unread", pin / unpin tab, and — for
+    /// pane's active tab, the one the row's dot mirrors), pin / unpin and
+    /// snooze group, and "Close session" (the close-group confirm); a tile tab offers "Mark as unread", pin / unpin tab, and — for
     /// a webview — hide / show its title bar. Never changes focus. The hit is
     /// resolved here; the menu itself is shown by [`App::show_context_menu`].
     fn on_right_mouse_down(&mut self, window: &Window, cx: &mut Context<Self>) {
@@ -2683,6 +2727,13 @@ impl App {
                     context_menu::MenuItem {
                         title: if ws.snoozed { "Unsnooze group" } else { "Snooze group" }.into(),
                         enabled: true,
+                        separator_after: true,
+                    },
+                    // The primary pane has no × of its own, so the row's
+                    // menu is where a session is closed with the mouse.
+                    context_menu::MenuItem {
+                        title: "Close session".into(),
+                        enabled: true,
                         separator_after: false,
                     },
                 ];
@@ -2696,12 +2747,16 @@ impl App {
         let area = self.area();
         let ws = &self.workspaces[self.active];
         let (tiles, _) = workspace::layout_tiles(&ws.root, area, scale);
-        let axes = workspace::tile_collapse_axis(&ws.root);
+        let axes = ws.collapse_axes();
         for (id, rect) in &tiles {
             let strip = workspace::tab_strip_rect(area, rect, scale, self.sidebar_w());
             let bar = workspace::tile_tab_bar(&strip, scale);
             if !bar.contains(px, py) {
                 continue;
+            }
+            // The primary pane has a title row, not tabs: no tab menu.
+            if ws.is_primary(*id) {
+                return;
             }
             let has_caret = axes.iter().any(|(tid, a)| tid == id && a.is_some());
             if let Some(tile) = ws.root.find_tile(*id) {
@@ -2805,6 +2860,16 @@ impl App {
                         if w.snoozed {
                             w.pinned = false;
                         }
+                    },
+                    // Through the same confirm dialog as ⌘⇧W.
+                    3 => {
+                        let primary_tile = w.primary_tile;
+                        self.confirm = Some(ConfirmClose {
+                            text: "Closing this session closes all of its panes.".into(),
+                            action: ConfirmAction::CloseGroup { primary_tile },
+                        });
+                        self.request_redraw();
+                        return;
                     },
                     _ => return,
                 }
@@ -3463,10 +3528,17 @@ impl App {
         let area = self.area();
         let ws = &self.workspaces[self.active];
         let (tiles, _) = workspace::layout_tiles(&ws.root, area, scale);
-        let axes = workspace::tile_collapse_axis(&ws.root);
+        let axes = ws.collapse_axes();
         for (id, rect) in &tiles {
             if !rect.contains(px, py) {
                 continue;
+            }
+            // The primary pane holds exactly one tab: its header (title row
+            // and info bar) is no landing zone, and below it only the edge
+            // bands — which open a new tile — are offered.
+            let primary = ws.is_primary(*id);
+            if primary && py < workspace::tile_content_for(rect, scale, true).y {
+                return None;
             }
             let strip = workspace::tab_strip_rect(area, rect, scale, self.sidebar_w());
             let bar = workspace::tile_tab_bar(&strip, scale);
@@ -3493,10 +3565,16 @@ impl App {
                 };
                 return Some(DropTarget::TabBar { tile: *id, index });
             }
-            let content = workspace::tile_content(rect, scale);
+            let content = workspace::tile_content_for(rect, scale, ws.is_primary(*id));
             // Edge bands: outer eighth of the content on each side splits.
             let ex = content.w / 4.0;
             let ey = content.h / 4.0;
+            // A new tile can only open to the primary pane's right (normalize
+            // re-homes anything else there), so that is the one band offered.
+            if primary {
+                return (px > content.x + content.w - ex)
+                    .then_some(DropTarget::Edge { tile: *id, dir: Dir::Row, first: false });
+            }
             if px < content.x + ex {
                 return Some(DropTarget::Edge { tile: *id, dir: Dir::Row, first: true });
             }
@@ -3851,7 +3929,7 @@ impl App {
                     {
                         let strip =
                             workspace::tab_strip_rect(area, &rect, scale, self.sidebar_w());
-                        let axes = workspace::tile_collapse_axis(&wsp.root);
+                        let axes = wsp.collapse_axes();
                         let has_caret =
                             axes.iter().any(|(tid, a)| *tid == tile && a.is_some());
                         let (titles, active) = wsp
@@ -3869,9 +3947,11 @@ impl App {
                         &workspace::tab_strip_rect(area, &rect, scale, self.sidebar_w()),
                         scale,
                     ),
-                    DropTarget::Center { .. } => workspace::tile_content(&rect, scale),
+                    DropTarget::Center { .. } => {
+                        workspace::tile_content_for(&rect, scale, wsp.is_primary(tile))
+                    },
                     DropTarget::Edge { dir, first, .. } => {
-                        let c = workspace::tile_content(&rect, scale);
+                        let c = workspace::tile_content_for(&rect, scale, wsp.is_primary(tile));
                         match (dir, first) {
                             (Dir::Row, true) => {
                                 workspace::LayoutRect { w: c.w / 2.0, ..c }
@@ -3959,7 +4039,15 @@ impl App {
             .root
             .find_tile(src_tile)
             .map_or(0, |t| t.tabs.len());
+        // The primary pane's one tab stays put, and nothing joins it.
+        let primary = self.workspaces[self.active].primary_tile;
+        if src_tile == primary {
+            return;
+        }
         match target {
+            DropTarget::TabBar { tile, .. } | DropTarget::Center { tile } if tile == primary => {
+                return;
+            },
             DropTarget::Center { tile } if tile == src_tile => return,
             DropTarget::Edge { tile, .. } if tile == src_tile && src_len <= 1 => return,
             DropTarget::Group { ws } if ws == self.active && src_len <= 1 => {
@@ -4060,7 +4148,7 @@ impl App {
         let ws = &self.workspaces[self.active];
         let (tiles, _) = workspace::layout_tiles(&ws.root, self.area(), scale);
         for (id, rect) in &tiles {
-            let content = workspace::tile_content(rect, scale);
+            let content = workspace::tile_content_for(rect, scale, ws.is_primary(*id));
             if !content.contains(px, py) {
                 continue;
             }
@@ -4116,7 +4204,7 @@ impl App {
             MouseLoc::Flyover => workspace::flyover_content(&self.flyover_rect_now(), scale),
             MouseLoc::Tool => workspace::tile_content(&self.tool_area(), scale),
             MouseLoc::Tile(id) => match self.tile_rect(id) {
-                Some(rect) => workspace::tile_content(&rect, scale),
+                Some(rect) => workspace::tile_content_for(&rect, scale, self.workspaces[self.active].is_primary(id)),
                 None => return,
             },
         };
@@ -4206,7 +4294,7 @@ impl App {
         let (tiles, _) = workspace::layout_tiles(&ws.root, self.area(), scale);
         tiles
             .iter()
-            .find(|(_, r)| workspace::tile_content(r, scale).contains(px, py))
+            .find(|(id, r)| workspace::tile_content_for(r, scale, ws.is_primary(*id)).contains(px, py))
             .map(|(id, _)| MouseLoc::Tile(*id))
     }
 
@@ -4432,7 +4520,7 @@ impl App {
         let area = self.area();
         let ws = &self.workspaces[self.active];
         let (tiles, _) = workspace::layout_tiles(&ws.root, area, scale);
-        let axes = workspace::tile_collapse_axis(&ws.root);
+        let axes = ws.collapse_axes();
 
         // Tiles: caret/collapse handling, tab strip press (activate + arm
         // drag), or content focus.
@@ -4451,6 +4539,13 @@ impl App {
                 // Element-owned too (`tile_ui`); kept for a press that slips
                 // past the element (it never should).
                 self.press_tile_expand(*id);
+                return;
+            }
+            // The primary pane's header — its title row and info bar — has
+            // no tabs, caret or "+": a press there only focuses the pane and
+            // never reaches the terminal as a report or a selection.
+            if ws.is_primary(*id) && py < workspace::tile_content_for(rect, scale, true).y {
+                self.press_primary_header();
                 return;
             }
             let bar = workspace::tile_tab_bar(&strip, scale);
@@ -4501,7 +4596,7 @@ impl App {
                     self.request_redraw();
                     return;
                 }
-                let content = workspace::tile_content(rect, scale);
+                let content = workspace::tile_content_for(rect, scale, self.workspaces[self.active].is_primary(*id));
                 if let Some((col, row)) = self.renderer.cell_at(&content, px, py) {
                     if let Some(tab) =
                         self.workspaces[self.active].root.find_tile(*id).and_then(|t| t.active_tab())
@@ -4659,7 +4754,7 @@ impl App {
                 let area = self.area();
                 let scale = self.renderer.scale;
                 if let Some(rect) = self.tile_rect(tile) {
-                    let content = workspace::tile_content(&rect, scale);
+                    let content = workspace::tile_content_for(&rect, scale, self.workspaces[self.active].is_primary(tile));
                     if let Some((col, row)) = self.renderer.cell_at(&content, px, py)
                         && let Some(tab) = self.workspaces[self.active]
                             .root
@@ -4727,7 +4822,7 @@ impl App {
                     let (tiles, _) = workspace::layout_tiles(&ws.root, self.area(), scale);
                     let mut found = None;
                     for (id, rect) in &tiles {
-                        let content = workspace::tile_content(rect, scale);
+                        let content = workspace::tile_content_for(rect, scale, ws.is_primary(*id));
                         if !content.contains(px, py) {
                             continue;
                         }
@@ -6499,6 +6594,8 @@ impl Render for App {
             // Tile tab strips: pixels on the element tree, clipped per
             // strip; clicks and drags still resolve on the canvas rects.
             .child(self.render_tile_chrome(cx))
+            // The primary pane's info bar, under its title row (`infobar_ui`).
+            .child(self.render_info_bar(cx))
             // Browser chrome sits in the strip reserved above each native
             // child webview and remains GPUI-owned for consistent controls.
             .child(self.render_webview_chrome(window, cx))

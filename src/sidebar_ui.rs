@@ -977,7 +977,7 @@ pub(crate) fn separator(theme: &Theme) -> Hsla {
 /// Every glyph here is plain Latin punctuation or an arrow/check that the
 /// macOS UI font carries itself — nothing that falls back to a missing-glyph
 /// box the way a branch or fork symbol would.
-fn avatar_icon(kind: CardAvatar) -> &'static str {
+pub(crate) fn avatar_icon(kind: CardAvatar) -> &'static str {
     match kind {
         CardAvatar::NoPr => crate::ui::assets::ICON_PR_NONE,
         CardAvatar::Draft => crate::ui::assets::ICON_PR_DRAFT,
@@ -1004,7 +1004,7 @@ pub(crate) fn accent() -> Hsla {
 }
 
 /// Ink for the "no pull request yet" commit graph — the mock's `#57606a`.
-fn pr_none_ink(dark: bool) -> Hsla {
+pub(crate) fn pr_none_ink(dark: bool) -> Hsla {
     if dark {
         gpui::rgb(0x8b949e).into()
     } else {
@@ -1012,7 +1012,7 @@ fn pr_none_ink(dark: bool) -> Hsla {
     }
 }
 
-fn pr_open(dark: bool) -> Hsla {
+pub(crate) fn pr_open(dark: bool) -> Hsla {
     if dark {
         gpui::rgb(0x3fb950).into()
     } else {
@@ -1022,7 +1022,7 @@ fn pr_open(dark: bool) -> Hsla {
 
 /// Git's merged purple (`#8250df` in the mock), with the same dark-chrome
 /// lift as [`pr_open`].
-fn pr_merged(dark: bool) -> Hsla {
+pub(crate) fn pr_merged(dark: bool) -> Hsla {
     if dark {
         gpui::rgb(0xa371f7).into()
     } else {
@@ -1032,7 +1032,7 @@ fn pr_merged(dark: bool) -> Hsla {
 
 /// Diff green. These are the one colour pair the theme has no token for, so
 /// they live here beside the card rollups that paint them.
-fn diff_added(dark: bool) -> Hsla {
+pub(crate) fn diff_added(dark: bool) -> Hsla {
     if dark {
         gpui::rgb(0x78be8c).into()
     } else {
@@ -1053,7 +1053,7 @@ fn typographic_minus(removed: &str) -> String {
 }
 
 /// Diff red, the counterpart to [`diff_added`].
-fn diff_removed(dark: bool) -> Hsla {
+pub(crate) fn diff_removed(dark: bool) -> Hsla {
     if dark {
         gpui::rgb(0xe06c75).into()
     } else {

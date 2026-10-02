@@ -494,7 +494,12 @@ impl App {
                                     }),
                                 })
                                 .collect();
-                            json!({ "id": t.id, "focused": t.id == w.focused_tile, "tabs": tabs })
+                            json!({
+                                "id": t.id,
+                                "focused": t.id == w.focused_tile,
+                                "primary": w.is_primary(t.id),
+                                "tabs": tabs,
+                            })
                         })
                         .collect();
                     json!({

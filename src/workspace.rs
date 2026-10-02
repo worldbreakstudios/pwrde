@@ -404,6 +404,29 @@ impl Node {
         false
     }
 
+    /// [`Self::remove_tile`], but handing the removed tile back instead of
+    /// dropping it (and its sessions): the sibling takes the parent's place.
+    /// `None` when `id` is the root leaf or not in the tree.
+    pub fn take_tile(&mut self, id: u64) -> Option<Tile> {
+        let Node::Split { a, b, .. } = self else { return None };
+        let hit_a = matches!(&**a, Node::Leaf(t) if t.id == id);
+        let hit_b = matches!(&**b, Node::Leaf(t) if t.id == id);
+        if !hit_a && !hit_b {
+            return a.take_tile(id).or_else(|| b.take_tile(id));
+        }
+        let Node::Split { a, b, .. } =
+            std::mem::replace(self, Node::Leaf(Tile::empty(u64::MAX)))
+        else {
+            return None;
+        };
+        let (taken, survivor) = if hit_a { (*a, *b) } else { (*b, *a) };
+        *self = survivor;
+        match taken {
+            Node::Leaf(tile) => Some(tile),
+            Node::Split { .. } => None,
+        }
+    }
+
     /// Walk a path of 0 (first child) / 1 (second child) steps.
     pub fn node_at_path_mut(&mut self, path: &[u8]) -> Option<&mut Node> {
         let mut node = self;
@@ -561,6 +584,143 @@ impl Workspace {
             t.collapsed = false;
             t.collapse_anim = 0.0;
         }
+    }
+
+    /// Whether `id` is this group's primary pane (see
+    /// [`Self::normalize_primary`]).
+    pub fn is_primary(&self, id: u64) -> bool {
+        self.primary_tile == id
+    }
+
+    /// Restore the primary-pane invariant; returns whether anything changed.
+    ///
+    /// The primary tile is the group's tab-less pane on the left: with more
+    /// than one tile the root is a [`Dir::Row`] split whose `a` is
+    /// `Leaf(primary)` and whose `b` is everything else, and a lone primary
+    /// is simply the root leaf. A primary found anywhere else is lifted out
+    /// (its sibling takes the parent's place, as [`Node::remove_tile`] does)
+    /// and re-wrapped as the root's left half at ratio 0.5 (or, when it was only
+    /// nested by a split made at it, at the root's existing ratio); one
+    /// already in place keeps the tree — and the user's ratio — untouched.
+    ///
+    /// The primary also holds exactly one tab — its first unpinned one, kept
+    /// unpinned — and never collapses: every other tab moves, in order, to the first tile of the right
+    /// subtree — or into a new tile (id from `new_tile_id`) split to the
+    /// right when the primary is alone — so a tab pushed onto the primary
+    /// by any path lands on the right instead. The moved tab that was the
+    /// primary's active one becomes active over there, and focus follows it
+    /// when the primary held focus.
+    ///
+    /// A `primary_tile` missing from the tree is left alone (the rest of the
+    /// app tolerates a dangling primary). Idempotent.
+    pub fn normalize_primary(&mut self, mut new_tile_id: impl FnMut() -> u64) -> bool {
+        let primary = self.primary_tile;
+        let Some(tile) = self.root.find_tile_mut(primary) else { return false };
+        let mut changed = tile.collapsed || tile.collapse_anim != 0.0;
+        tile.collapsed = false;
+        tile.collapse_anim = 0.0;
+        // Lift the extras out first; they are re-homed once the tree is in
+        // shape. The pane keeps its first unpinned tab — a pinned tab dropped
+        // onto the primary sorts ahead of the original, which must not be
+        // evicted by it — and the kept tab is never pinned (a pin would block
+        // ⌘W's close-group confirm with no strip to unpin it from).
+        // `moved_active` is the extras index of the tab that was the
+        // primary's active one, when it is among them.
+        let keep = tile.tabs.iter().position(|t| !t.pinned).unwrap_or(0);
+        let active = tile.active;
+        let mut extras = Vec::new();
+        let mut moved_active = None;
+        if tile.tabs.len() > 1 {
+            let kept = tile.tabs.remove(keep);
+            extras = std::mem::replace(&mut tile.tabs, vec![kept]);
+            if active != keep && active <= extras.len() {
+                moved_active = Some(if active < keep { active } else { active - 1 });
+            }
+        }
+        if let Some(tab) = tile.tabs.first_mut()
+            && tab.pinned
+        {
+            tab.pinned = false;
+            changed = true;
+        }
+        if tile.active != 0 {
+            tile.active = 0;
+            changed = true;
+        }
+
+        let in_place = match &self.root {
+            Node::Leaf(_) => true,
+            Node::Split { dir: Dir::Row, a, .. } => {
+                matches!(&**a, Node::Leaf(t) if t.id == primary)
+            },
+            Node::Split { .. } => false,
+        };
+        // A split made *at* an in-place primary nests it inside the root's
+        // left half. Lifting it back out must not cost the user their dragged
+        // primary width: the root's ratio stays with the primary divider and
+        // the split that inherits the old root starts even.
+        let kept_ratio = match &self.root {
+            Node::Split { dir: Dir::Row, ratio, a, b } if a.find_tile(primary).is_some() => {
+                Some((*ratio, b.tiles().first().map(|t| t.id)))
+            },
+            _ => None,
+        };
+        if !in_place && let Some(tile) = self.root.take_tile(primary) {
+            let mut rest = std::mem::replace(&mut self.root, Node::Leaf(Tile::empty(u64::MAX)));
+            let mut outer = 0.5;
+            if let Some((ratio, b_first)) = kept_ratio
+                && let Node::Split { ratio: inner, b, .. } = &mut rest
+                && b.tiles().first().map(|t| t.id) == b_first
+            {
+                outer = ratio;
+                *inner = 0.5;
+            }
+            self.root = Node::Split {
+                dir: Dir::Row,
+                ratio: outer,
+                a: Box::new(Node::Leaf(tile)),
+                b: Box::new(rest),
+            };
+            changed = true;
+        }
+
+        if extras.is_empty() {
+            return changed;
+        }
+        if matches!(self.root, Node::Leaf(_)) {
+            let mut fresh = Some(Tile::empty(new_tile_id()));
+            self.root.split_tile(primary, Dir::Row, &mut fresh, false);
+        }
+        let Node::Split { b, .. } = &mut self.root else { return changed };
+        let Some(host) = b.tiles_mut().into_iter().next() else { return changed };
+        for (i, tab) in extras.into_iter().enumerate() {
+            let at = host.insert_tab(host.tabs.len(), tab);
+            if moved_active == Some(i) {
+                host.active = at;
+            } else if at <= host.active && host.tabs.len() > 1 {
+                host.active += 1;
+            }
+        }
+        if moved_active.is_some() {
+            // The pane is about to show the moved tab: it cannot stay folded.
+            host.collapsed = false;
+            if self.focused_tile == primary {
+                self.focused_tile = host.id;
+            }
+        }
+        true
+    }
+
+    /// [`tile_collapse_axis`] for this group, with the primary pane reported
+    /// as un-collapsible (`None`): it has no caret and never folds.
+    pub fn collapse_axes(&self) -> Vec<(u64, Option<Dir>)> {
+        let mut axes = tile_collapse_axis(&self.root);
+        for (id, axis) in &mut axes {
+            if *id == self.primary_tile {
+                *axis = None;
+            }
+        }
+        axes
     }
 }
 
@@ -974,16 +1134,34 @@ pub fn folders_header_chips(card: &LayoutRect, scale: f32) -> (LayoutRect, Layou
 }
 
 /// [`folders_header_chips`] at chrome factor `ui`: the chips and their gap
-/// grow with it, centred in the header strip, whose height stays tied to the
-/// native traffic lights.
+/// grow with it; each chip is centred on the traffic lights' centre line
+/// inside the header strip, whose height stays tied to those lights.
 fn folders_header_chips_at(card: &LayoutRect, scale: f32, ui: f32) -> (LayoutRect, LayoutRect) {
     let side = (HEADER_CHIP * ui * scale).round();
     let gap = (HEADER_CHIP_GAP * ui * scale).round();
-    let y = card.y + (((FOLDERS_HEADER_H - HEADER_CHIP * ui) / 2.0) * scale).round();
+    let y = header_chip_y(card, FOLDERS_HEADER_H, side, scale);
     let right = card.x + card.w - (REGION_PAD * scale).round();
     let new = LayoutRect { x: right - side, y, w: side, h: side };
     let hide = LayoutRect { x: new.x - gap - side, y, w: side, h: side };
     (hide, new)
+}
+
+/// Top of a header chip square so the chip's centre rides the traffic
+/// lights' centre line, for every chip in both clusters (the folders card's
+/// pair and the sessions header's set, `show_folders` included).
+///
+/// The native lights float in ABSOLUTE window coordinates — macOS draws them
+/// [`TRAFFIC_LIGHT_ORIGIN`] from the window's own top edge (see
+/// [`traffic_light_origin_at`]) — so the line is a *window* coordinate and
+/// must not be measured from `strip.y`: both strips start [`REGION_PAD`]
+/// lower, which used to push every chip that far below the lights. `side`
+/// must already be in physical px; the result is clamped so an oversized
+/// chip still sits inside the `band_h` strip.
+fn header_chip_y(strip: &LayoutRect, band_h: f32, side: f32, scale: f32) -> f32 {
+    let light_centre = (TRAFFIC_LIGHT_ORIGIN + TRAFFIC_LIGHT_BTN_H / 2.0) * scale;
+    let band = (band_h * scale).round();
+    let y = (light_centre - side / 2.0).round();
+    y.clamp(strip.y, (strip.y + band - side).max(strip.y))
 }
 
 /// The chips in the sessions list header, all [`HEADER_CHIP`] squares
@@ -1016,7 +1194,7 @@ fn sessions_header_chips_at(
 ) -> SessionsHeaderChips {
     let side = (HEADER_CHIP * ui * scale).round().min(list.w.max(0.0));
     let gap = (HEADER_CHIP_GAP * ui * scale).round();
-    let y = list.y + (((SESSIONS_HEADER_H - HEADER_CHIP * ui) / 2.0) * scale).round();
+    let y = header_chip_y(list, SESSIONS_HEADER_H, side, scale);
     let right = list.x + list.w - (HEADER_CHIP_INSET * scale).round();
     let gear = LayoutRect { x: right - side, y, w: side, h: side };
     let plus = LayoutRect { x: gear.x - gap - side, y, w: side, h: side };
@@ -1116,6 +1294,13 @@ pub fn titlebar(scale: f32, sidebar_w: f32) -> LayoutRect {
 /// Messages puts them there rather than at macOS's default (12, 12), which
 /// now lands on the gutter.
 pub const TRAFFIC_LIGHT_ORIGIN: f32 = 20.0;
+
+/// Measured height of the native traffic-light buttons in logical px: the
+/// close button's span is y 20–34 with the origin at 20, so the lights'
+/// centre line is [`TRAFFIC_LIGHT_ORIGIN`] + half of this. The header chips
+/// ride that line rather than the centre of the 44px header strip, which
+/// sits 5–6px lower than the lights.
+pub const TRAFFIC_LIGHT_BTN_H: f32 = 14.0;
 
 /// Which surface owns the window's top-left corner, and so where the native
 /// traffic lights float.
@@ -2207,6 +2392,78 @@ pub fn tile_content(rect: &LayoutRect, scale: f32) -> LayoutRect {
 fn tile_content_at(rect: &LayoutRect, scale: f32, ui: f32) -> LayoutRect {
     let bar = tab_bar_h(scale, ui);
     LayoutRect { y: rect.y + bar, h: (rect.h - bar).max(0.0), ..*rect }
+}
+
+/// Height of the primary pane's info bar at the default chrome text size —
+/// the webview toolbar's 48px, scaled the same way.
+const INFO_BAR_H: f32 = 48.0;
+
+/// Height (physical px) of the primary pane's info bar at display `scale`
+/// and chrome factor `ui`.
+fn info_bar_h(scale: f32, ui: f32) -> f32 {
+    (INFO_BAR_H * ui * scale).round()
+}
+
+/// Height of a tile's header: the tab bar, plus — on the group's primary
+/// pane — the info bar under its title row. Every consumer of a tile's
+/// content rect (PTY sizing, painting, hit-testing, webview bounds, drop
+/// hints) reads this through [`tile_content_for`].
+pub fn tile_header_h(scale: f32, is_primary: bool) -> f32 {
+    tile_header_h_at(scale, chrome_ui_scale(), is_primary)
+}
+
+/// [`tile_header_h`] at chrome factor `ui`.
+fn tile_header_h_at(scale: f32, ui: f32, is_primary: bool) -> f32 {
+    tab_bar_h(scale, ui) + if is_primary { info_bar_h(scale, ui) } else { 0.0 }
+}
+
+/// The content region of a tile below its header — [`tile_content`] for an
+/// ordinary tile, a shorter one below the info bar for the primary pane.
+pub fn tile_content_for(rect: &LayoutRect, scale: f32, is_primary: bool) -> LayoutRect {
+    tile_content_for_at(rect, scale, chrome_ui_scale(), is_primary)
+}
+
+/// [`tile_content_for`] at chrome factor `ui`.
+fn tile_content_for_at(rect: &LayoutRect, scale: f32, ui: f32, is_primary: bool) -> LayoutRect {
+    let header = tile_header_h_at(scale, ui, is_primary).min(rect.h.max(0.0));
+    LayoutRect { y: rect.y + header, h: (rect.h - header).max(0.0), ..*rect }
+}
+
+/// The primary pane's info bar: the tile's full width, directly under its
+/// title row ([`tile_tab_bar`]) and directly above its content
+/// ([`tile_content_for`]). Clamped to the tile, so a very short pane never
+/// paints a bar outside its card.
+pub fn primary_info_bar(rect: &LayoutRect, scale: f32) -> LayoutRect {
+    primary_info_bar_at(rect, scale, chrome_ui_scale())
+}
+
+/// [`primary_info_bar`] at chrome factor `ui`.
+fn primary_info_bar_at(rect: &LayoutRect, scale: f32, ui: f32) -> LayoutRect {
+    let top = tab_bar_h(scale, ui).min(rect.h.max(0.0));
+    let bottom = tile_header_h_at(scale, ui, true).min(rect.h.max(0.0));
+    LayoutRect { y: rect.y + top, h: bottom - top, ..*rect }
+}
+
+/// The primary pane's title row: the bar is `strip`'s tab bar (so the
+/// collapsed-sidebar inset of [`tab_strip_rect`] carries over) and the row
+/// is the same padded 30px band a tab strip lays its chips in, inset by the
+/// strip's end padding. Returns `(bar, row)`.
+pub fn primary_title_row(strip: &LayoutRect, scale: f32) -> (LayoutRect, LayoutRect) {
+    primary_title_row_at(strip, scale, chrome_ui_scale())
+}
+
+/// [`primary_title_row`] at chrome factor `ui`.
+fn primary_title_row_at(strip: &LayoutRect, scale: f32, ui: f32) -> (LayoutRect, LayoutRect) {
+    let s = scale * ui;
+    let bar = tile_tab_bar_at(strip, scale, ui);
+    let pad = (TILE_TAB_PAD_X * s).round().min(bar.w / 2.0);
+    let row = LayoutRect {
+        x: bar.x + pad,
+        y: bar.y + (TILE_TAB_PAD_TOP * s).round(),
+        w: (bar.w - 2.0 * pad).max(0.0),
+        h: (TILE_TAB_ROW_H * s).round(),
+    };
+    (bar, row)
 }
 
 /// A square caret button at the RIGHT edge of a tile's tab bar.
@@ -3765,8 +4022,61 @@ mod tests {
         }
     }
 
-    /// The header chips grow with the chrome factor and stay centred inside
-    /// the fixed header strip, up to the cap.
+    /// The header chips ride the traffic lights' centre line — not the
+    /// header band's — at every chrome factor. macOS draws the lights in
+    /// absolute window coordinates, so the line is a window coordinate:
+    /// `(TRAFFIC_LIGHT_ORIGIN + TRAFFIC_LIGHT_BTN_H / 2) * scale` from the
+    /// window top, while the strips themselves start [`REGION_PAD`] lower
+    /// (asserted here, so the premise cannot silently rot). Both chip
+    /// clusters (the folders card's pair and the sessions header's set,
+    /// `show_folders` included) follow that window-relative line, and every
+    /// chip still fits inside the fixed [`TITLEBAR_H`] strip.
+    #[test]
+    fn header_chips_center_on_the_traffic_light_line() {
+        for scale in [1.0, 2.0] {
+            for ui in [1.0, 1.25, MAX_CHROME_UI_SCALE] {
+                let light_centre = (TRAFFIC_LIGHT_ORIGIN + TRAFFIC_LIGHT_BTN_H / 2.0) * scale;
+                let band = (TITLEBAR_H * scale).round();
+                let list = sessions_list_rect(SIDEBAR_DEFAULT_W, FOLDERS_CARD_W, true, 1000, scale);
+                let card = folders_card_rect(1000, FOLDERS_CARD_W, scale);
+                // The strips sit a region-pad below the window top; the
+                // lights do not, so the line must be window-relative.
+                assert_eq!(list.y, (REGION_PAD * scale).round());
+                assert_eq!(card.y, (REGION_PAD * scale).round());
+                assert!(light_centre > list.y, "the lights float above the strip top");
+                let chips = sessions_header_chips_at(&list, true, scale, ui);
+                let (hide, new) = folders_header_chips_at(&card, scale, ui);
+                for c in [chips.focus, chips.plus, chips.gear, hide, new] {
+                    assert!(
+                        (c.y + c.h / 2.0 - light_centre).abs() <= 1.0,
+                        "chip {:?} is off the traffic-light centre at scale {scale} ui {ui}",
+                        c
+                    );
+                    assert!(c.y >= list.y && c.y + c.h <= list.y + band);
+                }
+                // The card's own two chips ride the same line inside the card.
+                let band_card = (FOLDERS_HEADER_H * scale).round();
+                for c in [hide, new] {
+                    assert!(c.y >= card.y && c.y + c.h <= card.y + band_card);
+                }
+                // The left-hand chip follows the same line (it exists only
+                // while the card is hidden).
+                let open = sessions_list_rect(SIDEBAR_DEFAULT_W, FOLDERS_CARD_W, false, 1000, scale);
+                let show = sessions_header_chips_at(&open, false, scale, ui)
+                    .show_folders
+                    .expect("show-folders chip while the card is hidden");
+                assert!((show.y + show.h / 2.0 - light_centre).abs() <= 1.0);
+            }
+        }
+        // Zero offset at the default chrome factor: chip centre == light centre.
+        let list = sessions_list_rect(SIDEBAR_DEFAULT_W, FOLDERS_CARD_W, true, 1000, 2.0);
+        let chips = sessions_header_chips(&list, true, 2.0);
+        let light_centre = (TRAFFIC_LIGHT_ORIGIN + TRAFFIC_LIGHT_BTN_H / 2.0) * 2.0;
+        assert_eq!(chips.plus.y + chips.plus.h / 2.0, light_centre);
+    }
+
+    /// The header chips grow with the chrome factor, keep the traffic-light
+    /// centre line inside the fixed header strip, up to the cap.
     #[test]
     fn header_chips_scale_with_the_chrome_factor() {
         let scale = 2.0;
@@ -3778,7 +4088,10 @@ mod tests {
             let show = chips.show_folders.unwrap();
             for c in [show, chips.focus, chips.plus, chips.gear] {
                 assert_eq!((c.w, c.h), (side, side));
-                assert!((c.y - list.y - (band - side) / 2.0).abs() <= 1.0);
+                assert!(
+                    (c.y + c.h / 2.0 - (TRAFFIC_LIGHT_ORIGIN + TRAFFIC_LIGHT_BTN_H / 2.0) * scale).abs()
+                        <= 1.0
+                );
                 assert!(c.y >= list.y && c.y + c.h <= list.y + band);
             }
             assert!(chips.focus.x + side < chips.plus.x && chips.plus.x + side < chips.gear.x);
@@ -3813,6 +4126,11 @@ mod tests {
         assert_eq!(chips.focus.x + side + gap, chips.plus.x);
         assert!(chips.gear.y >= list.y);
         assert!(chips.gear.y + side <= list.y + (SESSIONS_HEADER_H * scale).round());
+        // Centred on the traffic lights (window-relative), not on the band.
+        assert_eq!(
+            chips.gear.y + side / 2.0,
+            (TRAFFIC_LIGHT_ORIGIN + TRAFFIC_LIGHT_BTN_H / 2.0) * scale
+        );
 
         let closed = sessions_list_rect(SIDEBAR_DEFAULT_W, FOLDERS_CARD_W, false, 1000, scale);
         let chips = sessions_header_chips(&closed, false, scale);
@@ -4403,6 +4721,330 @@ mod tests {
         assert!(advanced.x >= pane.x && advanced.x + advanced.w <= pane.x + pane.w);
     }
 
+
+    // ── Primary pane ────────────────────────────────────────────────────
+
+    /// A tile whose tabs carry `marks` in their `cols`, so a test can tell
+    /// which tab ended up where.
+    fn marked_tile(id: u64, marks: &[usize]) -> Tile {
+        let mut tile = Tile::empty(id);
+        for mark in marks {
+            let mut tab = Tab::new(Session::placeholder());
+            tab.cols = *mark;
+            tile.tabs.push(tab);
+        }
+        tile
+    }
+
+    fn marks(tile: &Tile) -> Vec<usize> {
+        tile.tabs.iter().map(|tab| tab.cols).collect()
+    }
+
+    /// The tree as text — `R`/`C` splits around tile ids — for shape asserts.
+    fn shape(node: &Node) -> String {
+        match node {
+            Node::Leaf(t) => t.id.to_string(),
+            Node::Split { dir, a, b, .. } => {
+                let d = if *dir == Dir::Row { 'R' } else { 'C' };
+                format!("{d}({},{})", shape(a), shape(b))
+            },
+        }
+    }
+
+    fn group(root: Node, primary: u64) -> Workspace {
+        let mut ws = Workspace::new("g".into(), Tile::empty(primary), None);
+        ws.root = root;
+        ws
+    }
+
+    /// An id source that must not be asked: the case under test never needs
+    /// a new tile.
+    fn no_new_tile() -> u64 {
+        panic!("normalize_primary asked for a new tile id")
+    }
+
+    #[test]
+    fn normalize_lifts_a_nested_primary_to_the_root_left() {
+        // The primary (3) sits two levels down, on the right.
+        let root = split(
+            Dir::Column,
+            0.3,
+            leaf(1, false),
+            split(Dir::Row, 0.7, leaf(2, false), split(Dir::Column, 0.4, leaf(3, false), leaf(4, false))),
+        );
+        let mut ws = group(root, 3);
+        assert!(ws.normalize_primary(no_new_tile));
+        // Its sibling (4) took the parent's place; the rest kept its shape.
+        assert_eq!(shape(&ws.root), "R(3,C(1,R(2,4)))");
+        let Node::Split { ratio, b, .. } = &ws.root else { panic!("root is a split") };
+        assert_eq!(*ratio, 0.5);
+        // The right subtree's own ratios are untouched.
+        let Node::Split { ratio, .. } = &**b else { panic!("right side is a split") };
+        assert_eq!(*ratio, 0.3);
+    }
+
+    #[test]
+    fn normalize_rewraps_a_primary_on_the_wrong_side_or_axis() {
+        // Right half of the root row.
+        let mut ws = group(split(Dir::Row, 0.6, leaf(1, false), leaf(2, false)), 2);
+        assert!(ws.normalize_primary(no_new_tile));
+        assert_eq!(shape(&ws.root), "R(2,1)");
+        // Top half of a stacked root.
+        let mut ws = group(split(Dir::Column, 0.6, leaf(1, false), leaf(2, false)), 1);
+        assert!(ws.normalize_primary(no_new_tile));
+        assert_eq!(shape(&ws.root), "R(1,2)");
+    }
+
+    #[test]
+    fn normalize_leaves_a_primary_already_in_place_alone() {
+        let root = split(
+            Dir::Row,
+            0.27,
+            Node::Leaf(marked_tile(1, &[10])),
+            split(Dir::Column, 0.6, leaf(2, false), leaf(3, false)),
+        );
+        let mut ws = group(root, 1);
+        ws.focused_tile = 3;
+        assert!(!ws.normalize_primary(no_new_tile));
+        assert_eq!(shape(&ws.root), "R(1,C(2,3))");
+        // The user's divider position survives.
+        let Node::Split { ratio, .. } = &ws.root else { panic!("root is a split") };
+        assert_eq!(*ratio, 0.27);
+        assert_eq!(ws.focused_tile, 3);
+    }
+
+    /// A split made at an in-place primary (⌘D on it, or a drop on its right
+    /// band) nests it; lifting it back out keeps the dragged primary width.
+    #[test]
+    fn normalize_keeps_the_primary_ratio_when_a_split_nested_it() {
+        let root = split(
+            Dir::Row,
+            0.27,
+            split(Dir::Column, 0.5, leaf(1, false), leaf(9, false)),
+            leaf(2, false),
+        );
+        let mut ws = group(root, 1);
+        assert!(ws.normalize_primary(no_new_tile));
+        assert_eq!(shape(&ws.root), "R(1,R(9,2))");
+        let Node::Split { ratio, b, .. } = &ws.root else { panic!("root is a split") };
+        assert_eq!(*ratio, 0.27);
+        // The split that inherited the old root starts even.
+        let Node::Split { ratio, .. } = &**b else { panic!("right side is a split") };
+        assert_eq!(*ratio, 0.5);
+    }
+
+    /// A pinned tab dropped onto the primary sorts ahead of the original
+    /// tab; the original stays the primary pane and is never left pinned.
+    #[test]
+    fn normalize_keeps_the_unpinned_original_over_a_pinned_arrival() {
+        let mut tile = marked_tile(1, &[99, 10]);
+        tile.tabs[0].pinned = true;
+        tile.active = 0;
+        let root = split(Dir::Row, 0.4, Node::Leaf(tile), Node::Leaf(marked_tile(2, &[20])));
+        let mut ws = group(root, 1);
+        ws.focused_tile = 1;
+        assert!(ws.normalize_primary(no_new_tile));
+        assert_eq!(marks(ws.root.find_tile(1).unwrap()), vec![10]);
+        let host = ws.root.find_tile(2).unwrap();
+        assert_eq!(marks(host), vec![99, 20]);
+        assert_eq!(host.active, 0);
+        assert_eq!(ws.focused_tile, 2);
+
+        // A lone pinned primary tab is unpinned in place.
+        let mut tile = marked_tile(7, &[10]);
+        tile.tabs[0].pinned = true;
+        let mut ws = group(Node::Leaf(tile), 7);
+        assert!(ws.normalize_primary(no_new_tile));
+        assert!(!ws.root.find_tile(7).unwrap().tabs[0].pinned);
+    }
+
+    #[test]
+    fn normalize_leaves_a_lone_primary_alone() {
+        let mut ws = group(Node::Leaf(marked_tile(7, &[10])), 7);
+        assert!(!ws.normalize_primary(no_new_tile));
+        assert_eq!(shape(&ws.root), "7");
+        assert_eq!(marks(ws.root.find_tile(7).unwrap()), vec![10]);
+    }
+
+    #[test]
+    fn normalize_moves_extra_primary_tabs_right_in_order() {
+        // The right subtree's first tile (2) hosts them, after its own tabs.
+        let root = split(
+            Dir::Row,
+            0.4,
+            Node::Leaf(marked_tile(1, &[10, 11, 12])),
+            split(Dir::Column, 0.5, Node::Leaf(marked_tile(2, &[20])), Node::Leaf(marked_tile(3, &[30]))),
+        );
+        let mut ws = group(root, 1);
+        ws.focused_tile = 3;
+        assert!(ws.normalize_primary(no_new_tile));
+        assert_eq!(shape(&ws.root), "R(1,C(2,3))");
+        assert_eq!(marks(ws.root.find_tile(1).unwrap()), vec![10]);
+        assert_eq!(marks(ws.root.find_tile(2).unwrap()), vec![20, 11, 12]);
+        assert_eq!(marks(ws.root.find_tile(3).unwrap()), vec![30]);
+        // The primary showed its first tab, so nothing else changes hands:
+        // the host keeps its active tab and focus stays where it was.
+        assert_eq!(ws.root.find_tile(1).unwrap().active, 0);
+        assert_eq!(ws.root.find_tile(2).unwrap().active, 0);
+        assert_eq!(ws.focused_tile, 3);
+        // The ratio of a root that was already in shape survives.
+        let Node::Split { ratio, .. } = &ws.root else { panic!("root is a split") };
+        assert_eq!(*ratio, 0.4);
+    }
+
+    /// The new-tab path: a tab pushed onto a lone primary (and made active)
+    /// lands in a new tile split to its right, and focus follows it.
+    #[test]
+    fn normalize_splits_a_lone_multi_tab_primary_and_focus_follows() {
+        let mut tile = marked_tile(1, &[10, 11]);
+        tile.active = 1;
+        let mut ws = group(Node::Leaf(tile), 1);
+        let mut next = 40;
+        assert!(ws.normalize_primary(|| {
+            next += 1;
+            next
+        }));
+        assert_eq!(shape(&ws.root), "R(1,41)");
+        assert_eq!(marks(ws.root.find_tile(1).unwrap()), vec![10]);
+        assert_eq!(ws.root.find_tile(1).unwrap().active, 0);
+        assert_eq!(marks(ws.root.find_tile(41).unwrap()), vec![11]);
+        assert_eq!(ws.focused_tile, 41);
+        let Node::Split { ratio, .. } = &ws.root else { panic!("root is a split") };
+        assert_eq!(*ratio, 0.5);
+    }
+
+    /// A new tab on a primary that already has neighbours joins the right
+    /// subtree's first tile as its active tab.
+    #[test]
+    fn normalize_makes_the_moved_active_tab_active_on_the_right() {
+        let mut primary = marked_tile(1, &[10, 11]);
+        primary.active = 1;
+        let mut host = marked_tile(2, &[20, 21]);
+        host.collapsed = true;
+        let mut ws = group(split(Dir::Row, 0.5, Node::Leaf(primary), Node::Leaf(host)), 1);
+        assert!(ws.normalize_primary(no_new_tile));
+        let host = ws.root.find_tile(2).unwrap();
+        assert_eq!(marks(host), vec![20, 21, 11]);
+        assert_eq!(host.active, 2);
+        assert!(!host.collapsed);
+        assert_eq!(ws.focused_tile, 2);
+    }
+
+    #[test]
+    fn normalize_tolerates_a_dangling_primary() {
+        let mut ws = group(split(Dir::Column, 0.5, leaf(1, false), leaf(2, false)), 999);
+        assert!(!ws.normalize_primary(no_new_tile));
+        assert_eq!(shape(&ws.root), "C(1,2)");
+    }
+
+    #[test]
+    fn normalize_is_idempotent() {
+        let mut primary = marked_tile(3, &[10, 11, 12]);
+        primary.active = 2;
+        let root = split(
+            Dir::Column,
+            0.3,
+            Node::Leaf(marked_tile(1, &[20])),
+            split(Dir::Row, 0.7, Node::Leaf(marked_tile(2, &[30])), Node::Leaf(primary)),
+        );
+        let mut ws = group(root, 3);
+        assert!(ws.normalize_primary(no_new_tile));
+        let once = shape(&ws.root);
+        assert_eq!(once, "R(3,C(1,2))");
+        let tabs_once: Vec<Vec<usize>> = ws.root.tiles().iter().map(|t| marks(t)).collect();
+        let focus_once = ws.focused_tile;
+        assert!(!ws.normalize_primary(no_new_tile));
+        assert_eq!(shape(&ws.root), once);
+        let tabs_twice: Vec<Vec<usize>> = ws.root.tiles().iter().map(|t| marks(t)).collect();
+        assert_eq!(tabs_twice, tabs_once);
+        assert_eq!(ws.focused_tile, focus_once);
+    }
+
+    /// The primary pane never folds: a persisted collapse is cleared and it
+    /// reports no collapse axis (so no caret), while its neighbours keep
+    /// theirs.
+    #[test]
+    fn primary_is_never_collapsed() {
+        let mut ws = group(split(Dir::Row, 0.5, leaf(1, true), leaf(2, false)), 1);
+        assert!(ws.normalize_primary(no_new_tile));
+        let primary = ws.root.find_tile(1).unwrap();
+        assert!(!primary.collapsed);
+        assert_eq!(primary.collapse_anim, 0.0);
+        assert_eq!(ws.collapse_axes(), vec![(1, None), (2, Some(Dir::Row))]);
+    }
+
+    #[test]
+    fn take_tile_returns_the_tile_and_promotes_its_sibling() {
+        let mut root = split(
+            Dir::Row,
+            0.5,
+            leaf(1, false),
+            split(Dir::Column, 0.5, Node::Leaf(marked_tile(2, &[20, 21])), leaf(3, false)),
+        );
+        let taken = root.take_tile(2).expect("tile 2 is in the tree");
+        assert_eq!(marks(&taken), vec![20, 21]);
+        assert_eq!(shape(&root), "R(1,3)");
+        assert!(root.take_tile(9).is_none());
+        // A root leaf cannot be taken.
+        assert!(leaf(1, false).take_tile(1).is_none());
+    }
+
+    /// The primary pane's content starts below its taller header — the tab
+    /// bar plus the 48px info bar — at every display scale and chrome
+    /// factor, and the info bar fills exactly the band between the title row
+    /// and that content. Any other tile keeps the plain tab-bar header.
+    #[test]
+    fn primary_content_starts_below_the_title_row_and_info_bar() {
+        let rect = LayoutRect { x: 20.0, y: 30.0, w: 900.0, h: 700.0 };
+        for scale in [1.0_f32, 2.0] {
+            for ui in [1.0_f32, 1.25] {
+                let bar = (40.0 * ui * scale).round();
+                let info = (48.0 * ui * scale).round();
+                assert_eq!(tile_header_h_at(scale, ui, true), bar + info);
+                assert_eq!(tile_header_h_at(scale, ui, false), bar);
+
+                let content = tile_content_for_at(&rect, scale, ui, true);
+                assert_eq!(content.y, rect.y + bar + info);
+                assert_eq!(content.h, rect.h - bar - info);
+                assert_eq!((content.x, content.w), (rect.x, rect.w));
+
+                let info_bar = primary_info_bar_at(&rect, scale, ui);
+                assert_eq!(info_bar.y, tile_tab_bar_at(&rect, scale, ui).y + bar);
+                assert_eq!(info_bar.y + info_bar.h, content.y);
+                assert_eq!((info_bar.x, info_bar.w), (rect.x, rect.w));
+
+                assert_eq!(
+                    tile_content_for_at(&rect, scale, ui, false),
+                    tile_content_at(&rect, scale, ui)
+                );
+            }
+        }
+    }
+
+    /// A pane shorter than its header keeps every rect inside the tile.
+    #[test]
+    fn primary_header_never_overruns_a_short_tile() {
+        let rect = LayoutRect { x: 0.0, y: 10.0, w: 300.0, h: 60.0 };
+        let content = tile_content_for_at(&rect, 1.0, 1.0, true);
+        assert_eq!((content.y, content.h), (70.0, 0.0));
+        let info_bar = primary_info_bar_at(&rect, 1.0, 1.0);
+        assert_eq!((info_bar.y, info_bar.h), (50.0, 20.0));
+    }
+
+    /// The title row is the strip's own padded 30px band, so the title sits
+    /// where a tab's would — and follows the collapsed-sidebar inset.
+    #[test]
+    fn primary_title_row_matches_the_strip_row() {
+        let strip = LayoutRect { x: 100.0, y: 8.0, w: 500.0, h: 600.0 };
+        for (scale, ui) in [(1.0_f32, 1.0_f32), (2.0, 1.25)] {
+            let (bar, row) = primary_title_row_at(&strip, scale, ui);
+            let layout = tile_strip_layout_at(&strip, &["a".to_string()], 0, scale, ui, false);
+            assert_eq!(bar, layout.bar);
+            assert_eq!((row.y, row.h), (layout.row.y, layout.row.h));
+            assert_eq!(row.x, layout.tabs[0].x);
+            assert_eq!(row.x + row.w, bar.x + bar.w - (row.x - bar.x));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4742,4 +5384,3 @@ mod strip_layout_tests {
         assert!(max.new_tab.unwrap().x > max.tabs[2].x);
     }
 }
-
