@@ -262,6 +262,11 @@ impl App {
         let Some(tile) = ws.root.find_tile(ws.primary_tile) else {
             return div().into_any_element();
         };
+        // A collapsed (or mid-animation) primary is a bare sideways strip
+        // (`tile_ui`): no info bar.
+        if tile.collapsed || tile.collapse_anim > 0.0 {
+            return div().into_any_element();
+        }
         let bar = workspace::primary_info_bar(rect, scale);
         if bar.w < 1.0 || bar.h < 1.0 {
             return div().into_any_element();

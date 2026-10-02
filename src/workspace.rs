@@ -31,7 +31,8 @@
 //!
 //! [`tile_collapse_axis`] maps every tile id to its parent split's [`Dir`]
 //! (or `None` for a root leaf that has no parent). The renderer and app use
-//! this to decide caret visibility and collapsed appearance.
+//! this to decide caret visibility and collapsed appearance. The group's
+//! primary pane is no exception: it folds to a sideways strip at the left.
 
 use crate::term::Session;
 
@@ -604,21 +605,22 @@ impl Workspace {
     /// already in place keeps the tree — and the user's ratio — untouched.
     ///
     /// The primary also holds exactly one tab — its first unpinned one, kept
-    /// unpinned — and never collapses: every other tab moves, in order, to the first tile of the right
+    /// unpinned: every other tab moves, in order, to the first tile of the right
     /// subtree — or into a new tile (id from `new_tile_id`) split to the
     /// right when the primary is alone — so a tab pushed onto the primary
     /// by any path lands on the right instead. The moved tab that was the
     /// primary's active one becomes active over there, and focus follows it
     /// when the primary held focus.
     ///
+    /// The primary's collapse state is left as it is: it folds like any
+    /// other pane, to a sideways strip at the left ([`Self::collapse_axes`]).
+    ///
     /// A `primary_tile` missing from the tree is left alone (the rest of the
     /// app tolerates a dangling primary). Idempotent.
     pub fn normalize_primary(&mut self, mut new_tile_id: impl FnMut() -> u64) -> bool {
         let primary = self.primary_tile;
         let Some(tile) = self.root.find_tile_mut(primary) else { return false };
-        let mut changed = tile.collapsed || tile.collapse_anim != 0.0;
-        tile.collapsed = false;
-        tile.collapse_anim = 0.0;
+        let mut changed = false;
         // Lift the extras out first; they are re-homed once the tree is in
         // shape. The pane keeps its first unpinned tab — a pinned tab dropped
         // onto the primary sorts ahead of the original, which must not be
@@ -711,16 +713,12 @@ impl Workspace {
         true
     }
 
-    /// [`tile_collapse_axis`] for this group, with the primary pane reported
-    /// as un-collapsible (`None`): it has no caret and never folds.
+    /// [`tile_collapse_axis`] for this group. The primary pane is reported
+    /// like any other: as the root `Row` split's left leaf it folds sideways
+    /// (`Some(Dir::Row)`) whenever the group has more than one tile, and has
+    /// no axis (`None`) — so no caret — as a lone root leaf.
     pub fn collapse_axes(&self) -> Vec<(u64, Option<Dir>)> {
-        let mut axes = tile_collapse_axis(&self.root);
-        for (id, axis) in &mut axes {
-            if *id == self.primary_tile {
-                *axis = None;
-            }
-        }
-        axes
+        tile_collapse_axis(&self.root)
     }
 }
 
@@ -1411,14 +1409,15 @@ pub const COLLAPSED_STRIP_INSET: f32 =
     TRAFFIC_LIGHT_END + SHOW_SESSIONS_GAP + SHOW_SESSIONS_BTN + SHOW_SESSIONS_GAP;
 
 /// A tile's rect adjusted for tab-strip geometry: while the sidebar is
-/// collapsed (`sidebar_w == 0.0`), the tile owning the area's top-left
-/// corner cedes its strip's left end to the native traffic lights, pushing
-/// its tabs right. The inset also clears the floating
+/// collapsed (`sidebar_w == 0.0`), a top-row tile reaching into the area's
+/// top-left corner — the top-left tile, or its neighbour when that one is a
+/// collapsed strip narrower than the corner — cedes its strip's left end to
+/// the native traffic lights, pushing its tabs right. The inset also clears the floating
 /// "Show sessions" button that rides beside the lights. Every strip consumer (painting, hit-testing, drops) must
 /// feed this to the `tile_tab_*` functions so they never disagree; the card
 /// and content keep the original rect.
 pub fn tab_strip_rect(area: LayoutRect, rect: &LayoutRect, scale: f32, sidebar_w: f32) -> LayoutRect {
-    if sidebar_w != 0.0 || rect.x > area.x || rect.y > area.y {
+    if sidebar_w != 0.0 || rect.y > area.y {
         return *rect;
     }
     let inset = ((COLLAPSED_STRIP_INSET * scale).round() - rect.x).clamp(0.0, rect.w);
@@ -2447,16 +2446,28 @@ fn primary_info_bar_at(rect: &LayoutRect, scale: f32, ui: f32) -> LayoutRect {
 /// The primary pane's title row: the bar is `strip`'s tab bar (so the
 /// collapsed-sidebar inset of [`tab_strip_rect`] carries over) and the row
 /// is the same padded 30px band a tab strip lays its chips in, inset by the
-/// strip's end padding. Returns `(bar, row)`.
-pub fn primary_title_row(strip: &LayoutRect, scale: f32) -> (LayoutRect, LayoutRect) {
-    primary_title_row_at(strip, scale, chrome_ui_scale())
+/// strip's end padding. With `has_caret` (the primary has a parent split)
+/// the row gives up the caret square ([`tile_caret_rect`]) at each end, so
+/// the title stays centred in the bar and never runs under the caret.
+/// Returns `(bar, row)`.
+pub fn primary_title_row(
+    strip: &LayoutRect,
+    scale: f32,
+    has_caret: bool,
+) -> (LayoutRect, LayoutRect) {
+    primary_title_row_at(strip, scale, chrome_ui_scale(), has_caret)
 }
 
 /// [`primary_title_row`] at chrome factor `ui`.
-fn primary_title_row_at(strip: &LayoutRect, scale: f32, ui: f32) -> (LayoutRect, LayoutRect) {
+fn primary_title_row_at(
+    strip: &LayoutRect,
+    scale: f32,
+    ui: f32,
+    has_caret: bool,
+) -> (LayoutRect, LayoutRect) {
     let s = scale * ui;
     let bar = tile_tab_bar_at(strip, scale, ui);
-    let pad = (TILE_TAB_PAD_X * s).round().min(bar.w / 2.0);
+    let pad = if has_caret { bar.h } else { (TILE_TAB_PAD_X * s).round() }.min(bar.w / 2.0);
     let row = LayoutRect {
         x: bar.x + pad,
         y: bar.y + (TILE_TAB_PAD_TOP * s).round(),
@@ -3464,6 +3475,12 @@ mod tests {
         let s = tab_strip_rect(area, &sliver, scale, 0.0);
         assert_eq!(s.w, 0.0);
         assert_eq!(s.x, sliver.x + sliver.w);
+
+        // …and its top-row neighbour cedes the rest of the corner.
+        let next = LayoutRect { x: sliver.x + sliver.w + 8.0, y: area.y, w: 800.0, h: 400.0 };
+        let n = tab_strip_rect(area, &next, scale, 0.0);
+        assert_eq!(n.x, inset);
+        assert_eq!(n.x + n.w, next.x + next.w);
     }
 
     #[test]
@@ -4960,17 +4977,90 @@ mod tests {
         assert_eq!(ws.focused_tile, focus_once);
     }
 
-    /// The primary pane never folds: a persisted collapse is cleared and it
-    /// reports no collapse axis (so no caret), while its neighbours keep
-    /// theirs.
+    /// The primary pane folds like any other: in a split it reports the
+    /// root's `Row` axis (so it has a caret and collapses sideways), and as
+    /// a lone root leaf it has none.
     #[test]
-    fn primary_is_never_collapsed() {
-        let mut ws = group(split(Dir::Row, 0.5, leaf(1, true), leaf(2, false)), 1);
-        assert!(ws.normalize_primary(no_new_tile));
+    fn primary_reports_its_collapse_axis() {
+        let ws = group(split(Dir::Row, 0.5, leaf(1, false), leaf(2, false)), 1);
+        assert_eq!(ws.collapse_axes(), vec![(1, Some(Dir::Row)), (2, Some(Dir::Row))]);
+        let nested = group(
+            split(
+                Dir::Row,
+                0.5,
+                leaf(1, false),
+                split(Dir::Column, 0.5, leaf(2, false), leaf(3, false)),
+            ),
+            1,
+        );
+        assert_eq!(
+            nested.collapse_axes(),
+            vec![(1, Some(Dir::Row)), (2, Some(Dir::Column)), (3, Some(Dir::Column))]
+        );
+        let lone = group(leaf(1, false), 1);
+        assert_eq!(lone.collapse_axes(), vec![(1, None)]);
+    }
+
+    /// A collapsed primary stays collapsed through normalize — settled or
+    /// mid-animation — and an in-shape tree reports no change, every time.
+    #[test]
+    fn normalize_preserves_a_collapsed_primary() {
+        let mut ws = group(split(Dir::Row, 0.4, leaf(1, true), leaf(2, false)), 1);
+        for _ in 0..2 {
+            assert!(!ws.normalize_primary(no_new_tile));
+            let primary = ws.root.find_tile(1).unwrap();
+            assert!(primary.collapsed);
+            assert_eq!(primary.collapse_anim, 1.0);
+            assert_eq!(shape(&ws.root), "R(1,2)");
+        }
+        ws.root.find_tile_mut(1).unwrap().collapse_anim = 0.45;
+        assert!(!ws.normalize_primary(no_new_tile));
         let primary = ws.root.find_tile(1).unwrap();
-        assert!(!primary.collapsed);
-        assert_eq!(primary.collapse_anim, 0.0);
-        assert_eq!(ws.collapse_axes(), vec![(1, None), (2, Some(Dir::Row))]);
+        assert!(primary.collapsed);
+        assert_eq!(primary.collapse_anim, 0.45);
+    }
+
+    /// A collapsed primary lifted back into place keeps its collapse state,
+    /// and the second pass is a no-op.
+    #[test]
+    fn normalize_keeps_collapse_when_lifting_the_primary() {
+        let mut ws = group(split(Dir::Column, 0.5, leaf(2, false), leaf(1, true)), 1);
+        assert!(ws.normalize_primary(no_new_tile));
+        assert_eq!(shape(&ws.root), "R(1,2)");
+        assert!(ws.root.find_tile(1).unwrap().collapsed);
+        assert!(!ws.normalize_primary(no_new_tile));
+        assert!(ws.root.find_tile(1).unwrap().collapsed);
+    }
+
+    /// A collapsed primary takes the ordinary collapsed strip width — the
+    /// tab bar's height, not its taller header — and the right subtree
+    /// takes everything else.
+    #[test]
+    fn collapsed_primary_shrinks_to_the_strip_width() {
+        for (scale, ui) in [(1.0_f32, 1.0_f32), (2.0, 1.25)] {
+            let gap = (TILE_GAP * scale).round();
+            let ce = tab_bar_h(scale, ui);
+            let ws = group(
+                split(
+                    Dir::Row,
+                    0.5,
+                    leaf(1, true),
+                    split(Dir::Column, 0.5, leaf(2, false), leaf(3, false)),
+                ),
+                1,
+            );
+            let (tiles, dividers) = layout_tiles_at(&ws.root, AREA, scale, ui);
+            let primary = rect_of(&tiles, 1);
+            assert_eq!((primary.x, primary.w, primary.h), (AREA.x, ce, AREA.h));
+            assert!(primary.w < tile_header_h_at(scale, ui, true));
+            for id in [2, 3] {
+                let r = rect_of(&tiles, id);
+                assert_eq!(r.x, ce + gap);
+                assert_eq!(r.w, AREA.w - gap - ce);
+            }
+            // The collapsed edge has no divider; the right subtree keeps its own.
+            assert_eq!(dividers.len(), 1);
+        }
     }
 
     #[test]
@@ -5037,13 +5127,35 @@ mod tests {
     fn primary_title_row_matches_the_strip_row() {
         let strip = LayoutRect { x: 100.0, y: 8.0, w: 500.0, h: 600.0 };
         for (scale, ui) in [(1.0_f32, 1.0_f32), (2.0, 1.25)] {
-            let (bar, row) = primary_title_row_at(&strip, scale, ui);
+            let (bar, row) = primary_title_row_at(&strip, scale, ui, false);
             let layout = tile_strip_layout_at(&strip, &["a".to_string()], 0, scale, ui, false);
             assert_eq!(bar, layout.bar);
             assert_eq!((row.y, row.h), (layout.row.y, layout.row.h));
             assert_eq!(row.x, layout.tabs[0].x);
             assert_eq!(row.x + row.w, bar.x + bar.w - (row.x - bar.x));
         }
+    }
+
+    /// With a caret the title row stops at the caret square and gives up
+    /// the same width on the left, so the title stays centred in the bar;
+    /// a strip too narrow for both leaves an empty row, never a negative one.
+    #[test]
+    fn primary_title_row_reserves_the_caret() {
+        let strip = LayoutRect { x: 100.0, y: 8.0, w: 500.0, h: 600.0 };
+        for (scale, ui) in [(1.0_f32, 1.0_f32), (2.0, 1.25)] {
+            let (bar, row) = primary_title_row_at(&strip, scale, ui, true);
+            let (plain_bar, plain) = primary_title_row_at(&strip, scale, ui, false);
+            let caret = tile_caret_rect_at(&strip, scale, ui);
+            assert_eq!(bar, plain_bar);
+            assert_eq!((row.y, row.h), (plain.y, plain.h));
+            assert_eq!(row.x + row.w, caret.x);
+            assert_eq!(row.x - bar.x, caret.w);
+            assert!(row.w < plain.w);
+            assert_eq!(row.x + row.w / 2.0, bar.x + bar.w / 2.0);
+        }
+        let narrow = LayoutRect { w: 50.0, ..strip };
+        let (_, row) = primary_title_row_at(&narrow, 1.0, 1.0, true);
+        assert_eq!(row.w, 0.0);
     }
 }
 
