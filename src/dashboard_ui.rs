@@ -18,7 +18,8 @@
 //!   sidebar row's accent dot, with a halo ring, while unread, a dim dot with
 //!   none once read — the title the sidebar row shows, `repo/branch` on cards
 //!   300px or wider, the "unread" / "read" chip), the body, and a 30px footer
-//!   (elapsed time since the group last asked for attention, the PR, the
+//!   (elapsed time since the group last asked for attention, the PR as
+//!   `#N` and its title, cut with an ellipsis when it does not fit, the
 //!   branch diff and, at the right, a hint of the tabs outside the primary
 //!   pane — "N tabs", or "N tabs · ● M unread" while some are unread; a hint
 //!   only, it never changes the card's own unread treatment — then
@@ -98,7 +99,7 @@ use gpui::{
 
 use crate::App;
 use crate::git_context::derive_rollup;
-use crate::infobar_ui::{pr_state_word, repo_counts, repo_label};
+use crate::infobar_ui::{repo_counts, repo_label};
 use crate::pages::Page;
 use crate::renderer::color;
 use crate::sidebar_card::{CardAvatar, avatar_for, relative_time};
@@ -386,6 +387,14 @@ impl Layout {
             ),
         )
     }
+}
+
+/// The pull request title a card footer shows after `#N` — the glyph beside
+/// it already says draft / open / merged — on one line, whitespace runs
+/// collapsed; `None` for a blank title, which leaves `#N` alone.
+pub(crate) fn pr_footer_title(title: &str) -> Option<String> {
+    let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!title.is_empty()).then_some(title)
 }
 
 /// A group's primary pane tab — the one its card shows.
@@ -1217,15 +1226,29 @@ impl App {
             };
             // An element target like "Open": the press stops here, so the
             // canvas path never sees it — `dashboard_open_pr` reads and
-            // focuses the card itself.
-            run()
+            // focuses the card itself. The one left run that shrinks: a long
+            // title ends in an ellipsis — the glyph and `#N` stay whole —
+            // rather than pushing the diff counts out of the footer.
+            div()
+                .min_w(px(0.0))
+                .flex()
+                .items_center()
+                .gap(px(5.0 * ui))
                 .cursor_pointer()
                 .on_mouse_down(
                     MouseButton::Left,
                     press(entity.clone(), move |this, _ev, _cx| this.dashboard_open_pr(group)),
                 )
-                .child(icon(crate::sidebar_ui::avatar_icon(kind), glyph, tint))
-                .child(format!("#{} {}", pr.number, pr_state_word(pr)))
+                .child(div().flex_shrink_0().child(icon(
+                    crate::sidebar_ui::avatar_icon(kind),
+                    glyph,
+                    tint,
+                )))
+                .child(div().flex_shrink_0().child(format!("#{}", pr.number)))
+                .children(
+                    pr_footer_title(&pr.title)
+                        .map(|title| div().min_w(px(0.0)).truncate().child(title)),
+                )
         });
         let diff = git.and_then(|c| repo_counts(c).0).map(|(added, removed)| {
             run()
@@ -1331,6 +1354,16 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The footer names the pull request by its title, on one line, never
+    /// by its state word; a blank title leaves the number alone.
+    #[test]
+    fn pr_footer_title_is_the_one_line_title() {
+        assert_eq!(pr_footer_title("Dashboard: side-tab hint").as_deref(), Some("Dashboard: side-tab hint"));
+        assert_eq!(pr_footer_title(" Fix\n  the  footer ").as_deref(), Some("Fix the footer"));
+        assert_eq!(pr_footer_title("  "), None);
+        assert_eq!(pr_footer_title(""), None);
+    }
 
     /// The status is the unread flag, spelled "unread" / "read" in `state`
     /// and on the chip.
