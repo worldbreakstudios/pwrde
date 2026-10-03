@@ -373,6 +373,11 @@ struct App {
     /// The paint path only ever *reads* it (`get`); every write arrives as a
     /// `TermEvent::GitContextReady` from the refresh worker.
     git_contexts: git_context::GitContextCache,
+    /// Branch → PR per repo from the last repo-wide PR list, for the fork
+    /// picker's worktree rows: applied synchronously when the Base step opens
+    /// and refreshed behind it (`TermEvent::ForkPrsReady`). Runtime-only,
+    /// never persisted.
+    fork_pr_cache: std::collections::HashMap<std::path::PathBuf, picker::ForkPrMap>,
     /// True while the serial git-context worker is alive, so a burst of
     /// refresh triggers cannot fan out into N simultaneous `gh` calls.
     git_ctx_busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -3111,6 +3116,24 @@ impl App {
         self.request_redraw();
     }
 
+    /// Fetch `repo`'s PR list on a background thread — one CLI call for the
+    /// whole repo, never one per worktree — and post it back as a
+    /// `TermEvent::ForkPrsReady`, where it updates `fork_pr_cache` and the
+    /// open fork picker. Run each time the Base step opens.
+    fn spawn_fork_pr_refresh(&self, repo: &std::path::Path) {
+        let events_tx = self.events_tx.clone();
+        let repo = repo.to_path_buf();
+        std::thread::spawn(move || {
+            let prs = gh::pr_list_for_repo(&repo).ok().map(|list| {
+                gh::prs_by_head(list)
+                    .iter()
+                    .map(|(head, pr)| (head.clone(), picker::ForkPr::from_summary(pr)))
+                    .collect::<picker::ForkPrMap>()
+            });
+            let _ = events_tx.send(TermEvent::ForkPrsReady { repo, prs });
+        });
+    }
+
     /// Close the palette without choosing. Cancelling the flyover's
     /// first-open flow closes the waiting surface too — there is nothing
     /// to show yet.
@@ -3146,7 +3169,12 @@ impl App {
                     self.command = None;
                     self.spawn_flyover_tab(Some(entry.path));
                 } else if entry.is_git {
-                    let all = build_fork_choices(&entry.path);
+                    // Worktree rows open already annotated and sorted from the
+                    // last PR list for this repo (no network here); the fresh
+                    // list is fetched behind the picker and re-sorts it only
+                    // if something changed.
+                    let all = build_fork_choices(&entry.path, self.fork_pr_cache.get(&entry.path));
+                    self.spawn_fork_pr_refresh(&entry.path);
                     let choices = if for_flyover {
                         all.into_iter()
                             .filter(|c| {
@@ -6152,6 +6180,33 @@ impl App {
                     // `merge`) until the new ones land.
                     self.git_contexts.mark_all_stale();
                     self.spawn_git_context_refresh();
+                    // An open fork picker read the same cache; read it again.
+                    if let Some(repo) = self.command.as_ref().and_then(|c| c.base.as_ref()).map(|b| b.repo.clone()) {
+                        self.spawn_fork_pr_refresh(&repo);
+                    }
+                },
+                TermEvent::ForkPrsReady { repo, prs } => {
+                    // A failed fetch keeps the last good map and whatever the
+                    // picker shows; nothing is reported.
+                    if let Some(prs) = prs {
+                        // The palette's picker for this repo is re-sorted
+                        // (keeping its filter and highlight) on whatever step
+                        // it is — ⌫ from Layout comes back to these rows.
+                        let changed = self
+                            .command
+                            .as_mut()
+                            .and_then(|pal| pal.base.as_mut())
+                            .filter(|base| base.repo == repo)
+                            .is_some_and(|base| base.apply_prs(&prs));
+                        self.fork_pr_cache.insert(repo, prs);
+                        if changed {
+                            // The highlight moved with its row; keep it in view.
+                            if let Some(c) = self.command.as_ref().filter(|c| c.stage == command::Stage::Base) {
+                                self.command_scroll_to = Some(c.selected());
+                            }
+                            redraw = true;
+                        }
+                    }
                 },
                 TermEvent::GitContextReady { cwd, ctx } => {
                     // Folded through the cache's `merge`, then repainted the
@@ -6412,8 +6467,13 @@ fn tab_command(tab: &workspace::Tab) -> Option<String> {
 
 /// Build the fork picker's rows for a git repo: a default "new branch" row and
 /// a repo-root row, followed by existing worktrees, then local and remote
-/// branches.
-fn build_fork_choices(repo: &std::path::Path) -> Vec<picker::ForkEntry> {
+/// branches. Worktree rows are stamped with their branch's pull request from
+/// `prs` (the cached repo-wide list, if any) and sorted by PR status; without
+/// it they keep git's order, all "no PR". Local git only — never the network.
+fn build_fork_choices(
+    repo: &std::path::Path,
+    prs: Option<&picker::ForkPrMap>,
+) -> Vec<picker::ForkEntry> {
     use picker::{ForkEntry, ForkScope};
     let default = git::default_remote_branch(repo);
     let base_label = default.clone().unwrap_or_else(|| "HEAD".into());
@@ -6425,12 +6485,16 @@ fn build_fork_choices(repo: &std::path::Path) -> Vec<picker::ForkEntry> {
             from: None,
             path: None,
             scope: ForkScope::Default,
+            branch: None,
+            pr: None,
         },
         ForkEntry {
             label: "⌂ repo root (no worktree)".into(),
             from: None,
             path: Some(repo.to_path_buf()),
             scope: ForkScope::RepoRoot,
+            branch: None,
+            pr: None,
         },
     ];
     // Existing worktrees (drop's and any others) — attach a group to one
@@ -6449,7 +6513,14 @@ fn build_fork_choices(repo: &std::path::Path) -> Vec<picker::ForkEntry> {
             from: None,
             path: Some(wt.path),
             scope: ForkScope::Worktree,
+            // A detached worktree has no branch, so no PR can match it.
+            branch: wt.branch,
+            pr: None,
         });
+    }
+    if let Some(prs) = prs {
+        picker::annotate_worktree_prs(&mut out, prs);
+        picker::sort_worktree_run(&mut out);
     }
     for b in branches.iter().filter(|b| !b.is_remote) {
         let mut marks = Vec::new();
@@ -6465,6 +6536,8 @@ fn build_fork_choices(repo: &std::path::Path) -> Vec<picker::ForkEntry> {
             from: Some(b.name.clone()),
             path: None,
             scope: ForkScope::Local,
+            branch: None,
+            pr: None,
         });
     }
     for b in branches.iter().filter(|b| b.is_remote) {
@@ -6473,6 +6546,8 @@ fn build_fork_choices(repo: &std::path::Path) -> Vec<picker::ForkEntry> {
             from: Some(b.name.clone()),
             path: None,
             scope: ForkScope::Remote,
+            branch: None,
+            pr: None,
         });
     }
     out
@@ -7726,6 +7801,7 @@ fn main() {
                         sections: Vec::new(),
                         next_section_id: 0,
                         git_contexts: git_context::GitContextCache::new(),
+                        fork_pr_cache: std::collections::HashMap::new(),
                         git_ctx_busy: std::sync::Arc::new(
                             std::sync::atomic::AtomicBool::new(false),
                         ),
@@ -8058,6 +8134,11 @@ fn main() {
                                                 is_held: false,
                                                 prefer_character_input: false,
                                             };
+                                            // The palette's keys are routed
+                                            // by its own window; do the same.
+                                            if app.command.is_some() && app.palette_key(&ev) {
+                                                continue;
+                                            }
                                             app.on_key_down(&ev, window, cx);
                                         }
                                         // No key-up follows a synthetic press:

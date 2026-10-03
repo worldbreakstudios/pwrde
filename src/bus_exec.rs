@@ -209,8 +209,12 @@ impl App {
                         crate::webview_popover_window::WINDOW_TITLE,
                         "no webview popover is open (pwrde-cli action find_in_page opens Tools)",
                     ),
+                    Some("palette") => titled_window_number(
+                        crate::palette_window::WINDOW_TITLE,
+                        "the command palette is not open (pwrde-cli key cmd-p opens it)",
+                    ),
                     Some(other) => {
-                        Err(format!("screenshot: unknown window {other:?} (main|settings|popover)"))
+                        Err(format!("screenshot: unknown window {other:?} (main|settings|popover|palette)"))
                     },
                 };
                 let number = match number {

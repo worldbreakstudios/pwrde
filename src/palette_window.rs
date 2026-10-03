@@ -27,6 +27,9 @@ use gpui::{
 
 use crate::App;
 
+/// The window's hidden title — how `screenshot --window palette` finds it.
+pub(crate) const WINDOW_TITLE: &str = "pwrde command palette";
+
 /// How far down its display the card's top edge sits: 30% of the display's
 /// height. Dead center (50%) leaves the card floating in the middle of the
 /// screen; a search-bar height reads as "hanging from above".
@@ -142,7 +145,7 @@ pub(crate) fn open_palette_window(app: gpui::Entity<App>, cx: &mut GpuiApp) {
             // `appears_transparent` gives the card the whole frame (no title
             // strip above it), so the rounded corners sit at the window edge.
             titlebar: Some(gpui::TitlebarOptions {
-                title: None,
+                title: Some(WINDOW_TITLE.into()),
                 appears_transparent: true,
                 traffic_light_position: None,
             }),
