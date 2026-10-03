@@ -649,7 +649,7 @@ pub fn settings_index() -> Vec<SettingsEntry> {
     out.push(SettingsEntry {
         section: Section::Tools,
         label: "CLI tool pages",
-        keywords: "tool tools cli command page sidebar cwd drop cleanup register",
+        keywords: "tool tools cli command page sidebar icon cwd drop cleanup register",
     });
 
     // Accessibility

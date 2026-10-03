@@ -1,7 +1,7 @@
 //! User CLI tools: a settings-backed registry of named commands. gpui-free.
 //!
 //! A *CLI tool* is a named shell command the user can launch in a terminal
-//! session (name, command string, working directory). The list is
+//! session (name, command string, working directory, icon glyph). The list is
 //! persisted in settings under `tools.cli` as a JSON array of [`CliTool`]
 //! objects serialized to a STRING value. Nothing here touches gpui.
 //!
@@ -21,12 +21,13 @@ use crate::settings;
 /// Settings key holding the JSON array of CLI tools (as a string value).
 pub const TOOLS_KEY: &str = "tools.cli";
 
-/// A user-registered CLI tool: name, command and cwd.
+/// A user-registered CLI tool: name, command, cwd, and icon glyph.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CliTool {
     pub name: String,
     pub command: String,
     pub cwd: String,
+    pub icon: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -39,6 +40,7 @@ pub fn default_tools() -> Vec<CliTool> {
         name: "Cleanup".into(),
         command: "drop -d".into(),
         cwd: "~/src".into(),
+        icon: "\u{f00d4}".into(), // nf-md-broom
     }]
 }
 
@@ -111,7 +113,6 @@ mod tests {
 
     #[test]
     fn parse_tools_valid() {
-        // The `"icon"` key is stale data from older builds: it must be ignored.
         let raw = r#"[
             {"name":"Cleanup","command":"drop -d","cwd":"~/src","icon":"x"}
         ]"#;
@@ -120,6 +121,7 @@ mod tests {
         assert_eq!(tools[0].name, "Cleanup");
         assert_eq!(tools[0].command, "drop -d");
         assert_eq!(tools[0].cwd, "~/src");
+        assert_eq!(tools[0].icon, "x");
     }
 
     #[test]
