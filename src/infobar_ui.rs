@@ -11,8 +11,8 @@
 //! - the **repo/branch pill** (only in a git checkout): a branch glyph,
 //!   `repo / branch` (the short `HEAD` SHA when detached), then 11.5px counts —
 //!   the committed branch diff as `+A −R`, the way the sidebar rows show it
-//!   (`GitContext` carries no commits-ahead count), and `●N` in amber for `N`
-//!   uncommitted files;
+//!   (`GitContext` carries no commits-ahead count), and `● N` in amber for `N`
+//!   uncommitted files (the dot 3px clear of its count);
 //! - the **cwd pill**, centred in the space that is left and capped at 420px:
 //!   a folder glyph and the group's directory with `$HOME` as `~`, truncated
 //!   from the left so the tail stays readable;
@@ -60,6 +60,9 @@ const GLYPH: f32 = 13.0;
 /// The pills' type, and the smaller size of the counts.
 const TEXT_SIZE: f32 = 12.5;
 const COUNT_SIZE: f32 = 11.5;
+/// The uncommitted dot, and the gap between it and its count.
+const DIRTY_DOT: &str = "●";
+const DIRTY_GAP: f32 = 3.0;
 /// The cwd pill's cap.
 const CWD_MAX_W: f32 = 420.0;
 /// Advance of one character as a share of the type size — the chrome face is
@@ -217,7 +220,7 @@ fn repo_counts(ctx: &GitContext) -> (Option<(String, String)>, Option<String>) {
         .branch_diff
         .filter(|d| d.insertions > 0 || d.deletions > 0)
         .map(|d| (format!("+{}", d.insertions), format!("−{}", d.deletions)));
-    let dirty = ctx.dirty.filter(|d| d.files > 0).map(|d| format!("●{}", d.files));
+    let dirty = ctx.dirty.filter(|d| d.files > 0).map(|d| d.files.to_string());
     (diff, dirty)
 }
 
@@ -306,10 +309,11 @@ impl App {
                 let runs: Vec<usize> = diff
                     .iter()
                     .flat_map(|(a, r)| [a.chars().count(), r.chars().count()])
-                    .chain(dirty.iter().map(|d| d.chars().count()))
+                    .chain(dirty.iter().map(|d| 1 + d.chars().count()))
                     .collect();
                 let bare = est(chars, &[]);
-                (bare, est(chars, &runs) - bare)
+                let dirty_gap = if dirty.is_some() { DIRTY_GAP } else { 0.0 };
+                (bare, est(chars, &runs) - bare + dirty_gap)
             });
             let pr_w = git.and_then(|c| c.pr.as_ref()).map_or(0.0, |pr| {
                 let chars = format!("#{}", pr.number).len() + 1 + pr_state_word(pr).len();
@@ -330,9 +334,13 @@ impl App {
                 let count_chars = diff
                     .as_ref()
                     .map_or(0, |(a, r)| a.chars().count() + 1 + r.chars().count())
-                    + dirty.as_deref().map_or(0, |d| d.chars().count());
+                    + dirty.as_deref().map_or(0, |d| 1 + d.chars().count());
                 let runs = usize::from(diff.is_some()) + usize::from(dirty.is_some());
-                others.push(pill_width(chars, count_chars, runs).min(bar_w / ui * REPO_MAX_SHARE));
+                let dirty_gap = if dirty.is_some() { DIRTY_GAP } else { 0.0 };
+                others.push(
+                    (pill_width(chars, count_chars, runs) + dirty_gap)
+                        .min(bar_w / ui * REPO_MAX_SHARE),
+                );
 
                 let mut name =
                     div().flex().items_center().min_w(px(0.0)).text_size(px(text_size));
@@ -373,7 +381,16 @@ impl App {
                         )
                     })
                     .when_some(dirty, |d, files| {
-                        d.child(div().text_size(px(count_size)).text_color(amber).child(files))
+                        d.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(DIRTY_GAP * ui))
+                                .text_size(px(count_size))
+                                .text_color(amber)
+                                .child(DIRTY_DOT)
+                                .child(files),
+                        )
                     })
             },
         );
@@ -709,7 +726,7 @@ mod tests {
         c.dirty = Some(DirtyStats { files: 2, insertions: 1, deletions: 0 });
         assert_eq!(
             repo_counts(&c),
-            (Some(("+42".to_string(), "−7".to_string())), Some("●2".to_string()))
+            (Some(("+42".to_string(), "−7".to_string())), Some("2".to_string()))
         );
         // A clean tree and an empty branch show nothing.
         c.branch_diff = Some(DirtyStats::default());
