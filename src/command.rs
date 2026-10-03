@@ -10,6 +10,7 @@
 //! for a non-git directory).
 
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use crate::pages::Action;
 use crate::palette::fuzzy_match;
@@ -815,9 +816,84 @@ pub fn group_name(path: &Path) -> String {
         .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
+/// How long a palette hidden by losing key status keeps its progress before
+/// it is reset for good.
+pub const HIDDEN_RESET: Duration = Duration::from_secs(120);
+
+/// Where the palette is, from the model (`open`) and the instant its window
+/// was hidden (it hides, keeping the model, when it loses key status).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Presence {
+    /// No palette model.
+    Closed,
+    /// Open with its window up.
+    Visible,
+    /// Open but hidden: the hotkey brings it back where it was left.
+    Hidden,
+    /// Hidden for [`HIDDEN_RESET`] or longer: due a full reset.
+    Expired,
+}
+
+/// The palette's [`Presence`] at `now`. Pure, with the clock injected.
+pub fn presence(open: bool, hidden_since: Option<Instant>, now: Instant) -> Presence {
+    match (open, hidden_since) {
+        (false, _) => Presence::Closed,
+        (true, None) => Presence::Visible,
+        (true, Some(since)) if now.saturating_duration_since(since) >= HIDDEN_RESET => {
+            Presence::Expired
+        },
+        (true, Some(_)) => Presence::Hidden,
+    }
+}
+
+/// What the palette hotkey does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Toggle {
+    /// Open a fresh palette at the command root (an expired one is reset
+    /// first).
+    OpenRoot,
+    /// Close the visible palette.
+    Close,
+    /// Bring the hidden palette back with its progress.
+    Reveal,
+}
+
+/// The hotkey's outcome for a palette in `presence`.
+pub fn toggle_outcome(presence: Presence) -> Toggle {
+    match presence {
+        Presence::Closed | Presence::Expired => Toggle::OpenRoot,
+        Presence::Visible => Toggle::Close,
+        Presence::Hidden => Toggle::Reveal,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn presence_follows_model_hidden_instant_and_clock() {
+        let t0 = Instant::now();
+        // No model: closed, whatever stale hidden instant is left behind.
+        assert_eq!(presence(false, None, t0), Presence::Closed);
+        assert_eq!(presence(false, Some(t0), t0 + HIDDEN_RESET), Presence::Closed);
+        assert_eq!(presence(true, None, t0), Presence::Visible);
+        assert_eq!(presence(true, Some(t0), t0), Presence::Hidden);
+        let just_before = t0 + HIDDEN_RESET - Duration::from_millis(1);
+        assert_eq!(presence(true, Some(t0), just_before), Presence::Hidden);
+        assert_eq!(presence(true, Some(t0), t0 + HIDDEN_RESET), Presence::Expired);
+        assert_eq!(presence(true, Some(t0), t0 + HIDDEN_RESET * 2), Presence::Expired);
+        // A clock behind the hidden instant never expires it.
+        assert_eq!(presence(true, Some(t0 + HIDDEN_RESET), t0), Presence::Hidden);
+    }
+
+    #[test]
+    fn toggle_reveals_hidden_closes_visible_opens_otherwise() {
+        assert_eq!(toggle_outcome(Presence::Closed), Toggle::OpenRoot);
+        assert_eq!(toggle_outcome(Presence::Visible), Toggle::Close);
+        assert_eq!(toggle_outcome(Presence::Hidden), Toggle::Reveal);
+        assert_eq!(toggle_outcome(Presence::Expired), Toggle::OpenRoot);
+    }
     use crate::picker::{ForkScope, PickerRow, PickerStore};
     use std::path::PathBuf;
 
@@ -956,12 +1032,16 @@ mod tests {
                     from: Some("origin/main".into()),
                     path: None,
                     scope: ForkScope::Default,
+                    branch: None,
+                    pr: None,
                 },
                 ForkEntry {
                     label: "repo root".into(),
                     from: None,
                     path: Some(PathBuf::from("/home/u/pwrde")),
                     scope: ForkScope::RepoRoot,
+                    branch: None,
+                    pr: None,
                 },
             ],
         )

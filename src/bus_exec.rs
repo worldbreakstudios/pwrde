@@ -227,8 +227,12 @@ impl App {
                         crate::webview_popover_window::WINDOW_TITLE,
                         "no webview popover is open (pwrde-cli action find_in_page opens Tools)",
                     ),
+                    Some("palette") => titled_window_number(
+                        crate::palette_window::WINDOW_TITLE,
+                        "the command palette is not open (pwrde-cli key cmd-p opens it)",
+                    ),
                     Some(other) => {
-                        Err(format!("screenshot: unknown window {other:?} (main|settings|popover)"))
+                        Err(format!("screenshot: unknown window {other:?} (main|settings|popover|palette)"))
                     },
                 };
                 let number = match number {
@@ -589,7 +593,10 @@ impl App {
             "active_group": if self.is_empty_state() { Value::Null } else { json!(self.active) },
             "groups": groups,
             "sections": sections,
-            "command_palette_open": self.command.is_some(),
+            "command_palette_open": self.palette_visible(),
+            // Open but hidden (its window lost key status): the model is kept
+            // and the palette hotkey brings it back.
+            "command_palette_hidden": self.palette_hidden(),
             // The palette's own window, distinct from the model flag above:
             // `command_palette_open` says the palette wants a surface,
             // `palette_window_open` says the pump has actually got one open.

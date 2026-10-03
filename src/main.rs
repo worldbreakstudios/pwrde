@@ -382,6 +382,11 @@ struct App {
     /// The paint path only ever *reads* it (`get`); every write arrives as a
     /// `TermEvent::GitContextReady` from the refresh worker.
     git_contexts: git_context::GitContextCache,
+    /// Branch → PR per repo from the last repo-wide PR list, for the fork
+    /// picker's worktree rows: applied synchronously when the Base step opens
+    /// and refreshed behind it (`TermEvent::ForkPrsReady`). Runtime-only,
+    /// never persisted.
+    fork_pr_cache: std::collections::HashMap<std::path::PathBuf, picker::ForkPrMap>,
     /// True while the serial git-context worker is alive, so a burst of
     /// refresh triggers cannot fan out into N simultaneous `gh` calls.
     git_ctx_busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -462,7 +467,7 @@ struct App {
     /// view, so the grid follows the active group without undoing a wheel
     /// scroll on every layout pass (`App::dashboard_follow_active`).
     dashboard_revealed: Option<u64>,
-    /// The folders card's "Pinned tools" run is folded (`sidebar.tools_collapsed`).
+    /// The sessions list's "Tools" run is folded (`sidebar.tools_collapsed`).
     tools_collapsed: bool,
     /// The sessions list's "Pinned" run is folded (`sidebar.pinned_collapsed`).
     pinned_collapsed: bool,
@@ -528,6 +533,9 @@ struct App {
     /// replaces the centered `message` overlay — see `toast_ui` for why a
     /// webview makes an in-window overlay the wrong tool.
     toasts: Vec<crate::toast_ui::ToastNote>,
+    /// While set, the info bar's cwd pill reads "Copied" — until this
+    /// deadline, which `infobar_ui` sets on a copy and `drain_events` clears.
+    pub(crate) cwd_copied_until: Option<std::time::Instant>,
     /// Monotonic id for the next toast, so a row keeps its identity while the
     /// stack shifts under the pointer.
     next_toast_id: u64,
@@ -621,6 +629,11 @@ struct App {
     /// model (`command`) is the source of truth for whether it should exist;
     /// the pump reconciles the window against it every tick.
     palette_window: Option<gpui::WindowHandle<crate::palette_window::PaletteWindow>>,
+    /// When the palette window lost key status and was hidden. The model
+    /// (`command`) is kept, so the hotkey brings the palette back where it was
+    /// left; `command::HIDDEN_RESET` later it is closed for good. Only
+    /// meaningful while `command` is `Some` (see `palette_presence`).
+    palette_hidden_since: Option<std::time::Instant>,
     /// Keystrokes queued by the bus `key` command, drained through the real
     /// gpui key-down handler so bindings and overlay routing are exercised.
     pending_keys: Vec<gpui::Keystroke>,
@@ -718,13 +731,41 @@ impl App {
     }
 
     /// The sessions list rect the *rows* lay out in: [`App::sessions_list`]
-    /// shifted up by the wheel scroll, so every row helper (paint, hit-test,
-    /// drop preview) sees the same scrolled stack. The header and the clip
-    /// band keep the unshifted rect.
+    /// pushed below the fixed tools band and shifted up by the wheel scroll,
+    /// so every row helper (paint, hit-test, drop preview) sees the same
+    /// scrolled stack. The header, the tools band and the clip band keep the
+    /// unshifted rect.
     pub(crate) fn sessions_rows_list(&self, scale: f32) -> workspace::LayoutRect {
-        let mut list = self.sessions_list(scale);
-        list.y -= (self.sessions_scroll() * scale).round();
-        list
+        workspace::sessions_rows_rect(
+            &self.sessions_list(scale),
+            self.tools_band_h(scale),
+            self.sessions_scroll() * scale,
+        )
+    }
+
+    /// The fixed "Tools" band under the sessions header (physical px at
+    /// `scale`): the caption and one rect per registered CLI tool, none
+    /// while the run is folded. `sidebar_ui` paints it at 1.0.
+    pub(crate) fn tools_band(&self, scale: f32) -> workspace::ToolsBand {
+        workspace::tools_band(
+            &self.sessions_list(scale),
+            self.tools.len(),
+            self.tools_collapsed,
+            scale,
+        )
+    }
+
+    /// Height of [`App::tools_band`]: what pushes the session rows down.
+    pub(crate) fn tools_band_h(&self, scale: f32) -> f32 {
+        workspace::tools_band_h(self.tools.len(), self.tools_collapsed, scale)
+    }
+
+    /// Whether physical `py` is above the session rows' viewport — on the
+    /// list header or the tools band. The canvas hit tests (context menu,
+    /// drops) check this first so nothing falls through to a session row
+    /// scrolled beneath them.
+    fn above_session_rows(&self, py: f32, scale: f32) -> bool {
+        py < workspace::sessions_rows_top(&self.sessions_list(scale), self.tools_band_h(scale), scale)
     }
 
     /// The sessions list's wheel scroll, logical px, clamped so the last
@@ -775,7 +816,9 @@ impl App {
             scale,
             &list,
         );
-        let viewport = (list.h - (workspace::SESSIONS_HEADER_H * scale).round()).max(0.0);
+        // The rows' window: the list below its header and the tools band.
+        let top = workspace::sessions_rows_top(&list, self.tools_band_h(scale), scale);
+        let viewport = (list.y + list.h - top).max(0.0);
         workspace::max_scroll(extent, viewport) / scale
     }
 
@@ -786,10 +829,9 @@ impl App {
         workspace::folders_card_rect(h, self.folders_w, scale)
     }
 
-    /// The folders card's rows in paint order, with the "Pinned tools" run
-    /// folded away when collapsed.
+    /// The folders card's rows in paint order.
     pub(crate) fn folder_rows(&self) -> Vec<workspace::FolderRow> {
-        workspace::folder_rows(self.tools.len(), self.tools_collapsed, self.sections.len())
+        workspace::folder_rows(self.sections.len())
     }
 
     /// The folders card's wheel scroll, logical px, clamped like
@@ -837,7 +879,7 @@ impl App {
         }
     }
 
-    /// Fold or unfold the folders card's "Pinned tools" run.
+    /// Fold or unfold the sessions list's "Tools" run.
     pub(crate) fn toggle_tools_collapsed(&mut self) {
         self.tools_collapsed = !self.tools_collapsed;
         settings::set("sidebar.tools_collapsed", self.tools_collapsed.into());
@@ -1364,7 +1406,8 @@ impl App {
         )
     }
 
-    /// Snapshot the live groups, tabs and sidebar folders to SQLite.
+    /// Snapshot the live groups, tabs, sidebar folders and the flyover
+    /// panel's tabs to SQLite.
     ///
     /// This runs regardless of the shpool toggle: the folders, the sessions
     /// and the split layouts they were launched with have to survive a restart
@@ -1376,6 +1419,43 @@ impl App {
         if let Err(e) = persist::save_snapshot_default(&saved, &sections) {
             eprintln!("persist_snapshot error: {}", e);
         }
+        let flyover = persist::flyover_to_saved(&self.flyover_tabs, self.flyover_active);
+        if let Err(e) = persist::save_flyover_default(&flyover) {
+            eprintln!("persist_snapshot flyover error: {}", e);
+        }
+    }
+
+    /// Rebuild the flyover panel's tabs from the persisted snapshot,
+    /// reattaching each to its saved shpool session, as `restore_node` does
+    /// for a group's terminal tabs. The panel stays hidden until toggled; with
+    /// nothing saved the first open still shows the picker.
+    fn restore_flyover(&mut self) {
+        let saved = persist::load_flyover_default();
+        if saved.is_empty() {
+            return;
+        }
+        let mut active = 0;
+        for (i, st) in saved.iter().enumerate() {
+            let cwd = st.cwd.as_ref().map(std::path::PathBuf::from);
+            let session = self.spawn_session_named(
+                cwd.as_deref(),
+                persist::reattach_shpool_name(
+                    st.shpool_session.as_deref(),
+                    settings::persist_sessions(),
+                ),
+            );
+            let mut tab = Tab::new(session);
+            tab.unread = st.unread;
+            tab.unread_at = persist::from_epoch_secs(st.unread_at);
+            tab.cwd = cwd;
+            self.flyover_tabs.push(tab);
+            if st.active {
+                active = i;
+            }
+        }
+        self.flyover_active = active.min(self.flyover_tabs.len() - 1);
+        self.flyover_open = false;
+        self.flyover_focused = false;
     }
 
     /// Rebuild workspaces and sidebar sections from the persisted snapshot,
@@ -1662,7 +1742,7 @@ impl App {
         self.tools.len()
     }
 
-    /// The label tool `i`'s row shows in the folders card: its terminal's own
+    /// The label tool `i`'s row shows in the sessions list's tools band: its terminal's own
     /// pane title once one is running, else the tool's command — never the name
     /// it was registered under (see [`tool_label`]).
     fn tool_row_label(&self, i: usize) -> String {
@@ -2150,6 +2230,7 @@ impl App {
         self.flyover_focused = true;
         self.flyover_mark_read();
         self.request_redraw();
+        self.persist_snapshot();
     }
 
     /// Record a pointer position from an element event (logical px) in the
@@ -2586,13 +2667,18 @@ impl App {
     }
 
     /// Clear the unread dot on the flyover tab that just came on screen
-    /// (panel opened or active tab switched).
-    fn flyover_mark_read(&mut self) {
+    /// (panel opened or active tab switched). Returns whether a dot was
+    /// cleared; the caller persists.
+    fn flyover_mark_read(&mut self) -> bool {
         if !self.flyover_open {
-            return;
+            return false;
         }
-        if let Some(tab) = self.flyover_tabs.get_mut(self.flyover_active) {
-            tab.unread = false;
+        match self.flyover_tabs.get_mut(self.flyover_active) {
+            Some(tab) if tab.unread => {
+                tab.unread = false;
+                true
+            },
+            _ => false,
         }
     }
 
@@ -2615,7 +2701,12 @@ impl App {
         if ti >= self.flyover_tabs.len() {
             return;
         }
-        self.flyover_tabs.remove(ti);
+        let tab = self.flyover_tabs.remove(ti);
+        // Explicit close ends the persistent session too, as closing a tile
+        // tab does; an exited shell goes through remove_session instead.
+        if let Some(name) = tab.session().and_then(|session| session.shpool_session.as_deref()) {
+            term::shpool_kill(name);
+        }
         if self.flyover_tabs.is_empty() {
             self.flyover_open = false;
             self.flyover_focused = false;
@@ -2626,6 +2717,7 @@ impl App {
             self.flyover_active = self.flyover_active.min(self.flyover_tabs.len() - 1);
         }
         self.request_redraw();
+        self.persist_snapshot();
     }
 
     /// Toggle the flyover panel between its resizable height and filling the
@@ -2721,8 +2813,12 @@ impl App {
             .iter_mut()
             .find(|tab| tab.session().is_some_and(|session| session.id == id))
         {
-            if !tab.unread {
+            // The stamp is saved with the flyover tabs, on the same
+            // not-already-unread rule as a group tab's below.
+            let stamped = !tab.unread;
+            if stamped {
                 tab.unread_at = Some(now);
+                self.persist_snapshot();
             }
             return false; // Flyover tabs have no sidebar card to restamp.
         }
@@ -2747,7 +2843,7 @@ impl App {
     /// only on a false→true transition, so repeated attention signals from
     /// one pane don't churn the snapshot.
     fn set_unread_by_session(&mut self, id: u64) -> bool {
-        // Flyover tabs aren't persisted, so their dots skip the snapshot.
+        // Flyover tabs are persisted too, on the same transition-only rule.
         if let Some(tab) = self
             .flyover_tabs
             .iter_mut()
@@ -2757,6 +2853,7 @@ impl App {
             tab.unread = true;
             if hit {
                 tab.unread_at = Some(SystemTime::now());
+                self.persist_snapshot();
             }
             return hit;
         }
@@ -2848,6 +2945,10 @@ impl App {
         let (_, h) = self.renderer.surface_size();
 
         if workspace::sidebar(h, scale, self.sidebar_w()).contains(px, py) {
+            // The tools band has no menu, and hides the rows under it.
+            if self.above_session_rows(py, scale) {
+                return;
+            }
             let rows = self.sidebar_rows();
             for (ri, row) in rows.iter().enumerate() {
                 let rect = workspace::sidebar_row_rect(
@@ -3197,15 +3298,64 @@ impl App {
         }
         self.command_scroll_to = self.command.as_ref().map(|c| c.selected());
         self.modal_search_reset = Some(self.command_placeholder().to_string());
+        // Every opener and stage change comes through here, and each one
+        // shows the palette: a fresh palette is never born hidden.
+        self.palette_hidden_since = None;
     }
 
-    /// Toggle the palette at its command root (⌘P).
-    fn toggle_command_root(&mut self) {
-        if self.command.is_some() {
+    /// Where the palette is right now: closed, visible, hidden, or hidden
+    /// long enough to be reset.
+    fn palette_presence(&self) -> command::Presence {
+        command::presence(
+            self.command.is_some(),
+            self.palette_hidden_since,
+            std::time::Instant::now(),
+        )
+    }
+
+    /// True while the palette is open with its window up — false while it is
+    /// hidden, when the rest of the app behaves as if no palette were open.
+    pub(crate) fn palette_visible(&self) -> bool {
+        self.palette_presence() == command::Presence::Visible
+    }
+
+    /// True while the palette keeps its progress behind a hidden window.
+    pub(crate) fn palette_hidden(&self) -> bool {
+        self.command.is_some() && self.palette_hidden_since.is_some()
+    }
+
+    /// The palette window lost key status: hide it, keeping the model.
+    pub(crate) fn hide_palette_on_blur(&mut self) {
+        // The flyover's first-open picker has an empty flyover waiting on it,
+        // which would be left holding the keyboard: that one closes outright.
+        if self.command.as_ref().is_some_and(|c| c.for_flyover) && self.flyover_tabs.is_empty() {
             self.close_command();
-        } else {
-            self.command = Some(command::CommandPalette::root());
-            self.claim_command_search();
+            return;
+        }
+        if self.palette_visible() {
+            self.palette_hidden_since = Some(std::time::Instant::now());
+            self.request_redraw();
+        }
+    }
+
+    /// Toggle the palette at its command root (⌘P): close a visible one,
+    /// bring a hidden one back where it was left, else open a fresh root.
+    fn toggle_command_root(&mut self) {
+        match command::toggle_outcome(self.palette_presence()) {
+            command::Toggle::Close => self.close_command(),
+            command::Toggle::Reveal => {
+                // The shared Input still holds the retained query, so there
+                // is no claim (which would clear it): the pump reopens the
+                // window, whose render focuses the field.
+                self.palette_hidden_since = None;
+                self.command_scroll_to = self.command.as_ref().map(|c| c.selected());
+            },
+            command::Toggle::OpenRoot => {
+                // An expired hidden palette is reset before the fresh one.
+                self.close_command();
+                self.command = Some(command::CommandPalette::root());
+                self.claim_command_search();
+            },
         }
         self.request_redraw();
     }
@@ -3218,12 +3368,31 @@ impl App {
         self.request_redraw();
     }
 
+    /// Fetch `repo`'s PR list on a background thread — one CLI call for the
+    /// whole repo, never one per worktree — and post it back as a
+    /// `TermEvent::ForkPrsReady`, where it updates `fork_pr_cache` and the
+    /// open fork picker. Run each time the Base step opens.
+    fn spawn_fork_pr_refresh(&self, repo: &std::path::Path) {
+        let events_tx = self.events_tx.clone();
+        let repo = repo.to_path_buf();
+        std::thread::spawn(move || {
+            let prs = gh::pr_list_for_repo(&repo).ok().map(|list| {
+                gh::prs_by_head(list)
+                    .iter()
+                    .map(|(head, pr)| (head.clone(), picker::ForkPr::from_summary(pr)))
+                    .collect::<picker::ForkPrMap>()
+            });
+            let _ = events_tx.send(TermEvent::ForkPrsReady { repo, prs });
+        });
+    }
+
     /// Close the palette without choosing. Cancelling the flyover's
     /// first-open flow closes the waiting surface too — there is nothing
     /// to show yet.
     pub(crate) fn close_command(&mut self) {
         let for_flyover = self.command.as_ref().is_some_and(|c| c.for_flyover);
         self.command = None;
+        self.palette_hidden_since = None;
         if for_flyover && self.flyover_tabs.is_empty() {
             self.flyover_open = false;
             self.flyover_focused = false;
@@ -3253,7 +3422,12 @@ impl App {
                     self.command = None;
                     self.spawn_flyover_tab(Some(entry.path));
                 } else if entry.is_git {
-                    let all = build_fork_choices(&entry.path);
+                    // Worktree rows open already annotated and sorted from the
+                    // last PR list for this repo (no network here); the fresh
+                    // list is fetched behind the picker and re-sorts it only
+                    // if something changed.
+                    let all = build_fork_choices(&entry.path, self.fork_pr_cache.get(&entry.path));
+                    self.spawn_fork_pr_refresh(&entry.path);
                     let choices = if for_flyover {
                         all.into_iter()
                             .filter(|c| {
@@ -3411,14 +3585,19 @@ impl App {
         self.open_command_new_session(true);
     }
 
-    /// Spawn a new flyover tab with a plain (non-persisted) session at `cwd`.
+    /// Spawn a new flyover tab at `cwd`. Its session is shpool-backed exactly
+    /// when a group tab's is (see [`Self::spawn_session_in`]), and the tab is
+    /// saved with the snapshot so it comes back after a restart.
     fn spawn_flyover_tab(&mut self, cwd: Option<std::path::PathBuf>) {
-        let session = self.spawn_session_named(cwd.as_deref(), None);
-        self.flyover_tabs.push(workspace::Tab::new(session));
+        let session = self.spawn_session_in(cwd.as_deref());
+        let mut tab = workspace::Tab::new(session);
+        tab.cwd = cwd;
+        self.flyover_tabs.push(tab);
         self.flyover_active = self.flyover_tabs.len() - 1;
         self.flyover_focused = true;
         self.sync_layout();
         self.request_redraw();
+        self.persist_snapshot();
     }
 
     /// The flyover strip's "+" button: a new flyover tab in the active
@@ -3442,7 +3621,9 @@ impl App {
             // Open: show the panel.
             self.flyover_open = true;
             self.flyover_focused = true;
-            self.flyover_mark_read();
+            if self.flyover_mark_read() {
+                self.persist_snapshot();
+            }
             if self.flyover_tabs.is_empty() {
                 // First-ever open: open directory picker to create the first tab.
                 self.open_flyover_picker();
@@ -3467,6 +3648,7 @@ impl App {
                     self.flyover_active =
                         pages::cycle(self.flyover_active, self.flyover_tabs.len(), -1);
                     self.flyover_mark_read();
+                    self.persist_snapshot();
                 }
             },
             Action::NextTab => {
@@ -3474,6 +3656,7 @@ impl App {
                     self.flyover_active =
                         pages::cycle(self.flyover_active, self.flyover_tabs.len(), 1);
                     self.flyover_mark_read();
+                    self.persist_snapshot();
                 }
             },
             Action::Copy => {
@@ -3866,6 +4049,10 @@ impl App {
         // Terminal-tab → sidebar group: hit-test via the shared row list.
         let (_, h) = self.renderer.surface_size();
         if workspace::sidebar(h, scale, self.sidebar_w()).contains(px, py) {
+            // Tool rows are not drop targets, nor are the rows under them.
+            if self.above_session_rows(py, scale) {
+                return None;
+            }
             let rows = self.sidebar_rows();
             for (ri, row) in rows.iter().enumerate() {
                 let rect = workspace::sidebar_row_rect(
@@ -3918,11 +4105,15 @@ impl App {
                             pinned: None,
                             gap: self.sidebar_rows().len(),
                         }),
-                        _ => None,
                     };
                 }
                 return None;
             }
+        }
+        // The fixed tools band is no landing zone, and it covers whatever
+        // rows are scrolled beneath it.
+        if self.above_session_rows(py, scale) {
+            return None;
         }
         let rows = self.sidebar_rows();
         // The "Pinned" caption is a landing zone of its own: drop there to
@@ -4130,7 +4321,7 @@ impl App {
                         ));
                     }
                 }
-                Some(workspace::tab_rect(ws, scale, &self.sessions_list(scale)))
+                Some(workspace::tab_rect(ws, scale, &self.sessions_rows_list(scale)))
             },
             DropTarget::SidebarAppend { section_id } => {
                 // Highlight the folder's row in the folders card.
@@ -5879,10 +6070,16 @@ impl App {
     }
 
     /// ⌘⇧↑/↓: step through the sidebar's tabs, wrapping at both ends —
-    /// the workspace groups on the Sessions page, and on the Dashboard too,
-    /// where the selection is the focused card (the page stays up).
+    /// the tools band's rows (unless folded), then the workspace groups. On
+    /// the Dashboard only the groups: the selection is the focused card, and
+    /// the page stays up.
     fn cycle_sidebar_tab(&mut self, delta: isize) {
-        if matches!(self.page, Page::Sessions | Page::Dashboard)
+        let current = match self.page {
+            Page::Tool(i) => workspace::SidebarStop::Tool(i),
+            _ => workspace::SidebarStop::Group(self.active),
+        };
+        let on_dashboard = self.page == Page::Dashboard;
+        if matches!(self.page, Page::Sessions | Page::Tool(_) | Page::Dashboard)
             // Leading-edge throttle on the key-repeat burst only; the first
             // press always lands (the field is backdated at startup).
             && workspace::throttle_ready(self.sidebar_cycle_at.elapsed(), SIDEBAR_CYCLE_THROTTLE)
@@ -5893,8 +6090,16 @@ impl App {
             // away) not the raw workspace order, so
             // the selection lands on the row next to the one it left.
             let rows = self.sidebar_rows();
-            if let Some(next) = workspace::cycle_sidebar_active(&rows, self.active, delta) {
-                self.switch_workspace(next);
+            let n_tools = if self.tools_collapsed || on_dashboard { 0 } else { self.n_tools() };
+            match workspace::cycle_sidebar_stop(n_tools, &rows, current, delta) {
+                Some(workspace::SidebarStop::Tool(i)) => self.set_page(Page::Tool(i)),
+                Some(workspace::SidebarStop::Group(next)) => {
+                    if !on_dashboard {
+                        self.set_page(Page::Sessions);
+                    }
+                    self.switch_workspace(next);
+                },
+                None => {},
             }
         }
     }
@@ -6072,6 +6277,15 @@ impl App {
         // the foreground executor every ~16ms, so the toast disappears within
         // a frame of its deadline; redraw only flips on the expiry frame.
         if self.toast_due() {
+            redraw = true;
+        }
+        // A palette hidden for `command::HIDDEN_RESET` is closed for good.
+        if self.palette_presence() == command::Presence::Expired {
+            self.close_command();
+            redraw = true;
+        }
+        // The cwd pill's "Copied" flash ends the same way.
+        if crate::infobar_ui::flash_due(&mut self.cwd_copied_until, std::time::Instant::now()) {
             redraw = true;
         }
         while let Ok(event) = self.events_rx.try_recv() {
@@ -6309,6 +6523,33 @@ impl App {
                     // `merge`) until the new ones land.
                     self.git_contexts.mark_all_stale();
                     self.spawn_git_context_refresh();
+                    // An open fork picker read the same cache; read it again.
+                    if let Some(repo) = self.command.as_ref().and_then(|c| c.base.as_ref()).map(|b| b.repo.clone()) {
+                        self.spawn_fork_pr_refresh(&repo);
+                    }
+                },
+                TermEvent::ForkPrsReady { repo, prs } => {
+                    // A failed fetch keeps the last good map and whatever the
+                    // picker shows; nothing is reported.
+                    if let Some(prs) = prs {
+                        // The palette's picker for this repo is re-sorted
+                        // (keeping its filter and highlight) on whatever step
+                        // it is — ⌫ from Layout comes back to these rows.
+                        let changed = self
+                            .command
+                            .as_mut()
+                            .and_then(|pal| pal.base.as_mut())
+                            .filter(|base| base.repo == repo)
+                            .is_some_and(|base| base.apply_prs(&prs));
+                        self.fork_pr_cache.insert(repo, prs);
+                        if changed {
+                            // The highlight moved with its row; keep it in view.
+                            if let Some(c) = self.command.as_ref().filter(|c| c.stage == command::Stage::Base) {
+                                self.command_scroll_to = Some(c.selected());
+                            }
+                            redraw = true;
+                        }
+                    }
                 },
                 TermEvent::GitContextReady { cwd, ctx } => {
                     // Folded through the cache's `merge`, then repainted the
@@ -6427,6 +6668,7 @@ impl App {
             } else {
                 self.flyover_active = self.flyover_active.min(self.flyover_tabs.len() - 1);
             }
+            self.persist_snapshot();
             return;
         }
         // Find and remove the tab whose session matches, cascading empties.
@@ -6569,8 +6811,13 @@ fn tab_command(tab: &workspace::Tab) -> Option<String> {
 
 /// Build the fork picker's rows for a git repo: a default "new branch" row and
 /// a repo-root row, followed by existing worktrees, then local and remote
-/// branches.
-fn build_fork_choices(repo: &std::path::Path) -> Vec<picker::ForkEntry> {
+/// branches. Worktree rows are stamped with their branch's pull request from
+/// `prs` (the cached repo-wide list, if any) and sorted by PR status; without
+/// it they keep git's order, all "no PR". Local git only — never the network.
+fn build_fork_choices(
+    repo: &std::path::Path,
+    prs: Option<&picker::ForkPrMap>,
+) -> Vec<picker::ForkEntry> {
     use picker::{ForkEntry, ForkScope};
     let default = git::default_remote_branch(repo);
     let base_label = default.clone().unwrap_or_else(|| "HEAD".into());
@@ -6582,12 +6829,16 @@ fn build_fork_choices(repo: &std::path::Path) -> Vec<picker::ForkEntry> {
             from: None,
             path: None,
             scope: ForkScope::Default,
+            branch: None,
+            pr: None,
         },
         ForkEntry {
             label: "⌂ repo root (no worktree)".into(),
             from: None,
             path: Some(repo.to_path_buf()),
             scope: ForkScope::RepoRoot,
+            branch: None,
+            pr: None,
         },
     ];
     // Existing worktrees (drop's and any others) — attach a group to one
@@ -6606,7 +6857,14 @@ fn build_fork_choices(repo: &std::path::Path) -> Vec<picker::ForkEntry> {
             from: None,
             path: Some(wt.path),
             scope: ForkScope::Worktree,
+            // A detached worktree has no branch, so no PR can match it.
+            branch: wt.branch,
+            pr: None,
         });
+    }
+    if let Some(prs) = prs {
+        picker::annotate_worktree_prs(&mut out, prs);
+        picker::sort_worktree_run(&mut out);
     }
     for b in branches.iter().filter(|b| !b.is_remote) {
         let mut marks = Vec::new();
@@ -6622,6 +6880,8 @@ fn build_fork_choices(repo: &std::path::Path) -> Vec<picker::ForkEntry> {
             from: Some(b.name.clone()),
             path: None,
             scope: ForkScope::Local,
+            branch: None,
+            pr: None,
         });
     }
     for b in branches.iter().filter(|b| b.is_remote) {
@@ -6630,6 +6890,8 @@ fn build_fork_choices(repo: &std::path::Path) -> Vec<picker::ForkEntry> {
             from: Some(b.name.clone()),
             path: None,
             scope: ForkScope::Remote,
+            branch: None,
+            pr: None,
         });
     }
     out
@@ -7965,6 +8227,7 @@ fn main() {
                         sections: Vec::new(),
                         next_section_id: 0,
                         git_contexts: git_context::GitContextCache::new(),
+                        fork_pr_cache: std::collections::HashMap::new(),
                         git_ctx_busy: std::sync::Arc::new(
                             std::sync::atomic::AtomicBool::new(false),
                         ),
@@ -8049,6 +8312,7 @@ fn main() {
                         pending_group_section: None,
                         save_ws: None,
                         toasts: Vec::new(),
+                        cwd_copied_until: None,
                         next_toast_id: 0,
                         confirm: None,
                         pending_primary_cmd: std::collections::HashMap::new(),
@@ -8182,6 +8446,7 @@ fn main() {
                         flyover_maximized: true,
                         main_window: None,
                         palette_window: None,
+                        palette_hidden_since: None,
                         settings_open: false,
                         settings_window: None,
                         settings_activate: false,
@@ -8221,6 +8486,10 @@ fn main() {
                     // fresh plain shells instead of live ones. Only a
                     // missing/empty snapshot falls back to the empty state
                     // (no shell until the user starts a group, CTA or ⇧⌘T).
+                    // The flyover's tabs come back whether or not any
+                    // groups were saved, and before anything can snapshot
+                    // (which would rewrite their rows from an empty panel).
+                    app.restore_flyover();
                     if !app.restore_workspaces() {
                         app.workspaces.push(Workspace::placeholder());
                     }
@@ -8263,9 +8532,11 @@ fn main() {
                                     (
                                         redraw,
                                         // The palette window exists exactly while the
-                                        // palette model does: no per-site plumbing, a
-                                        // stage change keeps the same surface up.
-                                        app.command.is_some(),
+                                        // palette model does and is not hidden: no
+                                        // per-site plumbing, a stage change keeps the
+                                        // same surface up. A hidden palette's window is
+                                        // removed and reopened when it is shown again.
+                                        app.palette_visible(),
                                         app.palette_window,
                                         // The Settings window exists exactly while
                                         // `settings_open` is set.
@@ -8299,6 +8570,11 @@ fn main() {
                                                 is_held: false,
                                                 prefer_character_input: false,
                                             };
+                                            // The palette's keys are routed
+                                            // by its own window; do the same.
+                                            if app.command.is_some() && app.palette_key(&ev) {
+                                                continue;
+                                            }
                                             app.on_key_down(&ev, window, cx);
                                         }
                                         // No key-up follows a synthetic press:
@@ -8321,10 +8597,13 @@ fn main() {
                                     });
                                 },
                                 (false, Some(w)) => {
-                                    let _ = w.update(cx, |_, window, _| window.remove_window());
+                                    // Clear the handle first: the window's
+                                    // resign-key observer only hides a palette
+                                    // whose window is still the app's.
                                     let _ = app.update(cx, |app: &mut App, _| {
                                         app.palette_window = None;
                                     });
+                                    let _ = w.update(cx, |_, window, _| window.remove_window());
                                 },
                                 (_, Some(w)) => {
                                     if redraw {
@@ -8731,7 +9010,7 @@ mod tool_page_title_tests {
         assert_eq!(tool_page_title("\twezterm\n", "drop -d"), "drop -d");
     }
 
-    /// The same rule for the folders card's tool row: the live pane title names
+    /// The same rule for the tools band's tool row: the live pane title names
     /// the row ("this pane is named test", not "drip --tui"), and a tool with no
     /// terminal — or a terminal with no title of its own — falls back to the
     /// command.

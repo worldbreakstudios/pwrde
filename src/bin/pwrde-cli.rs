@@ -329,11 +329,11 @@ fn parse_command(sub: &str, args: &[String]) -> Result<Command, CliError> {
                 } else if a == "--window" {
                     i += 1;
                     let Some(name) = args.get(i) else {
-                        return Err(CliError::Usage("--window requires main|settings|popover".into()));
+                        return Err(CliError::Usage("--window requires main|settings|popover|palette".into()));
                     };
-                    if !matches!(name.as_str(), "main" | "settings" | "popover") {
+                    if !matches!(name.as_str(), "main" | "settings" | "popover" | "palette") {
                         return Err(CliError::Usage(format!(
-                            "--window expects main, settings or popover, got {name:?}"
+                            "--window expects main, settings, popover or palette, got {name:?}"
                         )));
                     }
                     window = Some(name.clone());

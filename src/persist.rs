@@ -1,5 +1,5 @@
-//! Session persistence — snapshots group layouts, sidebar sections, and
-//! shpool sessions to SQLite.
+//! Session persistence — snapshots group layouts, sidebar sections, shpool
+//! sessions and the flyover panel's tabs to SQLite.
 //!
 //! The default DB path is `<data_dir>/pwrde/state.db`. When the process is
 //! launched from a linked git worktree (see [`crate::git::worktree_scope`]),
@@ -10,7 +10,8 @@
 //! Schema evolution: `open_db` creates tables with `CREATE TABLE IF NOT EXISTS`
 //! and migrates older DBs by adding `groups.section_id` and `groups.pinned`
 //! (duplicate-column errors are ignored) plus a `sections` table for collapsible
-//! sidebar groups.
+//! sidebar groups, and a `flyover_tabs` table for the flyover panel's tabs
+//! (saved and loaded on their own, see [`save_flyover`]).
 
 use rusqlite::{Connection, Result as SqlResult};
 use serde::{Deserialize, Serialize};
@@ -74,6 +75,18 @@ pub struct SavedTab {
     pub toolbar_hidden: bool,
     pub kind: SavedTabKind,
     pub url: Option<String>,
+}
+
+/// A saved flyover-panel tab. The flyover holds terminals only, in one strip,
+/// so a row is just its place in that strip.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SavedFlyoverTab {
+    pub position: usize,
+    pub active: bool,
+    pub shpool_session: Option<String>,
+    pub cwd: Option<String>,
+    pub unread: bool,
+    pub unread_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,6 +183,21 @@ fn open_db(path: &Path) -> SqlResult<Connection> {
         [],
     )?;
     let _ = conn.execute("ALTER TABLE sections ADD COLUMN anchor_tile INTEGER", []);
+
+    // The flyover panel's tabs live outside the group tree, so they get a
+    // table of their own that `save_snapshot` never touches.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS flyover_tabs (
+            id INTEGER PRIMARY KEY,
+            position INTEGER NOT NULL,
+            active INTEGER NOT NULL,
+            shpool_session TEXT,
+            cwd TEXT,
+            unread INTEGER,
+            unread_at INTEGER
+        )",
+        [],
+    )?;
 
     Ok(conn)
 }
@@ -425,6 +453,83 @@ fn load_groups(conn: &Connection) -> Vec<SavedGroup> {
     groups
 }
 
+/// Save the flyover panel's tabs, rewriting the `flyover_tabs` table in one
+/// transaction. Groups and sections are left alone.
+/// Returns Ok(()) on success, Err on DB failure. Never panics.
+pub fn save_flyover(tabs: &[SavedFlyoverTab], path: &Path) -> SqlResult<()> {
+    let conn = open_db(path)?;
+    let tx = conn.unchecked_transaction()?;
+
+    tx.execute("DELETE FROM flyover_tabs", [])?;
+
+    for tab in tabs {
+        tx.execute(
+            "INSERT INTO flyover_tabs (position, active, shpool_session, cwd, unread, unread_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            (
+                tab.position,
+                if tab.active { 1 } else { 0 },
+                &tab.shpool_session,
+                &tab.cwd,
+                if tab.unread { 1 } else { 0 },
+                tab.unread_at,
+            ),
+        )?;
+    }
+
+    tx.commit()?;
+    Ok(())
+}
+
+/// Load the flyover panel's saved tabs, ordered by position.
+/// Returns an empty vector on missing/corrupt DB. Never panics.
+pub fn load_flyover(path: &Path) -> Vec<SavedFlyoverTab> {
+    let conn = match open_db(path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("persist: failed to open DB: {}", e);
+            return Vec::new();
+        }
+    };
+
+    let mut stmt = match conn.prepare(
+        "SELECT position, active, shpool_session, cwd, unread, unread_at
+         FROM flyover_tabs ORDER BY position",
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("persist: failed to prepare flyover query: {}", e);
+            return Vec::new();
+        }
+    };
+
+    let rows = match stmt.query_map([], |row| {
+        Ok(SavedFlyoverTab {
+            position: row.get::<_, i64>(0)?.max(0) as usize,
+            active: row.get::<_, i64>(1)? != 0,
+            shpool_session: row.get(2)?,
+            cwd: row.get(3)?,
+            unread: row.get::<_, Option<i64>>(4)?.unwrap_or(0) != 0,
+            unread_at: row.get(5)?,
+        })
+    }) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("persist: failed to query flyover tabs: {}", e);
+            return Vec::new();
+        }
+    };
+
+    rows.filter_map(|row| match row {
+        Ok(tab) => Some(tab),
+        Err(e) => {
+            eprintln!("persist: failed to read flyover tab row: {}", e);
+            None
+        }
+    })
+    .collect()
+}
+
 /// Convert a system time to non-negative Unix epoch seconds.
 pub fn to_epoch_secs(time: Option<SystemTime>) -> Option<i64> {
     time.and_then(|t| t.duration_since(UNIX_EPOCH).ok())
@@ -455,6 +560,25 @@ pub fn workspaces_to_saved(workspaces: &[crate::workspace::Workspace]) -> Vec<Sa
                 pinned: ws.pinned,
                 snoozed: ws.snoozed,
             }
+        })
+        .collect()
+}
+
+/// Convert the flyover panel's live tabs to SavedFlyoverTab format. Only
+/// terminal tabs are kept (the flyover has no webviews); `active` is an index
+/// into `tabs`.
+pub fn flyover_to_saved(tabs: &[crate::workspace::Tab], active: usize) -> Vec<SavedFlyoverTab> {
+    tabs.iter()
+        .enumerate()
+        .filter(|(_, tab)| tab.kind() == crate::workspace::TabKind::Terminal)
+        .enumerate()
+        .map(|(position, (index, tab))| SavedFlyoverTab {
+            position,
+            active: index == active,
+            shpool_session: tab.session().and_then(|session| session.shpool_session.clone()),
+            cwd: tab.cwd.as_ref().map(|p| p.display().to_string()),
+            unread: tab.unread,
+            unread_at: to_epoch_secs(tab.unread_at),
         })
         .collect()
 }
@@ -568,6 +692,28 @@ pub fn load_snapshot_default() -> (Vec<SavedGroup>, Vec<SavedSection>) {
         None => {
             eprintln!("persist: cannot determine data directory");
             (Vec::new(), Vec::new())
+        }
+    }
+}
+
+/// Public API using the default DB path.
+pub fn save_flyover_default(tabs: &[SavedFlyoverTab]) -> SqlResult<()> {
+    match db_path() {
+        Some(path) => save_flyover(tabs, &path),
+        None => {
+            eprintln!("persist: cannot determine data directory");
+            Ok(())
+        }
+    }
+}
+
+/// Public API using the default DB path.
+pub fn load_flyover_default() -> Vec<SavedFlyoverTab> {
+    match db_path() {
+        Some(path) => load_flyover(&path),
+        None => {
+            eprintln!("persist: cannot determine data directory");
+            Vec::new()
         }
     }
 }
@@ -1263,4 +1409,112 @@ mod tests {
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
+    fn flyover_tab(position: usize, active: bool, shpool: Option<&str>) -> SavedFlyoverTab {
+        SavedFlyoverTab {
+            position,
+            active,
+            shpool_session: shpool.map(str::to_string),
+            cwd: None,
+            unread: false,
+            unread_at: None,
+        }
+    }
+
+    #[test]
+    fn flyover_roundtrips_order_active_shpool_and_unread() {
+        let path = temp_db("flyover-roundtrip");
+        let mut second = flyover_tab(1, true, None);
+        second.cwd = Some("/tmp/fly".to_string());
+        second.unread = true;
+        second.unread_at = Some(1_700_000_000);
+        // Saved out of order: load sorts by position.
+        let tabs = vec![
+            flyover_tab(2, false, Some("pwrde-fly-c")),
+            flyover_tab(0, false, Some("pwrde-fly-a")),
+            second.clone(),
+        ];
+        save_flyover(&tabs, &path).expect("save flyover");
+
+        let loaded = load_flyover(&path);
+        assert_eq!(
+            loaded,
+            vec![
+                flyover_tab(0, false, Some("pwrde-fly-a")),
+                second,
+                flyover_tab(2, false, Some("pwrde-fly-c")),
+            ]
+        );
+
+        // A second save rewrites the table rather than appending to it.
+        save_flyover(&[flyover_tab(0, true, None)], &path).expect("resave flyover");
+        assert_eq!(load_flyover(&path), vec![flyover_tab(0, true, None)]);
+        save_flyover(&[], &path).expect("clear flyover");
+        assert!(load_flyover(&path).is_empty());
+    }
+
+    #[test]
+    fn flyover_missing_db_loads_empty() {
+        assert!(load_flyover(Path::new("/nonexistent/pwrde/state.db")).is_empty());
+    }
+
+    #[test]
+    fn flyover_and_group_saves_leave_each_other_alone() {
+        let path = temp_db("flyover-independent");
+        let fly = vec![flyover_tab(0, false, Some("pwrde-fly-a")), flyover_tab(1, true, None)];
+        save_flyover(&fly, &path).expect("save flyover");
+
+        let groups = vec![sample_group(0, "alpha", None)];
+        save_snapshot(&groups, &[], &path).expect("save groups");
+        assert_eq!(load_flyover(&path), fly);
+
+        save_flyover(&[flyover_tab(0, true, None)], &path).expect("resave flyover");
+        let (loaded, _) = load_snapshot(&path);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "alpha");
+        assert_eq!(loaded[0].tabs, groups[0].tabs);
+
+        // Emptying the groups still keeps the flyover rows.
+        save_snapshot(&[], &[], &path).expect("clear groups");
+        assert_eq!(load_flyover(&path), vec![flyover_tab(0, true, None)]);
+    }
+
+    #[test]
+    fn pre_flyover_db_loads_empty_then_saves() {
+        let path = temp_db("pre-flyover");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        {
+            // A DB from before the flyover_tabs table existed.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute(
+                "CREATE TABLE groups (
+                    id INTEGER PRIMARY KEY,
+                    position INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    cwd TEXT,
+                    focused_tile INTEGER NOT NULL,
+                    layout TEXT NOT NULL
+                )",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "CREATE TABLE tabs (
+                    id INTEGER PRIMARY KEY,
+                    group_id INTEGER NOT NULL,
+                    tile_id INTEGER NOT NULL,
+                    tab_index INTEGER NOT NULL,
+                    active INTEGER NOT NULL,
+                    shpool_session TEXT,
+                    cwd TEXT
+                )",
+                [],
+            )
+            .unwrap();
+        }
+
+        assert!(load_flyover(&path).is_empty());
+        let fly = vec![flyover_tab(0, true, Some("pwrde-fly-a"))];
+        save_flyover(&fly, &path).expect("save flyover into migrated DB");
+        assert_eq!(load_flyover(&path), fly);
+    }
 }
