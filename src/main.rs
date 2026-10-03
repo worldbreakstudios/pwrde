@@ -5843,6 +5843,26 @@ impl App {
 
     /// Actions that work on every page. Returns whether `action` was one.
     fn run_global_action(&mut self, action: Action) -> bool {
+        // On the dashboard the ⌘⇧+arrow actions walk the card grid instead of
+        // the sidebar's rows and the page cycle.
+        if self.page == Page::Dashboard {
+            let dir = match action {
+                Action::PrevPage => Some(workspace::NavDir::Left),
+                Action::NextPage => Some(workspace::NavDir::Right),
+                Action::PrevSidebarTab => Some(workspace::NavDir::Up),
+                Action::NextSidebarTab => Some(workspace::NavDir::Down),
+                _ => None,
+            };
+            if let Some(dir) = dir {
+                // The same leading-edge throttle as the sidebar walk.
+                if workspace::throttle_ready(self.sidebar_cycle_at.elapsed(), SIDEBAR_CYCLE_THROTTLE)
+                {
+                    self.sidebar_cycle_at = std::time::Instant::now();
+                    self.dashboard_arrow(dir);
+                }
+                return true;
+            }
+        }
         match action {
             Action::PrevPage => self.cycle_page(-1),
             Action::NextPage => self.cycle_page(1),
@@ -6070,16 +6090,14 @@ impl App {
     }
 
     /// ⌘⇧↑/↓: step through the sidebar's tabs, wrapping at both ends —
-    /// the tools band's rows (unless folded), then the workspace groups. On
-    /// the Dashboard only the groups: the selection is the focused card, and
-    /// the page stays up.
+    /// the tools band's rows (unless folded), then the workspace groups. The
+    /// Dashboard never gets here: `run_global_action` walks its grid instead.
     fn cycle_sidebar_tab(&mut self, delta: isize) {
         let current = match self.page {
             Page::Tool(i) => workspace::SidebarStop::Tool(i),
             _ => workspace::SidebarStop::Group(self.active),
         };
-        let on_dashboard = self.page == Page::Dashboard;
-        if matches!(self.page, Page::Sessions | Page::Tool(_) | Page::Dashboard)
+        if matches!(self.page, Page::Sessions | Page::Tool(_))
             // Leading-edge throttle on the key-repeat burst only; the first
             // press always lands (the field is backdated at startup).
             && workspace::throttle_ready(self.sidebar_cycle_at.elapsed(), SIDEBAR_CYCLE_THROTTLE)
@@ -6090,13 +6108,11 @@ impl App {
             // away) not the raw workspace order, so
             // the selection lands on the row next to the one it left.
             let rows = self.sidebar_rows();
-            let n_tools = if self.tools_collapsed || on_dashboard { 0 } else { self.n_tools() };
+            let n_tools = if self.tools_collapsed { 0 } else { self.n_tools() };
             match workspace::cycle_sidebar_stop(n_tools, &rows, current, delta) {
                 Some(workspace::SidebarStop::Tool(i)) => self.set_page(Page::Tool(i)),
                 Some(workspace::SidebarStop::Group(next)) => {
-                    if !on_dashboard {
-                        self.set_page(Page::Sessions);
-                    }
+                    self.set_page(Page::Sessions);
                     self.switch_workspace(next);
                 },
                 None => {},

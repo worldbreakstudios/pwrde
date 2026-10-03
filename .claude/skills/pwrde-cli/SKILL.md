@@ -70,7 +70,9 @@ Settings Input or the PR composer won't receive it; use `send-text` for text.
 line in a shell. Actions that don't apply (e.g. `split_right` on the Settings
 page, or with no session open) return exit `1` with a reason rather than a
 silent no-op — treat that as a real signal. On the dashboard `key` types into
-the focused card's primary pane, `focus_*` / `next_tile` / `prev_tile` move the
+the focused card's primary pane, `prev_page` / `next_page` / `prev_sidebar_tab` /
+`next_sidebar_tab` (⌘⇧←/→/↑/↓) move the focused card by grid position, wrapping
+within its row or column, `focus_*` / `next_tile` / `prev_tile` move the
 focused card, `new_group` opens the session picker, and the other group and
 tile actions (`split_right`, `new_tab`, `close_tab`, `close_group`,
 `toggle_pin`, `open_pr_in_github`, …) are refused the same way; `focus <group>`
