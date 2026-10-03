@@ -890,15 +890,7 @@ impl App {
             CardAvatar::Open => pr_open(theme.dark),
             CardAvatar::Merged => pr_merged(theme.dark),
         };
-        // Mock: the selected row is a white wash (`rgba(255,255,255,.10)`) on
-        // the dark ground, an ink wash on the light one; hover is half that.
-        let wash = |a: f32| {
-            if theme.dark {
-                gpui::white().opacity(a)
-            } else {
-                theme.foreground.opacity(a * 0.8)
-            }
-        };
+        let wash = |a: f32| row_wash(theme, a);
 
         div()
             .absolute()
@@ -1059,7 +1051,8 @@ impl App {
 
 /// One CLI-tool row of the tools band: a green dot and the terminal's own
 /// pane title — or the tool's command while that terminal has none of its
-/// own (`App::tool_row_label`) — in monospace.
+/// own (`App::tool_row_label`) — in monospace. Selected and hovered it wears
+/// the session rows' wash (`row_wash`), not the folder rows' accent fill.
 fn tool_row(
     theme: &Theme,
     index: usize,
@@ -1068,8 +1061,12 @@ fn tool_row(
     selected: bool,
     hovered: bool,
 ) -> gpui::Stateful<gpui::Div> {
-    let ink = if selected { theme.primary_foreground } else { theme.foreground };
-    crate::folders_ui::row_shell(r, selected, hovered, theme)
+    // The folder rows' box for its layout only: the radius and the fills are
+    // the session rows'.
+    crate::folders_ui::row_shell(r, false, false, theme)
+        .rounded(px(ROW_RADIUS))
+        .when(selected, |d| d.bg(row_wash(theme, 0.10)))
+        .when(!selected && hovered, |d| d.bg(row_wash(theme, 0.05)))
         .id(("sessions-tool", index))
         .cursor_pointer()
         .child(
@@ -1089,9 +1086,21 @@ fn tool_row(
                 .text_ellipsis()
                 .font_family(crate::renderer::FONT_FAMILY)
                 .text_size(px(scaled(11.5)))
-                .text_color(ink)
+                .text_color(theme.foreground)
                 .child(label.to_string()),
         )
+}
+
+/// The sessions list's row highlight, shared by the session rows and the
+/// tools band's rows. Mock: the selected row is a white wash
+/// (`rgba(255,255,255,.10)`) on the dark ground, an ink wash on the light
+/// one; hover is half that.
+fn row_wash(theme: &Theme, a: f32) -> Hsla {
+    if theme.dark {
+        gpui::white().opacity(a)
+    } else {
+        theme.foreground.opacity(a * 0.8)
+    }
 }
 
 /// The hairline that separates list rows and closes the tools band:
