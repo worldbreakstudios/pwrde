@@ -476,7 +476,7 @@ impl App {
 
     /// `state.dashboard`: whether the page is up, its filter, the folder
     /// set's size and unread count (the header subtitle's two numbers), the
-    /// grid's shape, the scroll hint's counts, and one entry per **showing**
+    /// grid's shape, the two scroll hints' counts, and one entry per **showing**
     /// card, in slot order — a card of the selected folder's sessions that
     /// the filter shows: its status, whether it is focused, and its primary
     /// PTY's grid size (the card's while the dashboard is open, the
@@ -490,6 +490,7 @@ impl App {
             .iter()
             .filter(|card| card.status == crate::dashboard_ui::Status::Unread)
             .count();
+        let (above, unread_above) = layout.above();
         let (below, unread_below) = layout.below();
         let cards: Vec<Value> = layout
             .shown_cards()
@@ -514,6 +515,8 @@ impl App {
             "unread": unread,
             "cols": layout.grid.cols,
             "rows": layout.grid.rows,
+            "above": above,
+            "unread_above": unread_above,
             "below": below,
             "unread_below": unread_below,
             "cards": cards,

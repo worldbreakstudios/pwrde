@@ -3436,6 +3436,116 @@ fn dashboard_more_scroll_at(
     (scroll + grid.card_h + (DASH_GAP * scale * ui).round()).min(max_scroll).max(0.0)
 }
 
+/// Whether slot `slot`'s card has its top edge above the viewport's — cut
+/// off by the top edge, or scrolled wholly out: the test both counts of the
+/// top hint share, the mirror of [`dashboard_slot_below_at`].
+fn dashboard_slot_above_at(
+    viewport: &LayoutRect,
+    grid: &DashGrid,
+    slot: usize,
+    scroll: f32,
+    scale: f32,
+    ui: f32,
+) -> bool {
+    let card = dashboard_card_rect_at(viewport, grid, slot, scroll, scale, ui);
+    card.y < viewport.y - 0.5
+}
+
+/// The "↑ N more" hint at the top of the viewport, the mirror of the bottom
+/// one: how many of the first `shown` slots hold a card whose top edge lies
+/// above the viewport's. 0 hides the hint.
+pub fn dashboard_more_above(
+    viewport: &LayoutRect,
+    grid: &DashGrid,
+    shown: usize,
+    scroll: f32,
+    scale: f32,
+) -> usize {
+    dashboard_more_above_at(viewport, grid, shown, scroll, scale, chrome_ui_scale())
+}
+
+/// [`dashboard_more_above`] at chrome factor `ui`.
+fn dashboard_more_above_at(
+    viewport: &LayoutRect,
+    grid: &DashGrid,
+    shown: usize,
+    scroll: f32,
+    scale: f32,
+    ui: f32,
+) -> usize {
+    (0..shown)
+        .filter(|&slot| dashboard_slot_above_at(viewport, grid, slot, scroll, scale, ui))
+        .count()
+}
+
+/// How many of the cards [`dashboard_more_above`] counts are unread
+/// (`unread[slot]`, one entry per showing card) — the M of "↑ N more · M
+/// unread".
+pub fn dashboard_unread_above(
+    viewport: &LayoutRect,
+    grid: &DashGrid,
+    unread: &[bool],
+    scroll: f32,
+    scale: f32,
+) -> usize {
+    dashboard_unread_above_at(viewport, grid, unread, scroll, scale, chrome_ui_scale())
+}
+
+/// [`dashboard_unread_above`] at chrome factor `ui`.
+fn dashboard_unread_above_at(
+    viewport: &LayoutRect,
+    grid: &DashGrid,
+    unread: &[bool],
+    scroll: f32,
+    scale: f32,
+    ui: f32,
+) -> usize {
+    unread
+        .iter()
+        .enumerate()
+        .filter(|&(slot, &unread)| {
+            unread && dashboard_slot_above_at(viewport, grid, slot, scroll, scale, ui)
+        })
+        .count()
+}
+
+/// The top hint's two runs of text: "↑ N more" and, while some of those
+/// cards are unread, "M unread" (as [`dashboard_more_parts`]).
+pub fn dashboard_above_parts(n: usize, unread: usize) -> (String, Option<String>) {
+    (format!("↑ {n} more"), (unread > 0).then(|| format!("{unread} unread")))
+}
+
+/// The top hint's pill: the bottom pill's size (the two labels are the same
+/// length), [`DASH_MORE_BOTTOM`] under the viewport's top edge.
+pub fn dashboard_above_pill(viewport: &LayoutRect, n: usize, unread: usize, scale: f32) -> LayoutRect {
+    dashboard_above_pill_at(viewport, n, unread, scale, chrome_ui_scale())
+}
+
+/// [`dashboard_above_pill`] at chrome factor `ui`.
+fn dashboard_above_pill_at(
+    viewport: &LayoutRect,
+    n: usize,
+    unread: usize,
+    scale: f32,
+    ui: f32,
+) -> LayoutRect {
+    LayoutRect {
+        y: viewport.y + (DASH_MORE_BOTTOM * scale * ui).round(),
+        ..dashboard_more_pill_at(viewport, n, unread, scale, ui)
+    }
+}
+
+/// Where a click on the top hint scrolls to from `scroll`: one row up,
+/// clamped at the top (physical px).
+pub fn dashboard_above_scroll(grid: &DashGrid, scroll: f32, scale: f32) -> f32 {
+    dashboard_above_scroll_at(grid, scroll, scale, chrome_ui_scale())
+}
+
+/// [`dashboard_above_scroll`] at chrome factor `ui`.
+fn dashboard_above_scroll_at(grid: &DashGrid, scroll: f32, scale: f32, ui: f32) -> f32 {
+    (scroll - grid.card_h - (DASH_GAP * scale * ui).round()).max(0.0)
+}
+
 /// The group a directional focus move (⇧⌘H/J/K/L) lands on. `shown` is the
 /// group index in each occupied slot, in slot order; `cols` the grid's
 /// column count. `None` at the grid's edge (no wraparound, like
@@ -3655,6 +3765,39 @@ mod dashboard_tests {
         assert_eq!(dashboard_more_below_at(&VIEW, &grid, 7, max - 10.0, 1.0, 1.0), 0);
         assert_eq!(dashboard_more_below_at(&VIEW, &grid, 7, max - 11.0, 1.0, 1.0), 1);
         assert_eq!(dashboard_more_label(1, 0), "↓ 1 more");
+    }
+
+    /// The top hint mirrors the bottom one: it counts the cards cut off by, or
+    /// scrolled out above, the viewport's top edge.
+    #[test]
+    fn more_above_counts_the_cards_over_the_viewport() {
+        let grid = dashboard_grid_at(&VIEW, 7, 1.0, 1.0);
+        let max = max_scroll(dashboard_content_h_at(&grid, 7, 1.0, 1.0), VIEW.h);
+        // Nothing is above at the top of the scroll, nor with only the 10px
+        // padding scrolled off; 1px more cuts the first row.
+        assert_eq!(dashboard_more_above_at(&VIEW, &grid, 7, 0.0, 1.0, 1.0), 0);
+        assert_eq!(dashboard_more_above_at(&VIEW, &grid, 7, 10.0, 1.0, 1.0), 0);
+        assert_eq!(dashboard_more_above_at(&VIEW, &grid, 7, 11.0, 1.0, 1.0), 3);
+        // At the bottom the first row is out of view and the second is whole.
+        assert_eq!(dashboard_more_above_at(&VIEW, &grid, 7, max, 1.0, 1.0), 3);
+        // The unread ones among them; one still in view does not count.
+        let unread = [true, false, false, true, false, false, true];
+        assert_eq!(dashboard_unread_above_at(&VIEW, &grid, &unread, max, 1.0, 1.0), 1);
+        assert_eq!(dashboard_unread_above_at(&VIEW, &grid, &unread, 0.0, 1.0, 1.0), 0);
+        assert_eq!(dashboard_above_parts(3, 0), ("↑ 3 more".to_string(), None));
+        assert_eq!(
+            dashboard_above_parts(3, 1),
+            ("↑ 3 more".to_string(), Some("1 unread".to_string()))
+        );
+        // The pill is the bottom pill's size, 12px under the top edge.
+        let top = dashboard_above_pill_at(&VIEW, 3, 1, 1.0, 1.0);
+        let bottom = dashboard_more_pill_at(&VIEW, 3, 1, 1.0, 1.0);
+        assert_eq!((top.x, top.w, top.h), (bottom.x, bottom.w, bottom.h));
+        assert_eq!(top.y, VIEW.y + 12.0);
+        // A click scrolls one row up, clamped at the top.
+        let row = grid.card_h + 10.0;
+        assert_eq!(dashboard_above_scroll_at(&grid, max, 1.0, 1.0), max - row);
+        assert_eq!(dashboard_above_scroll_at(&grid, 5.0, 1.0, 1.0), 0.0);
     }
 
     /// No unread card below the fold: the count is 0 and the label plain —

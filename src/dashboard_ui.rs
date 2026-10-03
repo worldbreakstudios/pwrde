@@ -25,12 +25,14 @@
 //!   (`Renderer::dashboard`). A primary
 //!   tab with no terminal (a webview) shows its title, dim and centred,
 //!   instead;
-//! - the **scroll hint**: while showing cards extend below the viewport, a
+//! - the **scroll hints**: while showing cards extend below the viewport, a
 //!   "↓ N more" pill floats over its bottom edge (opaque, so it reads over
 //!   terminal text); a click scrolls one row down. While some of those cards
 //!   are unread it takes the unread style — the cards' unread dot at its
 //!   left, "↓ N more · M unread" with the count in the unread ink, the
-//!   unread border — and widens to fit.
+//!   unread border — and widens to fit. Its mirror, "↑ N more", floats under
+//!   the top edge while showing cards are scrolled out above it; a click
+//!   scrolls one row up.
 //!
 //! Every size is the figure at the default chrome text size and scales by
 //! [`crate::workspace::chrome_ui_scale`]. The geometry is pure and lives in
@@ -328,8 +330,31 @@ impl Layout {
         self.cards.iter().filter(|card| card.visible)
     }
 
-    /// The scroll hint's counts: showing cards whose bottom edge lies below
+    /// The top scroll hint's counts: showing cards whose top edge lies above
     /// the viewport, and how many of those are unread.
+    pub(crate) fn above(&self) -> (usize, usize) {
+        let unread: Vec<bool> =
+            self.shown_cards().map(|card| card.status == Status::Unread).collect();
+        (
+            workspace::dashboard_more_above(
+                &self.viewport,
+                &self.grid,
+                unread.len(),
+                self.scroll,
+                self.scale,
+            ),
+            workspace::dashboard_unread_above(
+                &self.viewport,
+                &self.grid,
+                &unread,
+                self.scroll,
+                self.scale,
+            ),
+        )
+    }
+
+    /// The bottom scroll hint's counts: showing cards whose bottom edge lies
+    /// below the viewport, and how many of those are unread.
     pub(crate) fn below(&self) -> (usize, usize) {
         let unread: Vec<bool> =
             self.shown_cards().map(|card| card.status == Status::Unread).collect();
@@ -490,6 +515,14 @@ impl App {
             layout.max_scroll,
             layout.scale,
         );
+        self.dashboard_scroll = next / layout.scale;
+        self.request_redraw();
+    }
+
+    /// A click on the "↑ N more" pill: scroll the grid one row up.
+    pub(crate) fn dashboard_scroll_less(&mut self) {
+        let layout = self.dashboard_layout();
+        let next = workspace::dashboard_above_scroll(&layout.grid, layout.scroll, layout.scale);
         self.dashboard_scroll = next / layout.scale;
         self.request_redraw();
     }
@@ -860,19 +893,45 @@ impl App {
             );
         }
 
-        // ── Scroll hint ─────────────────────────────────────────────────
-        // Last in the viewport layer, so it floats above the cards; opaque,
-        // because the terminals under it are canvas paint it must cover.
-        // While some of the cards below are unread it says so, in the unread
-        // style: the cards' unread dot, "M unread" in the unread ink, and the
-        // unread border.
-        let (more, unread_below) = layout.below();
-        if more > 0 {
-            let chrome = crate::theme::current();
-            let theme = Theme::from_chrome(chrome);
-            let pill = workspace::dashboard_more_pill(&vp, more, unread_below, layout.scale);
-            let (more_text, unread_text) = workspace::dashboard_more_parts(more, unread_below);
-            let ring = (DOT + 2.0 * DOT_RING) * ui;
+        // ── Scroll hints ────────────────────────────────────────────────
+        // Last in the viewport layer, so they float above the cards; opaque,
+        // because the terminals under them are canvas paint they must cover.
+        // One at the bottom while cards extend below the viewport, its mirror
+        // at the top while cards are scrolled out above it. While some of the
+        // cards a hint counts are unread it says so, in the unread style: the
+        // cards' unread dot, "M unread" in the unread ink, the unread border.
+        let (above, unread_above) = layout.above();
+        let (below, unread_below) = layout.below();
+        let hints = [
+            (
+                above,
+                unread_above,
+                workspace::dashboard_above_pill(&vp, above, unread_above, layout.scale),
+                workspace::dashboard_above_parts(above, unread_above),
+                true,
+            ),
+            (
+                below,
+                unread_below,
+                workspace::dashboard_more_pill(&vp, below, unread_below, layout.scale),
+                workspace::dashboard_more_parts(below, unread_below),
+                false,
+            ),
+        ];
+        let chrome = crate::theme::current();
+        let theme = Theme::from_chrome(chrome);
+        let ring = (DOT + 2.0 * DOT_RING) * ui;
+        let shadow = |blur: f32, y: f32, alpha: f32| BoxShadow {
+            color: color(chrome.shadow, alpha),
+            offset: point(px(0.0), px(y * ui)),
+            blur_radius: px(blur * ui),
+            spread_radius: px(0.0),
+            inset: false,
+        };
+        for (n, unread, pill, (more_text, unread_text), up) in hints {
+            if n == 0 {
+                continue;
+            }
             let dot = unread_text.is_some().then(|| {
                 div()
                     .flex_shrink_0()
@@ -886,15 +945,7 @@ impl App {
                     .justify_center()
                     .child(div().w(px(DOT * ui)).h(px(DOT * ui)).rounded_full().bg(inks.unread))
             });
-            let border =
-                if unread_below > 0 { inks.unread.opacity(UNREAD_BORDER) } else { theme.border };
-            let shadow = |blur: f32, y: f32, alpha: f32| BoxShadow {
-                color: color(chrome.shadow, alpha),
-                offset: point(px(0.0), px(y * ui)),
-                blur_radius: px(blur * ui),
-                spread_radius: px(0.0),
-                inset: false,
-            };
+            let border = if unread > 0 { inks.unread.opacity(UNREAD_BORDER) } else { theme.border };
             grid_el = grid_el.child(
                 div()
                     .absolute()
@@ -918,7 +969,13 @@ impl App {
                     .cursor_pointer()
                     .on_mouse_down(
                         MouseButton::Left,
-                        press(entity.clone(), |this, _ev, _cx| this.dashboard_scroll_more()),
+                        press(entity.clone(), move |this, _ev, _cx| {
+                            if up {
+                                this.dashboard_scroll_less()
+                            } else {
+                                this.dashboard_scroll_more()
+                            }
+                        }),
                     )
                     .children(dot)
                     .child(more_text)

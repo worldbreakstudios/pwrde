@@ -44,7 +44,7 @@ When finished: `pkill -f target/debug/pwrde`.
 ## 3. Commands
 
 ```sh
-pwrde-cli state                                  # JSON: page, groups → tiles → tabs (title/active/unread/cols/rows), sections, sidebar {collapsed, folders_open, folder, sessions_w, region_w}, dashboard {open, filter, panes, unread, cols, rows, below, unread_below, cards[group/title/status/focused/visible/cols/rows]}, palette open, status message
+pwrde-cli state                                  # JSON: page, groups → tiles → tabs (title/active/unread/cols/rows), sections, sidebar {collapsed, folders_open, folder, sessions_w, region_w}, dashboard {open, filter, panes, unread, cols, rows, above, unread_above, below, unread_below, cards[group/title/status/focused/visible/cols/rows]}, palette open, status message
 pwrde-cli read panes [query]                     # read-only: one line per pane in every group (session id, group, title, foreground; focused *), filtered by substring; --json for rows
 pwrde-cli read pane <id> [--lines N|--all] [--json]   # read-only: a pane's text (screen, or scrollback tail/all) by session id; --json adds title/size/cursor/group/foreground. Never moves focus/scroll
 pwrde-cli commands                               # every bus command + every rebindable Action with its current key binding
@@ -88,7 +88,8 @@ count that folder's sessions, the grid (`cols` × `rows`) and every card's PTY
 size come from that count, and `dashboard.cards` lists just the cards showing —
 the folder's sessions the All / Unread filter keeps, plus the focused card
 (which `unread` keeps even once read), in slot order. `below` /
-`unread_below` are the "↓ N more · M unread" hint's counts. Groups outside the
+`unread_below` are the "↓ N more · M unread" hint's counts, `above` /
+`unread_above` those of its "↑ N more" mirror at the top. Groups outside the
 folder have no card and keep their PTY size; if the active group is one of
 them no card is `focused` and `key` types into nothing until a focus action
 (`focus_right`, `next_tile`, …) lands on the first card. There is no bus
