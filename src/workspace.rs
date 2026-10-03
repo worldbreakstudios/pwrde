@@ -579,6 +579,19 @@ impl Workspace {
         }
     }
 
+    /// The tabs outside the primary pane — what a dashboard card never
+    /// shows — and how many of them are unread: `(tabs, unread)`. The primary
+    /// pane's own tab is in neither count, so a lone primary gives `(0, 0)`;
+    /// with a dangling `primary_tile` every tab counts.
+    pub fn side_tab_counts(&self) -> (usize, usize) {
+        let primary = self.primary_tile;
+        let tabs = || {
+            let tiles = self.root.tiles().into_iter().filter(move |tile| tile.id != primary);
+            tiles.flat_map(|tile| tile.tabs.iter())
+        };
+        (tabs().count(), tabs().filter(|tab| tab.unread).count())
+    }
+
     /// Return the moment this workspace most recently asked for attention.
     ///
     /// When tabs are currently unread, this is the oldest timestamp among
@@ -3306,6 +3319,15 @@ pub fn dashboard_more_parts(n: usize, unread: usize) -> (String, Option<String>)
     (format!("↓ {n} more"), (unread > 0).then(|| format!("{unread} unread")))
 }
 
+/// A card footer's side-tab hint for a group with `n` tabs outside its
+/// primary pane, `unread` of them unread: "N tabs" ("1 tab"), and — only
+/// while some are unread — "M unread", which the footer paints in the unread
+/// ink after a dot. `None` with no side tabs: the footer shows nothing.
+pub fn dashboard_side_parts(n: usize, unread: usize) -> Option<(String, Option<String>)> {
+    let tabs = if n == 1 { "1 tab".to_string() } else { format!("{n} tabs") };
+    (n > 0).then(|| (tabs, (unread > 0).then(|| format!("{unread} unread"))))
+}
+
 /// The hint's whole label: "↓ N more", or "↓ N more · M unread" while some
 /// of the cards below are unread. It is what sizes the pill.
 pub fn dashboard_more_label(n: usize, unread: usize) -> String {
@@ -3875,6 +3897,23 @@ mod dashboard_tests {
         assert_eq!(dashboard_unread_below_at(&VIEW, &grid, &unread[..7], 0.0, 1.0, 1.0), 1);
         let max = max_scroll(dashboard_content_h_at(&grid, 9, 1.0, 1.0), VIEW.h);
         assert_eq!(dashboard_unread_below_at(&VIEW, &grid, &unread, max, 1.0, 1.0), 0);
+    }
+
+    /// The footer's side-tab hint: nothing without side tabs, a singular
+    /// "1 tab", and the unread run only while some side tabs are unread.
+    #[test]
+    fn dashboard_side_parts_spell_the_tab_and_unread_counts() {
+        assert_eq!(dashboard_side_parts(0, 0), None);
+        assert_eq!(dashboard_side_parts(1, 0), Some(("1 tab".to_string(), None)));
+        assert_eq!(dashboard_side_parts(3, 0), Some(("3 tabs".to_string(), None)));
+        assert_eq!(
+            dashboard_side_parts(3, 1),
+            Some(("3 tabs".to_string(), Some("1 unread".to_string())))
+        );
+        assert_eq!(
+            dashboard_side_parts(1, 1),
+            Some(("1 tab".to_string(), Some("1 unread".to_string())))
+        );
     }
 
     /// The unread style's pill is wider — the longer label and the dot — and
@@ -4727,6 +4766,43 @@ mod tests {
         assert_eq!(ws.attention_at(), Some(stamp));
         assert!(ws.root.find_tile(43).unwrap().tabs[0].unread, "a secondary pane stays unread");
         assert!(!ws.mark_primary_read(), "already read");
+    }
+
+    #[test]
+    fn side_tab_counts_are_zero_for_a_lone_primary() {
+        use crate::term::Session;
+        let mut tile = Tile::new(42, Session::placeholder());
+        tile.tabs[0].unread = true;
+        let ws = Workspace::new("g".into(), tile, None);
+        assert_eq!(ws.side_tab_counts(), (0, 0), "the primary's own tab is not a side tab");
+    }
+
+    /// Every tab of every non-primary tile counts, the unread ones in both
+    /// figures; the primary's tab, unread or not, never does.
+    #[test]
+    fn side_tab_counts_cover_every_tab_outside_the_primary() {
+        use crate::term::Session;
+        let mut tile = Tile::new(42, Session::placeholder());
+        tile.tabs[0].unread = true;
+        let mut ws = Workspace::new("g".into(), tile, None);
+        let mut side = Tile::new(43, Session::placeholder());
+        side.tabs.push(Tab::new(Session::placeholder()));
+        let mut fresh = Some(side);
+        assert!(ws.root.split_tile(42, Dir::Row, &mut fresh, false));
+        let mut fresh = Some(Tile::new(44, Session::placeholder()));
+        assert!(ws.root.split_tile(43, Dir::Column, &mut fresh, false));
+        assert_eq!(ws.primary_tile, 42);
+        assert_eq!(ws.side_tab_counts(), (3, 0), "an unread primary tab is not counted");
+
+        ws.root.find_tile_mut(43).unwrap().tabs[1].unread = true;
+        ws.root.find_tile_mut(44).unwrap().tabs[0].unread = true;
+        assert_eq!(ws.side_tab_counts(), (3, 2));
+        assert!(ws.mark_primary_read());
+        assert_eq!(ws.side_tab_counts(), (3, 2), "reading the primary changes neither count");
+
+        // A dangling primary: no tile is the primary, so every tab is a side tab.
+        ws.primary_tile = 999;
+        assert_eq!(ws.side_tab_counts(), (4, 2));
     }
 
     /// The open "Snoozed" section: one snoozed group, not folded.

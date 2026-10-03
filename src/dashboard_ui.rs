@@ -19,7 +19,11 @@
 //!   none once read — the title the sidebar row shows, `repo/branch` on cards
 //!   300px or wider, the "unread" / "read" chip), the body, and a 30px footer
 //!   (elapsed time since the group last asked for attention, the PR, the
-//!   branch diff, "Open →"). The border is the chrome accent at 2px on the
+//!   branch diff and, at the right, a hint of the tabs outside the primary
+//!   pane — "N tabs", or "N tabs · ● M unread" while some are unread; a hint
+//!   only, it never changes the card's own unread treatment — then
+//!   "Open →"; on a narrow card the runs left of the hint clip, never the
+//!   hint or "Open"). The border is the chrome accent at 2px on the
 //!   focused card, the same accent thin and faint on an unread one, brighter
 //!   under the pointer; an unread card's ground is tinted with it too
 //!   (`Renderer::dashboard`). A primary
@@ -1228,6 +1232,22 @@ impl App {
                 .child(div().text_color(crate::sidebar_ui::diff_added(inks.dark)).child(added))
                 .child(div().text_color(inks.red).child(removed))
         });
+        // The tabs outside the primary pane, which the card never shows: a
+        // hint only — no handler, and nothing else on the card reads it.
+        let (side_tabs, side_unread) = ws.side_tab_counts();
+        let side = workspace::dashboard_side_parts(side_tabs, side_unread)
+            .map(|(tabs, unread)| {
+                run()
+                    .child(tabs)
+                    .children(unread.is_some().then_some("·"))
+                    .children(unread.map(|text| {
+                        run()
+                            .child(
+                                div().w(px(DOT * ui)).h(px(DOT * ui)).rounded_full().bg(inks.unread),
+                            )
+                            .child(div().text_color(inks.unread).child(text))
+                    }))
+            });
         let open_ink = inks.ink.opacity(0.8);
         let open = div()
             .flex_shrink_0()
@@ -1259,12 +1279,23 @@ impl App {
             .whitespace_nowrap()
             .text_size(px(FOOTER_TEXT_SIZE * ui))
             .text_color(inks.ink_dim)
-            .children(
-                stamp.map(|stamp| run().child(icon(ICON_CLOCK, glyph, inks.ink_dim)).child(stamp)),
+            // The left runs take what the hint and "Open" leave and clip
+            // there, so a narrow card never pushes those two out.
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .flex()
+                    .items_center()
+                    .gap(px(FOOTER_GAP * ui))
+                    .children(stamp.map(|stamp| {
+                        run().child(icon(ICON_CLOCK, glyph, inks.ink_dim)).child(stamp)
+                    }))
+                    .children(pr)
+                    .children(diff),
             )
-            .children(pr)
-            .children(diff)
-            .child(div().flex_1().min_w(px(0.0)))
+            .children(side)
             .child(open);
 
         // ── Border ──────────────────────────────────────────────────────
