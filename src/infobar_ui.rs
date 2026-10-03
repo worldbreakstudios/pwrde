@@ -16,7 +16,8 @@
 //! - the **cwd pill**, centred in the space that is left and capped at 420px:
 //!   a folder glyph and the group's directory with `$HOME` as `~`, truncated
 //!   from the left so the tail stays readable; a click copies the whole
-//!   `~`-abbreviated directory to the clipboard and confirms with a toast;
+//!   `~`-abbreviated directory to the clipboard and the pill reads "Copied"
+//!   in the status green for half a second;
 //! - the **PR pill** (only when the branch has a pull request): the state
 //!   glyph in the sidebar's PR colours, `#<number>`, a dim state word and the
 //!   checks rollup as `✓ p/t`; a click runs `Action::OpenPrInGithub`'s path;
@@ -32,6 +33,9 @@
 //! `App::git_contexts` snapshot keyed by the group's cwd — exactly what the
 //! sidebar row reads, refreshed by the same `spawn_git_context_refresh` walk
 //! (which covers every group), so the bar never fetches on its own.
+
+use std::time::{Duration, Instant};
+
 
 use gpui::{
     AnyElement, App as GpuiApp, Context, Hsla, InteractiveElement, IntoElement, MouseButton,
@@ -82,6 +86,19 @@ const CWD_MIN_W: f32 = 120.0;
 const REPO_MAX_SHARE: f32 = 0.45;
 /// The uncommitted amber: the mock's on dark, a darker one that still reads
 /// on a light pill.
+/// How long the cwd pill reads "Copied" after a click.
+const COPIED_FLASH: Duration = Duration::from_millis(500);
+
+/// True on the frame the "Copied" flash passes its deadline: clears it
+/// exactly once, then stays false until the next copy.
+pub(crate) fn flash_due(until: &mut Option<Instant>, now: Instant) -> bool {
+    if until.is_some_and(|deadline| now >= deadline) {
+        *until = None;
+        return true;
+    }
+    false
+}
+
 fn amber(dark: bool) -> Hsla {
     gpui::rgb(if dark { 0xe3b341 } else { 0x9a6700 }).into()
 }
@@ -484,13 +501,25 @@ impl App {
         // A click copies the directory as shown, but whole — never the
         // truncated label.
         let full_cwd = cwd.clone();
-        let cwd = truncate_left(&cwd, cwd_char_budget(bar_w / ui, &others));
+        // Just copied: the pill says so, in the status green, until
+        // `drain_events` ends the flash.
+        let copied = self.cwd_copied_until.is_some();
+        let cwd = if copied {
+            "Copied".to_string()
+        } else {
+            truncate_left(&cwd, cwd_char_budget(bar_w / ui, &others))
+        };
+        let (cwd_fill, cwd_ink, cwd_icon_ink) = if copied {
+            (green.opacity(2.0 * PILL_FILL), green, green)
+        } else {
+            (fill, strip.ink, strip.ink_dim)
+        };
         let entity = cx.entity().downgrade();
         let cwd_pill = div().flex_1().min_w(px(0.0)).flex().justify_center().child(
-            pill(ui, fill)
+            pill(ui, cwd_fill)
                 .id("infobar-cwd")
                 .cursor_pointer()
-                .hover(move |d| d.bg(strip.ink.opacity(2.0 * PILL_FILL)))
+                .when(!copied, |d| d.hover(move |d| d.bg(strip.ink.opacity(2.0 * PILL_FILL))))
                 .flex_shrink(1.0)
                 .min_w(px(0.0))
                 .max_w(px(CWD_MAX_W * ui))
@@ -509,7 +538,7 @@ impl App {
                         }
                     },
                 )
-                .child(icon(ICON_FOLDER, glyph, strip.ink_dim))
+                .child(icon(ICON_FOLDER, glyph, cwd_icon_ink))
                 .child(
                     // Right-aligned, so if the estimate above ever runs
                     // long it is still the head that is clipped.
@@ -520,7 +549,7 @@ impl App {
                         .flex()
                         .justify_end()
                         .text_size(px(text_size))
-                        .text_color(strip.ink)
+                        .text_color(cwd_ink)
                         .child(cwd),
                 ),
         );
@@ -580,9 +609,8 @@ impl App {
         // `$HOME` itself reads `~/`; paste it as `~`.
         let cwd = if cwd == "~/" { "~" } else { cwd };
         match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(cwd)) {
-            // Toasts cut their text from the right, which would lose the
-            // path's tail — so the path stays out of it.
-            Ok(()) => self.toast_status("Copied directory"),
+            // Confirmed in place: the pill reads "Copied" for a moment.
+            Ok(()) => self.cwd_copied_until = Some(Instant::now() + COPIED_FLASH),
             Err(error) => self.toast_notification(format!("copy directory: {error}")),
         }
     }
@@ -646,6 +674,17 @@ mod tests {
         assert_eq!(visible_parts(700.0, 1.25), Parts { counts: false, ..all });
         assert_eq!(visible_parts(775.0, 1.25), all);
         assert_eq!(visible_parts(499.0, 1.25), Parts { counts: false, pr: false, unread: false });
+    }
+
+    #[test]
+    fn copied_flash_clears_once_at_its_deadline() {
+        let now = Instant::now();
+        let mut until = Some(now + COPIED_FLASH);
+        assert!(!flash_due(&mut until, now));
+        assert!(until.is_some());
+        assert!(flash_due(&mut until, now + COPIED_FLASH));
+        assert!(until.is_none());
+        assert!(!flash_due(&mut until, now + 2 * COPIED_FLASH));
     }
 
     #[test]
