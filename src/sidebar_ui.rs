@@ -53,9 +53,6 @@ const ROW_PAD: f32 = 12.0;
 const UNREAD_DOT: f32 = 6.0;
 /// Corner radius of a session row's selection / hover fill (mock: 9px).
 pub(crate) const ROW_RADIUS: f32 = 9.0;
-/// The tool rows' green "running" dot (mock: `#3fb950`, 6px).
-const TOOL_DOT: f32 = 6.0;
-const TOOL_GREEN: u32 = 0x3fb950;
 /// Side of the PR-state icon on a row's first line (mock: 11px, tinted
 /// with the PR palette below).
 const STATUS_ICON: f32 = 12.0;
@@ -657,6 +654,7 @@ impl App {
             .flatten();
 
         let n_pinned = crate::workspace::pinned_run(&rows, &self.workspaces);
+        let n_snoozed = crate::workspace::snoozed_run(&rows, &self.workspaces);
         let mut layer = div().absolute().left(px(0.0)).top(px(0.0)).size_full();
         // The "Pinned" caption heads the list while anything in the folder
         // is pinned (or a group drag is live — the caption is the drop zone
@@ -802,8 +800,9 @@ impl App {
             let rect = crate::workspace::sidebar_row_rect(&rows, i, &self.workspaces, self.pinned_section(), 1.0, &list);
             let selected = active == Some(i);
             // No hairline under the last row, nor under the last pinned row
-            // (the section gap closes that run).
-            let last = i + 1 == rows.len() || i + 1 == n_pinned;
+            // (the section gap closes that run), nor under the last row
+            // above an unfolded snoozed run (its rail closes that one).
+            let last = crate::workspace::sidebar_row_closes_run(i, rows.len(), n_pinned, n_snoozed);
             layer = layer.child(
                 self.session_row(theme, ws, &rect, selected, last, hover).on_mouse_down(
                     MouseButton::Left,
@@ -1072,10 +1071,10 @@ impl App {
     }
 }
 
-/// One CLI-tool row of the tools band: a green dot and the terminal's own
-/// pane title — or the tool's command while that terminal has none of its
-/// own (`App::tool_row_label`) — in monospace. Selected and hovered it wears
-/// the session rows' wash (`row_wash`), not the folder rows' accent fill.
+/// One CLI-tool row of the tools band: the terminal's own pane title — or the
+/// tool's command while that terminal has none of its own
+/// (`App::tool_row_label`) — in monospace. Selected and hovered it wears the
+/// session rows' wash (`row_wash`), not the folder rows' accent fill.
 fn tool_row(
     theme: &Theme,
     index: usize,
@@ -1092,14 +1091,6 @@ fn tool_row(
         .when(!selected && hovered, |d| d.bg(row_wash(theme, 0.05)))
         .id(("sessions-tool", index))
         .cursor_pointer()
-        .child(
-            div()
-                .flex_none()
-                .w(px(scaled(TOOL_DOT)))
-                .h(px(scaled(TOOL_DOT)))
-                .rounded_full()
-                .bg(gpui::rgb(TOOL_GREEN)),
-        )
         .child(
             div()
                 .flex_1()

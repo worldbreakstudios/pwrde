@@ -271,12 +271,11 @@ struct ToolForm {
     name: gpui::Entity<crate::ui::Input>,
     command: gpui::Entity<crate::ui::Input>,
     cwd: gpui::Entity<crate::ui::Input>,
-    icon: gpui::Entity<crate::ui::Input>,
 }
 
 impl ToolForm {
-    fn inputs(&self) -> [&gpui::Entity<crate::ui::Input>; 4] {
-        [&self.name, &self.command, &self.cwd, &self.icon]
+    fn inputs(&self) -> [&gpui::Entity<crate::ui::Input>; 3] {
+        [&self.name, &self.command, &self.cwd]
     }
 }
 
@@ -1976,7 +1975,7 @@ impl App {
     /// Settings → Tools "Add": register the form's tool and clear the form.
     /// Only the command is required; the rest default sensibly.
     pub(crate) fn add_tool_from_form(&mut self, cx: &mut Context<Self>) {
-        let [name, command, cwd, icon] =
+        let [name, command, cwd] =
             self.tool_form.inputs().map(|e| e.read(cx).text().trim().to_string());
         if command.is_empty() {
             return;
@@ -1985,7 +1984,6 @@ impl App {
             name: if name.is_empty() { command.clone() } else { name },
             command,
             cwd: if cwd.is_empty() { "~".into() } else { cwd },
-            icon: if icon.is_empty() { ">_".into() } else { icon },
         };
         cli_tools::add_tool(tool);
         for e in self.tool_form.inputs() {
@@ -8490,7 +8488,6 @@ fn main() {
                             name: cx.new(crate::ui::Input::new),
                             command: cx.new(crate::ui::Input::new),
                             cwd: cx.new(crate::ui::Input::new),
-                            icon: cx.new(crate::ui::Input::new),
                         },
                         link_hover: None,
                         image_hits: Vec::new(),
