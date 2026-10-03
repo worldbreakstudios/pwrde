@@ -38,8 +38,50 @@ pub struct Worktree {
 /// additions — so `git`, `drop`, and the `bun` runtime `drop` needs would not
 /// resolve. Prepending the common bin dirs (plus `~/.bun/bin`) keeps those
 /// invocations working regardless of how pwrde was started.
+///
+/// The program is resolved against that PATH *here*, to an absolute path. std
+/// only spawns through `posix_spawn` when it need not search a PATH the
+/// command overrides; a bare name plus `env("PATH")` drops it to `fork` +
+/// `exec`, and with Chromium (CEF) loaded a forked child can deadlock in its
+/// atfork handlers on a lock another thread held — before `exec`, so the
+/// parent blocks in `spawn` forever and no timeout can reach it. That wedged
+/// the git-context worker and froze every sidebar card. A name found nowhere
+/// becomes an absolute path that does not exist, so the caller still sees
+/// `NotFound` — from `posix_spawn`, not from a forked child's failed `exec`.
 pub fn augmented_command(program: &str) -> Command {
-    let mut cmd = Command::new(program);
+    let paths = augmented_paths();
+    let mut cmd = Command::new(resolve_program(program, &paths));
+    if let Ok(joined) = std::env::join_paths(paths) {
+        cmd.env("PATH", joined);
+    }
+    cmd
+}
+
+/// `program` as an absolute path: the first file of that name in `paths` this
+/// user may execute. A program that already has a directory part is returned
+/// unchanged; a name that matches nothing is placed under `/usr/bin`, where
+/// the search just established it does not exist. Relative `paths` entries are
+/// skipped — they would be relative to a cwd the command has not chosen yet.
+fn resolve_program(program: &str, paths: &[PathBuf]) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    if program.contains('/') {
+        return PathBuf::from(program);
+    }
+    let executable = |p: &PathBuf| {
+        p.is_file()
+            && std::ffi::CString::new(p.as_os_str().as_bytes())
+                .is_ok_and(|c| unsafe { libc::access(c.as_ptr(), libc::X_OK) } == 0)
+    };
+    paths
+        .iter()
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(program))
+        .find(executable)
+        .unwrap_or_else(|| Path::new("/usr/bin").join(program))
+}
+
+/// The usual tool locations followed by the process PATH.
+fn augmented_paths() -> Vec<PathBuf> {
     let mut paths: Vec<PathBuf> = Vec::new();
     if let Some(home) = dirs::home_dir() {
         paths.push(home.join(".bun/bin"));
@@ -51,10 +93,7 @@ pub fn augmented_command(program: &str) -> Command {
     if let Some(existing) = std::env::var_os("PATH") {
         paths.extend(std::env::split_paths(&existing));
     }
-    if let Ok(joined) = std::env::join_paths(paths) {
-        cmd.env("PATH", joined);
-    }
-    cmd
+    paths
 }
 
 /// A git command rooted at `repo`, inheriting the augmented PATH.
@@ -118,7 +157,12 @@ pub fn output_within(cmd: &mut Command, limit: Duration) -> Result<Output, Comma
     /// enough not to spin a core while we wait.
     const POLL: Duration = Duration::from_millis(5);
 
-    let program = cmd.get_program().to_string_lossy().into_owned();
+    // The bare name, for messages: `augmented_command` resolved it to a path.
+    let program = Path::new(cmd.get_program())
+        .file_name()
+        .unwrap_or(cmd.get_program())
+        .to_string_lossy()
+        .into_owned();
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => CommandError::NotInstalled(program.clone()),
@@ -521,6 +565,48 @@ pub fn dirty_stats(dir: &Path) -> Option<DirtyStats> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn augmented_command_resolves_the_program_to_an_absolute_path() {
+        // An absolute program is what keeps std on `posix_spawn` (no `fork`)
+        // even though the command overrides PATH.
+        assert!(Path::new(augmented_command("git").get_program()).is_absolute());
+        let paths = [PathBuf::from("/bin")];
+        assert_eq!(resolve_program("sh", &paths), PathBuf::from("/bin/sh"));
+        // Explicit paths pass through untouched.
+        assert_eq!(resolve_program("./sh", &paths), PathBuf::from("./sh"));
+        // An unknown name stays absolute (no `fork`) and still reads as
+        // "not installed", under its bare name.
+        let missing = resolve_program("no-such-tool-xyz", &paths);
+        assert_eq!(missing, PathBuf::from("/usr/bin/no-such-tool-xyz"));
+        let err = output_within(&mut augmented_command("no-such-tool-xyz"), TIMEOUT_QUICK)
+            .unwrap_err();
+        assert!(matches!(&err, CommandError::NotInstalled(p) if p == "no-such-tool-xyz"), "{err}");
+        // A directory of that name is not an executable.
+        assert_eq!(resolve_program("bin", &[PathBuf::from("/")]), PathBuf::from("/usr/bin/bin"));
+    }
+
+    /// Counts `fork`s in this process. Ignored by default: the counter is
+    /// process-wide, so it only means something run alone
+    /// (`cargo test shell_outs_never_fork -- --ignored`).
+    #[test]
+    #[ignore]
+    fn shell_outs_never_fork() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static FORKS: AtomicUsize = AtomicUsize::new(0);
+        extern "C" fn prepare() {
+            FORKS.fetch_add(1, Ordering::SeqCst);
+        }
+        unsafe { libc::pthread_atfork(Some(prepare), None, None) };
+        let dir = std::env::temp_dir();
+        let out = output_within(git(&dir).arg("--version"), TIMEOUT_REF).expect("git runs");
+        assert!(out.status.success());
+        assert_eq!(FORKS.load(Ordering::SeqCst), 0, "git was spawned through fork()");
+        // The harness itself is sound: a bare name with an overridden PATH
+        // (the old shape) does fork.
+        let _ = Command::new("git").env("PATH", "/usr/bin:/bin").arg("--version").output();
+        assert_eq!(FORKS.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn sanitize_keeps_safe_chars() {
