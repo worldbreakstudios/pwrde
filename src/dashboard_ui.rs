@@ -48,6 +48,11 @@
 //! view. Keys and paste reach the focused card's session
 //! (`App::keyboard_session`). "Open →" and the right-click menu's **Go to
 //! session** leave for the Sessions page with that group's primary focused.
+//! A left press on a footer's PR label reads and focuses its card like any
+//! card press, then opens that group's pull request
+//! (`App::dashboard_open_pr`); ⇧⌘G (`Action::OpenPrInGithub`) opens the
+//! focused card's, a no-op with no card focused. Both always open the
+//! browser, whatever `git.open_pr_in_webview` says: cards show no web tabs.
 //!
 //! **Status** ([`status`]) is the primary tab's `unread` flag and nothing
 //! else: *unread* or *read*. On this page a primary tab is read only by the
@@ -76,7 +81,9 @@
 //! at the first card — focuses one.
 //!
 //! Nothing here is persisted, and the data in the footer is
-//! the `App::git_contexts` snapshot the sidebar rows read: no fetches.
+//! the `App::git_contexts` snapshot the sidebar rows read: no fetches (opening
+//! a pull request whose group has no snapshot yet runs ⇧⌘G's one background
+//! `pr list`).
 
 use std::time::SystemTime;
 
@@ -598,6 +605,20 @@ impl App {
         self.set_page(Page::Sessions);
     }
 
+    /// A left press on a card footer's PR label: read and focus that card,
+    /// as a press anywhere on it does, then open its group's pull request —
+    /// always in the browser, whatever `git.open_pr_in_webview` says, since
+    /// cards show no web tabs.
+    pub(crate) fn dashboard_open_pr(&mut self, group: usize) {
+        if self.is_empty_state() || group >= self.workspaces.len() {
+            return;
+        }
+        self.dashboard_mark_read(group);
+        self.switch_workspace(group);
+        self.open_pr_for_group(group, true);
+        self.request_redraw();
+    }
+
     /// The session of the card whose primary tile is `tile`.
     pub(crate) fn dashboard_session(&self, tile: u64) -> Option<&Session> {
         self.workspaces
@@ -626,8 +647,9 @@ impl App {
             .then(|| crate::MouseLoc::Card(self.workspaces[group].primary_tile))
     }
 
-    /// A left press on the dashboard's canvas (the bar's controls, "Open" and
-    /// the scroll hint are element targets that stop the press first): read
+    /// A left press on the dashboard's canvas (the bar's controls, a footer's
+    /// PR label and "Open", and the scroll hint are element targets that stop
+    /// the press first): read
     /// and focus the card under it — reading it even when it already was the
     /// focused one — and inside its body hand the click to the terminal: a
     /// mouse report for a TUI that tracks the mouse, else the start of a
@@ -1180,6 +1202,7 @@ impl App {
         let glyph = px(FOOTER_GLYPH * ui);
         let run = || div().flex_shrink_0().flex().items_center().gap(px(5.0 * ui));
         let stamp = ws.attention_at().map(|t| relative_time(t, SystemTime::now()));
+        let group = card.group;
         let pr = git.and_then(|c| c.pr.as_ref()).map(|pr| {
             let kind = avatar_for(derive_rollup(Some(pr)), pr.is_draft);
             let tint = match kind {
@@ -1188,7 +1211,15 @@ impl App {
                 CardAvatar::Open => crate::sidebar_ui::pr_open(inks.dark),
                 CardAvatar::Merged => crate::sidebar_ui::pr_merged(inks.dark),
             };
+            // An element target like "Open": the press stops here, so the
+            // canvas path never sees it — `dashboard_open_pr` reads and
+            // focuses the card itself.
             run()
+                .cursor_pointer()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    press(entity.clone(), move |this, _ev, _cx| this.dashboard_open_pr(group)),
+                )
                 .child(icon(crate::sidebar_ui::avatar_icon(kind), glyph, tint))
                 .child(format!("#{} {}", pr.number, pr_state_word(pr)))
         });
@@ -1198,7 +1229,6 @@ impl App {
                 .child(div().text_color(inks.red).child(removed))
         });
         let open_ink = inks.ink.opacity(0.8);
-        let group = card.group;
         let open = div()
             .flex_shrink_0()
             .flex()

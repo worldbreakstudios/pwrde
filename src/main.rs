@@ -390,7 +390,7 @@ struct App {
     /// True while the serial git-context worker is alive, so a burst of
     /// refresh triggers cannot fan out into N simultaneous `gh` calls.
     git_ctx_busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Guards the ⇧⌘G fallback lookup (`open_pr_in_github`): one `pr list`
+    /// Guards the ⇧⌘G fallback lookup (`open_pr_for_group`): one `pr list`
     /// in flight at a time, so repeated presses cannot pop several tabs.
     open_pr_busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// A refresh trigger that arrived while the worker was busy. Remembered
@@ -933,15 +933,25 @@ impl App {
     /// used as the working directory for git / PR CLI invocations. `None` only
     /// when neither is available.
     fn active_repo_dir(&self) -> Option<std::path::PathBuf> {
-        match self.workspaces.get(self.active).and_then(|ws| ws.cwd.clone()) {
+        self.group_repo_dir(self.active)
+    }
+
+    /// [`Self::active_repo_dir`] for any group: its cwd, or the process cwd
+    /// when the group inherits it (or does not exist).
+    fn group_repo_dir(&self, group: usize) -> Option<std::path::PathBuf> {
+        match self.workspaces.get(group).and_then(|ws| ws.cwd.clone()) {
             Some(p) => Some(p),
             None => std::env::current_dir().ok(),
         }
     }
 
-    /// Whether the active group's cwd (or an ancestor) is a git checkout.
-    fn active_cwd_is_git(&self) -> bool {
-        let cwd = match &self.workspaces[self.active].cwd {
+    /// Whether `group`'s cwd (or an ancestor) is a git checkout. `false` for
+    /// a group that does not exist.
+    fn group_cwd_is_git(&self, group: usize) -> bool {
+        let Some(ws) = self.workspaces.get(group) else {
+            return false;
+        };
+        let cwd = match &ws.cwd {
             Some(p) => p.clone(),
             // `None` inherits the directory pwrde was launched from.
             None => match std::env::current_dir() {
@@ -957,9 +967,24 @@ impl App {
         hit
     }
 
-    /// ⇧⌘G (`Action::OpenPrInGithub`): open the active group's pull request —
-    /// as a webview tab when `git.open_pr_in_webview` is on ([`Self::open_pr_url`]),
-    /// in the browser otherwise. The sidebar's git-context cache usually already holds
+    /// ⇧⌘G (`Action::OpenPrInGithub`) on the Sessions page, and the info
+    /// bar's PR pill: open the active group's pull request — as a webview tab
+    /// when `git.open_pr_in_webview` is on ([`Self::open_pr_url`]), in the
+    /// browser otherwise — through [`Self::open_pr_for_group`]. A no-op off
+    /// the Sessions page: the Dashboard has its own entry points (⇧⌘G for the
+    /// focused card in `run_action`, a card footer's PR label through
+    /// `App::dashboard_open_pr`), which always open the browser.
+    fn open_pr_in_github(&mut self) -> bool {
+        if self.page != Page::Sessions {
+            return false;
+        }
+        self.open_pr_for_group(self.active, false)
+    }
+
+    /// Open `group`'s pull request. With `force_browser` (the Dashboard,
+    /// whose cards show no web tabs) it always opens in the browser;
+    /// otherwise `git.open_pr_in_webview` decides, as [`Self::open_pr_url`]
+    /// does. The sidebar's git-context cache usually already holds
     /// the PR its card shows, so the common case is instant. A cached "no
     /// PR" is an honest no-op that also bumps that group's rollup stale, so a
     /// PR opened since the last poll is picked up on the next press. Only a
@@ -968,12 +993,12 @@ impl App {
     /// can't queue up opens. Returns whether the action applied — the
     /// tab was opened or the lookup that will open it was started — so the
     /// bus can report a no-op everywhere else.
-    fn open_pr_in_github(&mut self) -> bool {
+    fn open_pr_for_group(&mut self, group: usize, force_browser: bool) -> bool {
         use std::sync::atomic::Ordering;
-        if self.page != Page::Sessions || self.is_empty_state() || !self.active_cwd_is_git() {
+        if self.is_empty_state() || !self.group_cwd_is_git(group) {
             return false;
         }
-        let Some(cwd) = self.active_repo_dir() else {
+        let Some(cwd) = self.group_repo_dir(group) else {
             return false;
         };
         if self.git_contexts.get(&cwd).is_some() {
@@ -988,7 +1013,11 @@ impl App {
                 .map(|pr| pr.url.clone())
                 .unwrap_or_default();
             if !url.is_empty() {
-                self.open_pr_url(&url);
+                if force_browser {
+                    open_in_browser(&url);
+                } else {
+                    self.open_pr_url(&url);
+                }
                 return true;
             }
             self.git_contexts.mark_stale(&cwd);
@@ -1013,7 +1042,7 @@ impl App {
                     .and_then(git_context::select_pr)
                 && !pr.url.is_empty()
             {
-                if settings::open_pr_in_webview() {
+                if !force_browser && settings::open_pr_in_webview() {
                     // A webview tab needs `&mut App`, which this worker thread
                     // cannot touch, so the URL goes back over the event channel.
                     let _ = events_tx.send(TermEvent::OpenPrUrl { url: pr.url });
@@ -5925,11 +5954,17 @@ impl App {
         // The dashboard is a grid of primary panes: the clipboard reaches the
         // focused card's terminal and the focus actions move between the
         // showing cards. A new session opens the picker, as the sidebar's ＋
-        // does here. Everything that acts on a group's split tree (tabs,
-        // splits, closes, collapse, the flyover, a pull request opened as a
-        // web tab) does not apply here.
+        // does here, and ⇧⌘G opens the focused card's pull request — always in
+        // the browser, since cards show no web tabs (a no-op with no card
+        // focused). Everything that acts on a group's split tree (tabs,
+        // splits, closes, collapse, the flyover) does not apply here.
         if self.page == Page::Dashboard {
             match action {
+                Action::OpenPrInGithub => {
+                    return self
+                        .dashboard_focused()
+                        .is_some_and(|group| self.open_pr_for_group(group, true));
+                },
                 Action::NewGroup => self.open_picker(),
                 Action::Copy => self.copy(),
                 Action::Paste => self.paste(),
