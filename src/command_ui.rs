@@ -28,7 +28,8 @@ use gpui::{
 use crate::ui::icon;
 use crate::App;
 use crate::command::{action_icon, RootRow, Stage, StepState, Token};
-use crate::picker::{FolderKind, ForkScope, PickerRow};
+use crate::picker::{FolderKind, ForkScope, PickerRow, PrState};
+use crate::sidebar_card::CardAvatar;
 use crate::pwrspace::ProfileNode;
 use crate::ui::assets::{
     ICON_ARROW_UP, ICON_CHEVRON_RIGHT, ICON_GIT_BRANCH, ICON_GIT_FORK, ICON_HOUSE, ICON_MINUS,
@@ -507,9 +508,38 @@ impl App {
                                         .text_size(px(13.0))
                                         .font_weight(gpui::FontWeight::MEDIUM)
                                         .text_color(theme.foreground)
+                                        // A long worktree path gives way
+                                        // before the PR badge does.
+                                        .min_w(px(0.0))
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
                                         .child(entry.label.clone()),
                                 )
                                 .child(div().flex_1())
+                                // A worktree's pull request, as on its sidebar
+                                // row: the number in muted ink, then the
+                                // state glyph in the PR colours.
+                                .when_some(entry.pr, |row, pr| {
+                                    let (kind, tint) = match pr.state {
+                                        PrState::Draft => (CardAvatar::Draft, crate::sidebar_ui::accent()),
+                                        PrState::Open => (CardAvatar::Open, crate::sidebar_ui::pr_open(theme.dark)),
+                                        PrState::Finished => (CardAvatar::Merged, crate::sidebar_ui::pr_merged(theme.dark)),
+                                    };
+                                    row.child(
+                                        div()
+                                            .flex_none()
+                                            .font_family(crate::renderer::FONT_FAMILY)
+                                            .text_size(px(11.0))
+                                            .text_color(theme.muted_foreground)
+                                            .child(format!("#{}", pr.number)),
+                                    )
+                                    .child(div().flex_none().child(crate::ui::icon(
+                                        crate::sidebar_ui::avatar_icon(kind),
+                                        px(12.0),
+                                        tint,
+                                    )))
+                                })
                                 .child(
                                     div()
                                         .font_family(crate::renderer::FONT_FAMILY)

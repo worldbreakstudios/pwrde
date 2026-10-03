@@ -1030,12 +1030,16 @@ mod tests {
                     from: Some("origin/main".into()),
                     path: None,
                     scope: ForkScope::Default,
+                    branch: None,
+                    pr: None,
                 },
                 ForkEntry {
                     label: "repo root".into(),
                     from: None,
                     path: Some(PathBuf::from("/home/u/pwrde")),
                     scope: ForkScope::RepoRoot,
+                    branch: None,
+                    pr: None,
                 },
             ],
         )

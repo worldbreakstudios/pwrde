@@ -373,6 +373,11 @@ struct App {
     /// The paint path only ever *reads* it (`get`); every write arrives as a
     /// `TermEvent::GitContextReady` from the refresh worker.
     git_contexts: git_context::GitContextCache,
+    /// Branch → PR per repo from the last repo-wide PR list, for the fork
+    /// picker's worktree rows: applied synchronously when the Base step opens
+    /// and refreshed behind it (`TermEvent::ForkPrsReady`). Runtime-only,
+    /// never persisted.
+    fork_pr_cache: std::collections::HashMap<std::path::PathBuf, picker::ForkPrMap>,
     /// True while the serial git-context worker is alive, so a burst of
     /// refresh triggers cannot fan out into N simultaneous `gh` calls.
     git_ctx_busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -443,7 +448,7 @@ struct App {
     /// (clamped on read — see `sessions_scroll` / `folders_scroll`).
     sessions_scroll: f32,
     folders_scroll: f32,
-    /// The folders card's "Pinned tools" run is folded (`sidebar.tools_collapsed`).
+    /// The sessions list's "Tools" run is folded (`sidebar.tools_collapsed`).
     tools_collapsed: bool,
     /// The sessions list's "Pinned" run is folded (`sidebar.pinned_collapsed`).
     pinned_collapsed: bool,
@@ -707,13 +712,41 @@ impl App {
     }
 
     /// The sessions list rect the *rows* lay out in: [`App::sessions_list`]
-    /// shifted up by the wheel scroll, so every row helper (paint, hit-test,
-    /// drop preview) sees the same scrolled stack. The header and the clip
-    /// band keep the unshifted rect.
+    /// pushed below the fixed tools band and shifted up by the wheel scroll,
+    /// so every row helper (paint, hit-test, drop preview) sees the same
+    /// scrolled stack. The header, the tools band and the clip band keep the
+    /// unshifted rect.
     pub(crate) fn sessions_rows_list(&self, scale: f32) -> workspace::LayoutRect {
-        let mut list = self.sessions_list(scale);
-        list.y -= (self.sessions_scroll() * scale).round();
-        list
+        workspace::sessions_rows_rect(
+            &self.sessions_list(scale),
+            self.tools_band_h(scale),
+            self.sessions_scroll() * scale,
+        )
+    }
+
+    /// The fixed "Tools" band under the sessions header (physical px at
+    /// `scale`): the caption and one rect per registered CLI tool, none
+    /// while the run is folded. `sidebar_ui` paints it at 1.0.
+    pub(crate) fn tools_band(&self, scale: f32) -> workspace::ToolsBand {
+        workspace::tools_band(
+            &self.sessions_list(scale),
+            self.tools.len(),
+            self.tools_collapsed,
+            scale,
+        )
+    }
+
+    /// Height of [`App::tools_band`]: what pushes the session rows down.
+    pub(crate) fn tools_band_h(&self, scale: f32) -> f32 {
+        workspace::tools_band_h(self.tools.len(), self.tools_collapsed, scale)
+    }
+
+    /// Whether physical `py` is above the session rows' viewport — on the
+    /// list header or the tools band. The canvas hit tests (context menu,
+    /// drops) check this first so nothing falls through to a session row
+    /// scrolled beneath them.
+    fn above_session_rows(&self, py: f32, scale: f32) -> bool {
+        py < workspace::sessions_rows_top(&self.sessions_list(scale), self.tools_band_h(scale), scale)
     }
 
     /// The sessions list's wheel scroll, logical px, clamped so the last
@@ -764,7 +797,9 @@ impl App {
             scale,
             &list,
         );
-        let viewport = (list.h - (workspace::SESSIONS_HEADER_H * scale).round()).max(0.0);
+        // The rows' window: the list below its header and the tools band.
+        let top = workspace::sessions_rows_top(&list, self.tools_band_h(scale), scale);
+        let viewport = (list.y + list.h - top).max(0.0);
         workspace::max_scroll(extent, viewport) / scale
     }
 
@@ -775,10 +810,9 @@ impl App {
         workspace::folders_card_rect(h, self.folders_w, scale)
     }
 
-    /// The folders card's rows in paint order, with the "Pinned tools" run
-    /// folded away when collapsed.
+    /// The folders card's rows in paint order.
     pub(crate) fn folder_rows(&self) -> Vec<workspace::FolderRow> {
-        workspace::folder_rows(self.tools.len(), self.tools_collapsed, self.sections.len())
+        workspace::folder_rows(self.sections.len())
     }
 
     /// The folders card's wheel scroll, logical px, clamped like
@@ -826,7 +860,7 @@ impl App {
         }
     }
 
-    /// Fold or unfold the folders card's "Pinned tools" run.
+    /// Fold or unfold the sessions list's "Tools" run.
     pub(crate) fn toggle_tools_collapsed(&mut self) {
         self.tools_collapsed = !self.tools_collapsed;
         settings::set("sidebar.tools_collapsed", self.tools_collapsed.into());
@@ -1634,7 +1668,7 @@ impl App {
         self.tools.len()
     }
 
-    /// The label tool `i`'s row shows in the folders card: its terminal's own
+    /// The label tool `i`'s row shows in the sessions list's tools band: its terminal's own
     /// pane title once one is running, else the tool's command — never the name
     /// it was registered under (see [`tool_label`]).
     fn tool_row_label(&self, i: usize) -> String {
@@ -2726,6 +2760,10 @@ impl App {
         let (_, h) = self.renderer.surface_size();
 
         if workspace::sidebar(h, scale, self.sidebar_w()).contains(px, py) {
+            // The tools band has no menu, and hides the rows under it.
+            if self.above_session_rows(py, scale) {
+                return;
+            }
             let rows = self.sidebar_rows();
             for (ri, row) in rows.iter().enumerate() {
                 let rect = workspace::sidebar_row_rect(
@@ -3132,6 +3170,24 @@ impl App {
         self.request_redraw();
     }
 
+    /// Fetch `repo`'s PR list on a background thread — one CLI call for the
+    /// whole repo, never one per worktree — and post it back as a
+    /// `TermEvent::ForkPrsReady`, where it updates `fork_pr_cache` and the
+    /// open fork picker. Run each time the Base step opens.
+    fn spawn_fork_pr_refresh(&self, repo: &std::path::Path) {
+        let events_tx = self.events_tx.clone();
+        let repo = repo.to_path_buf();
+        std::thread::spawn(move || {
+            let prs = gh::pr_list_for_repo(&repo).ok().map(|list| {
+                gh::prs_by_head(list)
+                    .iter()
+                    .map(|(head, pr)| (head.clone(), picker::ForkPr::from_summary(pr)))
+                    .collect::<picker::ForkPrMap>()
+            });
+            let _ = events_tx.send(TermEvent::ForkPrsReady { repo, prs });
+        });
+    }
+
     /// Close the palette without choosing. Cancelling the flyover's
     /// first-open flow closes the waiting surface too — there is nothing
     /// to show yet.
@@ -3168,7 +3224,12 @@ impl App {
                     self.command = None;
                     self.spawn_flyover_tab(Some(entry.path));
                 } else if entry.is_git {
-                    let all = build_fork_choices(&entry.path);
+                    // Worktree rows open already annotated and sorted from the
+                    // last PR list for this repo (no network here); the fresh
+                    // list is fetched behind the picker and re-sorts it only
+                    // if something changed.
+                    let all = build_fork_choices(&entry.path, self.fork_pr_cache.get(&entry.path));
+                    self.spawn_fork_pr_refresh(&entry.path);
                     let choices = if for_flyover {
                         all.into_iter()
                             .filter(|c| {
@@ -3781,6 +3842,10 @@ impl App {
         // Terminal-tab → sidebar group: hit-test via the shared row list.
         let (_, h) = self.renderer.surface_size();
         if workspace::sidebar(h, scale, self.sidebar_w()).contains(px, py) {
+            // Tool rows are not drop targets, nor are the rows under them.
+            if self.above_session_rows(py, scale) {
+                return None;
+            }
             let rows = self.sidebar_rows();
             for (ri, row) in rows.iter().enumerate() {
                 let rect = workspace::sidebar_row_rect(
@@ -3833,11 +3898,15 @@ impl App {
                             pinned: None,
                             gap: self.sidebar_rows().len(),
                         }),
-                        _ => None,
                     };
                 }
                 return None;
             }
+        }
+        // The fixed tools band is no landing zone, and it covers whatever
+        // rows are scrolled beneath it.
+        if self.above_session_rows(py, scale) {
+            return None;
         }
         let rows = self.sidebar_rows();
         // The "Pinned" caption is a landing zone of its own: drop there to
@@ -4045,7 +4114,7 @@ impl App {
                         ));
                     }
                 }
-                Some(workspace::tab_rect(ws, scale, &self.sessions_list(scale)))
+                Some(workspace::tab_rect(ws, scale, &self.sessions_rows_list(scale)))
             },
             DropTarget::SidebarAppend { section_id } => {
                 // Highlight the folder's row in the folders card.
@@ -5741,9 +5810,13 @@ impl App {
     }
 
     /// ⌘⇧↑/↓: step through the sidebar's tabs, wrapping at both ends —
-    /// the workspace groups on the Sessions page.
+    /// the tools band's rows (unless folded), then the workspace groups.
     fn cycle_sidebar_tab(&mut self, delta: isize) {
-        if let Page::Sessions = self.page
+        let current = match self.page {
+            Page::Tool(i) => workspace::SidebarStop::Tool(i),
+            _ => workspace::SidebarStop::Group(self.active),
+        };
+        if matches!(self.page, Page::Sessions | Page::Tool(_))
             // Leading-edge throttle on the key-repeat burst only; the first
             // press always lands (the field is backdated at startup).
             && workspace::throttle_ready(self.sidebar_cycle_at.elapsed(), SIDEBAR_CYCLE_THROTTLE)
@@ -5754,8 +5827,14 @@ impl App {
             // away) not the raw workspace order, so
             // the selection lands on the row next to the one it left.
             let rows = self.sidebar_rows();
-            if let Some(next) = workspace::cycle_sidebar_active(&rows, self.active, delta) {
-                self.switch_workspace(next);
+            let n_tools = if self.tools_collapsed { 0 } else { self.n_tools() };
+            match workspace::cycle_sidebar_stop(n_tools, &rows, current, delta) {
+                Some(workspace::SidebarStop::Tool(i)) => self.set_page(Page::Tool(i)),
+                Some(workspace::SidebarStop::Group(next)) => {
+                    self.set_page(Page::Sessions);
+                    self.switch_workspace(next);
+                },
+                None => {},
             }
         }
     }
@@ -6161,6 +6240,33 @@ impl App {
                     // `merge`) until the new ones land.
                     self.git_contexts.mark_all_stale();
                     self.spawn_git_context_refresh();
+                    // An open fork picker read the same cache; read it again.
+                    if let Some(repo) = self.command.as_ref().and_then(|c| c.base.as_ref()).map(|b| b.repo.clone()) {
+                        self.spawn_fork_pr_refresh(&repo);
+                    }
+                },
+                TermEvent::ForkPrsReady { repo, prs } => {
+                    // A failed fetch keeps the last good map and whatever the
+                    // picker shows; nothing is reported.
+                    if let Some(prs) = prs {
+                        // The palette's picker for this repo is re-sorted
+                        // (keeping its filter and highlight) on whatever step
+                        // it is — ⌫ from Layout comes back to these rows.
+                        let changed = self
+                            .command
+                            .as_mut()
+                            .and_then(|pal| pal.base.as_mut())
+                            .filter(|base| base.repo == repo)
+                            .is_some_and(|base| base.apply_prs(&prs));
+                        self.fork_pr_cache.insert(repo, prs);
+                        if changed {
+                            // The highlight moved with its row; keep it in view.
+                            if let Some(c) = self.command.as_ref().filter(|c| c.stage == command::Stage::Base) {
+                                self.command_scroll_to = Some(c.selected());
+                            }
+                            redraw = true;
+                        }
+                    }
                 },
                 TermEvent::GitContextReady { cwd, ctx } => {
                     // Folded through the cache's `merge`, then repainted the
@@ -6421,8 +6527,13 @@ fn tab_command(tab: &workspace::Tab) -> Option<String> {
 
 /// Build the fork picker's rows for a git repo: a default "new branch" row and
 /// a repo-root row, followed by existing worktrees, then local and remote
-/// branches.
-fn build_fork_choices(repo: &std::path::Path) -> Vec<picker::ForkEntry> {
+/// branches. Worktree rows are stamped with their branch's pull request from
+/// `prs` (the cached repo-wide list, if any) and sorted by PR status; without
+/// it they keep git's order, all "no PR". Local git only — never the network.
+fn build_fork_choices(
+    repo: &std::path::Path,
+    prs: Option<&picker::ForkPrMap>,
+) -> Vec<picker::ForkEntry> {
     use picker::{ForkEntry, ForkScope};
     let default = git::default_remote_branch(repo);
     let base_label = default.clone().unwrap_or_else(|| "HEAD".into());
@@ -6434,12 +6545,16 @@ fn build_fork_choices(repo: &std::path::Path) -> Vec<picker::ForkEntry> {
             from: None,
             path: None,
             scope: ForkScope::Default,
+            branch: None,
+            pr: None,
         },
         ForkEntry {
             label: "⌂ repo root (no worktree)".into(),
             from: None,
             path: Some(repo.to_path_buf()),
             scope: ForkScope::RepoRoot,
+            branch: None,
+            pr: None,
         },
     ];
     // Existing worktrees (drop's and any others) — attach a group to one
@@ -6458,7 +6573,14 @@ fn build_fork_choices(repo: &std::path::Path) -> Vec<picker::ForkEntry> {
             from: None,
             path: Some(wt.path),
             scope: ForkScope::Worktree,
+            // A detached worktree has no branch, so no PR can match it.
+            branch: wt.branch,
+            pr: None,
         });
+    }
+    if let Some(prs) = prs {
+        picker::annotate_worktree_prs(&mut out, prs);
+        picker::sort_worktree_run(&mut out);
     }
     for b in branches.iter().filter(|b| !b.is_remote) {
         let mut marks = Vec::new();
@@ -6474,6 +6596,8 @@ fn build_fork_choices(repo: &std::path::Path) -> Vec<picker::ForkEntry> {
             from: Some(b.name.clone()),
             path: None,
             scope: ForkScope::Local,
+            branch: None,
+            pr: None,
         });
     }
     for b in branches.iter().filter(|b| b.is_remote) {
@@ -6482,6 +6606,8 @@ fn build_fork_choices(repo: &std::path::Path) -> Vec<picker::ForkEntry> {
             from: Some(b.name.clone()),
             path: None,
             scope: ForkScope::Remote,
+            branch: None,
+            pr: None,
         });
     }
     out
@@ -7735,6 +7861,7 @@ fn main() {
                         sections: Vec::new(),
                         next_section_id: 0,
                         git_contexts: git_context::GitContextCache::new(),
+                        fork_pr_cache: std::collections::HashMap::new(),
                         git_ctx_busy: std::sync::Arc::new(
                             std::sync::atomic::AtomicBool::new(false),
                         ),
@@ -8070,6 +8197,11 @@ fn main() {
                                                 is_held: false,
                                                 prefer_character_input: false,
                                             };
+                                            // The palette's keys are routed
+                                            // by its own window; do the same.
+                                            if app.command.is_some() && app.palette_key(&ev) {
+                                                continue;
+                                            }
                                             app.on_key_down(&ev, window, cx);
                                         }
                                         // No key-up follows a synthetic press:
@@ -8505,7 +8637,7 @@ mod tool_page_title_tests {
         assert_eq!(tool_page_title("\twezterm\n", "drop -d"), "drop -d");
     }
 
-    /// The same rule for the folders card's tool row: the live pane title names
+    /// The same rule for the tools band's tool row: the live pane title names
     /// the row ("this pane is named test", not "drip --tui"), and a tool with no
     /// terminal — or a terminal with no title of its own — falls back to the
     /// command.
