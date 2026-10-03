@@ -495,6 +495,136 @@ impl FolderPicker {
     }
 }
 
+/// One row of the Claude-session picker: a resumable session, or a
+/// non-selectable note (`Note`) such as the empty state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SessionRow {
+    /// A resumable session.
+    Entry(crate::claude_sessions::ClaudeSession),
+    /// A dim caption the selection can never land on.
+    Note(String),
+}
+
+/// The picker over this machine's recent Claude Code sessions, newest first.
+/// It mirrors [`Picker`]'s conventions — the query filters, ↑↓ skips notes and
+/// clamps, and selecting resolves to a session — but its rows come from
+/// [`crate::claude_sessions`], which the app supplies once the flow lands here.
+#[derive(Clone, Debug)]
+pub struct ClaudeSessionPicker {
+    /// Every recent session the reader returned (deduped, newest first).
+    pub entries: Vec<crate::claude_sessions::ClaudeSession>,
+    /// The current search text.
+    pub query: String,
+    /// Index into [`ClaudeSessionPicker::rows`].
+    pub selected: usize,
+    /// The filtered, ordered list currently on screen.
+    pub rows: Vec<SessionRow>,
+}
+
+impl ClaudeSessionPicker {
+    /// Opens the picker over `entries`.
+    pub fn new(entries: Vec<crate::claude_sessions::ClaudeSession>) -> Self {
+        let mut picker = Self {
+            entries,
+            query: String::new(),
+            selected: 0,
+            rows: Vec::new(),
+        };
+        picker.rebuild();
+        picker
+    }
+
+    /// True when the store held no usable session at all (the empty state).
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Replaces the whole query and refilters from the top of the list.
+    pub fn set_query(&mut self, query: &str) {
+        if self.query == query {
+            return;
+        }
+        self.query = query.to_string();
+        self.selected = 0;
+        self.rebuild();
+    }
+
+    /// Moves the highlight by `delta` selectable rows, skipping notes and
+    /// clamping at both ends.
+    pub fn move_selection(&mut self, delta: isize) {
+        let step = delta.signum();
+        let mut cursor = self.selected as isize;
+        for _ in 0..delta.unsigned_abs() {
+            let mut next = cursor + step;
+            let landed = loop {
+                match usize::try_from(next).ok().and_then(|i| self.rows.get(i)) {
+                    Some(SessionRow::Entry(_)) => break Some(next),
+                    Some(SessionRow::Note(_)) => next += step,
+                    None => break None,
+                }
+            };
+            // Running off an end leaves the highlight where it was.
+            let Some(landed) = landed else { break };
+            cursor = landed;
+        }
+        self.selected = cursor.max(0) as usize;
+    }
+
+    /// Selects the row at `index` when it is a selectable session.
+    pub fn select(&mut self, index: usize) {
+        if matches!(self.rows.get(index), Some(SessionRow::Entry(_))) {
+            self.selected = index;
+        }
+    }
+
+    /// The highlighted session, if the list has one.
+    pub fn selected_entry(&self) -> Option<&crate::claude_sessions::ClaudeSession> {
+        match self.rows.get(self.selected) {
+            Some(SessionRow::Entry(session)) => Some(session),
+            _ => None,
+        }
+    }
+
+    /// Recomputes the visible rows: the sessions matching the query
+    /// (case-insensitive substring on the title or cwd), or one non-selectable
+    /// empty-state / no-match note.
+    fn rebuild(&mut self) {
+        let query = self.query.trim().to_lowercase();
+        let matches = |session: &crate::claude_sessions::ClaudeSession| {
+            query.is_empty()
+                || session.title.to_lowercase().contains(&query)
+                || session
+                    .cwd
+                    .to_string_lossy()
+                    .to_lowercase()
+                    .contains(&query)
+        };
+        self.rows = if self.is_empty() {
+            vec![SessionRow::Note("No recent Claude sessions found".into())]
+        } else {
+            let rows: Vec<SessionRow> = self
+                .entries
+                .iter()
+                .filter(|session| matches(session))
+                .cloned()
+                .map(SessionRow::Entry)
+                .collect();
+            if rows.is_empty() {
+                vec![SessionRow::Note(format!("No session matches \"{query}\""))]
+            } else {
+                rows
+            }
+        };
+        if !matches!(self.rows.get(self.selected), Some(SessionRow::Entry(_))) {
+            self.selected = self
+                .rows
+                .iter()
+                .position(|row| matches!(row, SessionRow::Entry(_)))
+                .unwrap_or(0);
+        }
+    }
+}
+
 /// The open directory picker: candidates, query, selection and visible rows.
 ///
 /// The visible list is recomputed on every mutation. With an empty query it is
@@ -512,9 +642,35 @@ pub struct Picker {
     pub selected: usize,
     /// The filtered, ordered list currently on screen.
     pub rows: Vec<PickerRow>,
+    /// Whether the `Resume Claude session…` route is offered in this list.
+    /// The flyover New-session flow turns it off: that route launches a full
+    /// workspace group, which ignores the flyover pick entirely.
+    pub claude_route: bool,
+}
+
+/// The sentinel path of the repo picker's `Resume Claude session…` route row.
+/// It never names a directory — the flow recognizes it by identity, so a real
+/// checkout can never be mistaken for it.
+pub const CLAUDE_SESSIONS_PATH: &str = "\u{0}pwrde/claude-sessions";
+
+/// Whether `entry` is the Claude-session route row rather than a directory.
+pub fn is_claude_route(entry: &PickerEntry) -> bool {
+    entry.path.as_os_str() == std::ffi::OsStr::new(CLAUDE_SESSIONS_PATH)
 }
 
 impl Picker {
+    /// The repo list's first row: hand the New-session flow over to the
+    /// Claude-session picker (nothing on disk was scanned for it).
+    /// `Picker::new` offers it; the flyover's `provide_repo` call clears
+    /// [`Picker::claude_route`] so the row never reaches that flow.
+    pub fn claude_row() -> PickerEntry {
+        PickerEntry {
+            path: PathBuf::from(CLAUDE_SESSIONS_PATH),
+            label: "Resume Claude session…".into(),
+            is_git: false,
+        }
+    }
+
     /// Opens a picker: scans candidates, loads the store, builds the list.
     pub fn new() -> Self {
         let store = PickerStore::load();
@@ -532,6 +688,7 @@ impl Picker {
             query: String::new(),
             selected: 0,
             rows: Vec::new(),
+            claude_route: true,
         };
         picker.rebuild();
         picker
@@ -548,6 +705,7 @@ impl Picker {
             query: String::new(),
             selected: 0,
             rows: Vec::new(),
+            claude_route: true,
         };
         picker.rebuild();
         picker
@@ -609,6 +767,16 @@ impl Picker {
         self.rebuild();
     }
 
+    /// Offers or withholds the `Resume Claude session…` route and rebuilds
+    /// the visible rows. The flyover New-session flow withholds it.
+    pub fn set_claude_route(&mut self, on: bool) {
+        if self.claude_route == on {
+            return;
+        }
+        self.claude_route = on;
+        self.rebuild();
+    }
+
     /// Records `dir` as the newest recent choice and persists.
     pub fn record_recent(&mut self, dir: &Path) {
         self.store.add_recent(dir);
@@ -618,7 +786,16 @@ impl Picker {
     fn rebuild(&mut self) {
         let query = self.query.trim().to_lowercase();
         let mut rows = Vec::new();
+        // The Claude-session route is a fixed first row, never a directory: it
+        // is offered on an empty query and whenever the query matches it.
+        // The flyover flow withholds it (`set_claude_route(false)`) by leaving
+        // it out of RESUME alone — the FAVORITES/RECENTS/ALL grouping, the pin
+        // synthesis and the query filtering below stay exactly as they are.
+        let route = Self::claude_row();
         if query.is_empty() {
+            if self.claude_route {
+                push_section(&mut rows, "RESUME", vec![route]);
+            }
             let pinned: Vec<PickerEntry> = self
                 .store
                 .pinned
@@ -643,6 +820,9 @@ impl Picker {
                 .collect();
             push_section(&mut rows, "ALL", rest);
         } else {
+            if self.claude_route && route.label.to_lowercase().contains(&query) {
+                rows.push(PickerRow::Entry(route));
+            }
             for entry in &self.entries {
                 let path = entry.path.to_string_lossy().to_lowercase();
                 if entry.label.to_lowercase().contains(&query) || path.contains(&query) {
@@ -738,8 +918,6 @@ fn scan_children(dir: &Path) -> Vec<PickerEntry> {
 mod tests {
     use super::*;
 
-    /// The visible-row window: capped by the list, the row cap and the
-    /// window height, and scrolled so the selection is the last row shown.
     fn fork_entry(label: &str, from: Option<&str>, scope: ForkScope) -> ForkEntry {
         ForkEntry { label: label.to_string(), from: from.map(str::to_string), path: None, scope }
     }
@@ -759,6 +937,25 @@ mod tests {
             fork_entry("remote  origin/tw-term-features", Some("origin/tw-term-features"), ForkScope::Remote),
         ];
         ForkPicker::new(PathBuf::from("/repo"), entries)
+    }
+
+    #[test]
+    fn a_picker_without_the_route_lists_only_directories() {
+        let mut picker = Picker::from_entries(
+            vec![PickerEntry {
+                path: PathBuf::from("/tmp/notes"),
+                label: "notes".into(),
+                is_git: false,
+            }],
+            PickerStore::default(),
+        );
+        assert!(picker.rows.iter().any(|r| matches!(r, PickerRow::Entry(e) if is_claude_route(e))));
+        picker.set_claude_route(false);
+        assert!(
+            picker.rows.iter().all(|r| !matches!(r, PickerRow::Entry(e) if is_claude_route(e))),
+            "the route row is gone"
+        );
+        assert!(picker.selected_entry().is_some_and(|e| e.label == "notes"));
     }
 
     /// The default fork source is the first row and starts selected, so hitting
@@ -933,5 +1130,131 @@ mod tests {
         picker.set_query("");
         assert_eq!(picker.rows.len(), 5);
         assert_eq!(picker.rows[4].meta, "");
+    }
+}
+
+// Regression tests for the route-disabled flyover list: with the route off,
+// every section, pin, recent and query rule must behave exactly as it does
+// with the route on — only the RESUME row itself disappears.
+#[cfg(test)]
+mod route_toggle_tests {
+    use super::*;
+
+    fn store() -> PickerStore {
+        PickerStore {
+            pinned: vec![PathBuf::from("/tmp/pinned")],
+            recents: vec![PathBuf::from("/tmp/recent")],
+        }
+    }
+
+    fn picker() -> Picker {
+        Picker::from_entries(
+            vec![
+                PickerEntry {
+                    path: PathBuf::from("/tmp/pinned"),
+                    label: "pinned".into(),
+                    is_git: false,
+                },
+                PickerEntry {
+                    path: PathBuf::from("/tmp/recent"),
+                    label: "recent".into(),
+                    is_git: false,
+                },
+                PickerEntry {
+                    path: PathBuf::from("/tmp/alpha"),
+                    label: "alpha".into(),
+                    is_git: false,
+                },
+                PickerEntry {
+                    path: PathBuf::from("/tmp/beta"),
+                    label: "beta".into(),
+                    is_git: false,
+                },
+            ],
+            store(),
+        )
+    }
+
+    /// The route is synthesised from the store even when the scan never saw
+    /// it, and disabling the route does not disturb any other row.
+    #[test]
+    fn disabling_the_route_omits_only_the_route_row() {
+        let mut with_route = picker();
+        assert!(with_route.claude_route);
+        let full = with_route.rows.clone();
+        assert_eq!(
+            full.iter().map(row_key).collect::<Vec<_>>(),
+            vec![
+                "H:RESUME".to_string(),
+                "E:claude".to_string(),
+                "H:FAVORITES".to_string(),
+                "E:pinned".to_string(),
+                "H:RECENTS".to_string(),
+                "E:recent".to_string(),
+                "H:ALL".to_string(),
+                "E:alpha".to_string(),
+                "E:beta".to_string(),
+            ],
+            "the enabled list keeps its grouping and order"
+        );
+
+        with_route.set_claude_route(false);
+        assert_eq!(
+            with_route.rows.iter().map(row_key).collect::<Vec<_>>(),
+            full.iter()
+                .map(row_key)
+                // The route row and its now-empty RESUME caption go; every
+                // other header, entry and its position is untouched.
+                .filter(|k| k != "H:RESUME" && k != "E:claude")
+                .collect::<Vec<_>>(),
+            "disabling the route removes exactly the route row"
+        );
+    }
+
+    /// A typed query filters the same rows either way.
+    #[test]
+    fn disabling_the_route_keeps_query_filtering() {
+        let mut with_route = picker();
+        let mut without = picker();
+        without.set_claude_route(false);
+        for query in ["alp", "/tmp", "resume", "claude"] {
+            with_route.set_query(query);
+            without.set_query(query);
+            assert_eq!(
+                without.rows.iter().map(row_key).collect::<Vec<_>>(),
+                with_route
+                    .rows
+                    .iter()
+                    .map(row_key)
+                    .filter(|k| k != "H:RESUME" && k != "E:claude")
+                    .collect::<Vec<_>>(),
+                "query {query:?} filters identically"
+            );
+        }
+    }
+
+    /// Pinning still reorders (synthesising an unseen favourite) with the
+    /// route off, and the route never reappears.
+    #[test]
+    fn disabling_the_route_keeps_pin_synthesis() {
+        let mut without = picker();
+        without.set_claude_route(false);
+        without.set_query("beta");
+        without.toggle_pin(Path::new("/tmp/beta"));
+        without.set_query("");
+        let keys = without.rows.iter().map(row_key).collect::<Vec<_>>();
+        assert!(keys.iter().all(|k| k != "E:claude"), "no route row reappears");
+        let favorites = keys.iter().position(|k| k == "H:FAVORITES").expect("FAVORITES");
+        assert_eq!(keys[favorites + 1], "E:pinned", "the older pin still leads FAVORITES");
+        assert_eq!(keys[favorites + 2], "E:beta", "the fresh pin joins FAVORITES next");
+        assert!(without.rows.iter().any(|r| matches!(r, PickerRow::Entry(e) if e.path == Path::new("/tmp/beta"))));
+    }
+
+    fn row_key(row: &PickerRow) -> String {
+        match row {
+            PickerRow::Header(h) => format!("H:{h}"),
+            PickerRow::Entry(e) if is_claude_route(e) => "E:claude".to_string(),
+            PickerRow::Entry(e) => format!("E:{}", e.label),
+        }
     }
 }
