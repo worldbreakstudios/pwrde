@@ -610,6 +610,11 @@ struct App {
     /// model (`command`) is the source of truth for whether it should exist;
     /// the pump reconciles the window against it every tick.
     palette_window: Option<gpui::WindowHandle<crate::palette_window::PaletteWindow>>,
+    /// When the palette window lost key status and was hidden. The model
+    /// (`command`) is kept, so the hotkey brings the palette back where it was
+    /// left; `command::HIDDEN_RESET` later it is closed for good. Only
+    /// meaningful while `command` is `Some` (see `palette_presence`).
+    palette_hidden_since: Option<std::time::Instant>,
     /// Keystrokes queued by the bus `key` command, drained through the real
     /// gpui key-down handler so bindings and overlay routing are exercised.
     pending_keys: Vec<gpui::Keystroke>,
@@ -3150,15 +3155,64 @@ impl App {
         }
         self.command_scroll_to = self.command.as_ref().map(|c| c.selected());
         self.modal_search_reset = Some(self.command_placeholder().to_string());
+        // Every opener and stage change comes through here, and each one
+        // shows the palette: a fresh palette is never born hidden.
+        self.palette_hidden_since = None;
     }
 
-    /// Toggle the palette at its command root (⌘P).
-    fn toggle_command_root(&mut self) {
-        if self.command.is_some() {
+    /// Where the palette is right now: closed, visible, hidden, or hidden
+    /// long enough to be reset.
+    fn palette_presence(&self) -> command::Presence {
+        command::presence(
+            self.command.is_some(),
+            self.palette_hidden_since,
+            std::time::Instant::now(),
+        )
+    }
+
+    /// True while the palette is open with its window up — false while it is
+    /// hidden, when the rest of the app behaves as if no palette were open.
+    pub(crate) fn palette_visible(&self) -> bool {
+        self.palette_presence() == command::Presence::Visible
+    }
+
+    /// True while the palette keeps its progress behind a hidden window.
+    pub(crate) fn palette_hidden(&self) -> bool {
+        self.command.is_some() && self.palette_hidden_since.is_some()
+    }
+
+    /// The palette window lost key status: hide it, keeping the model.
+    pub(crate) fn hide_palette_on_blur(&mut self) {
+        // The flyover's first-open picker has an empty flyover waiting on it,
+        // which would be left holding the keyboard: that one closes outright.
+        if self.command.as_ref().is_some_and(|c| c.for_flyover) && self.flyover_tabs.is_empty() {
             self.close_command();
-        } else {
-            self.command = Some(command::CommandPalette::root());
-            self.claim_command_search();
+            return;
+        }
+        if self.palette_visible() {
+            self.palette_hidden_since = Some(std::time::Instant::now());
+            self.request_redraw();
+        }
+    }
+
+    /// Toggle the palette at its command root (⌘P): close a visible one,
+    /// bring a hidden one back where it was left, else open a fresh root.
+    fn toggle_command_root(&mut self) {
+        match command::toggle_outcome(self.palette_presence()) {
+            command::Toggle::Close => self.close_command(),
+            command::Toggle::Reveal => {
+                // The shared Input still holds the retained query, so there
+                // is no claim (which would clear it): the pump reopens the
+                // window, whose render focuses the field.
+                self.palette_hidden_since = None;
+                self.command_scroll_to = self.command.as_ref().map(|c| c.selected());
+            },
+            command::Toggle::OpenRoot => {
+                // An expired hidden palette is reset before the fresh one.
+                self.close_command();
+                self.command = Some(command::CommandPalette::root());
+                self.claim_command_search();
+            },
         }
         self.request_redraw();
     }
@@ -3195,6 +3249,7 @@ impl App {
     pub(crate) fn close_command(&mut self) {
         let for_flyover = self.command.as_ref().is_some_and(|c| c.for_flyover);
         self.command = None;
+        self.palette_hidden_since = None;
         if for_flyover && self.flyover_tabs.is_empty() {
             self.flyover_open = false;
             self.flyover_focused = false;
@@ -6015,6 +6070,11 @@ impl App {
         if self.toast_due() {
             redraw = true;
         }
+        // A palette hidden for `command::HIDDEN_RESET` is closed for good.
+        if self.palette_presence() == command::Presence::Expired {
+            self.close_command();
+            redraw = true;
+        }
         // The cwd pill's "Copied" flash ends the same way.
         if crate::infobar_ui::flash_due(&mut self.cwd_copied_until, std::time::Instant::now()) {
             redraw = true;
@@ -8082,6 +8142,7 @@ fn main() {
                         flyover_maximized: true,
                         main_window: None,
                         palette_window: None,
+                        palette_hidden_since: None,
                         settings_open: false,
                         settings_window: None,
                         settings_activate: false,
@@ -8167,9 +8228,11 @@ fn main() {
                                     (
                                         redraw,
                                         // The palette window exists exactly while the
-                                        // palette model does: no per-site plumbing, a
-                                        // stage change keeps the same surface up.
-                                        app.command.is_some(),
+                                        // palette model does and is not hidden: no
+                                        // per-site plumbing, a stage change keeps the
+                                        // same surface up. A hidden palette's window is
+                                        // removed and reopened when it is shown again.
+                                        app.palette_visible(),
                                         app.palette_window,
                                         // The Settings window exists exactly while
                                         // `settings_open` is set.
@@ -8230,10 +8293,13 @@ fn main() {
                                     });
                                 },
                                 (false, Some(w)) => {
-                                    let _ = w.update(cx, |_, window, _| window.remove_window());
+                                    // Clear the handle first: the window's
+                                    // resign-key observer only hides a palette
+                                    // whose window is still the app's.
                                     let _ = app.update(cx, |app: &mut App, _| {
                                         app.palette_window = None;
                                     });
+                                    let _ = w.update(cx, |_, window, _| window.remove_window());
                                 },
                                 (_, Some(w)) => {
                                     if redraw {

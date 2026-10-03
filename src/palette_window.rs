@@ -15,6 +15,13 @@
 //! window and routes the keys the model owns. The panel itself is
 //! `App::command_panel_card`.
 //!
+//! Losing key status (a click on the main window or another app) hides the
+//! palette instead of leaving it buried behind other windows: the view marks
+//! it hidden on [`App`] and the pump removes the window, but the model stays,
+//! so the hotkey reopens the window where the user left off (query, selection,
+//! token chips). Hidden for `command::HIDDEN_RESET` (2 minutes), it is closed
+//! for good and the next hotkey opens a fresh root palette.
+//!
 //! The window contains nothing but that one field, so this view keeps the
 //! shared `Input` focused for as long as the window is up: opening the palette
 //! is immediately typeable, with no click needed.
@@ -44,6 +51,11 @@ pub(crate) struct PaletteWindow {
     /// bottom-left corner, so the top is re-anchored to this whenever the
     /// card's height changes.
     top_px: f32,
+    /// Whether this window has been key yet. A resign-key before that is not
+    /// the user leaving the palette (it opened while pwrde was in the
+    /// background, or the notification beat the first activation), so it
+    /// must not hide it.
+    was_active: bool,
 }
 
 impl Render for PaletteWindow {
@@ -163,10 +175,36 @@ pub(crate) fn open_palette_window(app: gpui::Entity<App>, cx: &mut GpuiApp) {
                 });
                 true
             });
-            cx.new(|cx| PaletteWindow {
-                app: app_for_view.clone(),
-                focus_handle: cx.focus_handle(),
-                top_px,
+            cx.new(|cx| {
+                // Losing key status hides the palette (the model is kept) —
+                // but only once this window has been key, and only while it
+                // is still the app's palette window: the pump clears the
+                // handle before it removes a window itself.
+                cx.observe_window_activation(window, |view: &mut PaletteWindow, window, cx| {
+                    if window.is_window_active() {
+                        // Key in a background app is not the user being
+                        // here: AppKit takes it straight back.
+                        view.was_active |= app_is_active();
+                        return;
+                    }
+                    if !view.was_active {
+                        return;
+                    }
+                    let this_window = window.window_handle();
+                    view.app.update(cx, |app, cx| {
+                        if app.palette_window.map(AnyWindowHandle::from) == Some(this_window) {
+                            app.hide_palette_on_blur();
+                            cx.notify();
+                        }
+                    });
+                })
+                .detach();
+                PaletteWindow {
+                    app: app_for_view.clone(),
+                    focus_handle: cx.focus_handle(),
+                    top_px,
+                    was_active: false,
+                }
             })
         },
     );
@@ -291,6 +329,17 @@ fn pin_window_top(window: &Window, logical_top: f32) {
         let frame: CGRect = msg_send![ns_window, frame];
         let top = screen_frame.origin.y + screen_frame.size.height - logical_top as f64;
         let _: () = msg_send![ns_window, setFrameTopLeftPoint: CGPoint { x: frame.origin.x, y: top }];
+    }
+}
+
+/// Whether pwrde is the frontmost app (`NSApp.isActive`).
+fn app_is_active() -> bool {
+    use objc::runtime::{Object, YES};
+    use objc::{class, msg_send, sel, sel_impl};
+    unsafe {
+        let app: *mut Object = msg_send![class!(NSApplication), sharedApplication];
+        let active: objc::runtime::BOOL = msg_send![app, isActive];
+        active == YES
     }
 }
 
