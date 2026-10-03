@@ -15,7 +15,8 @@
 //!   uncommitted files;
 //! - the **cwd pill**, centred in the space that is left and capped at 420px:
 //!   a folder glyph and the group's directory with `$HOME` as `~`, truncated
-//!   from the left so the tail stays readable;
+//!   from the left so the tail stays readable; a click copies the whole
+//!   `~`-abbreviated directory to the clipboard and confirms with a toast;
 //! - the **PR pill** (only when the branch has a pull request): the state
 //!   glyph in the sidebar's PR colours, `#<number>`, a dim state word and the
 //!   checks rollup as `✓ p/t`; a click runs `Action::OpenPrInGithub`'s path;
@@ -480,12 +481,34 @@ impl App {
             .or_else(|| std::env::current_dir().ok())
             .map(|dir| crate::tilde(&dir))
             .unwrap_or_default();
+        // A click copies the directory as shown, but whole — never the
+        // truncated label.
+        let full_cwd = cwd.clone();
         let cwd = truncate_left(&cwd, cwd_char_budget(bar_w / ui, &others));
+        let entity = cx.entity().downgrade();
         let cwd_pill = div().flex_1().min_w(px(0.0)).flex().justify_center().child(
             pill(ui, fill)
+                .id("infobar-cwd")
+                .cursor_pointer()
+                .hover(move |d| d.bg(strip.ink.opacity(2.0 * PILL_FILL)))
                 .flex_shrink(1.0)
                 .min_w(px(0.0))
                 .max_w(px(CWD_MAX_W * ui))
+                // Focus the pane like any press on the bar, then copy.
+                .on_mouse_down(
+                    MouseButton::Left,
+                    move |ev: &MouseDownEvent, _win: &mut Window, app: &mut GpuiApp| {
+                        app.stop_propagation();
+                        if let Some(entity) = entity.upgrade() {
+                            entity.update(app, |this, cx| {
+                                this.note_pointer(ev);
+                                this.press_primary_header();
+                                this.copy_cwd(&full_cwd);
+                                cx.notify();
+                            });
+                        }
+                    },
+                )
                 .child(icon(ICON_FOLDER, glyph, strip.ink_dim))
                 .child(
                     // Right-aligned, so if the estimate above ever runs
@@ -547,6 +570,21 @@ impl App {
             })
             .child(bar_el)
             .into_any_element()
+    }
+
+    /// The cwd pill's click: put the directory on the clipboard and say so.
+    fn copy_cwd(&mut self, cwd: &str) {
+        if cwd.is_empty() {
+            return;
+        }
+        // `$HOME` itself reads `~/`; paste it as `~`.
+        let cwd = if cwd == "~/" { "~" } else { cwd };
+        match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(cwd)) {
+            // Toasts cut their text from the right, which would lose the
+            // path's tail — so the path stays out of it.
+            Ok(()) => self.toast_status("Copied directory"),
+            Err(error) => self.toast_notification(format!("copy directory: {error}")),
+        }
     }
 }
 
