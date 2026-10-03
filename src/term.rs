@@ -88,13 +88,6 @@ pub enum TermEvent {
         cwd: std::path::PathBuf,
         ctx: crate::git_context::GitContext,
     },
-    /// The fork picker's background repo-wide PR list finished for `repo`:
-    /// branch → PR for its worktree rows, folded into `App::fork_pr_cache`.
-    /// `None` when the fetch failed, which leaves the cache and rows alone.
-    ForkPrsReady {
-        repo: std::path::PathBuf,
-        prs: Option<crate::picker::ForkPrMap>,
-    },
     /// `lfg` reported a cache entry refreshed: the sidebar's PR rollups
     /// re-fetch so a card doesn't keep showing a merged/closed PR as open.
     PrCacheUpdated,

@@ -58,7 +58,7 @@ pwrde-cli page settings                          # sessions | tool:<n>; `setting
 pwrde-cli focus pwrde                            # by group name, sidebar title, or 0-based index
 pwrde-cli new-section Work && pwrde-cli move pwrde Work
 pwrde-cli resize 1100 700                        # window content size in points
-pwrde-cli screenshot /tmp/app.png                # PNG of the app window (no Screen Recording prompt); --window settings captures the Settings window, --window popover the open webview Site/Tools popover, --window palette the open ⌘P palette; no path = temp file printed on stdout; --clipboard
+pwrde-cli screenshot /tmp/app.png                # PNG of the app window (no Screen Recording prompt); --window settings captures the Settings window, --window popover the open webview Site/Tools popover; no path = temp file printed on stdout; --clipboard
 pwrde-cli raw '{"cmd":"send_text","text":"ls\r","group":"pwrde"}'   # anything the protocol accepts
 ```
 

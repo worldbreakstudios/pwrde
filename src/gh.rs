@@ -293,40 +293,6 @@ pub fn pr_list_for_branch(dir: &Path, branch: &str) -> Result<Vec<PrSummary>, St
     )
 }
 
-/// The fields the repo-wide list needs: enough to match a PR to a branch and
-/// name its state. The review / mergeability / check-rollup fields are left
-/// out on purpose — over a couple of hundred PRs they are what pushes the
-/// read past [`crate::git::TIMEOUT_LIST`].
-const REPO_LIST_FIELDS: &str = "number,title,state,isDraft,headRefName,url";
-
-/// How many PRs the repo-wide list reads (newest first).
-const REPO_LIST_LIMIT: &str = "200";
-
-/// List the repo's recent PRs in every state with one CLI call, for callers
-/// that annotate many branches at once (the fork picker's worktree rows) and
-/// must not pay one call per branch. **Blocking** — background threads only.
-pub fn pr_list_for_repo(dir: &Path) -> Result<Vec<PrSummary>, String> {
-    fetch_list(
-        dir,
-        &["pr", "list", "--state", "all", "--limit", REPO_LIST_LIMIT, "--json", REPO_LIST_FIELDS],
-    )
-}
-
-/// Group a PR list by head branch and keep the one PR to show for each, by
-/// the rule a single branch's list is read with
-/// ([`crate::git_context::select_pr`]): an open PR wins, else the first
-/// (newest) one.
-pub fn prs_by_head(prs: Vec<PrSummary>) -> std::collections::HashMap<String, PrSummary> {
-    let mut grouped: std::collections::HashMap<String, Vec<PrSummary>> = std::collections::HashMap::new();
-    for pr in prs.into_iter().filter(|p| !p.head.is_empty()) {
-        grouped.entry(pr.head.clone()).or_default().push(pr);
-    }
-    grouped
-        .into_iter()
-        .filter_map(|(head, list)| crate::git_context::select_pr(list).map(|pr| (head, pr)))
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -523,28 +489,6 @@ mod tests {
         assert_eq!(prs[0].checks[0].status, CheckStatus::Success);
         assert_eq!(prs[0].checks[1].status, CheckStatus::Pending);
         assert_eq!(aggregate_check_status(&prs[0].checks), Some(CheckStatus::Pending));
-    }
-
-    /// The repo-wide list's lean payload (no author / review / checks) parses,
-    /// and each head branch maps to one PR: an open PR beats a newer merged
-    /// one on the same branch, otherwise the first (newest) listed wins.
-    #[test]
-    fn prs_by_head_picks_one_pr_per_branch() {
-        let json = r#"[
-            {"number":30,"title":"c","state":"MERGED","isDraft":false,"headRefName":"reused","url":"u30"},
-            {"number":21,"title":"b","state":"OPEN","isDraft":true,"headRefName":"reused","url":"u21"},
-            {"number":12,"title":"a2","state":"CLOSED","isDraft":false,"headRefName":"done","url":"u12"},
-            {"number":11,"title":"a1","state":"MERGED","isDraft":false,"headRefName":"done","url":"u11"},
-            {"number":5,"title":"solo","state":"OPEN","isDraft":false,"headRefName":"solo","url":"u5"}]"#;
-        let map = prs_by_head(parse_summaries(json).unwrap());
-        assert_eq!(map.len(), 3);
-        assert_eq!(map["reused"].number, 21);
-        assert!(map["reused"].is_draft);
-        assert_eq!(map["done"].number, 12);
-        assert_eq!(map["done"].state, "closed");
-        assert_eq!(map["solo"].number, 5);
-        assert!(!map.contains_key("missing"));
-        assert!(prs_by_head(Vec::new()).is_empty());
     }
 
     #[test]

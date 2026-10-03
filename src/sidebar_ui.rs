@@ -1,16 +1,13 @@
 //! The sessions sidebar as a gpui element tree over the canvas: the flat
-//! region ground, the sessions list (header chips, the fixed "Tools" band —
-//! a fold caption and one row per registered CLI tool, a click opening that
-//! tool's page — then two-line rows in the GANTRY mock's style, the
-//! folder's pinned rows in a "Pinned" section on top, scrolling beneath
-//! the band), the toast stack at the region's bottom
+//! region ground, the sessions list (header chips + two-line rows in the
+//! GANTRY mock's style, the folder's pinned rows in a "Pinned" section on
+//! top), the toast stack at the region's bottom
 //! edge ([`crate::toast_ui`]), and the floating "Show sessions" button while
 //! everything is hidden. The folders card beside the list lives in
 //! [`crate::folders_ui`].
 //!
 //! Geometry lives in [`crate::workspace`] (`sessions_list_rect`,
-//! `tools_band`, `sessions_rows_rect`, `sidebar_rows_filtered` /
-//! `sidebar_row_rect`), and row presses and drags
+//! `sidebar_rows_filtered` / `sidebar_row_rect`), and row presses and drags
 //! are still resolved on the canvas mouse path in `main.rs` against those
 //! same rects. That is deliberate — the rects are the single authority that
 //! keeps painting, hit-testing and PTY resize in agreement, so this tree is
@@ -53,9 +50,6 @@ const ROW_PAD: f32 = 12.0;
 const UNREAD_DOT: f32 = 6.0;
 /// Corner radius of a session row's selection / hover fill (mock: 9px).
 pub(crate) const ROW_RADIUS: f32 = 9.0;
-/// The tool rows' green "running" dot (mock: `#3fb950`, 6px).
-const TOOL_DOT: f32 = 6.0;
-const TOOL_GREEN: u32 = 0x3fb950;
 /// Side of the PR-state icon on a row's first line (mock: 11px, tinted
 /// with the PR palette below).
 const STATUS_ICON: f32 = 12.0;
@@ -148,7 +142,6 @@ impl App {
             .child(region_ground(&theme, w))
             .when(self.folders_visible(), |d| d.child(self.render_folders_card(&theme, cx)))
             .child(self.clipped_row_layer(&theme, cx))
-            .child(self.tools_band_layer(&theme, cx.entity().downgrade()))
             .child(self.drop_feedback_layer(&theme))
             // The toast stack sits at the region's bottom edge — inside the one
             // column a webview child view never covers, which is why notes and
@@ -204,15 +197,12 @@ impl App {
         )
     }
 
-    /// [`App::list_rect`] pushed below the fixed tools band and shifted up
-    /// by the wheel scroll — the rect the row stack lays out in (the
-    /// logical twin of `App::sessions_rows_list`).
+    /// [`App::list_rect`] shifted up by the wheel scroll — the rect the row
+    /// stack lays out in (the logical twin of `App::sessions_rows_list`).
     pub(crate) fn rows_list_rect(&self) -> crate::workspace::LayoutRect {
-        crate::workspace::sessions_rows_rect(
-            &self.list_rect(),
-            self.tools_band_h(1.0),
-            self.sessions_scroll(),
-        )
+        let mut list = self.list_rect();
+        list.y -= self.sessions_scroll().round();
+        list
     }
 
     /// The window's logical height, rounded like the row rects are.
@@ -503,93 +493,13 @@ impl App {
             )
     }
 
-    /// The fixed "Tools" band between the header and the scrolling rows
-    /// ([`crate::workspace::tools_band`]): the fold caption, one row per
-    /// registered CLI tool and the hairline closing the band. Painted
-    /// outside the row clip so it never scrolls; presses are element-owned
-    /// (`press` stops them at the row), so a tool row never arms a group
-    /// drag. Empty with no tools.
-    fn tools_band_layer(&self, theme: &Theme, entity: gpui::WeakEntity<Self>) -> gpui::Div {
-        let band = self.tools_band(1.0);
-        let mut layer = div().absolute().left(px(0.0)).top(px(0.0)).size_full();
-        if band.h == 0.0 {
-            return layer;
-        }
-        let hover = self.sidebar_cursor();
-        let hovered =
-            |r: &crate::workspace::LayoutRect| hover.is_some_and(|(x, y)| r.contains(x, y));
-        layer = layer.child(
-            self.tools_caption_row(theme, &band.caption, hovered(&band.caption)).on_mouse_down(
-                MouseButton::Left,
-                press(entity.clone(), |this, _ev, _cx| this.toggle_tools_collapsed()),
-            ),
-        );
-        for (ti, rect) in band.rows.iter().enumerate() {
-            if self.tools.get(ti).is_none() {
-                continue;
-            }
-            let selected = self.page == crate::Page::Tool(ti);
-            let label = self.tool_row_label(ti);
-            layer = layer.child(
-                tool_row(theme, ti, rect, &label, selected, hovered(rect)).on_mouse_down(
-                    MouseButton::Left,
-                    press(entity.clone(), move |this, _ev, _cx| {
-                        this.set_page(crate::Page::Tool(ti))
-                    }),
-                ),
-            );
-        }
-        let sep = band.separator;
-        layer.child(
-            div()
-                .absolute()
-                .left(px(sep.x))
-                .top(px(sep.y))
-                .w(px(sep.w))
-                .h(px(sep.h))
-                .bg(separator(theme)),
-        )
-    }
-
-    /// The "Tools" caption row: wrench icon, label, tool count, and a
-    /// fold chevron — a click folds the tool rows away
-    /// ([`App::toggle_tools_collapsed`]).
-    fn tools_caption_row(
-        &self,
-        theme: &Theme,
-        r: &crate::workspace::LayoutRect,
-        hovered: bool,
-    ) -> gpui::Stateful<gpui::Div> {
-        let chevron = if self.tools_collapsed {
-            crate::ui::assets::ICON_CHEVRON_RIGHT
-        } else {
-            crate::ui::assets::ICON_CHEVRON_DOWN
-        };
-        let side = px(scaled(crate::folders_ui::ROW_ICON));
-        crate::folders_ui::row_shell(r, false, hovered, theme)
-            .id("sessions-tools-caption")
-            .cursor_pointer()
-            .child(icon(crate::ui::assets::ICON_WRENCH, side, theme.muted_foreground))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .text_size(px(scaled(12.5)))
-                    .text_color(theme.muted_foreground)
-                    .child("Tools"),
-            )
-            .child(crate::folders_ui::count_badge(theme, self.tools.len(), false))
-            .child(icon(chevron, side, theme.muted_foreground))
-    }
 
     fn clipped_row_layer(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
         let list = self.list_rect();
-        // Rows start below the list header and the fixed tools band —
-        // exactly where `workspace::sidebar_row_rect` starts its stack in
-        // `rows_list_rect` — and stop at the list's bottom edge, the
-        // region's padding. Scrolled rows are clipped under the band, so
-        // they neither paint over it nor take its presses.
-        let top = crate::workspace::sessions_rows_top(&list, self.tools_band_h(1.0), 1.0);
+        // Rows start below the list header — exactly where
+        // `workspace::sidebar_row_rect` starts its stack — and stop at the
+        // list's bottom edge, the region's padding.
+        let top = list.y + crate::workspace::SESSIONS_HEADER_H;
         let bottom = (list.y + list.h).max(top);
         let height = self.logical_height() as f32;
         let w = self.sidebar_w();
@@ -623,15 +533,9 @@ impl App {
     fn card_row_layer(&self, theme: &Theme, entity: gpui::WeakEntity<Self>) -> gpui::Div {
         let rows = self.sidebar_rows();
         let list = self.rows_list_rect();
-        // A pointer over the header or the tools band is not over the row
-        // scrolled beneath them.
-        let rows_top =
-            crate::workspace::sessions_rows_top(&self.list_rect(), self.tools_band_h(1.0), 1.0);
-        let hover = self.sidebar_cursor().filter(|(_, y)| *y >= rows_top);
-        // On a tool page the tool row is the selected one; no session row is.
-        let active = (self.page == crate::Page::Sessions)
-            .then(|| crate::workspace::active_row_index(&rows, self.active))
-            .flatten();
+        let hover = self.sidebar_cursor();
+        let active =
+            crate::workspace::active_row_index(&rows, self.active);
 
         let n_pinned = crate::workspace::pinned_run(&rows, &self.workspaces);
         let mut layer = div().absolute().left(px(0.0)).top(px(0.0)).size_full();
@@ -1057,44 +961,7 @@ impl App {
     }
 }
 
-/// One CLI-tool row of the tools band: a green dot and the terminal's own
-/// pane title — or the tool's command while that terminal has none of its
-/// own (`App::tool_row_label`) — in monospace.
-fn tool_row(
-    theme: &Theme,
-    index: usize,
-    r: &crate::workspace::LayoutRect,
-    label: &str,
-    selected: bool,
-    hovered: bool,
-) -> gpui::Stateful<gpui::Div> {
-    let ink = if selected { theme.primary_foreground } else { theme.foreground };
-    crate::folders_ui::row_shell(r, selected, hovered, theme)
-        .id(("sessions-tool", index))
-        .cursor_pointer()
-        .child(
-            div()
-                .flex_none()
-                .w(px(scaled(TOOL_DOT)))
-                .h(px(scaled(TOOL_DOT)))
-                .rounded_full()
-                .bg(gpui::rgb(TOOL_GREEN)),
-        )
-        .child(
-            div()
-                .flex_1()
-                .min_w(px(0.0))
-                .overflow_hidden()
-                .whitespace_nowrap()
-                .text_ellipsis()
-                .font_family(crate::renderer::FONT_FAMILY)
-                .text_size(px(scaled(11.5)))
-                .text_color(ink)
-                .child(label.to_string()),
-        )
-}
-
-/// The hairline that separates list rows and closes the tools band:
+/// The hairline that separates list rows and the folders card's sections:
 /// `rgba(255,255,255,.07)` on the dark ground, an ink hairline on the light.
 pub(crate) fn separator(theme: &Theme) -> Hsla {
     if theme.dark {
