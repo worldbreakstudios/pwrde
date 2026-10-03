@@ -422,7 +422,8 @@ impl App {
     /// The sessions list's header: the title block ("All sessions", the
     /// folder's name, or "Settings", over the row count) and the chip
     /// cluster — "Show folders" at the left while the card is hidden, then
-    /// Focus terminals, ＋ and the Settings gear at the right. Every chip is a
+    /// Dashboard (lit while that page is up), Focus terminals, ＋ and the
+    /// Settings gear at the right. Every chip is a
     /// real gpui click target that `occlude()`s the canvas; hover reads off
     /// the canvas cursor so the chips light up under the same pointer the
     /// rows use.
@@ -455,6 +456,28 @@ impl App {
                         c.cursor_pointer()
                             .on_click(handler(entity.clone(), |this| this.toggle_folders()))
                     }),
+            );
+        }
+        // The Dashboard toggle, left of Focus terminals: lit — bright ink on
+        // a faint ground — while that page is up. A list too narrow for it
+        // has no chip (`sessions_header_chips`).
+        if let Some(dash) = chips.dashboard {
+            let lit = self.page == crate::Page::Dashboard;
+            layer = layer.child(
+                icon_chip(
+                    theme,
+                    &dash,
+                    lit || hovered(&dash),
+                    false,
+                    crate::ui::assets::ICON_LAYOUT_GRID,
+                )
+                .when(lit, |c| c.bg(theme.foreground.opacity(0.1)))
+                .id("sidebar-dashboard")
+                .occlude()
+                .when(!modal, |c| {
+                    c.cursor_pointer()
+                        .on_click(handler(entity.clone(), |this| this.toggle_dashboard()))
+                }),
             );
         }
         layer

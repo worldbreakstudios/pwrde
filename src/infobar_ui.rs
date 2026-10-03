@@ -173,7 +173,7 @@ fn cwd_char_budget(bar_w: f32, others: &[f32]) -> usize {
 }
 
 /// The dim state word beside a PR's number.
-fn pr_state_word(pr: &PrSummary) -> &'static str {
+pub(crate) fn pr_state_word(pr: &PrSummary) -> &'static str {
     if pr.state.eq_ignore_ascii_case("open") {
         if pr.is_draft { "Draft" } else { "Open" }
     } else if pr.state.eq_ignore_ascii_case("merged") {
@@ -200,7 +200,7 @@ fn checks_summary(checks: &[Check]) -> Option<(usize, usize, CheckStatus)> {
 
 /// The repo pill's text: `(repo, branch-or-short-sha)`. Either half may be
 /// missing; `None` when the snapshot names neither.
-fn repo_label(ctx: &GitContext) -> Option<(Option<String>, Option<String>)> {
+pub(crate) fn repo_label(ctx: &GitContext) -> Option<(Option<String>, Option<String>)> {
     let repo = ctx.repo.clone().filter(|r| !r.is_empty());
     let head = ctx
         .branch
@@ -212,7 +212,7 @@ fn repo_label(ctx: &GitContext) -> Option<(Option<String>, Option<String>)> {
 
 /// The repo pill's counts: the committed branch diff as `(+A, −R)` when
 /// there is one, and the number of uncommitted files when above zero.
-fn repo_counts(ctx: &GitContext) -> (Option<(String, String)>, Option<String>) {
+pub(crate) fn repo_counts(ctx: &GitContext) -> (Option<(String, String)>, Option<String>) {
     let diff = ctx
         .branch_diff
         .filter(|d| d.insertions > 0 || d.deletions > 0)

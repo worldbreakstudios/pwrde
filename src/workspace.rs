@@ -556,6 +556,22 @@ impl Workspace {
         self.any_unread() && !self.snoozed
     }
 
+    /// Clear the unread dot of the primary pane's tab — what a left click on
+    /// this group's dashboard card does, and the only thing on that page that
+    /// reads it. Returns whether the tab was unread. No other pane's tab is
+    /// touched, and the `unread_at` stamp stays, so [`Self::attention_at`]
+    /// keeps saying when the pane last asked.
+    pub fn mark_primary_read(&mut self) -> bool {
+        let primary = self.primary_tile;
+        match self.root.find_tile_mut(primary).and_then(|tile| tile.active_tab_mut()) {
+            Some(tab) if tab.unread => {
+                tab.unread = false;
+                true
+            },
+            _ => false,
+        }
+    }
+
     /// Return the moment this workspace most recently asked for attention.
     ///
     /// When tabs are currently unread, this is the oldest timestamp among
@@ -760,6 +776,16 @@ impl LayoutRect {
     /// Grown by `m` on every side (for forgiving divider hit-tests).
     pub fn inflate(&self, m: f32) -> LayoutRect {
         LayoutRect { x: self.x - m, y: self.y - m, w: self.w + 2.0 * m, h: self.h + 2.0 * m }
+    }
+
+    /// The part of this rect inside `other` — zero-sized when they do not
+    /// meet (a dashboard card body clipped to the scroll viewport).
+    pub fn intersect(&self, other: &LayoutRect) -> LayoutRect {
+        let x = self.x.max(other.x);
+        let y = self.y.max(other.y);
+        let right = (self.x + self.w).min(other.x + other.w);
+        let bottom = (self.y + self.h).min(other.y + other.h);
+        LayoutRect { x, y, w: (right - x).max(0.0), h: (bottom - y).max(0.0) }
     }
 }
 
@@ -1165,11 +1191,15 @@ fn header_chip_y(strip: &LayoutRect, band_h: f32, side: f32, scale: f32) -> f32 
 /// The chips in the sessions list header, all [`HEADER_CHIP`] squares
 /// centred in [`SESSIONS_HEADER_H`]: `show_folders` at the left (only while
 /// the folders card is hidden — it sits past the traffic-light safe span the
-/// header then has to reserve), and `focus` (hide the whole region), `plus`
-/// (new session) and `gear` (Settings) clustered at the right.
+/// header then has to reserve), and `dashboard` (the Dashboard toggle),
+/// `focus` (hide the whole region), `plus` (new session) and `gear`
+/// (Settings) clustered at the right. `dashboard` is the cluster's leftmost
+/// chip and the one that gives way: a list too narrow to keep it clear of
+/// `show_folders` drops it (⌘G and the palette still toggle the page).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SessionsHeaderChips {
     pub show_folders: Option<LayoutRect>,
+    pub dashboard: Option<LayoutRect>,
     pub focus: LayoutRect,
     pub plus: LayoutRect,
     pub gear: LayoutRect,
@@ -1203,7 +1233,11 @@ fn sessions_header_chips_at(
         w: side,
         h: side,
     });
-    SessionsHeaderChips { show_folders, focus, plus, gear }
+    let dashboard = LayoutRect { x: focus.x - gap - side, y, w: side, h: side };
+    // Clear of the list's left edge and of the "Show folders" chip, or gone.
+    let left = show_folders.map_or(list.x, |show| show.x + show.w + gap);
+    let dashboard = (side > 0.0 && dashboard.x >= left).then_some(dashboard);
+    SessionsHeaderChips { show_folders, dashboard, focus, plus, gear }
 }
 
 
@@ -2880,6 +2914,1061 @@ pub fn flyover_maximize_rect(rect: &LayoutRect, scale: f32) -> LayoutRect {
     LayoutRect { x: bar.x + bar.w - bar.h, y: bar.y, w: bar.h, h: bar.h }
 }
 
+// ── Dashboard ───────────────────────────────────────────────────────────
+//
+// The Dashboard page (`dashboard_ui`): a header bar over a scrollable grid of
+// cards, one per group, each holding that group's primary pane as a live
+// terminal. These functions are the single authority for the bar, the scroll
+// viewport, the grid and every card's header / body / footer — the canvas
+// painter, the element tree, the mouse path and PTY sizing all read them.
+//
+// Every figure is at the default chrome text size and scales by the chrome
+// factor like the tab strips (the `*_at` functions take it as `ui`).
+//
+// The cards are the **folder set** ([`dashboard_groups`]): the groups the
+// sessions list shows for the folder selected in the folders card. The grid's
+// shape and the card size come from that set's count — never from the number
+// of groups in the app, and never from how many the All / Unread filter
+// leaves showing: the filter only decides which cards occupy the slots, so
+// changing or satisfying it never resizes a PTY. Picking another folder does.
+
+/// The dashboard's folder set: the group index of every card, in card order.
+/// It is exactly the sessions list for `filter` ([`sidebar_rows_filtered`]) —
+/// the same membership (a folded "Pinned" or "Snoozed" run is left out here
+/// too) in the same order (pinned first, snoozed last), so the grid and the
+/// list beside it always name the same sessions.
+pub fn dashboard_groups(
+    workspaces: &[Workspace],
+    sections: &[Section],
+    filter: Option<u64>,
+    pinned_collapsed: bool,
+    snoozed_collapsed: bool,
+) -> Vec<usize> {
+    sidebar_rows_filtered(workspaces, sections, filter, pinned_collapsed, snoozed_collapsed)
+        .into_iter()
+        .map(|row| row.ws_idx)
+        .collect()
+}
+
+/// Padding above and below the grid, at its sides, and between cards.
+const DASH_PAD_Y: f32 = 10.0;
+const DASH_PAD_X: f32 = 12.0;
+const DASH_GAP: f32 = 10.0;
+/// Narrowest column pitch — a card plus the gap after it, the mock's figure —
+/// before the grid drops one; the cards themselves get down to 270px.
+const DASH_MIN_COL_W: f32 = 280.0;
+/// Shortest a card may get: a short window scrolls instead of crushing them.
+const DASH_MIN_CARD_H: f32 = 200.0;
+/// A card's header (status dot, title, branch, status chip) and footer
+/// (elapsed time, PR, diff, "Open").
+const DASH_CARD_HEADER_H: f32 = 34.0;
+const DASH_CARD_FOOTER_H: f32 = 30.0;
+/// A card's corner radius: the canvas ground (`Renderer::dashboard`) and the
+/// element-tree border over it (`dashboard_ui`) round alike.
+pub const DASH_CARD_RADIUS: f32 = 10.0;
+
+/// The dashboard's header bar: the top of `area`, as high as a tile's tab
+/// bar. While the sidebar is collapsed it cedes its left end to the traffic
+/// lights and the "Show sessions" button, exactly as the first tile's strip
+/// does ([`tab_strip_rect`]).
+pub fn dashboard_bar(area: &LayoutRect, scale: f32, sidebar_w: f32) -> LayoutRect {
+    dashboard_bar_at(area, scale, chrome_ui_scale(), sidebar_w)
+}
+
+/// [`dashboard_bar`] at chrome factor `ui`.
+fn dashboard_bar_at(area: &LayoutRect, scale: f32, ui: f32, sidebar_w: f32) -> LayoutRect {
+    let bar = tile_tab_bar_at(area, scale, ui);
+    let bar = LayoutRect { h: bar.h.min(area.h), ..bar };
+    tab_strip_rect(*area, &bar, scale, sidebar_w)
+}
+
+/// The dashboard's scroll viewport: `area` below the header bar. Cards are
+/// clipped to it, so a half-scrolled card never paints over the bar.
+pub fn dashboard_viewport(area: &LayoutRect, scale: f32) -> LayoutRect {
+    dashboard_viewport_at(area, scale, chrome_ui_scale())
+}
+
+/// [`dashboard_viewport`] at chrome factor `ui`.
+fn dashboard_viewport_at(area: &LayoutRect, scale: f32, ui: f32) -> LayoutRect {
+    tile_content_at(area, scale, ui)
+}
+
+/// The dashboard grid for `n` groups: its shape and the one size every card
+/// shares (physical px).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DashGrid {
+    pub cols: usize,
+    /// Rows the `n` cards fill (at least one, so an empty grid has a shape).
+    pub rows: usize,
+    pub card_w: f32,
+    pub card_h: f32,
+}
+
+/// Columns a dashboard of `n` cards wants before the width cap: one card
+/// fills the page, up to four pair up, more go three abreast.
+fn dashboard_wanted_cols(n: usize) -> usize {
+    match n {
+        0 | 1 => 1,
+        2..=4 => 2,
+        _ => 3,
+    }
+}
+
+/// The grid for `n` groups in `viewport`. The width caps the column count
+/// (no column pitch under [`DASH_MIN_COL_W`]); one row fills the viewport, two or
+/// more rows are half of it each, so two fill it and further rows scroll;
+/// [`DASH_MIN_CARD_H`] floors the height.
+pub fn dashboard_grid(viewport: &LayoutRect, n: usize, scale: f32) -> DashGrid {
+    dashboard_grid_at(viewport, n, scale, chrome_ui_scale())
+}
+
+/// [`dashboard_grid`] at chrome factor `ui`.
+fn dashboard_grid_at(viewport: &LayoutRect, n: usize, scale: f32, ui: f32) -> DashGrid {
+    let s = scale * ui;
+    let pad_x = (DASH_PAD_X * s).round();
+    let pad_y = (DASH_PAD_Y * s).round();
+    let gap = (DASH_GAP * s).round();
+    // The cap is measured in px at the default chrome text size, like the
+    // info bar's shedding thresholds. (A negative quotient casts to 0.)
+    let fit = ((viewport.w / s - 2.0 * DASH_PAD_X + DASH_GAP) / DASH_MIN_COL_W).floor() as usize;
+    let cols = fit.clamp(1, dashboard_wanted_cols(n));
+    let rows = n.div_ceil(cols).max(1);
+    let card_w =
+        ((viewport.w - 2.0 * pad_x - (cols - 1) as f32 * gap) / cols as f32).floor().max(0.0);
+    let fill = if rows == 1 {
+        viewport.h - 2.0 * pad_y
+    } else {
+        (viewport.h - 2.0 * pad_y - gap) / 2.0
+    };
+    let card_h = fill.floor().max((DASH_MIN_CARD_H * s).round());
+    DashGrid { cols, rows, card_w, card_h }
+}
+
+/// Height (physical px) of the grid's content while `shown` cards occupy
+/// its slots — what [`max_scroll`] measures against the viewport. A filter
+/// shortens the content, never the cards.
+pub fn dashboard_content_h(grid: &DashGrid, shown: usize, scale: f32) -> f32 {
+    dashboard_content_h_at(grid, shown, scale, chrome_ui_scale())
+}
+
+/// [`dashboard_content_h`] at chrome factor `ui`.
+fn dashboard_content_h_at(grid: &DashGrid, shown: usize, scale: f32, ui: f32) -> f32 {
+    if shown == 0 {
+        return 0.0;
+    }
+    let s = scale * ui;
+    let rows = shown.div_ceil(grid.cols.max(1)) as f32;
+    2.0 * (DASH_PAD_Y * s).round() + rows * grid.card_h + (rows - 1.0) * (DASH_GAP * s).round()
+}
+
+/// The card in grid slot `slot` (row-major), `scroll` physical px into the
+/// content. Not clipped: a card scrolled half out of `viewport` keeps its
+/// full rect, and painters clip to the viewport.
+pub fn dashboard_card_rect(
+    viewport: &LayoutRect,
+    grid: &DashGrid,
+    slot: usize,
+    scroll: f32,
+    scale: f32,
+) -> LayoutRect {
+    dashboard_card_rect_at(viewport, grid, slot, scroll, scale, chrome_ui_scale())
+}
+
+/// [`dashboard_card_rect`] at chrome factor `ui`.
+fn dashboard_card_rect_at(
+    viewport: &LayoutRect,
+    grid: &DashGrid,
+    slot: usize,
+    scroll: f32,
+    scale: f32,
+    ui: f32,
+) -> LayoutRect {
+    let s = scale * ui;
+    let gap = (DASH_GAP * s).round();
+    let cols = grid.cols.max(1);
+    let (col, row) = ((slot % cols) as f32, (slot / cols) as f32);
+    LayoutRect {
+        x: viewport.x + (DASH_PAD_X * s).round() + col * (grid.card_w + gap),
+        y: viewport.y + (DASH_PAD_Y * s).round() + row * (grid.card_h + gap) - scroll.round(),
+        w: grid.card_w,
+        h: grid.card_h,
+    }
+}
+
+/// The slot whose card is under `(px, py)`, among the first `shown` slots.
+/// `None` outside the viewport (a card's clipped-away part hits nothing) or
+/// in the gaps between cards.
+pub fn dashboard_slot_at(
+    viewport: &LayoutRect,
+    grid: &DashGrid,
+    shown: usize,
+    scroll: f32,
+    scale: f32,
+    px: f32,
+    py: f32,
+) -> Option<usize> {
+    dashboard_slot_at_at(viewport, grid, shown, scroll, scale, chrome_ui_scale(), px, py)
+}
+
+/// [`dashboard_slot_at`] at chrome factor `ui`.
+#[allow(clippy::too_many_arguments)]
+fn dashboard_slot_at_at(
+    viewport: &LayoutRect,
+    grid: &DashGrid,
+    shown: usize,
+    scroll: f32,
+    scale: f32,
+    ui: f32,
+    px: f32,
+    py: f32,
+) -> Option<usize> {
+    if !viewport.contains(px, py) {
+        return None;
+    }
+    (0..shown).find(|&slot| {
+        dashboard_card_rect_at(viewport, grid, slot, scroll, scale, ui).contains(px, py)
+    })
+}
+
+/// A card's header strip: its top [`DASH_CARD_HEADER_H`].
+pub fn dashboard_card_header(card: &LayoutRect, scale: f32) -> LayoutRect {
+    dashboard_card_header_at(card, scale, chrome_ui_scale())
+}
+
+/// [`dashboard_card_header`] at chrome factor `ui`.
+fn dashboard_card_header_at(card: &LayoutRect, scale: f32, ui: f32) -> LayoutRect {
+    LayoutRect { h: (DASH_CARD_HEADER_H * ui * scale).round().min(card.h), ..*card }
+}
+
+/// A card's footer strip: its bottom [`DASH_CARD_FOOTER_H`] (never reaching
+/// up into the header on a card too short for both).
+pub fn dashboard_card_footer(card: &LayoutRect, scale: f32) -> LayoutRect {
+    dashboard_card_footer_at(card, scale, chrome_ui_scale())
+}
+
+/// [`dashboard_card_footer`] at chrome factor `ui`.
+fn dashboard_card_footer_at(card: &LayoutRect, scale: f32, ui: f32) -> LayoutRect {
+    let header = dashboard_card_header_at(card, scale, ui);
+    let h = (DASH_CARD_FOOTER_H * ui * scale).round().min(card.h - header.h);
+    LayoutRect { y: card.y + card.h - h, h, ..*card }
+}
+
+/// A card's body — the live terminal — between its header and footer. PTY
+/// sizing, the canvas painter and the mouse path all read this one rect.
+pub fn dashboard_card_body(card: &LayoutRect, scale: f32) -> LayoutRect {
+    dashboard_card_body_at(card, scale, chrome_ui_scale())
+}
+
+/// [`dashboard_card_body`] at chrome factor `ui`.
+fn dashboard_card_body_at(card: &LayoutRect, scale: f32, ui: f32) -> LayoutRect {
+    let header = dashboard_card_header_at(card, scale, ui);
+    let footer = dashboard_card_footer_at(card, scale, ui);
+    LayoutRect { y: card.y + header.h, h: (card.h - header.h - footer.h).max(0.0), ..*card }
+}
+
+/// The scroll offset (physical px) that brings slot `slot`'s card fully into
+/// the viewport with the grid's own padding around it, moving as little as
+/// possible from `scroll` — not at all when the card is already wholly in
+/// view. A card taller than the viewport shows its top.
+pub fn dashboard_reveal_scroll(
+    viewport: &LayoutRect,
+    grid: &DashGrid,
+    slot: usize,
+    scroll: f32,
+    scale: f32,
+) -> f32 {
+    dashboard_reveal_scroll_at(viewport, grid, slot, scroll, scale, chrome_ui_scale())
+}
+
+/// [`dashboard_reveal_scroll`] at chrome factor `ui`.
+fn dashboard_reveal_scroll_at(
+    viewport: &LayoutRect,
+    grid: &DashGrid,
+    slot: usize,
+    scroll: f32,
+    scale: f32,
+    ui: f32,
+) -> f32 {
+    let pad = (DASH_PAD_Y * scale * ui).round();
+    // The card's span in content coordinates (scroll 0, viewport-relative).
+    let top = dashboard_card_rect_at(viewport, grid, slot, 0.0, scale, ui).y - viewport.y;
+    let bottom = top + grid.card_h;
+    // A card wholly in view stays put — only its padding being cut off must
+    // not move the grid under a press. One cut off at either edge comes in
+    // with the padding around it.
+    if top < scroll {
+        (top - pad).max(0.0)
+    } else if bottom > scroll + viewport.h {
+        (bottom + pad - viewport.h).min(top - pad).max(0.0)
+    } else {
+        scroll
+    }
+}
+
+/// The "↓ N more" scroll hint: a pill floating over the bottom of the
+/// viewport while showing cards extend below it. Its height, the gap under
+/// it, its side padding, and the per-character estimate of its 11.5px label
+/// that sizes it.
+const DASH_MORE_H: f32 = 26.0;
+const DASH_MORE_BOTTOM: f32 = 12.0;
+const DASH_MORE_PAD_X: f32 = 12.0;
+const DASH_MORE_CHAR_W: f32 = 7.0;
+/// What the unread style adds at the pill's left: the cards' unread dot in
+/// its halo ring (13px) and the 6px gap before the label.
+pub const DASH_MORE_DOT_SLOT: f32 = 19.0;
+
+/// The hint's two runs of text for `n` cards below the viewport, `unread` of
+/// them unread: "↓ N more", and — only while some are unread — "M unread",
+/// which the pill paints in the unread ink.
+pub fn dashboard_more_parts(n: usize, unread: usize) -> (String, Option<String>) {
+    (format!("↓ {n} more"), (unread > 0).then(|| format!("{unread} unread")))
+}
+
+/// The hint's whole label: "↓ N more", or "↓ N more · M unread" while some
+/// of the cards below are unread. It is what sizes the pill.
+pub fn dashboard_more_label(n: usize, unread: usize) -> String {
+    match dashboard_more_parts(n, unread) {
+        (more, Some(unread)) => format!("{more} · {unread}"),
+        (more, None) => more,
+    }
+}
+
+/// Whether slot `slot`'s card has its bottom edge below the viewport's: the
+/// one test both of the hint's counts share. A card cut off by the bottom
+/// edge is below; one wholly inside the viewport is not.
+fn dashboard_slot_below_at(
+    viewport: &LayoutRect,
+    grid: &DashGrid,
+    slot: usize,
+    scroll: f32,
+    scale: f32,
+    ui: f32,
+) -> bool {
+    let card = dashboard_card_rect_at(viewport, grid, slot, scroll, scale, ui);
+    // Half a pixel of slack: the scroll is rounded when the cards are placed.
+    card.y + card.h > viewport.y + viewport.h + 0.5
+}
+
+/// How many of the first `shown` slots hold a card whose bottom edge lies
+/// below the viewport's — the N of "↓ N more". A card cut off by the bottom
+/// edge counts; 0 hides the hint.
+pub fn dashboard_more_below(
+    viewport: &LayoutRect,
+    grid: &DashGrid,
+    shown: usize,
+    scroll: f32,
+    scale: f32,
+) -> usize {
+    dashboard_more_below_at(viewport, grid, shown, scroll, scale, chrome_ui_scale())
+}
+
+/// [`dashboard_more_below`] at chrome factor `ui`.
+fn dashboard_more_below_at(
+    viewport: &LayoutRect,
+    grid: &DashGrid,
+    shown: usize,
+    scroll: f32,
+    scale: f32,
+    ui: f32,
+) -> usize {
+    (0..shown)
+        .filter(|&slot| dashboard_slot_below_at(viewport, grid, slot, scroll, scale, ui))
+        .count()
+}
+
+/// How many of the cards [`dashboard_more_below`] counts are unread — the M
+/// of "↓ N more · M unread". `unread[slot]` says whether the card showing in
+/// that slot is unread, one entry per showing card. An unread card that is
+/// wholly inside the viewport does not count; 0 leaves the hint plain.
+pub fn dashboard_unread_below(
+    viewport: &LayoutRect,
+    grid: &DashGrid,
+    unread: &[bool],
+    scroll: f32,
+    scale: f32,
+) -> usize {
+    dashboard_unread_below_at(viewport, grid, unread, scroll, scale, chrome_ui_scale())
+}
+
+/// [`dashboard_unread_below`] at chrome factor `ui`.
+fn dashboard_unread_below_at(
+    viewport: &LayoutRect,
+    grid: &DashGrid,
+    unread: &[bool],
+    scroll: f32,
+    scale: f32,
+    ui: f32,
+) -> usize {
+    unread
+        .iter()
+        .enumerate()
+        .filter(|&(slot, &unread)| {
+            unread && dashboard_slot_below_at(viewport, grid, slot, scroll, scale, ui)
+        })
+        .count()
+}
+
+/// The hint pill for `n` cards below, `unread` of them unread: centred
+/// horizontally in `viewport`, [`DASH_MORE_BOTTOM`] above its bottom edge —
+/// the viewport already ends above the Flow inset — and as wide as its
+/// label's estimate, plus the dot's slot in the unread style.
+pub fn dashboard_more_pill(viewport: &LayoutRect, n: usize, unread: usize, scale: f32) -> LayoutRect {
+    dashboard_more_pill_at(viewport, n, unread, scale, chrome_ui_scale())
+}
+
+/// [`dashboard_more_pill`] at chrome factor `ui`.
+fn dashboard_more_pill_at(
+    viewport: &LayoutRect,
+    n: usize,
+    unread: usize,
+    scale: f32,
+    ui: f32,
+) -> LayoutRect {
+    let s = scale * ui;
+    let chars = dashboard_more_label(n, unread).chars().count() as f32;
+    let dot = if unread > 0 { DASH_MORE_DOT_SLOT } else { 0.0 };
+    let w = ((2.0 * DASH_MORE_PAD_X + dot + chars * DASH_MORE_CHAR_W) * s).round().min(viewport.w);
+    let h = (DASH_MORE_H * s).round();
+    LayoutRect {
+        x: (viewport.x + (viewport.w - w) / 2.0).round(),
+        y: viewport.y + viewport.h - (DASH_MORE_BOTTOM * s).round() - h,
+        w,
+        h,
+    }
+}
+
+/// Where a click on the hint scrolls to from `scroll`: one row down — a
+/// card's height plus the gap — clamped to `max_scroll` (all physical px).
+pub fn dashboard_more_scroll(grid: &DashGrid, scroll: f32, max_scroll: f32, scale: f32) -> f32 {
+    dashboard_more_scroll_at(grid, scroll, max_scroll, scale, chrome_ui_scale())
+}
+
+/// [`dashboard_more_scroll`] at chrome factor `ui`.
+fn dashboard_more_scroll_at(
+    grid: &DashGrid,
+    scroll: f32,
+    max_scroll: f32,
+    scale: f32,
+    ui: f32,
+) -> f32 {
+    (scroll + grid.card_h + (DASH_GAP * scale * ui).round()).min(max_scroll).max(0.0)
+}
+
+/// The group a directional focus move (⇧⌘H/J/K/L) lands on. `shown` is the
+/// group index in each occupied slot, in slot order; `cols` the grid's
+/// column count. `None` at the grid's edge (no wraparound, like
+/// [`directional_neighbor`]); moving down from above a short last row lands
+/// on its last card. A `focused` that is not showing enters at the first card.
+pub fn dashboard_focus_dir(
+    shown: &[usize],
+    focused: usize,
+    cols: usize,
+    dir: NavDir,
+) -> Option<usize> {
+    let cols = cols.max(1);
+    let Some(slot) = shown.iter().position(|&g| g == focused) else {
+        return shown.first().copied();
+    };
+    let last = shown.len() - 1;
+    let target = match dir {
+        NavDir::Left => (slot % cols > 0).then(|| slot - 1),
+        NavDir::Right => (slot % cols + 1 < cols && slot < last).then(|| slot + 1),
+        NavDir::Up => slot.checked_sub(cols),
+        NavDir::Down => {
+            if slot + cols <= last {
+                Some(slot + cols)
+            } else {
+                (slot / cols < last / cols).then_some(last)
+            }
+        },
+    };
+    target.map(|slot| shown[slot])
+}
+
+/// The group `delta` cards along the grid from `focused` in slot order,
+/// wrapping at both ends (⌘[ / ⌘], like tile cycling). `None` when nothing
+/// shows; a `focused` that is not showing enters at the first card.
+pub fn dashboard_focus_cycle(shown: &[usize], focused: usize, delta: isize) -> Option<usize> {
+    let Some(slot) = shown.iter().position(|&g| g == focused) else {
+        return shown.first().copied();
+    };
+    let n = shown.len() as isize;
+    Some(shown[(((slot as isize + delta) % n + n) % n) as usize])
+}
+
+#[cfg(test)]
+mod dashboard_tests {
+    use super::*;
+
+    const VIEW: LayoutRect = LayoutRect { x: 300.0, y: 43.0, w: 1200.0, h: 800.0 };
+
+    fn shape(n: usize) -> (usize, usize) {
+        let grid = dashboard_grid_at(&VIEW, n, 1.0, 1.0);
+        (grid.cols, grid.rows)
+    }
+
+    /// The mock's count-adaptive grid: 1 → 1×1, 2 → side by side, 3–4 → two
+    /// columns, 5+ → three.
+    #[test]
+    fn grid_shape_follows_the_group_count() {
+        for (n, want) in [
+            (1, (1, 1)),
+            (2, (2, 1)),
+            (3, (2, 2)),
+            (4, (2, 2)),
+            (5, (3, 2)),
+            (6, (3, 2)),
+            (7, (3, 3)),
+            (9, (3, 3)),
+        ] {
+            assert_eq!(shape(n), want, "{n} groups");
+        }
+        // No groups: still a one-slot shape, so nothing divides by zero.
+        assert_eq!(shape(0), (1, 1));
+    }
+
+    /// The width caps the columns at `floor((w − 24 + 10) / 280)`, never
+    /// below one, and the cap is measured at the default chrome size.
+    #[test]
+    fn narrow_viewports_drop_columns() {
+        let cols = |w: f32, n: usize, scale: f32, ui: f32| {
+            dashboard_grid_at(&LayoutRect { w: w * scale * ui, ..VIEW }, n, scale, ui).cols
+        };
+        for (scale, ui) in [(1.0, 1.0), (2.0, 1.0), (2.0, 1.5)] {
+            // 854 fits three 280px column pitches; one px less fits two.
+            assert_eq!(cols(854.0, 6, scale, ui), 3);
+            assert_eq!(cols(853.0, 6, scale, ui), 2);
+            assert_eq!(cols(574.0, 6, scale, ui), 2);
+            assert_eq!(cols(573.0, 6, scale, ui), 1);
+            assert_eq!(cols(120.0, 6, scale, ui), 1, "never zero columns");
+            // The cap never raises the count past what `n` wants.
+            assert_eq!(cols(4000.0, 2, scale, ui), 2);
+            assert_eq!(cols(4000.0, 1, scale, ui), 1);
+        }
+    }
+
+    /// One row fills the viewport minus the padding; two or more rows are
+    /// half of it each, so a third row scrolls.
+    #[test]
+    fn rows_fill_the_viewport_two_at_a_time() {
+        let one = dashboard_grid_at(&VIEW, 2, 1.0, 1.0);
+        assert_eq!(one.card_h, 800.0 - 20.0);
+        assert_eq!(one.card_w, (1200.0 - 24.0 - 10.0) / 2.0);
+        for n in [3, 6, 9] {
+            let grid = dashboard_grid_at(&VIEW, n, 1.0, 1.0);
+            assert_eq!(grid.card_h, (800.0 - 30.0) / 2.0, "{n} groups");
+        }
+        let two = dashboard_grid_at(&VIEW, 4, 1.0, 1.0);
+        assert_eq!(dashboard_content_h_at(&two, 4, 1.0, 1.0), 800.0);
+        assert_eq!(max_scroll(dashboard_content_h_at(&two, 4, 1.0, 1.0), VIEW.h), 0.0);
+        // Three rows: one more card height plus its gap to scroll through.
+        let three = dashboard_grid_at(&VIEW, 9, 1.0, 1.0);
+        let content = dashboard_content_h_at(&three, 9, 1.0, 1.0);
+        assert_eq!(content, 20.0 + 3.0 * 385.0 + 2.0 * 10.0);
+        assert_eq!(max_scroll(content, VIEW.h), 385.0 + 10.0);
+    }
+
+    /// A short window keeps 200px cards and scrolls instead.
+    #[test]
+    fn card_height_has_a_floor() {
+        let short = LayoutRect { h: 180.0, ..VIEW };
+        for n in [1, 4, 9] {
+            assert_eq!(dashboard_grid_at(&short, n, 1.0, 1.0).card_h, 200.0, "{n} groups");
+        }
+        // Just above the floor a single row still fills the viewport.
+        assert_eq!(dashboard_grid_at(&LayoutRect { h: 260.0, ..VIEW }, 1, 1.0, 1.0).card_h, 240.0);
+        let grid = dashboard_grid_at(&short, 4, 1.0, 1.0);
+        let content = dashboard_content_h_at(&grid, 4, 1.0, 1.0);
+        assert_eq!(content, 20.0 + 2.0 * 200.0 + 10.0);
+        assert_eq!(max_scroll(content, short.h), content - 180.0);
+        // The floor scales with the display and the chrome factor.
+        let tall = LayoutRect { h: 100.0, ..VIEW };
+        assert_eq!(dashboard_grid_at(&tall, 1, 2.0, 1.5).card_h, 600.0);
+    }
+
+    /// Cards never overlap, stay inside the viewport's width, and — at
+    /// scroll 0 with at most two rows — inside its height too.
+    #[test]
+    fn cards_tile_inside_the_viewport_without_overlap() {
+        for (scale, ui) in [(1.0, 1.0), (2.0, 1.0), (2.0, 1.25)] {
+            let view = LayoutRect { x: 300.0, y: 43.0, w: 1200.0 * scale * ui, h: 800.0 * scale * ui };
+            for n in 1..=9usize {
+                let grid = dashboard_grid_at(&view, n, scale, ui);
+                let rects: Vec<LayoutRect> = (0..n)
+                    .map(|slot| dashboard_card_rect_at(&view, &grid, slot, 0.0, scale, ui))
+                    .collect();
+                for (i, a) in rects.iter().enumerate() {
+                    assert!(a.w > 0.0 && a.h > 0.0);
+                    assert!(a.x >= view.x && a.x + a.w <= view.x + view.w, "{n} groups, slot {i}");
+                    assert!(a.y >= view.y);
+                    if grid.rows <= 2 {
+                        assert!(a.y + a.h <= view.y + view.h, "{n} groups, slot {i}");
+                    }
+                    for b in &rects[i + 1..] {
+                        let apart = a.x + a.w <= b.x
+                            || b.x + b.w <= a.x
+                            || a.y + a.h <= b.y
+                            || b.y + b.h <= a.y;
+                        assert!(apart, "{n} groups: {a:?} overlaps {b:?}");
+                    }
+                }
+                // The first card sits at the side padding, the top padding
+                // down, and a full row's last card ends at the side padding
+                // (short of it by under a px per column of whole-px widths).
+                let pad_x = (DASH_PAD_X * scale * ui).round();
+                assert_eq!(rects[0].x, view.x + pad_x, "{n} groups");
+                assert_eq!(rects[0].y, view.y + (DASH_PAD_Y * scale * ui).round(), "{n} groups");
+                if n >= grid.cols {
+                    let row_end = rects[grid.cols - 1];
+                    let short = view.x + view.w - pad_x - (row_end.x + row_end.w);
+                    assert!((0.0..grid.cols as f32).contains(&short), "{n} groups: {short}");
+                }
+                // The last card's bottom plus the padding is the content's end.
+                let last = rects[n - 1];
+                assert_eq!(
+                    last.y + last.h + (DASH_PAD_Y * scale * ui).round() - view.y,
+                    dashboard_content_h_at(&grid, n, scale, ui)
+                );
+            }
+        }
+    }
+
+    /// The card size and column count come from the total group count: a
+    /// filter showing fewer cards moves none of them and resizes nothing.
+    #[test]
+    fn a_filter_never_changes_the_grid() {
+        let grid = dashboard_grid_at(&VIEW, 6, 1.0, 1.0);
+        let all: Vec<LayoutRect> =
+            (0..6).map(|slot| dashboard_card_rect_at(&VIEW, &grid, slot, 0.0, 1.0, 1.0)).collect();
+        for shown in 0..=6usize {
+            // The grid takes only the total; the shown count reaches nothing
+            // but the content height (and which slots are hit-testable).
+            for (slot, rect) in all.iter().enumerate().take(shown) {
+                let (cx, cy) = (rect.x + 1.0, rect.y + 1.0);
+                assert_eq!(dashboard_slot_at_at(&VIEW, &grid, shown, 0.0, 1.0, 1.0, cx, cy), Some(slot));
+            }
+            let rows = shown.div_ceil(3) as f32;
+            let want = if shown == 0 { 0.0 } else { 20.0 + rows * grid.card_h + (rows - 1.0) * 10.0 };
+            assert_eq!(dashboard_content_h_at(&grid, shown, 1.0, 1.0), want);
+        }
+        // One card left of six still sits in a third-width, half-height slot.
+        assert_eq!((all[0].w, all[0].h), (grid.card_w, grid.card_h));
+        assert_eq!(grid.cols, 3);
+    }
+
+    /// "↓ N more": seven cards are three rows of which two fit, so one card
+    /// lies below at the top of the scroll and none at its end.
+    #[test]
+    fn more_below_counts_the_cards_under_the_viewport() {
+        let grid = dashboard_grid_at(&VIEW, 7, 1.0, 1.0);
+        assert_eq!((grid.cols, grid.rows), (3, 3));
+        assert_eq!(dashboard_more_below_at(&VIEW, &grid, 7, 0.0, 1.0, 1.0), 1);
+        let max = max_scroll(dashboard_content_h_at(&grid, 7, 1.0, 1.0), VIEW.h);
+        assert!(max > 0.0);
+        assert_eq!(dashboard_more_below_at(&VIEW, &grid, 7, max, 1.0, 1.0), 0);
+        // Part-way down the last row is still cut off by the bottom edge.
+        assert_eq!(dashboard_more_below_at(&VIEW, &grid, 7, max - 20.0, 1.0, 1.0), 1);
+        // The edge itself: the card's bottom on the viewport's bottom (only
+        // the 10px padding under it is cut off) is in view; 1px short is not.
+        assert_eq!(dashboard_more_below_at(&VIEW, &grid, 7, max - 10.0, 1.0, 1.0), 0);
+        assert_eq!(dashboard_more_below_at(&VIEW, &grid, 7, max - 11.0, 1.0, 1.0), 1);
+        assert_eq!(dashboard_more_label(1, 0), "↓ 1 more");
+    }
+
+    /// No unread card below the fold: the count is 0 and the label plain —
+    /// including when the only unread cards are wholly inside the viewport.
+    #[test]
+    fn a_fully_visible_unread_card_does_not_count_below() {
+        let grid = dashboard_grid_at(&VIEW, 9, 1.0, 1.0);
+        // Nine cards, three rows, the third below the fold at scroll 0.
+        assert_eq!(dashboard_more_below_at(&VIEW, &grid, 9, 0.0, 1.0, 1.0), 3);
+        let read = [false; 9];
+        assert_eq!(dashboard_unread_below_at(&VIEW, &grid, &read, 0.0, 1.0, 1.0), 0);
+        // Unread in the two rows that fit: still nothing unread below.
+        let mut above = [false; 9];
+        above[0] = true;
+        above[4] = true;
+        above[5] = true;
+        assert_eq!(dashboard_unread_below_at(&VIEW, &grid, &above, 0.0, 1.0, 1.0), 0);
+        assert_eq!(dashboard_more_label(3, 0), "↓ 3 more");
+        assert_eq!(dashboard_more_parts(3, 0), ("↓ 3 more".to_string(), None));
+    }
+
+    /// Unread cards below the fold are counted among the cards below, and
+    /// the label says so; scrolled to the end, nothing is below at all.
+    #[test]
+    fn unread_cards_below_the_fold_are_counted_and_labelled() {
+        let grid = dashboard_grid_at(&VIEW, 9, 1.0, 1.0);
+        let mut unread = [false; 9];
+        unread[1] = true; // first row: visible
+        unread[6] = true; // third row: below
+        unread[8] = true; // third row: below
+        assert_eq!(dashboard_more_below_at(&VIEW, &grid, 9, 0.0, 1.0, 1.0), 3);
+        assert_eq!(dashboard_unread_below_at(&VIEW, &grid, &unread, 0.0, 1.0, 1.0), 2);
+        assert_eq!(dashboard_more_label(3, 2), "↓ 3 more · 2 unread");
+        assert_eq!(
+            dashboard_more_parts(3, 2),
+            ("↓ 3 more".to_string(), Some("2 unread".to_string()))
+        );
+        // A filtered set: only the first seven slots are occupied.
+        assert_eq!(dashboard_unread_below_at(&VIEW, &grid, &unread[..7], 0.0, 1.0, 1.0), 1);
+        let max = max_scroll(dashboard_content_h_at(&grid, 9, 1.0, 1.0), VIEW.h);
+        assert_eq!(dashboard_unread_below_at(&VIEW, &grid, &unread, max, 1.0, 1.0), 0);
+    }
+
+    /// The unread style's pill is wider — the longer label and the dot — and
+    /// still centred, at the same height and the same gap above the bottom.
+    #[test]
+    fn the_unread_pill_stays_centred_at_its_wider_width() {
+        let plain = dashboard_more_pill_at(&VIEW, 3, 0, 1.0, 1.0);
+        let unread = dashboard_more_pill_at(&VIEW, 3, 2, 1.0, 1.0);
+        let extra = " · 2 unread".chars().count() as f32 * 7.0 + DASH_MORE_DOT_SLOT;
+        assert_eq!(unread.w, plain.w + extra);
+        assert_eq!((unread.y, unread.h), (plain.y, plain.h));
+        let centre = VIEW.x + VIEW.w / 2.0;
+        assert!((plain.x + plain.w / 2.0 - centre).abs() <= 1.0);
+        assert!((unread.x + unread.w / 2.0 - centre).abs() <= 1.0);
+        assert!(unread.x >= VIEW.x && unread.x + unread.w <= VIEW.x + VIEW.w);
+        // Scaled like the rest.
+        assert_eq!(dashboard_more_pill_at(&VIEW, 3, 2, 2.0, 1.0).w, unread.w * 2.0);
+    }
+
+    /// The folder set is the sessions list's rows: same members, same order
+    /// (pinned first, snoozed last, a folded run left out), per folder.
+    #[test]
+    fn the_folder_set_is_the_sessions_list() {
+        let (workspaces, sections) = folder_fixture();
+        for filter in [None, Some(1), Some(2), Some(9)] {
+            for (pinned_folded, snoozed_folded) in [(false, false), (true, false), (false, true)] {
+                let rows: Vec<usize> = sidebar_rows_filtered(
+                    &workspaces,
+                    &sections,
+                    filter,
+                    pinned_folded,
+                    snoozed_folded,
+                )
+                .iter()
+                .map(|row| row.ws_idx)
+                .collect();
+                assert_eq!(
+                    dashboard_groups(&workspaces, &sections, filter, pinned_folded, snoozed_folded),
+                    rows
+                );
+            }
+        }
+        // Folder 1 holds groups 0, 2, 3 and 5: 2 is pinned, 5 snoozed.
+        assert_eq!(dashboard_groups(&workspaces, &sections, Some(1), false, false), [2, 0, 3, 5]);
+        assert_eq!(dashboard_groups(&workspaces, &sections, Some(1), true, true), [0, 3]);
+        assert_eq!(dashboard_groups(&workspaces, &sections, Some(2), false, false), [1]);
+        assert_eq!(dashboard_groups(&workspaces, &sections, None, false, false), [2, 0, 1, 3, 4, 6, 5]);
+        // An id no folder owns: nothing.
+        assert!(dashboard_groups(&workspaces, &sections, Some(9), false, false).is_empty());
+    }
+
+    /// The grid is shaped and its cards sized from the folder set's count,
+    /// not from the number of groups in the app.
+    #[test]
+    fn the_grid_is_sized_from_the_folder_set_not_the_group_count() {
+        let (workspaces, sections) = folder_fixture();
+        assert_eq!(workspaces.len(), 7);
+        let all = dashboard_groups(&workspaces, &sections, None, false, false);
+        let folder = dashboard_groups(&workspaces, &sections, Some(1), false, false);
+        let lone = dashboard_groups(&workspaces, &sections, Some(2), false, false);
+        let all_grid = dashboard_grid_at(&VIEW, all.len(), 1.0, 1.0);
+        let folder_grid = dashboard_grid_at(&VIEW, folder.len(), 1.0, 1.0);
+        let lone_grid = dashboard_grid_at(&VIEW, lone.len(), 1.0, 1.0);
+        assert_eq!((all_grid.cols, all_grid.rows), (3, 3));
+        // Four of the seven groups: a 2×2 of wider cards.
+        assert_eq!((folder_grid.cols, folder_grid.rows), (2, 2));
+        assert!(folder_grid.card_w > all_grid.card_w);
+        // One group: its card fills the page, as a one-group app's would.
+        assert_eq!((lone_grid.cols, lone_grid.rows), (1, 1));
+        assert_eq!(lone_grid, dashboard_grid_at(&VIEW, 1, 1.0, 1.0));
+        assert!(lone_grid.card_h > folder_grid.card_h);
+        // Nothing of the folder set scrolls, where all seven did.
+        assert_eq!(dashboard_more_below_at(&VIEW, &folder_grid, folder.len(), 0.0, 1.0, 1.0), 0);
+        assert_eq!(dashboard_more_below_at(&VIEW, &all_grid, all.len(), 0.0, 1.0, 1.0), 1);
+    }
+
+    /// Seven groups: 0, 2, 3 and 5 in folder 1 (2 pinned, 5 snoozed), 1 in
+    /// folder 2, 4 and 6 in none.
+    fn folder_fixture() -> (Vec<Workspace>, Vec<Section>) {
+        let section = |id: u64| Section {
+            id,
+            name: format!("folder{id}"),
+            emoji: String::new(),
+            collapsed: false,
+            anchor: None,
+        };
+        let mut workspaces: Vec<Workspace> = [Some(1), Some(2), Some(1), Some(1), None, Some(1), None]
+            .into_iter()
+            .enumerate()
+            .map(|(i, folder)| {
+                let mut ws = Workspace::new(format!("g{i}"), Tile::empty(i as u64 + 1), None);
+                ws.section = folder;
+                ws
+            })
+            .collect();
+        workspaces[2].pinned = true;
+        workspaces[5].snoozed = true;
+        (workspaces, vec![section(1), section(2)])
+    }
+
+    /// The count follows the cards a filter leaves showing — the slots they
+    /// are dealt into, not the total the grid was shaped for.
+    #[test]
+    fn more_below_follows_the_filtered_set() {
+        let grid = dashboard_grid_at(&VIEW, 9, 1.0, 1.0);
+        for (shown, want) in [(9, 3), (8, 2), (7, 1), (6, 0), (2, 0), (0, 0)] {
+            assert_eq!(
+                dashboard_more_below_at(&VIEW, &grid, shown, 0.0, 1.0, 1.0),
+                want,
+                "{shown} of 9 showing"
+            );
+        }
+        // A short viewport at the 200px floor: the second row starts inside
+        // it, but its bottom edge is below — both of its cards count.
+        let short = LayoutRect { h: 300.0, ..VIEW };
+        let grid = dashboard_grid_at(&short, 4, 1.0, 1.0);
+        assert_eq!((grid.cols, grid.card_h), (2, 200.0));
+        assert_eq!(dashboard_more_below_at(&short, &grid, 4, 0.0, 1.0, 1.0), 2);
+        assert_eq!(dashboard_more_below_at(&short, &grid, 3, 0.0, 1.0, 1.0), 1);
+        assert_eq!(dashboard_more_below_at(&short, &grid, 2, 0.0, 1.0, 1.0), 0);
+    }
+
+    /// The pill: 26px high, 12px above the viewport's bottom edge, centred,
+    /// wider for a longer count, and scaled like the rest.
+    #[test]
+    fn the_more_pill_is_centred_above_the_viewport_bottom() {
+        let pill = dashboard_more_pill_at(&VIEW, 1, 0, 1.0, 1.0);
+        assert_eq!(pill.h, 26.0);
+        assert_eq!(pill.y + pill.h, VIEW.y + VIEW.h - 12.0);
+        assert!((pill.x + pill.w / 2.0 - (VIEW.x + VIEW.w / 2.0)).abs() <= 1.0);
+        assert!(pill.x >= VIEW.x && pill.x + pill.w <= VIEW.x + VIEW.w);
+        assert!(dashboard_more_pill_at(&VIEW, 12, 0, 1.0, 1.0).w > pill.w);
+        let big = dashboard_more_pill_at(&VIEW, 1, 0, 2.0, 1.5);
+        assert_eq!(big.h, 78.0);
+        assert_eq!(big.y + big.h, VIEW.y + VIEW.h - 36.0);
+        assert_eq!(big.w, pill.w * 3.0);
+        // Never wider than a viewport too narrow for it.
+        let narrow = LayoutRect { w: 40.0, ..VIEW };
+        assert_eq!(dashboard_more_pill_at(&narrow, 1, 0, 1.0, 1.0).w, 40.0);
+    }
+
+    /// A click on the pill scrolls one row — card height plus gap — and
+    /// stops at the end of the content.
+    #[test]
+    fn a_pill_click_scrolls_one_row_clamped() {
+        let grid = dashboard_grid_at(&VIEW, 12, 1.0, 1.0);
+        assert_eq!((grid.cols, grid.rows), (3, 4));
+        let max = max_scroll(dashboard_content_h_at(&grid, 12, 1.0, 1.0), VIEW.h);
+        let row = grid.card_h + 10.0;
+        assert_eq!(max, 2.0 * row);
+        assert_eq!(dashboard_more_scroll_at(&grid, 0.0, max, 1.0, 1.0), row);
+        assert_eq!(dashboard_more_scroll_at(&grid, row, max, 1.0, 1.0), max);
+        assert_eq!(dashboard_more_scroll_at(&grid, max - 5.0, max, 1.0, 1.0), max);
+        assert_eq!(dashboard_more_scroll_at(&grid, 0.0, 0.0, 1.0, 1.0), 0.0);
+        // The step is the scaled row.
+        let big = dashboard_grid_at(&VIEW, 12, 2.0, 1.0);
+        assert_eq!(dashboard_more_scroll_at(&big, 0.0, 9999.0, 2.0, 1.0), big.card_h + 20.0);
+    }
+
+    /// Everything scales by display scale × chrome factor.
+    #[test]
+    fn the_grid_scales_with_the_display_and_the_chrome_factor() {
+        let base = dashboard_grid_at(&VIEW, 5, 1.0, 1.0);
+        for (scale, ui) in [(2.0, 1.0), (1.0, 1.5), (2.0, 1.5)] {
+            let s = scale * ui;
+            let view = LayoutRect { x: VIEW.x * s, y: VIEW.y * s, w: VIEW.w * s, h: VIEW.h * s };
+            let grid = dashboard_grid_at(&view, 5, scale, ui);
+            assert_eq!((grid.cols, grid.rows), (base.cols, base.rows));
+            assert!((grid.card_w - base.card_w * s).abs() <= 1.0);
+            assert!((grid.card_h - base.card_h * s).abs() <= 1.0);
+            let card = dashboard_card_rect_at(&view, &grid, 4, 0.0, scale, ui);
+            let want = dashboard_card_rect_at(&VIEW, &base, 4, 0.0, 1.0, 1.0);
+            assert!((card.x - want.x * s).abs() <= 2.0 && (card.y - want.y * s).abs() <= 2.0);
+            assert_eq!(dashboard_card_header_at(&card, scale, ui).h, (34.0 * s).round());
+            assert_eq!(dashboard_card_footer_at(&card, scale, ui).h, (30.0 * s).round());
+        }
+        // The public wrappers are the `*_at` forms at the live chrome factor.
+        let ui = chrome_ui_scale();
+        assert_eq!(dashboard_grid(&VIEW, 5, 2.0), dashboard_grid_at(&VIEW, 5, 2.0, ui));
+        assert_eq!(dashboard_viewport(&VIEW, 2.0), dashboard_viewport_at(&VIEW, 2.0, ui));
+    }
+
+    /// Header, body and footer stack exactly, top to bottom, inside the card.
+    #[test]
+    fn a_card_is_header_body_footer() {
+        let card = LayoutRect { x: 312.0, y: 53.0, w: 583.0, h: 385.0 };
+        let header = dashboard_card_header_at(&card, 1.0, 1.0);
+        let body = dashboard_card_body_at(&card, 1.0, 1.0);
+        let footer = dashboard_card_footer_at(&card, 1.0, 1.0);
+        assert_eq!((header.y, header.h), (card.y, 34.0));
+        assert_eq!((body.y, body.h), (card.y + 34.0, 385.0 - 64.0));
+        assert_eq!((footer.y, footer.h), (card.y + 385.0 - 30.0, 30.0));
+        for r in [header, body, footer] {
+            assert_eq!((r.x, r.w), (card.x, card.w));
+        }
+        // A card too short for its chrome never yields a negative body.
+        let stub = LayoutRect { h: 40.0, ..card };
+        assert_eq!(dashboard_card_body_at(&stub, 1.0, 1.0).h, 0.0);
+        assert_eq!(dashboard_card_footer_at(&stub, 1.0, 1.0).h, 6.0);
+    }
+
+    /// The bar sits atop the area and the viewport takes the rest; with the
+    /// sidebar collapsed the bar clears the traffic lights and the
+    /// "Show sessions" button like the first tile's strip.
+    #[test]
+    fn the_bar_and_the_viewport_split_the_area() {
+        for (scale, ui) in [(1.0, 1.0), (2.0, 1.25)] {
+            let area = terminal_area(1600, 1000, scale, SIDEBAR_DEFAULT_W, 0.0);
+            let bar = dashboard_bar_at(&area, scale, ui, SIDEBAR_DEFAULT_W);
+            let view = dashboard_viewport_at(&area, scale, ui);
+            assert_eq!((bar.x, bar.y, bar.w), (area.x, area.y, area.w));
+            assert_eq!(bar.h, tab_bar_h(scale, ui));
+            assert_eq!(view.y, bar.y + bar.h);
+            assert_eq!(view.y + view.h, area.y + area.h);
+            assert_eq!((view.x, view.w), (area.x, area.w));
+
+            let area = terminal_area(1600, 1000, scale, 0.0, 0.0);
+            let bar = dashboard_bar_at(&area, scale, ui, 0.0);
+            assert_eq!(bar.x, (COLLAPSED_STRIP_INSET * scale).round());
+            assert_eq!(bar.x + bar.w, area.x + area.w);
+            assert_eq!(bar, tab_strip_rect(area, &tile_tab_bar_at(&area, scale, ui), scale, 0.0));
+            // The viewport keeps the full width: only the bar is inset.
+            assert_eq!(dashboard_viewport_at(&area, scale, ui).x, area.x);
+        }
+    }
+
+    /// Hit-testing reads the same rects: a point in a card finds its slot,
+    /// the gaps and anything outside the viewport find none, and slots past
+    /// the shown count do not exist.
+    #[test]
+    fn slot_hit_testing_matches_the_card_rects() {
+        let grid = dashboard_grid_at(&VIEW, 9, 1.0, 1.0);
+        let scroll = 120.0;
+        for slot in 0..9 {
+            let card = dashboard_card_rect_at(&VIEW, &grid, slot, scroll, 1.0, 1.0);
+            let (cx, cy) = (card.x + card.w / 2.0, card.y + card.h / 2.0);
+            let hit = dashboard_slot_at_at(&VIEW, &grid, 9, scroll, 1.0, 1.0, cx, cy);
+            assert_eq!(hit, VIEW.contains(cx, cy).then_some(slot), "slot {slot}");
+        }
+        let first = dashboard_card_rect_at(&VIEW, &grid, 0, 0.0, 1.0, 1.0);
+        // The gap right of the first card.
+        assert_eq!(
+            dashboard_slot_at_at(&VIEW, &grid, 9, 0.0, 1.0, 1.0, first.x + first.w + 5.0, first.y + 5.0),
+            None
+        );
+        // A card scrolled above the viewport is not hit through the bar.
+        assert_eq!(
+            dashboard_slot_at_at(&VIEW, &grid, 9, scroll, 1.0, 1.0, first.x + 5.0, VIEW.y - 5.0),
+            None
+        );
+        // Only shown slots exist.
+        let (cx, cy) = (first.x + 5.0, first.y + 5.0);
+        assert_eq!(dashboard_slot_at_at(&VIEW, &grid, 0, 0.0, 1.0, 1.0, cx, cy), None);
+        assert_eq!(dashboard_slot_at_at(&VIEW, &grid, 1, 0.0, 1.0, 1.0, cx, cy), Some(0));
+    }
+
+    /// Revealing a card scrolls the least it can: nothing for a card in
+    /// view, down to a card below, back up to one above.
+    #[test]
+    fn reveal_scrolls_a_card_into_view() {
+        let grid = dashboard_grid_at(&VIEW, 9, 1.0, 1.0);
+        let reveal = |slot, scroll| dashboard_reveal_scroll_at(&VIEW, &grid, slot, scroll, 1.0, 1.0);
+        let max = max_scroll(dashboard_content_h_at(&grid, 9, 1.0, 1.0), VIEW.h);
+        // Rows one and two fit at scroll 0.
+        assert_eq!(reveal(0, 0.0), 0.0);
+        assert_eq!(reveal(5, 0.0), 0.0);
+        // The third row needs the whole overflow.
+        assert_eq!(reveal(8, 0.0), max);
+        assert_eq!(reveal(8, max), max);
+        // Back to the first row from the bottom.
+        assert_eq!(reveal(1, max), 0.0);
+        // The middle row is in view at either end.
+        assert_eq!(reveal(4, max), max);
+        // A card wholly in view never moves the grid, even with its padding
+        // cut off: a press on it must find it where it was.
+        assert_eq!(reveal(8, max - 5.0), max - 5.0);
+        assert_eq!(reveal(0, 5.0), 5.0);
+        // One cut off at the top comes back with its padding.
+        assert_eq!(reveal(0, 15.0), 0.0);
+        // A middle row below the fold moves the grid only as far as it needs:
+        // four rows, the third revealed from the top.
+        let grid = dashboard_grid_at(&VIEW, 12, 1.0, 1.0);
+        let third = dashboard_card_rect_at(&VIEW, &grid, 6, 0.0, 1.0, 1.0);
+        let want = third.y - VIEW.y + grid.card_h + 10.0 - VIEW.h;
+        assert!(want > 0.0 && want < max_scroll(dashboard_content_h_at(&grid, 12, 1.0, 1.0), VIEW.h));
+        assert_eq!(dashboard_reveal_scroll_at(&VIEW, &grid, 6, 0.0, 1.0, 1.0), want);
+        // A card taller than the viewport shows its top edge.
+        let short = LayoutRect { h: 150.0, ..VIEW };
+        let grid = dashboard_grid_at(&short, 4, 1.0, 1.0);
+        let top = dashboard_card_rect_at(&short, &grid, 2, 0.0, 1.0, 1.0).y - short.y;
+        assert_eq!(dashboard_reveal_scroll_at(&short, &grid, 2, 0.0, 1.0, 1.0), top - 10.0);
+    }
+
+    /// Directional focus walks the shown cards by grid position.
+    #[test]
+    fn focus_moves_by_grid_position() {
+        // Groups 10..17 in a 3-column grid:
+        //   10 11 12
+        //   13 14 15
+        //   16
+        let shown = [10, 11, 12, 13, 14, 15, 16];
+        let go = |from, dir| dashboard_focus_dir(&shown, from, 3, dir);
+        assert_eq!(go(10, NavDir::Right), Some(11));
+        assert_eq!(go(12, NavDir::Right), None, "no wrap at the row's end");
+        assert_eq!(go(11, NavDir::Left), Some(10));
+        assert_eq!(go(13, NavDir::Left), None);
+        assert_eq!(go(14, NavDir::Up), Some(11));
+        assert_eq!(go(11, NavDir::Up), None);
+        assert_eq!(go(10, NavDir::Down), Some(13));
+        assert_eq!(go(13, NavDir::Down), Some(16));
+        // Above the short last row: land on its last card.
+        assert_eq!(go(15, NavDir::Down), Some(16));
+        assert_eq!(go(16, NavDir::Down), None);
+        assert_eq!(go(16, NavDir::Right), None, "nothing right of the last card");
+        // A filter leaves holes in the group indices, not in the slots.
+        let filtered = [2, 5, 9];
+        assert_eq!(dashboard_focus_dir(&filtered, 2, 2, NavDir::Right), Some(5));
+        assert_eq!(dashboard_focus_dir(&filtered, 2, 2, NavDir::Down), Some(9));
+        assert_eq!(dashboard_focus_dir(&filtered, 5, 2, NavDir::Down), Some(9));
+        // A focus that is not showing enters at the first card; an empty
+        // grid has nowhere to go.
+        assert_eq!(dashboard_focus_dir(&filtered, 7, 2, NavDir::Left), Some(2));
+        assert_eq!(dashboard_focus_dir(&[], 0, 3, NavDir::Right), None);
+        // One column: only up and down move.
+        assert_eq!(dashboard_focus_dir(&shown, 11, 1, NavDir::Right), None);
+        assert_eq!(dashboard_focus_dir(&shown, 11, 1, NavDir::Down), Some(12));
+    }
+
+    /// A half-scrolled card body clips to the viewport; rects that do not
+    /// meet intersect to nothing.
+    #[test]
+    fn intersect_clips_to_the_overlap() {
+        let body = LayoutRect { x: 312.0, y: 20.0, w: 500.0, h: 300.0 };
+        let clipped = body.intersect(&VIEW);
+        assert_eq!(clipped, LayoutRect { x: 312.0, y: 43.0, w: 500.0, h: 277.0 });
+        assert_eq!(VIEW.intersect(&body), clipped);
+        let above = LayoutRect { y: -400.0, ..body };
+        let none = above.intersect(&VIEW);
+        assert_eq!((none.w.min(none.h), none.h), (0.0, 0.0));
+        assert!(!none.contains(none.x, none.y));
+    }
+
+    /// Cycling steps through the shown cards in slot order and wraps.
+    #[test]
+    fn focus_cycles_through_the_shown_cards() {
+        let shown = [3, 4, 8];
+        assert_eq!(dashboard_focus_cycle(&shown, 3, 1), Some(4));
+        assert_eq!(dashboard_focus_cycle(&shown, 8, 1), Some(3));
+        assert_eq!(dashboard_focus_cycle(&shown, 3, -1), Some(8));
+        assert_eq!(dashboard_focus_cycle(&shown, 6, 1), Some(3));
+        assert_eq!(dashboard_focus_cycle(&[5], 5, 1), Some(5));
+        assert_eq!(dashboard_focus_cycle(&[], 0, 1), None);
+    }
+}
+
 #[cfg(test)]
 mod area_tests {
     use super::*;
@@ -3313,6 +4402,31 @@ mod tests {
         ws.snoozed = true;
         assert!(ws.any_unread(), "snoozing must not clear the unread signal");
         assert!(!ws.shows_unread_dot(), "a snoozed row paints no dot");
+    }
+
+    /// The dashboard's click-to-read: only the primary pane's tab is read,
+    /// its stamp survives, and a second call has nothing left to clear.
+    #[test]
+    fn mark_primary_read_clears_only_the_primary_tab() {
+        use crate::term::Session;
+        let stamp = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(60);
+        let mut tile = Tile::new(42, Session::placeholder());
+        tile.tabs[0].unread = true;
+        tile.tabs[0].unread_at = Some(stamp);
+        let mut ws = Workspace::new("g".into(), tile, None);
+        let mut other = Tile::new(43, Session::placeholder());
+        other.tabs[0].unread = true;
+        let mut fresh = Some(other);
+        assert!(ws.root.split_tile(42, Dir::Row, &mut fresh, false));
+        assert_eq!(ws.primary_tile, 42);
+
+        assert!(ws.mark_primary_read());
+        let primary = ws.root.find_tile(42).unwrap();
+        assert!(!primary.tabs[0].unread);
+        assert_eq!(primary.tabs[0].unread_at, Some(stamp), "the stamp outlives the dot");
+        assert_eq!(ws.attention_at(), Some(stamp));
+        assert!(ws.root.find_tile(43).unwrap().tabs[0].unread, "a secondary pane stays unread");
+        assert!(!ws.mark_primary_read(), "already read");
     }
 
     /// The open "Snoozed" section: one snoozed group, not folded.
@@ -4063,7 +5177,8 @@ mod tests {
                 assert!(light_centre > list.y, "the lights float above the strip top");
                 let chips = sessions_header_chips_at(&list, true, scale, ui);
                 let (hide, new) = folders_header_chips_at(&card, scale, ui);
-                for c in [chips.focus, chips.plus, chips.gear, hide, new] {
+                let dashboard = chips.dashboard.expect("room for the dashboard chip");
+                for c in [dashboard, chips.focus, chips.plus, chips.gear, hide, new] {
                     assert!(
                         (c.y + c.h / 2.0 - light_centre).abs() <= 1.0,
                         "chip {:?} is off the traffic-light centre at scale {scale} ui {ui}",
@@ -4103,7 +5218,8 @@ mod tests {
             let side = (HEADER_CHIP * ui * scale).round();
             let chips = sessions_header_chips_at(&list, false, scale, ui);
             let show = chips.show_folders.unwrap();
-            for c in [show, chips.focus, chips.plus, chips.gear] {
+            let dashboard = chips.dashboard.unwrap();
+            for c in [show, dashboard, chips.focus, chips.plus, chips.gear] {
                 assert_eq!((c.w, c.h), (side, side));
                 assert!(
                     (c.y + c.h / 2.0 - (TRAFFIC_LIGHT_ORIGIN + TRAFFIC_LIGHT_BTN_H / 2.0) * scale).abs()
@@ -4111,6 +5227,7 @@ mod tests {
                 );
                 assert!(c.y >= list.y && c.y + c.h <= list.y + band);
             }
+            assert!(show.x + side < dashboard.x && dashboard.x + side < chips.focus.x);
             assert!(chips.focus.x + side < chips.plus.x && chips.plus.x + side < chips.gear.x);
             let (hide, new) = folders_header_chips_at(&list, scale, ui);
             assert_eq!((hide.w, new.w), (side, side));
@@ -4122,9 +5239,9 @@ mod tests {
         );
     }
 
-    /// The sessions-list header carries the chips: focus / ＋ / gear
-    /// right-clustered inside the header band, plus a "Show folders" chip
-    /// clear of the traffic lights only while the card is hidden.
+    /// The sessions-list header carries the chips: dashboard / focus / ＋ /
+    /// gear right-clustered inside the header band, plus a "Show folders"
+    /// chip clear of the traffic lights only while the card is hidden.
     #[test]
     fn sessions_header_chips_cluster_right_and_show_folders_only_when_closed() {
         let scale = 2.0;
@@ -4133,7 +5250,8 @@ mod tests {
         assert!(chips.show_folders.is_none());
         let side = (HEADER_CHIP * scale).round();
         let gap = (HEADER_CHIP_GAP * scale).round();
-        for c in [chips.focus, chips.plus, chips.gear] {
+        let dashboard = chips.dashboard.expect("the dashboard chip, left of focus");
+        for c in [dashboard, chips.focus, chips.plus, chips.gear] {
             assert_eq!(c.w, side);
             assert_eq!(c.h, side);
             assert_eq!(c.y, chips.gear.y);
@@ -4141,6 +5259,7 @@ mod tests {
         assert_eq!(chips.gear.x + side, list.x + list.w - (HEADER_CHIP_INSET * scale).round());
         assert_eq!(chips.plus.x + side + gap, chips.gear.x);
         assert_eq!(chips.focus.x + side + gap, chips.plus.x);
+        assert_eq!(dashboard.x + side + gap, chips.focus.x);
         assert!(chips.gear.y >= list.y);
         assert!(chips.gear.y + side <= list.y + (SESSIONS_HEADER_H * scale).round());
         // Centred on the traffic lights (window-relative), not on the band.
@@ -4156,12 +5275,27 @@ mod tests {
         assert!(show.x >= (TRAFFIC_LIGHT_END * scale).round());
         assert_eq!(show.y, chips.gear.y);
         assert!(show.x + show.w < chips.focus.x);
+        let dashboard = chips.dashboard.expect("the default width fits all five chips");
+        assert!(show.x + show.w + gap <= dashboard.x);
+        assert_eq!(dashboard.x + side + gap, chips.focus.x);
+
+        // The narrowest list has no room between "Show folders" and the
+        // cluster: the dashboard chip gives way rather than overlap it. With
+        // the folders card open nothing is in its way.
+        let narrow = sessions_list_rect(SIDEBAR_MIN_W, FOLDERS_CARD_W, false, 1000, scale);
+        let chips = sessions_header_chips(&narrow, false, scale);
+        assert!(chips.dashboard.is_none());
+        assert!(chips.show_folders.is_some());
+        let narrow = sessions_list_rect(SIDEBAR_MIN_W, FOLDERS_CARD_W, true, 1000, scale);
+        let chips = sessions_header_chips(&narrow, true, scale);
+        assert!(chips.dashboard.is_some_and(|d| d.x >= narrow.x));
 
         // Collapsed (no list): the chips shrink to nothing and hit nothing.
         let none = sessions_list_rect(0.0, FOLDERS_CARD_W, true, 1000, scale);
         let chips = sessions_header_chips(&none, true, scale);
         assert_eq!(chips.plus.w, 0.0);
         assert!(!chips.plus.contains(chips.plus.x, chips.plus.y));
+        assert!(chips.dashboard.is_none());
     }
 
     /// Folder rows: the pinned-tools caption and its tool rows come first

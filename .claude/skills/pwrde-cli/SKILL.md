@@ -44,7 +44,7 @@ When finished: `pkill -f target/debug/pwrde`.
 ## 3. Commands
 
 ```sh
-pwrde-cli state                                  # JSON: page, groups → tiles → tabs (title/active/unread/cols/rows), sections, sidebar {collapsed, folders_open, folder, sessions_w, region_w}, palette open, status message
+pwrde-cli state                                  # JSON: page, groups → tiles → tabs (title/active/unread/cols/rows), sections, sidebar {collapsed, folders_open, folder, sessions_w, region_w}, dashboard {open, filter, panes, unread, cols, rows, below, unread_below, cards[group/title/status/focused/visible/cols/rows]}, palette open, status message
 pwrde-cli read panes [query]                     # read-only: one line per pane in every group (session id, group, title, foreground; focused *), filtered by substring; --json for rows
 pwrde-cli read pane <id> [--lines N|--all] [--json]   # read-only: a pane's text (screen, or scrollback tail/all) by session id; --json adds title/size/cursor/group/foreground. Never moves focus/scroll
 pwrde-cli commands                               # every bus command + every rebindable Action with its current key binding
@@ -54,7 +54,8 @@ pwrde-cli send-text 'cargo test' --enter         # raw keystrokes into the focus
 pwrde-cli send-text $'\x03'                      # control bytes pass through (^C, escape sequences)
 pwrde-cli key cmd-p escape                       # press chords through the app's key handler (tests bindings/overlays; gpui syntax: cmd-shift-t, ctrl-c, enter)
 pwrde-cli action split_right                     # any Action by name (split_right, new_tab, close_tab, focus_left, toggle_sidebar, screenshot_to_file, …)
-pwrde-cli page settings                          # sessions | tool:<n>; `settings` opens the Settings window, `settings:keyboard` jumps to a section
+pwrde-cli page settings                          # sessions | dashboard | tool:<n>; `settings` opens the Settings window, `settings:keyboard` jumps to a section
+pwrde-cli dashboard-filter unread                # all | unread; exit 1 unless the dashboard is open (`page dashboard` or `action toggle_dashboard`)
 pwrde-cli focus pwrde                            # by group name, sidebar title, or 0-based index
 pwrde-cli new-section Work && pwrde-cli move pwrde Work
 pwrde-cli resize 1100 700                        # window content size in points
@@ -68,7 +69,32 @@ Settings Input or the PR composer won't receive it; use `send-text` for text.
 `send-text` is raw input, not a bracketed paste: multi-line text runs line by
 line in a shell. Actions that don't apply (e.g. `split_right` on the Settings
 page, or with no session open) return exit `1` with a reason rather than a
-silent no-op — treat that as a real signal.
+silent no-op — treat that as a real signal. On the dashboard `key` types into
+the focused card's primary pane, `focus_*` / `next_tile` / `prev_tile` move the
+focused card, `new_group` opens the session picker, and the other group and
+tile actions (`split_right`, `new_tab`, `close_tab`, `close_group`,
+`toggle_pin`, `open_pr_in_github`, …) are refused the same way; `focus <group>`
+leaves the dashboard for the Sessions page. Each card's `status` in `state` is
+`read` or `unread` — the primary tab's unread flag: an attention signal (OSC 9)
+turns any card `unread`, the focused one included, and only a left click on
+the card or on its sessions-list row (neither drivable over the bus) or going
+to the session reads it. `send-text` is not keyboard input: on the dashboard it
+still writes to the target group's focused pane, as on every page, which may
+be a pane no card shows.
+
+The dashboard shows only the folder selected in the folders card
+(`state.sidebar.folder`; `null` = All sessions): `dashboard.panes` / `unread`
+count that folder's sessions, the grid (`cols` × `rows`) and every card's PTY
+size come from that count, and `dashboard.cards` lists just the cards showing —
+the folder's sessions the All / Unread filter keeps, plus the focused card
+(which `unread` keeps even once read), in slot order. `below` /
+`unread_below` are the "↓ N more · M unread" hint's counts. Groups outside the
+folder have no card and keep their PTY size; if the active group is one of
+them no card is `focused` and `key` types into nothing until a focus action
+(`focus_right`, `next_tile`, …) lands on the first card. There is no bus
+command to pick a folder: `move <group> <section>` changes a folder's members,
+and `"sidebar.folder": "<section id>"` in the settings file selects one at
+launch.
 
 ## 4. The verification loop
 

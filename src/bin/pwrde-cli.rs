@@ -295,6 +295,16 @@ fn parse_command(sub: &str, args: &[String]) -> Result<Command, CliError> {
             // The app validates the name (see bus_exec::page_from_name).
             Ok(Command::GoToPage { page })
         }
+        "dashboard-filter" => {
+            let filter = args
+                .first()
+                .ok_or_else(|| {
+                    CliError::Usage("dashboard-filter requires <all|unread>".into())
+                })?
+                .clone();
+            // The app validates the name (see dashboard_ui::Filter::from_name).
+            Ok(Command::DashboardFilter { filter })
+        }
         "resize" => {
             if args.len() < 2 {
                 return Err(CliError::Usage("resize requires <width> <height>".into()));
@@ -509,6 +519,7 @@ fn usage() -> String {
         ("new_section", "new-section"),
         ("move_group_to_section", "move"),
         ("go_to_page", "page"),
+        ("dashboard_filter", "dashboard-filter"),
         ("resize_window", "resize"),
         ("screenshot", "screenshot"),
         ("read_pane", "read pane"),
@@ -660,6 +671,19 @@ mod tests {
         }
         assert!(parse_command("screenshot", &args(&["--window"])).is_err());
         assert!(parse_command("screenshot", &args(&["--window", "foo"])).is_err());
+    }
+
+    #[test]
+    fn parses_dashboard_filter() {
+        assert_eq!(
+            parse_command("dashboard-filter", &args(&["unread"])).unwrap(),
+            Command::DashboardFilter { filter: "unread".into() }
+        );
+        assert!(parse_command("dashboard-filter", &args(&[])).is_err());
+        assert_eq!(
+            parse_command("page", &args(&["dashboard"])).unwrap(),
+            Command::GoToPage { page: "dashboard".into() }
+        );
     }
 
     #[test]
