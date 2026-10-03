@@ -628,8 +628,10 @@ impl App {
         let rows_top =
             crate::workspace::sessions_rows_top(&self.list_rect(), self.tools_band_h(1.0), 1.0);
         let hover = self.sidebar_cursor().filter(|(_, y)| *y >= rows_top);
-        let active =
-            crate::workspace::active_row_index(&rows, self.active);
+        // On a tool page the tool row is the selected one; no session row is.
+        let active = (self.page == crate::Page::Sessions)
+            .then(|| crate::workspace::active_row_index(&rows, self.active))
+            .flatten();
 
         let n_pinned = crate::workspace::pinned_run(&rows, &self.workspaces);
         let mut layer = div().absolute().left(px(0.0)).top(px(0.0)).size_full();
