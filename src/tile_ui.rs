@@ -26,8 +26,8 @@
 //!
 //! The group's **primary pane** (`Workspace::primary_tile`, always the root's
 //! left leaf — see `Workspace::normalize_primary`) has no tabs: its bar is a
-//! title row ([`primary_title_row`]) — the terminal glyph and the pane's
-//! title at weight 500, no chip, × or "+", plus the same collapse caret
+//! title row ([`primary_title_row`]) — the pane's title alone at weight
+//! 500, no glyph, chip, × or "+", plus the same collapse caret
 //! every pane in a split has — over the info bar (`infobar_ui`). Collapsed,
 //! it is the bare sideways strip any `Row` pane becomes.
 //!
@@ -417,9 +417,9 @@ pub(crate) fn tab_strip(
     strip_el
 }
 
-/// The primary pane's title row, in place of a tab strip: the strip's
-/// terminal glyph and the pane `title` (weight 500, ellipsis-truncated),
-/// centred together on the bare ground — no chip, × or "+" (the caller adds
+/// The primary pane's title row, in place of a tab strip: the pane `title`
+/// alone (weight 500, ellipsis-truncated), centred on the bare ground — no
+/// glyph, chip, × or "+" (the caller adds
 /// the collapse caret). `bar` and `row` are
 /// [`crate::workspace::primary_title_row`]'s rects in physical px (converted
 /// with `inv`), so the collapsed-sidebar inset carries over from the strip
@@ -432,7 +432,6 @@ pub(crate) fn primary_title_row(
     style: &StripStyle,
 ) -> gpui::Div {
     let ui = workspace::chrome_ui_scale();
-    let glyph = GLYPH * ui;
     let text = if title.is_empty() { "shell".to_string() } else { title };
     div()
         .absolute()
@@ -452,17 +451,6 @@ pub(crate) fn primary_title_row(
                 .flex()
                 .items_center()
                 .justify_center()
-                .gap(px(CHIP_GAP * ui))
-                .child(
-                    div()
-                        .flex_none()
-                        .w(px(glyph))
-                        .h(px(glyph))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(icon(ICON_TERMINAL, px(glyph * inv), style.ink_dim)),
-                )
                 .child(
                     div()
                         .min_w(px(0.0))
