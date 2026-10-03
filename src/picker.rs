@@ -322,13 +322,21 @@ impl ForkPicker {
     }
 
     /// Recomputes [`ForkPicker::rows`] from the query (case-insensitive
-    /// substring match on the label; empty query shows everything).
+    /// substring match on the label, or on a worktree's pull request as
+    /// `#N` — so `142` and `#142` both find it; empty query shows everything).
     fn rebuild(&mut self) {
         let query = self.query.trim().to_lowercase();
         self.rows = if query.is_empty() {
             self.entries.clone()
         } else {
-            self.entries.iter().filter(|e| e.label.to_lowercase().contains(&query)).cloned().collect()
+            self.entries
+                .iter()
+                .filter(|e| {
+                    e.label.to_lowercase().contains(&query)
+                        || e.pr.is_some_and(|pr| format!("#{}", pr.number).contains(&query))
+                })
+                .cloned()
+                .collect()
         };
         if self.selected >= self.rows.len() {
             self.selected = self.rows.len().saturating_sub(1);
@@ -1013,6 +1021,26 @@ mod tests {
         // Every row is still there once the filter clears.
         picker.set_query("");
         assert_eq!(picker.rows.len(), 5);
+    }
+
+    #[test]
+    fn query_matches_a_worktrees_pr_number() {
+        let mut picker = worktree_picker();
+        let prs = ForkPrMap::from([
+            ("alpha".to_string(), ForkPr { number: 142, state: PrState::Finished }),
+            ("beta".to_string(), ForkPr { number: 97, state: PrState::Draft }),
+        ]);
+        picker.apply_prs(&prs);
+        picker.set_query("142");
+        assert_eq!(branches(&picker.rows), ["alpha"]);
+        picker.set_query("#97");
+        assert_eq!(branches(&picker.rows), ["beta"]);
+        // A PR that lands while the filter is typed brings its row in.
+        let mut picker = worktree_picker();
+        picker.set_query("#142");
+        assert!(picker.rows.is_empty());
+        assert!(picker.apply_prs(&prs));
+        assert_eq!(branches(&picker.rows), ["alpha"]);
     }
 
     fn sample_fork_picker() -> ForkPicker {
