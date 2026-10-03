@@ -443,7 +443,7 @@ struct App {
     /// (clamped on read — see `sessions_scroll` / `folders_scroll`).
     sessions_scroll: f32,
     folders_scroll: f32,
-    /// The folders card's "Pinned tools" run is folded (`sidebar.tools_collapsed`).
+    /// The sessions list's "Tools" run is folded (`sidebar.tools_collapsed`).
     tools_collapsed: bool,
     /// The sessions list's "Pinned" run is folded (`sidebar.pinned_collapsed`).
     pinned_collapsed: bool,
@@ -702,13 +702,41 @@ impl App {
     }
 
     /// The sessions list rect the *rows* lay out in: [`App::sessions_list`]
-    /// shifted up by the wheel scroll, so every row helper (paint, hit-test,
-    /// drop preview) sees the same scrolled stack. The header and the clip
-    /// band keep the unshifted rect.
+    /// pushed below the fixed tools band and shifted up by the wheel scroll,
+    /// so every row helper (paint, hit-test, drop preview) sees the same
+    /// scrolled stack. The header, the tools band and the clip band keep the
+    /// unshifted rect.
     pub(crate) fn sessions_rows_list(&self, scale: f32) -> workspace::LayoutRect {
-        let mut list = self.sessions_list(scale);
-        list.y -= (self.sessions_scroll() * scale).round();
-        list
+        workspace::sessions_rows_rect(
+            &self.sessions_list(scale),
+            self.tools_band_h(scale),
+            self.sessions_scroll() * scale,
+        )
+    }
+
+    /// The fixed "Tools" band under the sessions header (physical px at
+    /// `scale`): the caption and one rect per registered CLI tool, none
+    /// while the run is folded. `sidebar_ui` paints it at 1.0.
+    pub(crate) fn tools_band(&self, scale: f32) -> workspace::ToolsBand {
+        workspace::tools_band(
+            &self.sessions_list(scale),
+            self.tools.len(),
+            self.tools_collapsed,
+            scale,
+        )
+    }
+
+    /// Height of [`App::tools_band`]: what pushes the session rows down.
+    pub(crate) fn tools_band_h(&self, scale: f32) -> f32 {
+        workspace::tools_band_h(self.tools.len(), self.tools_collapsed, scale)
+    }
+
+    /// Whether physical `py` is above the session rows' viewport — on the
+    /// list header or the tools band. The canvas hit tests (context menu,
+    /// drops) check this first so nothing falls through to a session row
+    /// scrolled beneath them.
+    fn above_session_rows(&self, py: f32, scale: f32) -> bool {
+        py < workspace::sessions_rows_top(&self.sessions_list(scale), self.tools_band_h(scale), scale)
     }
 
     /// The sessions list's wheel scroll, logical px, clamped so the last
@@ -759,7 +787,9 @@ impl App {
             scale,
             &list,
         );
-        let viewport = (list.h - (workspace::SESSIONS_HEADER_H * scale).round()).max(0.0);
+        // The rows' window: the list below its header and the tools band.
+        let top = workspace::sessions_rows_top(&list, self.tools_band_h(scale), scale);
+        let viewport = (list.y + list.h - top).max(0.0);
         workspace::max_scroll(extent, viewport) / scale
     }
 
@@ -770,10 +800,9 @@ impl App {
         workspace::folders_card_rect(h, self.folders_w, scale)
     }
 
-    /// The folders card's rows in paint order, with the "Pinned tools" run
-    /// folded away when collapsed.
+    /// The folders card's rows in paint order.
     pub(crate) fn folder_rows(&self) -> Vec<workspace::FolderRow> {
-        workspace::folder_rows(self.tools.len(), self.tools_collapsed, self.sections.len())
+        workspace::folder_rows(self.sections.len())
     }
 
     /// The folders card's wheel scroll, logical px, clamped like
@@ -821,7 +850,7 @@ impl App {
         }
     }
 
-    /// Fold or unfold the folders card's "Pinned tools" run.
+    /// Fold or unfold the sessions list's "Tools" run.
     pub(crate) fn toggle_tools_collapsed(&mut self) {
         self.tools_collapsed = !self.tools_collapsed;
         settings::set("sidebar.tools_collapsed", self.tools_collapsed.into());
@@ -1629,7 +1658,7 @@ impl App {
         self.tools.len()
     }
 
-    /// The label tool `i`'s row shows in the folders card: its terminal's own
+    /// The label tool `i`'s row shows in the sessions list's tools band: its terminal's own
     /// pane title once one is running, else the tool's command — never the name
     /// it was registered under (see [`tool_label`]).
     fn tool_row_label(&self, i: usize) -> String {
@@ -2721,6 +2750,10 @@ impl App {
         let (_, h) = self.renderer.surface_size();
 
         if workspace::sidebar(h, scale, self.sidebar_w()).contains(px, py) {
+            // The tools band has no menu, and hides the rows under it.
+            if self.above_session_rows(py, scale) {
+                return;
+            }
             let rows = self.sidebar_rows();
             for (ri, row) in rows.iter().enumerate() {
                 let rect = workspace::sidebar_row_rect(
@@ -3726,6 +3759,10 @@ impl App {
         // Terminal-tab → sidebar group: hit-test via the shared row list.
         let (_, h) = self.renderer.surface_size();
         if workspace::sidebar(h, scale, self.sidebar_w()).contains(px, py) {
+            // Tool rows are not drop targets, nor are the rows under them.
+            if self.above_session_rows(py, scale) {
+                return None;
+            }
             let rows = self.sidebar_rows();
             for (ri, row) in rows.iter().enumerate() {
                 let rect = workspace::sidebar_row_rect(
@@ -3778,11 +3815,15 @@ impl App {
                             pinned: None,
                             gap: self.sidebar_rows().len(),
                         }),
-                        _ => None,
                     };
                 }
                 return None;
             }
+        }
+        // The fixed tools band is no landing zone, and it covers whatever
+        // rows are scrolled beneath it.
+        if self.above_session_rows(py, scale) {
+            return None;
         }
         let rows = self.sidebar_rows();
         // The "Pinned" caption is a landing zone of its own: drop there to
@@ -3990,7 +4031,7 @@ impl App {
                         ));
                     }
                 }
-                Some(workspace::tab_rect(ws, scale, &self.sessions_list(scale)))
+                Some(workspace::tab_rect(ws, scale, &self.sessions_rows_list(scale)))
             },
             DropTarget::SidebarAppend { section_id } => {
                 // Highlight the folder's row in the folders card.
@@ -5686,9 +5727,13 @@ impl App {
     }
 
     /// ⌘⇧↑/↓: step through the sidebar's tabs, wrapping at both ends —
-    /// the workspace groups on the Sessions page.
+    /// the tools band's rows (unless folded), then the workspace groups.
     fn cycle_sidebar_tab(&mut self, delta: isize) {
-        if let Page::Sessions = self.page
+        let current = match self.page {
+            Page::Tool(i) => workspace::SidebarStop::Tool(i),
+            _ => workspace::SidebarStop::Group(self.active),
+        };
+        if matches!(self.page, Page::Sessions | Page::Tool(_))
             // Leading-edge throttle on the key-repeat burst only; the first
             // press always lands (the field is backdated at startup).
             && workspace::throttle_ready(self.sidebar_cycle_at.elapsed(), SIDEBAR_CYCLE_THROTTLE)
@@ -5699,8 +5744,14 @@ impl App {
             // away) not the raw workspace order, so
             // the selection lands on the row next to the one it left.
             let rows = self.sidebar_rows();
-            if let Some(next) = workspace::cycle_sidebar_active(&rows, self.active, delta) {
-                self.switch_workspace(next);
+            let n_tools = if self.tools_collapsed { 0 } else { self.n_tools() };
+            match workspace::cycle_sidebar_stop(n_tools, &rows, current, delta) {
+                Some(workspace::SidebarStop::Tool(i)) => self.set_page(Page::Tool(i)),
+                Some(workspace::SidebarStop::Group(next)) => {
+                    self.set_page(Page::Sessions);
+                    self.switch_workspace(next);
+                },
+                None => {},
             }
         }
     }
@@ -8439,7 +8490,7 @@ mod tool_page_title_tests {
         assert_eq!(tool_page_title("\twezterm\n", "drop -d"), "drop -d");
     }
 
-    /// The same rule for the folders card's tool row: the live pane title names
+    /// The same rule for the tools band's tool row: the live pane title names
     /// the row ("this pane is named test", not "drip --tui"), and a tool with no
     /// terminal — or a terminal with no title of its own — falls back to the
     /// command.
