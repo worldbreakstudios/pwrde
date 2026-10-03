@@ -82,6 +82,9 @@ pub struct Tab {
     /// Browser-style pin: pinned tabs sort to the FRONT of their tile's tab
     /// strip, keep their full title, and cannot be closed. Persisted.
     pub pinned: bool,
+    /// The directory the tab's shell was started in. Set only for flyover
+    /// tabs, which have no group cwd to fall back on when restored.
+    pub cwd: Option<std::path::PathBuf>,
 }
 
 impl Tab {
@@ -114,6 +117,7 @@ impl Tab {
             unread: false,
             unread_at: None,
             pinned: false,
+            cwd: None,
         }
     }
 
@@ -137,6 +141,7 @@ impl Tab {
             unread: false,
             unread_at: None,
             pinned: false,
+            cwd: None,
         }
     }
 

@@ -1379,7 +1379,8 @@ impl App {
         )
     }
 
-    /// Snapshot the live groups, tabs and sidebar folders to SQLite.
+    /// Snapshot the live groups, tabs, sidebar folders and the flyover
+    /// panel's tabs to SQLite.
     ///
     /// This runs regardless of the shpool toggle: the folders, the sessions
     /// and the split layouts they were launched with have to survive a restart
@@ -1391,6 +1392,43 @@ impl App {
         if let Err(e) = persist::save_snapshot_default(&saved, &sections) {
             eprintln!("persist_snapshot error: {}", e);
         }
+        let flyover = persist::flyover_to_saved(&self.flyover_tabs, self.flyover_active);
+        if let Err(e) = persist::save_flyover_default(&flyover) {
+            eprintln!("persist_snapshot flyover error: {}", e);
+        }
+    }
+
+    /// Rebuild the flyover panel's tabs from the persisted snapshot,
+    /// reattaching each to its saved shpool session, as `restore_node` does
+    /// for a group's terminal tabs. The panel stays hidden until toggled; with
+    /// nothing saved the first open still shows the picker.
+    fn restore_flyover(&mut self) {
+        let saved = persist::load_flyover_default();
+        if saved.is_empty() {
+            return;
+        }
+        let mut active = 0;
+        for (i, st) in saved.iter().enumerate() {
+            let cwd = st.cwd.as_ref().map(std::path::PathBuf::from);
+            let session = self.spawn_session_named(
+                cwd.as_deref(),
+                persist::reattach_shpool_name(
+                    st.shpool_session.as_deref(),
+                    settings::persist_sessions(),
+                ),
+            );
+            let mut tab = Tab::new(session);
+            tab.unread = st.unread;
+            tab.unread_at = persist::from_epoch_secs(st.unread_at);
+            tab.cwd = cwd;
+            self.flyover_tabs.push(tab);
+            if st.active {
+                active = i;
+            }
+        }
+        self.flyover_active = active.min(self.flyover_tabs.len() - 1);
+        self.flyover_open = false;
+        self.flyover_focused = false;
     }
 
     /// Rebuild workspaces and sidebar sections from the persisted snapshot,
@@ -2103,6 +2141,7 @@ impl App {
         self.flyover_focused = true;
         self.flyover_mark_read();
         self.request_redraw();
+        self.persist_snapshot();
     }
 
     /// Record a pointer position from an element event (logical px) in the
@@ -2518,13 +2557,18 @@ impl App {
     }
 
     /// Clear the unread dot on the flyover tab that just came on screen
-    /// (panel opened or active tab switched).
-    fn flyover_mark_read(&mut self) {
+    /// (panel opened or active tab switched). Returns whether a dot was
+    /// cleared; the caller persists.
+    fn flyover_mark_read(&mut self) -> bool {
         if !self.flyover_open {
-            return;
+            return false;
         }
-        if let Some(tab) = self.flyover_tabs.get_mut(self.flyover_active) {
-            tab.unread = false;
+        match self.flyover_tabs.get_mut(self.flyover_active) {
+            Some(tab) if tab.unread => {
+                tab.unread = false;
+                true
+            },
+            _ => false,
         }
     }
 
@@ -2547,7 +2591,12 @@ impl App {
         if ti >= self.flyover_tabs.len() {
             return;
         }
-        self.flyover_tabs.remove(ti);
+        let tab = self.flyover_tabs.remove(ti);
+        // Explicit close ends the persistent session too, as closing a tile
+        // tab does; an exited shell goes through remove_session instead.
+        if let Some(name) = tab.session().and_then(|session| session.shpool_session.as_deref()) {
+            term::shpool_kill(name);
+        }
         if self.flyover_tabs.is_empty() {
             self.flyover_open = false;
             self.flyover_focused = false;
@@ -2558,6 +2607,7 @@ impl App {
             self.flyover_active = self.flyover_active.min(self.flyover_tabs.len() - 1);
         }
         self.request_redraw();
+        self.persist_snapshot();
     }
 
     /// Toggle the flyover panel between its resizable height and filling the
@@ -2642,8 +2692,12 @@ impl App {
             .iter_mut()
             .find(|tab| tab.session().is_some_and(|session| session.id == id))
         {
-            if !tab.unread {
+            // The stamp is saved with the flyover tabs, on the same
+            // not-already-unread rule as a group tab's below.
+            let stamped = !tab.unread;
+            if stamped {
                 tab.unread_at = Some(now);
+                self.persist_snapshot();
             }
             return false; // Flyover tabs have no sidebar card to restamp.
         }
@@ -2668,7 +2722,7 @@ impl App {
     /// only on a false→true transition, so repeated attention signals from
     /// one pane don't churn the snapshot.
     fn set_unread_by_session(&mut self, id: u64) -> bool {
-        // Flyover tabs aren't persisted, so their dots skip the snapshot.
+        // Flyover tabs are persisted too, on the same transition-only rule.
         if let Some(tab) = self
             .flyover_tabs
             .iter_mut()
@@ -2678,6 +2732,7 @@ impl App {
             tab.unread = true;
             if hit {
                 tab.unread_at = Some(SystemTime::now());
+                self.persist_snapshot();
             }
             return hit;
         }
@@ -3332,14 +3387,19 @@ impl App {
         self.open_command_new_session(true);
     }
 
-    /// Spawn a new flyover tab with a plain (non-persisted) session at `cwd`.
+    /// Spawn a new flyover tab at `cwd`. Its session is shpool-backed exactly
+    /// when a group tab's is (see [`Self::spawn_session_in`]), and the tab is
+    /// saved with the snapshot so it comes back after a restart.
     fn spawn_flyover_tab(&mut self, cwd: Option<std::path::PathBuf>) {
-        let session = self.spawn_session_named(cwd.as_deref(), None);
-        self.flyover_tabs.push(workspace::Tab::new(session));
+        let session = self.spawn_session_in(cwd.as_deref());
+        let mut tab = workspace::Tab::new(session);
+        tab.cwd = cwd;
+        self.flyover_tabs.push(tab);
         self.flyover_active = self.flyover_tabs.len() - 1;
         self.flyover_focused = true;
         self.sync_layout();
         self.request_redraw();
+        self.persist_snapshot();
     }
 
     /// The flyover strip's "+" button: a new flyover tab in the active
@@ -3363,7 +3423,9 @@ impl App {
             // Open: show the panel.
             self.flyover_open = true;
             self.flyover_focused = true;
-            self.flyover_mark_read();
+            if self.flyover_mark_read() {
+                self.persist_snapshot();
+            }
             if self.flyover_tabs.is_empty() {
                 // First-ever open: open directory picker to create the first tab.
                 self.open_flyover_picker();
@@ -3388,6 +3450,7 @@ impl App {
                     self.flyover_active =
                         pages::cycle(self.flyover_active, self.flyover_tabs.len(), -1);
                     self.flyover_mark_read();
+                    self.persist_snapshot();
                 }
             },
             Action::NextTab => {
@@ -3395,6 +3458,7 @@ impl App {
                     self.flyover_active =
                         pages::cycle(self.flyover_active, self.flyover_tabs.len(), 1);
                     self.flyover_mark_read();
+                    self.persist_snapshot();
                 }
             },
             Action::Copy => {
@@ -6325,6 +6389,7 @@ impl App {
             } else {
                 self.flyover_active = self.flyover_active.min(self.flyover_tabs.len() - 1);
             }
+            self.persist_snapshot();
             return;
         }
         // Find and remove the tab whose session matches, cascading empties.
@@ -8056,6 +8121,10 @@ fn main() {
                     // fresh plain shells instead of live ones. Only a
                     // missing/empty snapshot falls back to the empty state
                     // (no shell until the user starts a group, CTA or ⇧⌘T).
+                    // The flyover's tabs come back whether or not any
+                    // groups were saved, and before anything can snapshot
+                    // (which would rewrite their rows from an empty panel).
+                    app.restore_flyover();
                     if !app.restore_workspaces() {
                         app.workspaces.push(Workspace::placeholder());
                     }
