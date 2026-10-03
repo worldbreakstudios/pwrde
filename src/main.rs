@@ -147,6 +147,28 @@ enum MenuTarget {
     Tab { ws: usize, tile: u64, tab: usize },
     /// The sidebar session row of workspace `ws`.
     Group { ws: usize },
+    /// The header (title row or info bar) of workspace `ws`'s primary pane
+    /// `tile`. `collapse` is whether the menu carried the Collapse item.
+    PrimaryHeader { ws: usize, tile: u64, collapse: bool },
+}
+
+/// One row of the primary header's context menu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrimaryMenuItem {
+    SplitRight,
+    MarkUnread,
+    Collapse,
+}
+
+/// The primary header menu's rows, in order. Collapse is conditional, so the
+/// menu is built from this list and the pick is resolved against the same
+/// list (`App::apply_context_menu`) rather than by a hard-coded index.
+fn primary_menu_items(collapse: bool) -> Vec<PrimaryMenuItem> {
+    let mut items = vec![PrimaryMenuItem::SplitRight, PrimaryMenuItem::MarkUnread];
+    if collapse {
+        items.push(PrimaryMenuItem::Collapse);
+    }
+    items
 }
 
 /// A drop landing zone resolved from the pointer during a tab drag.
@@ -2671,7 +2693,9 @@ impl App {
     /// A sidebar session row offers "Mark as unread" (re-dots its primary
     /// pane's active tab, the one the row's dot mirrors), pin / unpin and
     /// snooze group, and "Close session" (the close-group confirm); a tile tab offers "Mark as unread", pin / unpin tab, and — for
-    /// a webview — hide / show its title bar. Never changes focus. The hit is
+    /// a webview — hide / show its title bar; the primary pane's header offers
+    /// Split Right, "Mark as unread" and Collapse pane. Showing a menu never
+    /// changes focus (a Split / Collapse pick focuses the primary). The hit is
     /// resolved here; the menu itself is shown by [`App::show_context_menu`].
     fn on_right_mouse_down(&mut self, window: &Window, cx: &mut Context<Self>) {
         // A mouse-tracking TUI under the cursor gets the right-click as a
@@ -2719,16 +2743,19 @@ impl App {
                         title: "Mark as unread".into(),
                         enabled: !unread,
                         separator_after: true,
+                        shortcut: None,
                     },
                     context_menu::MenuItem {
                         title: if ws.pinned { "Unpin group" } else { "Pin group" }.into(),
                         enabled: true,
                         separator_after: false,
+                        shortcut: None,
                     },
                     context_menu::MenuItem {
                         title: if ws.snoozed { "Unsnooze group" } else { "Snooze group" }.into(),
                         enabled: true,
                         separator_after: true,
+                        shortcut: None,
                     },
                     // The primary pane has no × of its own, so the row's
                     // menu is where a session is closed with the mouse.
@@ -2736,6 +2763,7 @@ impl App {
                         title: "Close session".into(),
                         enabled: true,
                         separator_after: false,
+                        shortcut: None,
                     },
                 ];
                 self.show_context_menu(view, at, MenuTarget::Group { ws: ws_idx }, items, window, cx);
@@ -2744,20 +2772,68 @@ impl App {
             return;
         }
 
-        // Tile tab strips of the active group.
+        // Tile headers of the active group: the primary pane's header, then
+        // the other tiles' tab strips.
         let area = self.area();
         let ws = &self.workspaces[self.active];
         let (tiles, _) = workspace::layout_tiles(&ws.root, area, scale);
         let axes = ws.collapse_axes();
         for (id, rect) in &tiles {
+            // The primary pane has a title row and an info bar, not tabs: a
+            // press anywhere on that header opens the pane menu instead of a
+            // tab menu.
+            if ws.is_primary(*id) {
+                // Inset like the title row, so the traffic lights and the
+                // "Show sessions" button keep their corner.
+                let strip = workspace::tab_strip_rect(area, rect, scale, self.sidebar_w());
+                if !strip.contains(px, py)
+                    || py >= workspace::tile_content_for(rect, scale, true).y
+                {
+                    continue;
+                }
+                let Some(tile) = ws.root.find_tile(*id) else { return };
+                // Collapsed or mid-animation it is a bare chevron strip with
+                // no header (as the left-press path treats it): no menu.
+                if tile.collapsed || tile.collapse_anim > 0.0 {
+                    return;
+                }
+                let unread = tile.active_tab().is_some_and(|t| t.unread);
+                // The same condition that gives the header its caret.
+                let collapse = axes.iter().any(|(tid, a)| tid == id && a.is_some());
+                // `set_collapsed` keeps the last expanded pane open.
+                let can_collapse = ws.root.tiles().iter().any(|t| t.id != *id && !t.collapsed);
+                let items = primary_menu_items(collapse)
+                    .into_iter()
+                    .map(|item| match item {
+                        // The live bindings, shown as native shortcut hints.
+                        PrimaryMenuItem::SplitRight => context_menu::MenuItem {
+                            title: "Split Right".into(),
+                            enabled: true,
+                            separator_after: true,
+                            shortcut: context_menu::shortcut_for(&Action::SplitRight.binding()),
+                        },
+                        PrimaryMenuItem::MarkUnread => context_menu::MenuItem {
+                            title: "Mark as unread".into(),
+                            enabled: !unread,
+                            separator_after: false,
+                            shortcut: None,
+                        },
+                        PrimaryMenuItem::Collapse => context_menu::MenuItem {
+                            title: "Collapse pane".into(),
+                            enabled: can_collapse,
+                            separator_after: false,
+                            shortcut: context_menu::shortcut_for(&Action::ToggleCollapse.binding()),
+                        },
+                    })
+                    .collect();
+                let target = MenuTarget::PrimaryHeader { ws: self.active, tile: *id, collapse };
+                self.show_context_menu(view, at, target, items, window, cx);
+                return;
+            }
             let strip = workspace::tab_strip_rect(area, rect, scale, self.sidebar_w());
             let bar = workspace::tile_tab_bar(&strip, scale);
             if !bar.contains(px, py) {
                 continue;
-            }
-            // The primary pane has a title row, not tabs: no tab menu.
-            if ws.is_primary(*id) {
-                return;
             }
             let has_caret = axes.iter().any(|(tid, a)| tid == id && a.is_some());
             if let Some(tile) = ws.root.find_tile(*id) {
@@ -2782,11 +2858,13 @@ impl App {
                         title: "Mark as unread".into(),
                         enabled: !tab.unread,
                         separator_after: true,
+                        shortcut: None,
                     },
                     context_menu::MenuItem {
                         title: if tab.pinned { "Unpin tab" } else { "Pin tab" }.into(),
                         enabled: true,
                         separator_after: false,
+                        shortcut: None,
                     },
                 ];
                 if tab.kind() == workspace::TabKind::Webview {
@@ -2795,6 +2873,7 @@ impl App {
                             .into(),
                         enabled: true,
                         separator_after: false,
+                        shortcut: None,
                     });
                 }
                 let target = MenuTarget::Tab { ws: self.active, tile: *id, tab: ti };
@@ -2828,7 +2907,8 @@ impl App {
     }
 
     /// Apply item `choice` of the menu shown for `target`. Indices follow
-    /// the item order built in `on_right_mouse_down`. The target is
+    /// the item order built in `on_right_mouse_down` (the primary header's
+    /// through `primary_menu_items`). The target is
     /// re-validated: the workspace or tab may have gone while the menu was
     /// up.
     fn apply_context_menu(&mut self, target: MenuTarget, choice: usize) {
@@ -2904,6 +2984,48 @@ impl App {
                         }
                     },
                     _ => return,
+                }
+            },
+            MenuTarget::PrimaryHeader { ws, tile, collapse } => {
+                // Split and Collapse act on the focused pane of the active
+                // group, so the target must still be that group's primary.
+                if ws != self.active {
+                    return;
+                }
+                let Some(w) = self.workspaces.get_mut(ws) else { return };
+                if !w.is_primary(tile) {
+                    return;
+                }
+                let Some(t) = w.root.find_tile_mut(tile) else { return };
+                // The pick is resolved against the list the menu was built
+                // from, so the conditional Collapse row cannot shift indices.
+                let Some(item) = primary_menu_items(collapse).get(choice).copied() else {
+                    return;
+                };
+                match item {
+                    PrimaryMenuItem::MarkUnread => {
+                        if let Some(tab) = t.active_tab_mut()
+                            && !tab.unread
+                        {
+                            tab.unread = true;
+                            tab.unread_at = Some(now);
+                        }
+                    },
+                    // Focus the primary (as `press_primary_header` does),
+                    // then run the action exactly as its shortcut would.
+                    PrimaryMenuItem::SplitRight => {
+                        w.focused_tile = tile;
+                        self.run_action(Action::SplitRight);
+                    },
+                    PrimaryMenuItem::Collapse => {
+                        // The action toggles: a pane that folded while the
+                        // menu was up must not be expanded by "Collapse".
+                        if t.collapsed {
+                            return;
+                        }
+                        w.focused_tile = tile;
+                        self.run_action(Action::ToggleCollapse);
+                    },
                 }
             },
         }

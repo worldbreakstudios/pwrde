@@ -8,6 +8,12 @@
 //! a `std::sync::OnceLock`; each menu item carries its index in its `tag` and calls
 //! `menuItemChosen:`, which stashes the tag into an `AtomicIsize`.
 //!
+//! An item may carry a [`Shortcut`] — a key equivalent plus modifier mask,
+//! derived from an action's live `pages::Binding` by the pure
+//! [`shortcut_for`] — which AppKit draws as the right-aligned hint column.
+//! It is a hint only: the menu is a context menu, never the main menu, so
+//! the chord itself still resolves through the app's bindings table.
+//!
 //! Because the tracking loop is nested, `pop_up` must NOT run inside a gpui
 //! callback: gpui's `App` is mutably borrowed there, and any foreground task
 //! the loop services (a PTY wakeup, a timer) would re-enter it and panic.
@@ -24,11 +30,78 @@ use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::OnceLock;
 
 /// One row of the context menu. `separator_after` appends a separator below
-/// the item; disabled items stay visible but grey and unclickable.
+/// the item; disabled items stay visible but grey and unclickable. `shortcut`
+/// is the hint drawn at the row's right edge (`None` → no hint).
 pub struct MenuItem {
     pub title: String,
     pub enabled: bool,
     pub separator_after: bool,
+    pub shortcut: Option<Shortcut>,
+}
+
+/// An `NSMenuItem` key equivalent: the (lowercase) character AppKit shows
+/// and the `NSEventModifierFlags` mask beside it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Shortcut {
+    pub key: String,
+    pub mask: usize,
+}
+
+/// `NSEventModifierFlags` bits.
+const MOD_SHIFT: usize = 1 << 17;
+const MOD_CONTROL: usize = 1 << 18;
+const MOD_OPTION: usize = 1 << 19;
+const MOD_COMMAND: usize = 1 << 20;
+
+/// The menu hint for a binding. ⌘ is always in the mask (every `Binding` is
+/// a ⌘ chord); shift goes in the mask too, with the key left lowercase, so
+/// AppKit draws `⇧⌘F` rather than inferring shift from an uppercase letter.
+/// Named keys map to the characters AppKit knows as key equivalents (the
+/// `NS…FunctionKey` code points for arrows, navigation and F-keys); a key
+/// with no such character returns `None` and the item shows no hint.
+pub fn shortcut_for(binding: &crate::pages::Binding) -> Option<Shortcut> {
+    let function_key = |code: u32| char::from_u32(code).map(String::from);
+    let key = match binding.key.as_str() {
+        "up" => function_key(0xF700)?,
+        "down" => function_key(0xF701)?,
+        "left" => function_key(0xF702)?,
+        "right" => function_key(0xF703)?,
+        "home" => function_key(0xF729)?,
+        "end" => function_key(0xF72B)?,
+        "pageup" => function_key(0xF72C)?,
+        "pagedown" => function_key(0xF72D)?,
+        "minus" => "-".into(),
+        "space" => " ".into(),
+        "enter" => "\r".into(),
+        "tab" => "\t".into(),
+        "escape" => "\u{1b}".into(),
+        "backspace" => "\u{8}".into(),
+        "delete" => "\u{7f}".into(),
+        k => {
+            let mut chars = k.chars();
+            match (chars.next(), chars.next()) {
+                // A letter, digit or punctuation key is its own equivalent.
+                (Some(c), None) if !c.is_control() => c.to_lowercase().collect(),
+                // f1…f35 are contiguous from NSF1FunctionKey.
+                (Some('f'), Some(_)) => match k[1..].parse::<u32>() {
+                    Ok(n @ 1..=35) => function_key(0xF704 + n - 1)?,
+                    _ => return None,
+                },
+                _ => return None,
+            }
+        },
+    };
+    let mut mask = MOD_COMMAND;
+    if binding.shift {
+        mask |= MOD_SHIFT;
+    }
+    if binding.ctrl {
+        mask |= MOD_CONTROL;
+    }
+    if binding.alt {
+        mask |= MOD_OPTION;
+    }
+    Some(Shortcut { key, mask })
 }
 
 /// The index of the item the user picked, or `None` if the menu was dismissed.
@@ -111,12 +184,15 @@ pub fn pop_up(view: NsView, at: (f32, f32), items: &[MenuItem]) -> Option<usize>
             let entry: *mut Object = msg_send![entry,
                 initWithTitle: ns_string(&item.title)
                 action: sel!(menuItemChosen:)
-                keyEquivalent: ns_string("")
+                keyEquivalent: ns_string(item.shortcut.as_ref().map_or("", |s| s.key.as_str()))
             ];
             if entry.is_null() {
                 let _: () = msg_send![menu, release];
                 let _: () = msg_send![target, release];
                 return None;
+            }
+            if let Some(shortcut) = &item.shortcut {
+                let _: () = msg_send![entry, setKeyEquivalentModifierMask: shortcut.mask];
             }
             let _: () = msg_send![entry, setTag: index as isize];
             let _: () = msg_send![entry, setEnabled: if item.enabled { YES } else { NO }];
@@ -200,7 +276,59 @@ fn window_y_to_view_y(view_h: f32, at_y: f32, flipped: bool) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::window_y_to_view_y;
+    use super::{shortcut_for, window_y_to_view_y, Shortcut};
+    use crate::pages::{Action, Binding};
+
+    const SHIFT: usize = 1 << 17;
+    const CONTROL: usize = 1 << 18;
+    const OPTION: usize = 1 << 19;
+    const COMMAND: usize = 1 << 20;
+
+    fn binding(s: &str) -> Binding {
+        Binding::parse(s).expect("test binding parses")
+    }
+
+    #[test]
+    fn default_split_right_is_command_d() {
+        assert_eq!(
+            shortcut_for(&Action::SplitRight.default_binding()),
+            Some(Shortcut { key: "d".into(), mask: COMMAND })
+        );
+    }
+
+    #[test]
+    fn shift_goes_in_the_mask_with_a_lowercase_key() {
+        assert_eq!(
+            shortcut_for(&binding("cmd-shift-f")),
+            Some(Shortcut { key: "f".into(), mask: COMMAND | SHIFT })
+        );
+    }
+
+    #[test]
+    fn ctrl_and_alt_set_their_mask_bits() {
+        assert_eq!(
+            shortcut_for(&binding("cmd-ctrl-alt-p")),
+            Some(Shortcut { key: "p".into(), mask: COMMAND | CONTROL | OPTION })
+        );
+    }
+
+    #[test]
+    fn named_keys_map_to_appkit_characters() {
+        let key = |s: &str| shortcut_for(&binding(s)).map(|s| s.key);
+        assert_eq!(key("cmd-up").as_deref(), Some("\u{F700}"));
+        assert_eq!(key("cmd-down").as_deref(), Some("\u{F701}"));
+        assert_eq!(key("cmd-shift-left").as_deref(), Some("\u{F702}"));
+        assert_eq!(key("cmd-right").as_deref(), Some("\u{F703}"));
+        assert_eq!(key("cmd-minus").as_deref(), Some("-"));
+        assert_eq!(key("cmd-f5").as_deref(), Some("\u{F708}"));
+        assert_eq!(key("cmd-]").as_deref(), Some("]"));
+    }
+
+    #[test]
+    fn unrepresentable_key_has_no_hint() {
+        assert_eq!(shortcut_for(&binding("cmd-capslock")), None);
+        assert_eq!(shortcut_for(&binding("cmd-f99")), None);
+    }
 
     #[test]
     fn unflipped_view_converts_top_down_to_bottom_up() {
