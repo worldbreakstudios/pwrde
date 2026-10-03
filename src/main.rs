@@ -31,6 +31,7 @@ mod cli_tools;
 mod command;
 mod command_ui;
 mod context_menu;
+mod dashboard_ui;
 mod features;
 mod flow;
 mod flow_ui;
@@ -150,6 +151,9 @@ enum MenuTarget {
     /// The header (title row or info bar) of workspace `ws`'s primary pane
     /// `tile`. `collapse` is whether the menu carried the Collapse item.
     PrimaryHeader { ws: usize, tile: u64, collapse: bool },
+    /// A dashboard card, named by its group's primary `tile` — an id, not an
+    /// index, so a group closing while the menu is up cannot retarget it.
+    Card { tile: u64 },
 }
 
 /// One row of the primary header's context menu.
@@ -316,6 +320,9 @@ enum Drag {
     FlyoverSelect,
     /// A text selection is being dragged inside a tool page's terminal.
     ToolSelect,
+    /// A text selection is being dragged inside the dashboard card of the
+    /// group whose primary pane is `tile`.
+    CardSelect { tile: u64 },
     /// The flyover panel's top edge is being dragged to resize it.
     FlyoverResize,
     /// Sidebar group row pressed; may become a group drag past threshold.
@@ -332,6 +339,8 @@ enum MouseLoc {
     Flyover,
     /// The active tool page's terminal.
     Tool,
+    /// The dashboard card of the group whose primary pane is this tile.
+    Card(u64),
 }
 
 /// An in-flight mouse-button grab by a tracking TUI: which pane got the
@@ -448,6 +457,16 @@ struct App {
     /// (clamped on read — see `sessions_scroll` / `folders_scroll`).
     sessions_scroll: f32,
     folders_scroll: f32,
+    /// The Dashboard page's filter segment (session-only; every open starts
+    /// at All — see `dashboard_ui`).
+    dashboard_filter: dashboard_ui::Filter,
+    /// Wheel scroll of the dashboard grid, logical px (clamped on read in
+    /// `App::dashboard_layout`).
+    dashboard_scroll: f32,
+    /// The primary tile of the group the dashboard grid last scrolled into
+    /// view, so the grid follows the active group without undoing a wheel
+    /// scroll on every layout pass (`App::dashboard_follow_active`).
+    dashboard_revealed: Option<u64>,
     /// The sessions list's "Tools" run is folded (`sidebar.tools_collapsed`).
     tools_collapsed: bool,
     /// The sessions list's "Pinned" run is folded (`sidebar.pinned_collapsed`).
@@ -871,6 +890,8 @@ impl App {
     pub(crate) fn toggle_pinned_collapsed(&mut self) {
         self.pinned_collapsed = !self.pinned_collapsed;
         settings::set("sidebar.pinned_collapsed", self.pinned_collapsed.into());
+        // The dashboard shows what the list shows: a folded run leaves it.
+        self.dashboard_set_changed();
         self.request_redraw();
     }
 
@@ -879,6 +900,7 @@ impl App {
     pub(crate) fn toggle_snoozed_collapsed(&mut self) {
         self.snoozed_collapsed = !self.snoozed_collapsed;
         settings::set("sidebar.snoozed_collapsed", self.snoozed_collapsed.into());
+        self.dashboard_set_changed();
         self.request_redraw();
     }
 
@@ -1626,6 +1648,12 @@ impl App {
         self.sync_layout_impl(false);
         self.sync_flyover_layout(false);
         self.sync_tool_layout(false);
+        self.sync_dashboard_layout(false);
+        // A changed active group (new, closed, switched) moves the dashboard's
+        // focused card: keep it on screen.
+        if self.page == Page::Dashboard {
+            self.dashboard_follow_active();
+        }
     }
 
     /// `force` pushes a PTY resize even when cols/rows are unchanged — needed
@@ -1650,7 +1678,15 @@ impl App {
         let (tiles, _) = workspace::layout_tiles(&ws.root, area, scale);
         let axes = ws.collapse_axes();
         let primary = ws.primary_tile;
+        // While the dashboard is up every primary PTY is sized to its card
+        // (`sync_dashboard_layout`) and must stay that way: fitting it to its
+        // workspace tile here as well would reflow it back and forth on every
+        // pass. Leaving the page re-fits it through the size check below.
+        let on_dashboard = self.page == Page::Dashboard;
         for (id, rect) in &tiles {
+            if on_dashboard && *id == primary {
+                continue;
+            }
             let content = workspace::tile_content_for(rect, scale, *id == primary);
             // `grid_size_for` subtracts 2*PANE_PAD, matching the renderer's
             // content_origin inset — so the PTY size tracks the padded render area.
@@ -1798,6 +1834,46 @@ impl App {
         if let Some(Some(ts)) = self.tool_sessions.get_mut(i) {
             let tab = &mut ts.tab;
             if force || (cols, rows) != (tab.cols, tab.rows) {
+                tab.cols = cols;
+                tab.rows = rows;
+                if let Some(session) = tab.session() {
+                    session.resize(cols, rows, cw, ch, dpi);
+                }
+            }
+        }
+    }
+
+    /// Resize the primary PTY of every group in the dashboard's folder set
+    /// (`App::dashboard_groups`: the sessions the selected folder lists) to
+    /// its card's body, the way `sync_tool_layout` fits a tool page. Every
+    /// card is the same size — it comes from the folder set's count, never
+    /// the All / Unread filter — so one grid fits them all, shown or not, and
+    /// a filter change resizes nothing. Groups outside the folder set have no
+    /// card and keep the PTY size they had. A no-op off the Dashboard page;
+    /// `sync_layout_impl` skips the primary tile while it is up, so the two
+    /// never fight over a PTY.
+    fn sync_dashboard_layout(&mut self, force: bool) {
+        if self.page != Page::Dashboard {
+            return;
+        }
+        let members = self.dashboard_groups();
+        if members.is_empty() {
+            return;
+        }
+        let scale = self.scale();
+        let viewport = workspace::dashboard_viewport(&self.area(), scale);
+        let grid = workspace::dashboard_grid(&viewport, members.len(), scale);
+        let card = workspace::dashboard_card_rect(&viewport, &grid, 0, 0.0, scale);
+        let body = workspace::dashboard_card_body(&card, scale);
+        let (cols, rows) = self.renderer.grid_size_for(&body);
+        let (cw, ch) = self.cell_px();
+        let dpi = self.dpi();
+        for group in members {
+            let Some(ws) = self.workspaces.get_mut(group) else { continue };
+            let primary = ws.primary_tile;
+            if let Some(tab) = ws.root.find_tile_mut(primary).and_then(|t| t.active_tab_mut())
+                && (force || (cols, rows) != (tab.cols, tab.rows))
+            {
                 tab.cols = cols;
                 tab.rows = rows;
                 if let Some(session) = tab.session() {
@@ -1963,6 +2039,11 @@ impl App {
                 self.persist_snapshot();
             }
             self.sync_layout();
+            // On the dashboard the active group is the focused card: nothing
+            // here changes page or re-fits a primary PTY (`sync_layout_impl`
+            // skips it there), `sync_layout` scrolled the card into view, and
+            // focusing it reads nothing — `mark_visible_read` is the Sessions
+            // page's sweep and does nothing off it.
             self.mark_visible_read();
             self.request_redraw();
         }
@@ -2104,6 +2185,9 @@ impl App {
         if let Page::Tool(_) = self.page {
             self.set_page(Page::Sessions);
         }
+        // The dashboard follows the folder: its cards are now this folder's
+        // sessions — re-lay the grid, re-fit their PTYs, clamp the scroll.
+        self.dashboard_set_changed();
         self.request_redraw();
     }
 
@@ -2370,6 +2454,7 @@ impl App {
         if self.folder_filter == Some(section_id) {
             self.folder_filter = None;
         }
+        self.dashboard_set_changed();
         self.request_redraw();
         self.persist_snapshot();
     }
@@ -2483,6 +2568,11 @@ impl App {
             }
             return;
         }
+        // The dashboard: the wheel is a card's terminal's or the grid's.
+        if self.page == Page::Dashboard {
+            self.dashboard_wheel(delta, cell_height);
+            return;
+        }
         // Only the Sessions page has terminals to scroll; the other pages'
         // gpui scroll containers handle their own wheel events.
         if self.page != Page::Sessions {
@@ -2534,12 +2624,29 @@ impl App {
         self.dirty = true;
     }
 
+    /// The terminal the keyboard is talking to: the focused tile's active tab
+    /// on the Sessions page, the focused card's primary pane on the Dashboard
+    /// (the active group is the focused card). Typing, ⌘C and ⌘V all resolve
+    /// through here, so the two pages cannot disagree about who gets input.
+    ///
+    /// On the Dashboard there is no session at all while no card is focused —
+    /// the active group is outside the selected folder, so it has no card:
+    /// keys then go nowhere rather than to a terminal the page is not showing.
+    fn keyboard_session(&self) -> Option<&Session> {
+        let ws = &self.workspaces[self.active];
+        let tile = if self.page == Page::Dashboard {
+            self.dashboard_focused()?;
+            ws.root.find_tile(ws.primary_tile)
+        } else {
+            ws.focused()
+        };
+        tile.and_then(|t| t.active_tab()).and_then(Tab::session)
+    }
+
     /// ⌘V: clipboard → focused terminal (bracketed-paste aware).
     /// Copy the active selection's text to the system clipboard.
     fn copy(&mut self) {
-        let ws = &self.workspaces[self.active];
-        let Some(tab) = ws.focused().and_then(|t| t.active_tab()) else { return };
-        let Some(text) = tab.session().and_then(Session::selected_text) else { return };
+        let Some(text) = self.keyboard_session().and_then(Session::selected_text) else { return };
         if let Ok(mut clipboard) = arboard::Clipboard::new() {
             let _ = clipboard.set_text(text);
         }
@@ -2547,9 +2654,7 @@ impl App {
 
     fn paste(&mut self) {
         let Ok(mut clipboard) = arboard::Clipboard::new() else { return };
-        let ws = &self.workspaces[self.active];
-        let Some(tab) = ws.focused().and_then(|t| t.active_tab()) else { return };
-        let Some(session) = tab.session() else { return };
+        let Some(session) = self.keyboard_session() else { return };
         match clipboard.get_text() {
             Ok(text) if !text.is_empty() => session.paste(&text),
             _ if clipboard.get_image().is_ok() => session.write([0x16u8]),
@@ -2681,6 +2786,17 @@ impl App {
                 .is_some_and(|session| session.id == id)
     }
 
+    /// True when the session is some group's primary pane — one of the
+    /// terminals the Dashboard page shows as a card.
+    fn is_primary_session(&self, id: u64) -> bool {
+        !self.is_empty_state()
+            && self.workspaces.iter().any(|ws| {
+                dashboard_ui::primary_tab(ws)
+                    .and_then(Tab::session)
+                    .is_some_and(|session| session.id == id)
+            })
+    }
+
     /// Record that the tab owning session `id` asked for attention, without
     /// dotting it — the pane is on screen, so the user is already watching it.
     ///
@@ -2795,12 +2911,26 @@ impl App {
     /// changes focus (a Split / Collapse pick focuses the primary). The hit is
     /// resolved here; the menu itself is shown by [`App::show_context_menu`].
     fn on_right_mouse_down(&mut self, window: &Window, cx: &mut Context<Self>) {
-        // A mouse-tracking TUI under the cursor gets the right-click as a
-        // report (before any sidebar context handling below).
-        if self.try_forward_secondary_press(MouseBtn::Right) {
+        // The dashboard: a right press anywhere on a card — its terminal
+        // included, mouse-tracking TUI or not — opens the card's menu
+        // ("Go to session"). The sessions list beside the grid keeps its
+        // rows' menu, which the sidebar branch below builds.
+        if self.page == Page::Dashboard {
+            if self.modal_overlay_open() {
+                return;
+            }
+            let (px, py) = (self.cursor.0 as f32, self.cursor.1 as f32);
+            let (_, h) = self.renderer.surface_size();
+            if !workspace::sidebar(h, self.scale(), self.sidebar_w()).contains(px, py) {
+                self.dashboard_right_mouse_down(window, cx);
+                return;
+            }
+        } else if self.try_forward_secondary_press(MouseBtn::Right) {
+            // A mouse-tracking TUI under the cursor gets the right-click as a
+            // report (before any sidebar context handling below).
             return;
         }
-        if self.page != Page::Sessions
+        if !matches!(self.page, Page::Sessions | Page::Dashboard)
             || self.confirm.is_some()
             || self.webview_prompt.is_some()
         {
@@ -3015,6 +3145,19 @@ impl App {
     fn apply_context_menu(&mut self, target: MenuTarget, choice: usize) {
         let now = SystemTime::now();
         match target {
+            // The dashboard card's one item, "Go to session": leave for the
+            // Sessions page showing that group. Looked up by its primary
+            // tile, so a group that closed meanwhile is simply not found.
+            MenuTarget::Card { tile } => {
+                if choice == 0
+                    && !self.is_empty_state()
+                    && let Some(group) =
+                        self.workspaces.iter().position(|ws| ws.primary_tile == tile)
+                {
+                    self.go_to_session(group);
+                }
+                return;
+            },
             MenuTarget::Group { ws } => {
                 let Some(w) = self.workspaces.get_mut(ws) else { return };
                 match choice {
@@ -4501,6 +4644,7 @@ impl App {
         match loc {
             MouseLoc::Flyover => self.flyover_tabs.get(self.flyover_active).and_then(Tab::session),
             MouseLoc::Tool => self.active_tool_session().and_then(|ts| ts.tab.session()),
+            MouseLoc::Card(tile) => self.dashboard_session(tile),
             MouseLoc::Tile(id) => self.workspaces[self.active]
                 .root
                 .find_tile(id)
@@ -4525,6 +4669,11 @@ impl App {
         let content = match loc {
             MouseLoc::Flyover => workspace::flyover_content(&self.flyover_rect_now(), scale),
             MouseLoc::Tool => workspace::tile_content(&self.tool_area(), scale),
+            // A card the filter stopped showing has no rect to report in.
+            MouseLoc::Card(tile) => match self.dashboard_body(tile) {
+                Some(body) => body,
+                None => return,
+            },
             MouseLoc::Tile(id) => match self.tile_rect(id) {
                 Some(rect) => workspace::tile_content_for(&rect, scale, self.workspaces[self.active].is_primary(id)),
                 None => return,
@@ -4608,6 +4757,9 @@ impl App {
             return workspace::tile_content(&self.tool_area(), scale)
                 .contains(px, py)
                 .then_some(MouseLoc::Tool);
+        }
+        if self.page == Page::Dashboard {
+            return self.dashboard_pane_at(px, py);
         }
         if self.page != Page::Sessions {
             return None;
@@ -4837,6 +4989,13 @@ impl App {
                 self.drag = Drag::ToolSelect;
             }
             self.request_redraw();
+            return;
+        }
+        // Dashboard: a press focuses the card under it and, inside its body,
+        // reaches that card's terminal (`dashboard_ui`). The workspace tiles
+        // below are not on screen.
+        if self.page == Page::Dashboard {
+            self.dashboard_mouse_down(px, py);
             return;
         }
         let area = self.area();
@@ -5083,6 +5242,16 @@ impl App {
                     self.request_redraw();
                 }
             },
+            Drag::CardSelect { tile } => {
+                let tile = *tile;
+                if let Some(body) = self.dashboard_body(tile)
+                    && let Some((col, row)) = self.renderer.cell_at(&body, px, py)
+                    && let Some(session) = self.dashboard_session(tile)
+                {
+                    session.update_selection(col, row);
+                    self.request_redraw();
+                }
+            },
             Drag::Select { tile } => {
                 let tile = *tile;
                 let area = self.area();
@@ -5227,6 +5396,11 @@ impl App {
                     self.set_page(Page::Sessions);
                 }
                 self.switch_workspace(ws);
+                // On the dashboard a row click is the user picking that
+                // session, so it reads the card as a press on the card does.
+                if self.page == Page::Dashboard {
+                    self.dashboard_mark_read(ws);
+                }
             },
             // Sidebar group drag: resolve against the shared row list.
             Drag::Group { ws } => {
@@ -5336,13 +5510,11 @@ impl App {
             self.handle_shortcut(ev);
             return;
         }
+        // Plain keys go to the terminal that owns the keyboard: the focused
+        // tile's, or on the Dashboard the focused card's (⎋ included — agents
+        // use it, so it never closes that page).
         if let Some(bytes) = key_to_bytes(&ev.keystroke) {
-            let ws = &self.workspaces[self.active];
-            if let Some(session) = ws
-                .focused()
-                .and_then(|tile| tile.active_tab())
-                .and_then(Tab::session)
-            {
+            if let Some(session) = self.keyboard_session() {
                 session.write(bytes);
                 // Typing snaps back to the live bottom and drops any
                 // selection, like every other terminal.
@@ -5659,7 +5831,8 @@ impl App {
             self.request_redraw();
             return;
         }
-        if self.page == Page::Sessions
+        // ⌘1…⌘9: the Nth group — on the Dashboard, its card.
+        if matches!(self.page, Page::Sessions | Page::Dashboard)
             && let Some(d) = ev.keystroke.key.chars().next().and_then(|c| c.to_digit(10))
             && d >= 1
         {
@@ -5677,6 +5850,7 @@ impl App {
             Action::NextSidebarTab => self.cycle_sidebar_tab(1),
             Action::ToggleSidebar => self.toggle_sidebar(),
             Action::ToggleFolders => self.toggle_folders(),
+            Action::ToggleDashboard => self.toggle_dashboard(),
             Action::OpenSettings => self.open_settings(),
             Action::Quit => {
                 // Take the agent children down before the abrupt exit below;
@@ -5727,6 +5901,27 @@ impl App {
                 },
                 _ => false,
             };
+        }
+        // The dashboard is a grid of primary panes: the clipboard reaches the
+        // focused card's terminal and the focus actions move between the
+        // showing cards. A new session opens the picker, as the sidebar's ＋
+        // does here. Everything that acts on a group's split tree (tabs,
+        // splits, closes, collapse, the flyover, a pull request opened as a
+        // web tab) does not apply here.
+        if self.page == Page::Dashboard {
+            match action {
+                Action::NewGroup => self.open_picker(),
+                Action::Copy => self.copy(),
+                Action::Paste => self.paste(),
+                Action::FocusLeft => self.dashboard_step(workspace::NavDir::Left),
+                Action::FocusDown => self.dashboard_step(workspace::NavDir::Down),
+                Action::FocusUp => self.dashboard_step(workspace::NavDir::Up),
+                Action::FocusRight => self.dashboard_step(workspace::NavDir::Right),
+                Action::PrevTile => self.dashboard_cycle(-1),
+                Action::NextTile => self.dashboard_cycle(1),
+                _ => return false,
+            }
+            return true;
         }
         if self.page != Page::Sessions {
             return false;
@@ -5820,6 +6015,7 @@ impl App {
             | Action::NextSidebarTab
             | Action::ToggleSidebar
             | Action::ToggleFolders
+            | Action::ToggleDashboard
             | Action::PrevPage
             | Action::NextPage
             | Action::OpenSettings
@@ -5843,11 +6039,11 @@ impl App {
     }
 
     /// ⌘= / ⌘-: grow or shrink a font size. Context-aware — the terminal
-    /// font when a terminal surface is focused (the Sessions page), the
-    /// app/chrome font otherwise. The next paint detects the settings change,
-    /// re-measures the cell, and reflows the PTYs.
+    /// font when a terminal surface is focused (the Sessions page, or the
+    /// Dashboard's cards), the app/chrome font otherwise. The next paint
+    /// detects the settings change, re-measures the cell, and reflows the PTYs.
     fn zoom_font(&mut self, delta: f32) {
-        let key = if self.page == Page::Sessions {
+        let key = if matches!(self.page, Page::Sessions | Page::Dashboard) {
             "terminal.font_size"
         } else {
             "appearance.font_size"
@@ -5874,13 +6070,16 @@ impl App {
     }
 
     /// ⌘⇧↑/↓: step through the sidebar's tabs, wrapping at both ends —
-    /// the tools band's rows (unless folded), then the workspace groups.
+    /// the tools band's rows (unless folded), then the workspace groups. On
+    /// the Dashboard only the groups: the selection is the focused card, and
+    /// the page stays up.
     fn cycle_sidebar_tab(&mut self, delta: isize) {
         let current = match self.page {
             Page::Tool(i) => workspace::SidebarStop::Tool(i),
             _ => workspace::SidebarStop::Group(self.active),
         };
-        if matches!(self.page, Page::Sessions | Page::Tool(_))
+        let on_dashboard = self.page == Page::Dashboard;
+        if matches!(self.page, Page::Sessions | Page::Tool(_) | Page::Dashboard)
             // Leading-edge throttle on the key-repeat burst only; the first
             // press always lands (the field is backdated at startup).
             && workspace::throttle_ready(self.sidebar_cycle_at.elapsed(), SIDEBAR_CYCLE_THROTTLE)
@@ -5891,11 +6090,13 @@ impl App {
             // away) not the raw workspace order, so
             // the selection lands on the row next to the one it left.
             let rows = self.sidebar_rows();
-            let n_tools = if self.tools_collapsed { 0 } else { self.n_tools() };
+            let n_tools = if self.tools_collapsed || on_dashboard { 0 } else { self.n_tools() };
             match workspace::cycle_sidebar_stop(n_tools, &rows, current, delta) {
                 Some(workspace::SidebarStop::Tool(i)) => self.set_page(Page::Tool(i)),
                 Some(workspace::SidebarStop::Group(next)) => {
-                    self.set_page(Page::Sessions);
+                    if !on_dashboard {
+                        self.set_page(Page::Sessions);
+                    }
                     self.switch_workspace(next);
                 },
                 None => {},
@@ -5926,6 +6127,14 @@ impl App {
             if let Page::Tool(i) = page {
                 self.ensure_tool_session(i);
                 self.sync_tool_layout(true);
+            }
+            // Entering the dashboard fits every primary PTY to its card and
+            // focuses the active group's. Leaving it needs nothing here: the
+            // Sessions branch above re-fits the active group to its tiles
+            // (the card size no longer matches `tab.cols/rows`), and every
+            // other group is re-fitted by the same check when it is shown.
+            if page == Page::Dashboard {
+                self.dashboard_opened();
             }
         }
         self.request_redraw();
@@ -6102,6 +6311,10 @@ impl App {
                                 self.title = title;
                             }
                         }
+                        redraw = true;
+                    } else if self.page == Page::Dashboard && self.is_primary_session(id) {
+                        // The dashboard shows every group's primary pane,
+                        // not just the active group's: its output repaints.
                         redraw = true;
                     }
                 },
@@ -6283,10 +6496,16 @@ impl App {
                 // watched, so only hidden tabs gain the unread dot — but a
                 // watched pane still stamps its attention time, or the one
                 // group the user is looking at would be the only card whose
-                // timestamp never moves.
+                // timestamp never moves. On the dashboard no pane is watched,
+                // the focused card's primary included: every signal there
+                // dots and stamps its tab, and only a click on the card reads
+                // it (`dashboard_ui::attention_watched`).
                 TermEvent::Attention(id) => {
-                    let watched = (self.page == Page::Sessions && self.is_visible(id))
-                        || self.flyover_visible(id);
+                    let watched = dashboard_ui::attention_watched(
+                        self.page,
+                        self.is_visible(id),
+                        self.flyover_visible(id),
+                    );
                     if watched {
                         if self.stamp_attention_by_session(id) {
                             redraw = true;
@@ -6997,6 +7216,9 @@ impl Render for App {
             .child(self.render_tile_chrome(cx))
             // The primary pane's info bar, under its title row (`infobar_ui`).
             .child(self.render_info_bar(cx))
+            // The Dashboard page's header bar and card chrome, over the
+            // terminals the canvas paints into each card (`dashboard_ui`).
+            .child(self.render_dashboard(cx))
             // Browser chrome sits in the strip reserved above each native
             // child webview and remains GPUI-owned for consistent controls.
             .child(self.render_webview_chrome(window, cx))
@@ -7057,11 +7279,21 @@ impl App {
             let chrome_cw = renderer::measure_cell_width(window, scale, chrome_font);
             self.renderer.update_metrics(scale, term_font, term_cw, chrome_font, chrome_cw);
         }
+        let resized = self.renderer.surface_size() != (phys_w, phys_h);
         self.renderer.resize(phys_w, phys_h);
         self.sync_layout_impl(rescaled);
         if rescaled {
             self.sync_flyover_layout(true);
             self.sync_tool_layout(true);
+        }
+        // The dashboard's cards follow the window like the tiles do.
+        self.sync_dashboard_layout(rescaled);
+        // The dashboard's chrome is an element tree laid out (in `render`,
+        // before this paint) from the surface size as it was: after a resize
+        // it would sit a frame behind the cards painted below, with nothing
+        // due to repaint it. Ask for one more frame.
+        if self.page == Page::Dashboard && (resized || rescaled) {
+            window.refresh();
         }
         self.sync_webviews(window);
         self.begin_frame();
@@ -7191,6 +7423,34 @@ impl App {
                 self.image_hits.extend(tool_hits);
             }
         }
+        // The dashboard's cards are built here from App state too, but kept
+        // out of the frame's shared layers: each card's terminal is clipped
+        // to its body and all of them to the scroll viewport, which the
+        // frame's flat quad / pane lists cannot express. The rects are the
+        // ones `dashboard_ui` lays its chrome out at and the mouse path hits.
+        let dashboard = (self.page == Page::Dashboard).then(|| {
+            let layout = self.dashboard_layout();
+            let cards: Vec<renderer::DashCard<'_>> = layout
+                .shown
+                .iter()
+                .enumerate()
+                .map(|(slot, &group)| {
+                    let card = layout.card(slot);
+                    let tab = dashboard_ui::primary_tab(&self.workspaces[group]);
+                    renderer::DashCard {
+                        tab,
+                        card,
+                        body: workspace::dashboard_card_body(&card, layout.scale),
+                        focused: group == self.active,
+                        unread: tab.is_some_and(|tab| tab.unread),
+                    }
+                })
+                .collect();
+            // The cursor shows only where typing lands: the focused card,
+            // and not while a modal or the focused flyover has the keyboard.
+            let draw_cursor = !overlay_open && !(self.flyover_open && self.flyover_focused);
+            self.renderer.dashboard(&cards, &layout.viewport, draw_cursor)
+        });
         // The flyover panel lives outside the workspace tree, so its layer is
         // built here from App state and slotted into the frame's flyover
         // fields (painted above tiles/labels, below the modal overlays).
@@ -7429,8 +7689,6 @@ impl App {
                 });
             }
 
-            // 4.5) flyover terminal panel — above the workspace chrome,
-            // below the modal overlays and their scrim.
             let metrics = FlyoverPaintMetrics {
                 origin,
                 inv,
@@ -7440,6 +7698,49 @@ impl App {
                 cell_height,
                 shadow_rgb,
             };
+
+            // 4.4) the dashboard's cards (the page's content, under the
+            // flyover): every ground inside the scroll viewport's mask, so a
+            // half-scrolled card never paints over the header bar, and each
+            // terminal inside its own body's — a grid can be larger than its
+            // card for a frame or two around a resize.
+            if let Some(dash) = &dashboard {
+                let mask = |r: &workspace::LayoutRect| gpui::ContentMask {
+                    bounds: Bounds {
+                        origin: Point::new(origin.x + px(r.x * inv), origin.y + px(r.y * inv)),
+                        size: Size::new(px(r.w * inv), px(r.h * inv)),
+                    },
+                };
+                window.with_content_mask(Some(mask(&dash.viewport)), |window| {
+                    for q in &dash.grounds {
+                        paint_quad(window, origin, inv, q, shadow_rgb);
+                    }
+                    for card in &dash.cards {
+                        window.with_content_mask(Some(mask(&card.clip)), |window| {
+                            for q in &card.bg_quads {
+                                paint_quad(window, origin, inv, q, shadow_rgb);
+                            }
+                            let pane = &card.pane;
+                            paint_pane_images(window, origin, pane.origin, inv, &pane.images, true);
+                            paint_flyover_layer(
+                                window,
+                                cx,
+                                &metrics,
+                                &[],
+                                std::slice::from_ref(pane),
+                                &[],
+                            );
+                            paint_pane_images(window, origin, pane.origin, inv, &pane.images, false);
+                            for q in &card.fg_quads {
+                                paint_quad(window, origin, inv, q, shadow_rgb);
+                            }
+                        });
+                    }
+                });
+            }
+
+            // 4.5) flyover terminal panel — above the workspace chrome,
+            // below the modal overlays and their scrim.
             paint_flyover_layer(
                 window,
                 cx,
@@ -7994,6 +8295,9 @@ fn main() {
                         folders_w: workspace::FOLDERS_CARD_W,
                         sessions_scroll: 0.0,
                         folders_scroll: 0.0,
+                        dashboard_filter: dashboard_ui::Filter::All,
+                        dashboard_scroll: 0.0,
+                        dashboard_revealed: None,
                         tools_collapsed: settings::get_bool("sidebar.tools_collapsed", false),
                         pinned_collapsed: settings::get_bool("sidebar.pinned_collapsed", false),
                         snoozed_collapsed: settings::get_bool("sidebar.snoozed_collapsed", false),

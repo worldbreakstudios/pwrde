@@ -362,6 +362,48 @@ pub struct Frame {
     pub hot: Vec<LayoutRect>,
 }
 
+/// One dashboard card as [`Renderer::dashboard`] takes it: the group's
+/// primary tab and the card's rects (physical px, already scrolled) from
+/// `workspace::dashboard_card_rect` / `dashboard_card_body`.
+pub struct DashCard<'a> {
+    /// The primary pane's tab; `None` for a group whose primary has no tab.
+    pub tab: Option<&'a workspace::Tab>,
+    pub card: LayoutRect,
+    pub body: LayoutRect,
+    /// The focused card — the active group — is the one that shows a cursor.
+    pub focused: bool,
+    /// An unread primary tab tints the card's ground with the accent.
+    pub unread: bool,
+}
+
+/// How much of the chrome accent an unread dashboard card's ground takes on:
+/// enough to tell it from a read card across the grid, not enough to shift
+/// the terminal's own colours.
+const DASH_UNREAD_TINT: f32 = 0.08;
+
+/// One dashboard card's terminal, laid out for painting. The grid may be
+/// larger than the card body for a frame or two around a resize, and a card
+/// may sit half out of the scroll viewport, so the painter clips all of it
+/// to `clip` (the body ∩ the viewport).
+pub struct CardPane {
+    pub clip: LayoutRect,
+    /// Cell backgrounds, painted under the text.
+    pub bg_quads: Vec<Quad>,
+    pub pane: PaneText,
+    /// Block / box geometry, the cursor, links and the selection.
+    pub fg_quads: Vec<Quad>,
+}
+
+/// The Dashboard page's canvas layer ([`Renderer::dashboard`]): plain data,
+/// painted by `main.rs` inside a content mask over `viewport`.
+pub struct DashboardFrame {
+    /// The scroll viewport every ground and card is clipped to.
+    pub viewport: LayoutRect,
+    /// One rounded ground per card on screen.
+    pub grounds: Vec<Quad>,
+    pub cards: Vec<CardPane>,
+}
+
 /// Stateless renderer: owns only cell metrics and scale. All measurements
 /// come from gpui's text system (see `main.rs`), so `new` takes them as
 /// arguments instead of creating a GPU surface. The terminal color palette is
@@ -696,10 +738,11 @@ impl Renderer {
 
         if matches!(
             chrome.page,
-            Page::Tool(_)
+            Page::Tool(_) | Page::Dashboard
         ) {
-            // A tool page's content is painted by `tool_page`; the canvas
-            // paints only the sidebar here.
+            // A tool page's content is painted by `tool_page` and the
+            // dashboard's by `dashboard`; the canvas paints only the sidebar
+            // here.
         } else {
             let hair = (1.0 * self.scale).round().max(1.0);
             // Messages-style blending: only the focused pane is a *card*. The
@@ -1076,6 +1119,70 @@ impl Renderer {
         );
         self.selection_rects(session, origin, resolved.colors.sel, &mut fg_quads);
         (quads, PaneText { origin, rows, images }, fg_quads, labels)
+    }
+
+    /// Build the Dashboard page's canvas layer: a rounded ground per card (the
+    /// terminal background, as [`Renderer::tool_page`] paints its card) and
+    /// each card's live terminal snapshot. The header, footer and border are
+    /// an element tree over this (`dashboard_ui`), at the same rects.
+    ///
+    /// `cards` are the showing cards at their scrolled rects. One scrolled
+    /// wholly out of `viewport` is skipped — no ground, no terminal lock —
+    /// and the cursor is drawn only in the focused card (and never under a
+    /// modal: `draw_cursor`). A card whose primary tab has no terminal (a
+    /// webview) gets only its ground; the element tree labels it.
+    pub fn dashboard(
+        &self,
+        cards: &[DashCard<'_>],
+        viewport: &LayoutRect,
+        draw_cursor: bool,
+    ) -> DashboardFrame {
+        let th = self.theme();
+        let resolved = crate::term_theme::resolved(crate::theme::dark_active());
+        let term_palette = resolved.to_color_palette();
+        let pane_bg = match crate::term_theme::selected(crate::theme::dark_active()) {
+            Some(t) => t.bg,
+            None => th.term_bg,
+        };
+        let radius =
+            (workspace::DASH_CARD_RADIUS * workspace::chrome_ui_scale() * self.scale).round();
+        let mut frame =
+            DashboardFrame { viewport: *viewport, grounds: Vec::new(), cards: Vec::new() };
+        for card in cards {
+            if card.card.intersect(viewport).h <= 0.0 {
+                continue;
+            }
+            frame.grounds.push(self.px_rect(&card.card, pane_bg, 1.0, radius));
+            if card.unread {
+                frame.grounds.push(self.px_rect(&card.card, th.accent, DASH_UNREAD_TINT, radius));
+            }
+            let clip = card.body.intersect(viewport);
+            let Some(session) = card.tab.and_then(|tab| tab.session()) else { continue };
+            if clip.w < 1.0 || clip.h < 1.0 {
+                continue;
+            }
+            let origin = self.content_origin(&card.body);
+            let mut bg_quads = Vec::new();
+            let mut fg_quads = Vec::new();
+            let (rows, images) = self.snapshot_pane(
+                session,
+                &term_palette,
+                &resolved,
+                origin,
+                draw_cursor && card.focused,
+                None,
+                &mut bg_quads,
+                &mut fg_quads,
+            );
+            self.selection_rects(session, origin, resolved.colors.sel, &mut fg_quads);
+            frame.cards.push(CardPane {
+                clip,
+                bg_quads,
+                pane: PaneText { origin, rows, images },
+                fg_quads,
+            });
+        }
+        frame
     }
 
     /// Snapshot one pane's grid into per-row text spans + geometry quads,

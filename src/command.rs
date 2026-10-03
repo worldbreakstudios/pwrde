@@ -723,6 +723,7 @@ pub fn action_group(action: Action) -> &'static str {
         Action::Copy | Action::Paste => "Edit",
         Action::ToggleSidebar
         | Action::ToggleFolders
+        | Action::ToggleDashboard
         | Action::ToggleFlyover
         | Action::OpenPrInGithub
         | Action::ToggleFlow
@@ -778,6 +779,7 @@ pub fn action_icon(action: Action) -> &'static str {
         Action::NextPage => ICON_CHEVRONS_DOWN,
         Action::ToggleSidebar => ICON_PANEL_LEFT,
         Action::ToggleFolders => ICON_FOLDER_OPEN,
+        Action::ToggleDashboard => ICON_LAYOUT_GRID,
         Action::ToggleFlyover => ICON_ARROW_DOWN_TO_LINE,
         Action::OpenSettings => ICON_SETTINGS,
         Action::CommandPalette => ICON_COMMAND,

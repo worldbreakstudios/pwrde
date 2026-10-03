@@ -492,6 +492,17 @@ const ICONS: &[(&str, &[u8])] = &[
         "icons/download.svg",
         br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/><path d="M12 15V3"/></svg>"##,
     ),
+    // Lucide layout-grid (at the header chips' 1.8 stroke): the sessions
+    // header's Dashboard chip and the "Toggle dashboard" palette icon. Lucide
+    // clock: the elapsed time in a dashboard card's footer.
+    (
+        "icons/layout-grid.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>"##,
+    ),
+    (
+        "icons/clock.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>"##,
+    ),
     (
         "icons/history.svg",
         br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/></svg>"##,
@@ -608,6 +619,8 @@ pub const ICON_ZOOM_OUT: &str = "icons/zoom-out.svg";
 pub const ICON_CAMERA: &str = "icons/camera.svg";
 pub const ICON_DOWNLOAD: &str = "icons/download.svg";
 pub const ICON_HISTORY: &str = "icons/history.svg";
+pub const ICON_LAYOUT_GRID: &str = "icons/layout-grid.svg";
+pub const ICON_CLOCK: &str = "icons/clock.svg";
 pub const ICON_ARROW_LEFT_TO_LINE: &str = "icons/arrow-left-to-line.svg";
 pub const ICON_ARROW_RIGHT_TO_LINE: &str = "icons/arrow-right-to-line.svg";
 

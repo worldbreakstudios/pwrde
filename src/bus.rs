@@ -58,6 +58,11 @@ pub enum Command {
     GoToPage {
         page: String,
     },
+    /// Set the Dashboard page's filter segment (`all` or `unread`); an error
+    /// while the dashboard is not open.
+    DashboardFilter {
+        filter: String,
+    },
     ResizeWindow {
         width: f32,
         height: f32,
@@ -192,7 +197,13 @@ pub fn command_specs() -> Vec<CommandSpec> {
         CommandSpec {
             name: "go_to_page",
             args: "<page>",
-            help: "Navigate to a page (sessions, tool:<n> or a tool's name), or open the Settings window (settings, settings:<section>)",
+            help: "Navigate to a page (sessions, dashboard, tool:<n> or a tool's name), or open the Settings window (settings, settings:<section>)",
+            read_only: false,
+        },
+        CommandSpec {
+            name: "dashboard_filter",
+            args: "<all|unread>",
+            help: "Set the Dashboard page's filter (the dashboard must be open: page dashboard)",
             read_only: false,
         },
         CommandSpec {
@@ -459,6 +470,7 @@ fn command_tag(cmd: &Command) -> &'static str {
         Command::NewSection { .. } => "new_section",
         Command::MoveGroupToSection { .. } => "move_group_to_section",
         Command::GoToPage { .. } => "go_to_page",
+        Command::DashboardFilter { .. } => "dashboard_filter",
         Command::ResizeWindow { .. } => "resize_window",
         Command::Screenshot { .. } => "screenshot",
         Command::ReadPane { .. } => "read_pane",
@@ -522,6 +534,9 @@ mod tests {
             },
             Command::GoToPage {
                 page: "sessions".into(),
+            },
+            Command::DashboardFilter {
+                filter: "unread".into(),
             },
             Command::ResizeWindow {
                 width: 800.0,
@@ -667,6 +682,9 @@ mod tests {
             },
             Command::GoToPage {
                 page: String::new(),
+            },
+            Command::DashboardFilter {
+                filter: String::new(),
             },
             Command::ResizeWindow {
                 width: 0.0,

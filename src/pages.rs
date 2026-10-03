@@ -6,6 +6,9 @@
 //! page but its own window (`crate::settings_window`), opened by ⌘, or the
 //! sessions header's gear chip; its [`Section`]s live here. ⌘⇧←/→ cycle pages
 //! with wraparound; ⌘⇧↑/↓ walk the sidebar's visible tool rows and groups the same way.
+//! The Dashboard (⌘G, `crate::dashboard_ui`) swaps the Sessions workspace for
+//! a grid of the selected folder's primary panes and stays out of the ⌘⇧←/→
+//! cycle.
 //!
 //! Every ⌘ shortcut is an [`Action`] dispatched through a bindings table
 //! resolved from the settings store (`"keyboard.<action>"` keys, falling back
@@ -20,11 +23,18 @@ pub enum Page {
     /// a full-page, non-persisted terminal running that tool's command from
     /// its configured directory.
     Tool(usize),
+    /// The primary pane of every group in the selected folder as a live
+    /// card in one grid (`crate::dashboard_ui`), toggled by
+    /// [`Action::ToggleDashboard`] or the
+    /// sessions header's grid chip.
+    Dashboard,
 }
 
 impl Page {
     /// Page order for `n_tools` registered CLI tools; `cycle` (⌘⇧←/→)
-    /// walks it. Settings is a separate window, not a page.
+    /// walks it. Settings is a separate window, not a page, and the
+    /// Dashboard is a view over Sessions rather than a stop of its own:
+    /// cycling from it steps as if from Sessions.
     pub fn all(n_tools: usize) -> Vec<Page> {
         let mut v = vec![Page::Sessions];
         v.extend((0..n_tools).map(Page::Tool));
@@ -117,6 +127,7 @@ pub enum Action {
     NextSidebarTab,
     ToggleSidebar,
     ToggleFolders,
+    ToggleDashboard,
     PrevPage,
     NextPage,
     OpenSettings,
@@ -136,7 +147,7 @@ pub enum Action {
 
 impl Action {
     /// Keyboard-page row order.
-    pub const ALL: [Action; 49] = [
+    pub const ALL: [Action; 50] = [
         Action::SplitRight,
         Action::SplitDown,
         Action::NewTab,
@@ -171,6 +182,7 @@ impl Action {
         Action::NextSidebarTab,
         Action::ToggleSidebar,
         Action::ToggleFolders,
+        Action::ToggleDashboard,
         Action::PrevPage,
         Action::NextPage,
         Action::OpenSettings,
@@ -194,13 +206,14 @@ impl Action {
     /// (`Layout`, `Tabs & sessions`, `Focus`, `Editing`, `App`).
     pub fn keyboard_group(self) -> &'static str {
         match self {
-            // Splits, collapse/expand and the sidebar/folders/title-bar toggles.
+            // Splits, collapse/expand and the sidebar/folders/dashboard toggles.
             Action::SplitRight
             | Action::SplitDown
             | Action::ToggleCollapse
             | Action::ToggleFocusOthers
             | Action::ToggleSidebar
-            | Action::ToggleFolders => "Layout",
+            | Action::ToggleFolders
+            | Action::ToggleDashboard => "Layout",
             // Tabs, groups, sessions and webviews.
             Action::NewTab
             | Action::NewWebview
@@ -265,6 +278,7 @@ impl Action {
             Action::NextSidebarTab => "next_sidebar_tab",
             Action::ToggleSidebar => "toggle_sidebar",
             Action::ToggleFolders => "toggle_folders",
+            Action::ToggleDashboard => "toggle_dashboard",
             Action::PrevPage => "prev_page",
             Action::NextPage => "next_page",
             Action::OpenSettings => "open_settings",
@@ -319,6 +333,7 @@ impl Action {
             Action::NextSidebarTab => "Next sidebar tab",
             Action::ToggleSidebar => "Focus terminals",
             Action::ToggleFolders => "Toggle folders",
+            Action::ToggleDashboard => "Toggle dashboard",
             Action::PrevPage => "Previous page",
             Action::NextPage => "Next page",
             Action::OpenSettings => "Open settings",
@@ -402,6 +417,8 @@ impl Action {
             Action::ScreenshotToFile => (false, true, true, "s"),
             Action::NewSection => (false, true, true, "n"),
             Action::ToggleFolders => (false, false, false, "\\"),
+            // ⌘G; ⇧⌘G stays "Open PR in GitHub".
+            Action::ToggleDashboard => (false, false, false, "g"),
             Action::GoToSessions => (false, true, true, "1"),
             Action::GoToTool => (false, true, true, "3"),
         };
@@ -738,6 +755,21 @@ mod tests {
             vec![Page::Sessions, Page::Tool(0), Page::Tool(1)]
         );
         assert_eq!(Page::all(0), vec![Page::Sessions]);
+    }
+
+    /// The Dashboard is a view over Sessions, not a stop in the ⌘⇧←/→
+    /// cycle; its action is a Layout toggle on ⌘G, clear of ⇧⌘G.
+    #[test]
+    fn dashboard_stays_out_of_the_page_cycle() {
+        for n in [0, 1, 3] {
+            assert!(!Page::all(n).contains(&Page::Dashboard));
+        }
+        let action = Action::ToggleDashboard;
+        assert_eq!(Action::from_name("toggle_dashboard"), Some(action));
+        assert_eq!(action.label(), "Toggle dashboard");
+        assert_eq!(action.keyboard_group(), "Layout");
+        assert_eq!(action.default_binding().serialize(), "cmd-g");
+        assert_ne!(action.default_binding(), Action::OpenPrInGithub.default_binding());
     }
 
     #[test]

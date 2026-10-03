@@ -107,9 +107,27 @@ impl App {
                     Reply::success(None)
                 }
                 None => Reply::err(format!(
-                    "unknown page {page:?}; expected one of sessions, settings[:section], tool:<n> or a registered tool's name"
+                    "unknown page {page:?}; expected one of sessions, dashboard, settings[:section], tool:<n> or a registered tool's name"
                 )),
             },
+            // The dashboard's filter segment. Only while that page is up: the
+            // filter is reset on every open, so setting it ahead of time
+            // would silently do nothing.
+            Command::DashboardFilter { filter } => {
+                let Some(parsed) = crate::dashboard_ui::Filter::from_name(&filter) else {
+                    return Reply::err(format!(
+                        "unknown dashboard filter {filter:?}; expected all or unread"
+                    ));
+                };
+                if self.page != Page::Dashboard {
+                    return Reply::err(format!(
+                        "the dashboard is not open (currently {}); pwrde-cli page dashboard opens it",
+                        page_name(self.page)
+                    ));
+                }
+                self.set_dashboard_filter(parsed);
+                Reply::success(json!({ "filter": parsed.name() }))
+            }
             Command::NewSession { cwd, base, layout } => self.bus_new_session(cwd, base, layout),
             Command::NewWebview { url, group } => self.bus_new_webview(url, group),
         Command::NewWebviewCommand { command, group } => {
@@ -456,6 +474,55 @@ impl App {
             .map(|s| s.id)
     }
 
+    /// `state.dashboard`: whether the page is up, its filter, the folder
+    /// set's size and unread count (the header subtitle's two numbers), the
+    /// grid's shape, the two scroll hints' counts, and one entry per **showing**
+    /// card, in slot order — a card of the selected folder's sessions that
+    /// the filter shows: its status, whether it is focused, and its primary
+    /// PTY's grid size (the card's while the dashboard is open, the
+    /// workspace tile's otherwise). Groups outside the folder, and cards the
+    /// filter hides, are not listed (`visible` is therefore always true; the
+    /// groups' own entries still carry every pane's size).
+    fn dashboard_json(&self) -> Value {
+        let layout = self.dashboard_layout();
+        let unread = layout
+            .cards
+            .iter()
+            .filter(|card| card.status == crate::dashboard_ui::Status::Unread)
+            .count();
+        let (above, unread_above) = layout.above();
+        let (below, unread_below) = layout.below();
+        let cards: Vec<Value> = layout
+            .shown_cards()
+            .map(|card| {
+                let ws = &self.workspaces[card.group];
+                let tab = crate::dashboard_ui::primary_tab(ws);
+                json!({
+                    "group": card.group,
+                    "title": ws.title(),
+                    "status": card.status.name(),
+                    "focused": card.focused,
+                    "visible": card.visible,
+                    "cols": tab.map(|t| t.cols),
+                    "rows": tab.map(|t| t.rows),
+                })
+            })
+            .collect();
+        json!({
+            "open": self.page == Page::Dashboard,
+            "filter": self.dashboard_filter.name(),
+            "panes": layout.cards.len(),
+            "unread": unread,
+            "cols": layout.grid.cols,
+            "rows": layout.grid.rows,
+            "above": above,
+            "unread_above": unread_above,
+            "below": below,
+            "unread_below": unread_below,
+            "cards": cards,
+        })
+    }
+
     /// A JSON snapshot of what the app is showing, for agents to inspect.
     fn state_json(&self) -> Value {
         let groups: Vec<Value> = if self.is_empty_state() {
@@ -539,6 +606,7 @@ impl App {
             "palette_window_open": self.palette_window.is_some(),
             "settings_window_open": self.settings_window.is_some(),
             "new_webview_prompt_open": self.webview_prompt.is_some(),
+            "dashboard": self.dashboard_json(),
             "sidebar": {
                 "collapsed": self.sidebar_collapsed,
                 "folders_open": self.folders_open,
@@ -764,6 +832,7 @@ pub(crate) fn page_from_name(name: &str) -> Option<PageTarget> {
     }
     match lower.replace('-', "_").as_str() {
         "sessions" => Some(PageTarget::Page(Page::Sessions)),
+        "dashboard" => Some(PageTarget::Page(Page::Dashboard)),
         "settings" => Some(PageTarget::Settings(None)),
         s => s
             .strip_prefix("tool:")
@@ -795,6 +864,7 @@ pub(crate) fn resolve_page(
 pub(crate) fn page_name(page: Page) -> String {
     match page {
         Page::Sessions => "sessions".into(),
+        Page::Dashboard => "dashboard".into(),
         Page::Tool(i) => format!("tool:{i}"),
     }
 }
@@ -1183,9 +1253,13 @@ mod tests {
 
     #[test]
     fn page_names_round_trip() {
-        for page in Page::all(2) {
+        // The cycle's pages, and the Dashboard, which sits outside it.
+        for page in Page::all(2).into_iter().chain([Page::Dashboard]) {
             assert_eq!(page_from_name(&page_name(page)), Some(PageTarget::Page(page)));
         }
+        assert_eq!(page_name(Page::Dashboard), "dashboard");
+        assert_eq!(page_from_name(" Dashboard "), Some(PageTarget::Page(Page::Dashboard)));
+        assert_eq!(resolve_page("dashboard", &[]), Some(PageTarget::Page(Page::Dashboard)));
         assert_eq!(page_from_name("tool:1"), Some(PageTarget::Page(Page::Tool(1))));
         assert_eq!(page_from_name("tool:x"), None);
         assert_eq!(page_from_name("settings"), Some(PageTarget::Settings(None)));
