@@ -8,7 +8,8 @@
 //! with wraparound; ⌘⇧↑/↓ walk the sidebar's visible tool rows and groups the same way.
 //! The Dashboard (⌘G, `crate::dashboard_ui`) swaps the Sessions workspace for
 //! a grid of the selected folder's primary panes and stays out of the ⌘⇧←/→
-//! cycle.
+//! cycle; while it is up all four ⌘⇧+arrow actions move the focused card by
+//! grid position instead (`App::dashboard_arrow`).
 //!
 //! Every ⌘ shortcut is an [`Action`] dispatched through a bindings table
 //! resolved from the settings store (`"keyboard.<action>"` keys, falling back

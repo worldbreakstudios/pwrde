@@ -3599,6 +3599,42 @@ pub fn dashboard_focus_dir(
     target.map(|slot| shown[slot])
 }
 
+/// The group a wrapping arrow move (⌘⇧←/↑/↓/→ on the dashboard) lands on.
+/// Unlike [`dashboard_focus_dir`] each arrow wraps within its own row or
+/// column: left of a row's first card is that row's last, above a column's
+/// top card is the lowest card that column has (a short last row leaves the
+/// columns past it one card shorter), and the reverse. `None` when the row or
+/// column holds only the focused card or nothing shows; a `focused` that is
+/// not showing enters at the first card.
+pub fn dashboard_focus_wrap(
+    shown: &[usize],
+    focused: usize,
+    cols: usize,
+    dir: NavDir,
+) -> Option<usize> {
+    let cols = cols.max(1);
+    let Some(slot) = shown.iter().position(|&g| g == focused) else {
+        return shown.first().copied();
+    };
+    let last = shown.len() - 1;
+    let col = slot % cols;
+    let row_start = slot - col;
+    let row_end = (row_start + cols - 1).min(last);
+    // The lowest slot of this column.
+    let col_end = col + (last - col) / cols * cols;
+    let target = match dir {
+        NavDir::Left if slot > row_start => slot - 1,
+        NavDir::Left => row_end,
+        NavDir::Right if slot < row_end => slot + 1,
+        NavDir::Right => row_start,
+        NavDir::Up if slot >= cols => slot - cols,
+        NavDir::Up => col_end,
+        NavDir::Down if slot + cols <= last => slot + cols,
+        NavDir::Down => col,
+    };
+    (target != slot).then(|| shown[target])
+}
+
 /// The group `delta` cards along the grid from `focused` in slot order,
 /// wrapping at both ends (⌘[ / ⌘], like tile cycling). `None` when nothing
 /// shows; a `focused` that is not showing enters at the first card.
@@ -4218,6 +4254,45 @@ mod dashboard_tests {
         let none = above.intersect(&VIEW);
         assert_eq!((none.w.min(none.h), none.h), (0.0, 0.0));
         assert!(!none.contains(none.x, none.y));
+    }
+
+    /// ⌘⇧+arrows wrap within the focused card's row or column, a short last
+    /// row shortening the columns past it.
+    #[test]
+    fn focus_wraps_within_rows_and_columns() {
+        // Groups 10..17 in a 3-column grid:
+        //   10 11 12
+        //   13 14 15
+        //   16
+        let shown = [10, 11, 12, 13, 14, 15, 16];
+        let go = |from, dir| dashboard_focus_wrap(&shown, from, 3, dir);
+        assert_eq!(go(11, NavDir::Left), Some(10));
+        assert_eq!(go(11, NavDir::Right), Some(12));
+        assert_eq!(go(14, NavDir::Up), Some(11));
+        assert_eq!(go(11, NavDir::Down), Some(14));
+        // Row wrap.
+        assert_eq!(go(10, NavDir::Left), Some(12));
+        assert_eq!(go(15, NavDir::Right), Some(13));
+        // Column wrap: column 0 has three cards, the others two.
+        assert_eq!(go(10, NavDir::Up), Some(16));
+        assert_eq!(go(16, NavDir::Down), Some(10));
+        assert_eq!(go(13, NavDir::Down), Some(16));
+        assert_eq!(go(11, NavDir::Up), Some(14));
+        assert_eq!(go(14, NavDir::Down), Some(11));
+        assert_eq!(go(12, NavDir::Up), Some(15));
+        // A card alone in its row has nowhere to go sideways.
+        assert_eq!(go(16, NavDir::Left), None);
+        assert_eq!(go(16, NavDir::Right), None);
+        // One column: left / right do nothing, up / down wrap.
+        assert_eq!(dashboard_focus_wrap(&shown, 11, 1, NavDir::Right), None);
+        assert_eq!(dashboard_focus_wrap(&shown, 10, 1, NavDir::Up), Some(16));
+        assert_eq!(dashboard_focus_wrap(&shown, 16, 1, NavDir::Down), Some(10));
+        // One row: up / down do nothing.
+        assert_eq!(dashboard_focus_wrap(&[3, 4], 3, 2, NavDir::Down), None);
+        assert_eq!(dashboard_focus_wrap(&[3, 4], 4, 2, NavDir::Right), Some(3));
+        // Not showing enters at the first card; nothing showing is None.
+        assert_eq!(dashboard_focus_wrap(&shown, 99, 3, NavDir::Up), Some(10));
+        assert_eq!(dashboard_focus_wrap(&[], 0, 3, NavDir::Right), None);
     }
 
     /// Cycling steps through the shown cards in slot order and wraps.

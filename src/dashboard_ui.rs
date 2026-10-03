@@ -46,7 +46,7 @@
 //! path all read that one value, so they cannot disagree.
 //!
 //! **Focus** is the active group: there is no dashboard focus of its own. A
-//! press on a card (or ⇧⌘H/J/K/L, ⌘[ / ⌘], ⌘⇧↑/↓, a sidebar row) goes through
+//! press on a card (or ⇧⌘H/J/K/L, ⌘[ / ⌘], ⌘⇧+arrows, a sidebar row) goes through
 //! `App::switch_workspace`, which on this page neither changes page nor
 //! resizes a primary PTY to its workspace tile; the card is scrolled into
 //! view. Keys and paste reach the focused card's session
@@ -555,7 +555,7 @@ impl App {
     }
 
     /// Follow the active group: when it is not the one the grid last
-    /// revealed — a card press, a sidebar row, ⌘⇧↑/↓, a new or closed group —
+    /// revealed — a card press, a sidebar row, ⌘⇧+arrows, a new or closed group —
     /// bring its card into view. Run from `App::sync_layout`, so a wheel
     /// scroll is not undone by unrelated layout passes.
     pub(crate) fn dashboard_follow_active(&mut self) {
@@ -570,6 +570,18 @@ impl App {
         let layout = self.dashboard_layout();
         if let Some(group) =
             workspace::dashboard_focus_dir(&layout.shown, self.active, layout.grid.cols, dir)
+        {
+            self.switch_workspace(group);
+        }
+    }
+
+    /// ⌘⇧←/↑/↓/→ on the dashboard (the page-cycle and sidebar-tab actions,
+    /// which mean the grid here): focus the showing card in that direction,
+    /// wrapping within its row or column.
+    pub(crate) fn dashboard_arrow(&mut self, dir: NavDir) {
+        let layout = self.dashboard_layout();
+        if let Some(group) =
+            workspace::dashboard_focus_wrap(&layout.shown, self.active, layout.grid.cols, dir)
         {
             self.switch_workspace(group);
         }
