@@ -73,7 +73,7 @@ silent no-op — treat that as a real signal. On the dashboard `key` types into
 the focused card's primary pane, `focus_*` / `next_tile` / `prev_tile` move the
 focused card, `new_group` opens the session picker, and the other group and
 tile actions (`split_right`, `new_tab`, `close_tab`, `close_group`,
-`toggle_pin`, `open_pr_in_github`, …) are refused the same way; `focus <group>`
+`toggle_pin`, …) are refused the same way, while `open_pr_in_github` opens the focused card's pull request in the browser (exit `1` with no card focused or no PR); `focus <group>`
 leaves the dashboard for the Sessions page. Each card's `status` in `state` is
 `read` or `unread` — the primary tab's unread flag: an attention signal (OSC 9)
 turns any card `unread`, the focused one included, and only a left click on

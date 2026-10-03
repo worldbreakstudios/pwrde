@@ -65,6 +65,12 @@ impl App {
                         Reply::success(None)
                     } else if action == Action::ToggleFlow && !crate::flow::enabled() {
                         Reply::err(FLOW_DISABLED)
+                    } else if action == Action::OpenPrInGithub && self.page == Page::Dashboard {
+                        // The one group action the dashboard takes, so the
+                        // Sessions-only reason below would be wrong for it.
+                        Reply::err(format!(
+                            "{name:?} found no pull request to open for the focused card"
+                        ))
                     } else if self.page != Page::Sessions {
                         Reply::err(format!(
                             "{name:?} only applies on the Sessions page (currently {})",
