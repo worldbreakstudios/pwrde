@@ -1,8 +1,10 @@
 //! The GANTRY folders card: the floating glass panel at the left of the
-//! sidebar region that lists the pinned CLI tools, "All sessions" and one
-//! row per section (the mock's "folders"). Picking a row sets the filter the
-//! flat sessions list beside it applies ([`App::set_folder_filter`]) or
-//! jumps to a tool page.
+//! sidebar region that lists "All sessions" and one row per section (the
+//! mock's "folders"). Picking a row sets the filter the flat sessions list
+//! beside it applies ([`App::set_folder_filter`]). The CLI tools are not
+//! here: they are the fixed "Tools" band at the top of the sessions list
+//! ([`crate::sidebar_ui`]), which stays visible while this card is hidden;
+//! that band borrows this file's `row_shell` / `count_badge`.
 //!
 //! Same discipline as [`crate::sidebar_ui`]: geometry is the pure
 //! [`crate::workspace`] helpers (`folders_card_rect`, `folder_rows`,
@@ -19,7 +21,7 @@ use gpui::{
 };
 
 use crate::App;
-use crate::sidebar_ui::{icon_chip, press, scaled, separator};
+use crate::sidebar_ui::{icon_chip, press, scaled};
 use crate::ui::icon;
 use crate::ui::theme::Theme;
 use crate::workspace::{FolderRow, LayoutRect};
@@ -31,20 +33,14 @@ const ROW_RADIUS: f32 = 8.0;
 /// Horizontal padding inside a row (mock: `7px 12px`).
 const ROW_PAD_X: f32 = 12.0;
 /// Side of a row's leading icon (mock: 15px).
-const ROW_ICON: f32 = 15.0;
+pub(crate) const ROW_ICON: f32 = 15.0;
 /// Gap between a row's icon and its label (mock: 9px).
 const ROW_GAP: f32 = 9.0;
-/// The pinned tool rows' green "running" dot (mock: `#3fb950`, 6px).
-const TOOL_DOT: f32 = 6.0;
 /// Unread dot on a folder row whose members want attention (matches the
 /// session rows' dot).
 const UNREAD_DOT: f32 = 6.0;
 /// Side of the hover-only delete chip on a folder row.
 const DELETE_CHIP: f32 = 16.0;
-
-fn tool_green() -> gpui::Hsla {
-    gpui::rgb(0x3fb950).into()
-}
 
 impl App {
     /// The folders card in logical px (the element tree's unit).
@@ -52,17 +48,16 @@ impl App {
         crate::workspace::folders_card_rect(self.logical_height(), self.folders_w, 1.0)
     }
 
-    /// Whether `row` is the one the card highlights: the tool page that is
-    /// showing, else the active folder filter ("All sessions" when none).
+    /// Whether `row` is the one the card highlights: the active folder
+    /// filter ("All sessions" when none) — nothing while a tool page is
+    /// showing (the sessions list's tools band highlights that).
     fn folder_row_selected(&self, row: FolderRow) -> bool {
         match (row, self.page) {
-            (FolderRow::Tool(i), crate::Page::Tool(j)) => i == j,
-            (FolderRow::Tool(_), _) | (_, crate::Page::Tool(_)) => false,
+            (_, crate::Page::Tool(_)) => false,
             (FolderRow::AllSessions, _) => self.folder_filter.is_none(),
             (FolderRow::Section(si), _) => {
                 self.sections.get(si).is_some_and(|s| Some(s.id) == self.folder_filter)
             },
-            (FolderRow::PinnedHeader, _) => false,
         }
     }
 
@@ -164,26 +159,6 @@ impl App {
             let selected = self.folder_row_selected(*row);
             let row_hovered = hovered(&rect);
             let el = match *row {
-                FolderRow::PinnedHeader => self
-                    .pinned_header_row(theme, &r, row_hovered)
-                    .cursor_pointer()
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        press(entity.clone(), |this, _ev, _cx| this.toggle_tools_collapsed()),
-                    ),
-                FolderRow::Tool(ti) => {
-                    if self.tools.get(ti).is_none() {
-                        continue;
-                    }
-                    let label = self.tool_row_label(ti);
-                    self.tool_row(theme, &r, &label, selected, row_hovered)
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            press(entity.clone(), move |this, _ev, _cx| {
-                                this.set_page(crate::Page::Tool(ti))
-                            }),
-                        )
-                },
                 FolderRow::AllSessions => {
                     // Every group: pinned ones are still in the list, as
                     // bubbles above the rows.
@@ -202,18 +177,6 @@ impl App {
                 },
             };
             rows_layer = rows_layer.child(el);
-        }
-        if let Some(sep) = crate::workspace::folder_separator_rect(&card, &rows, scroll, 1.0) {
-            let s = rel(&sep, &body);
-            rows_layer = rows_layer.child(
-                div()
-                    .absolute()
-                    .left(px(s.x))
-                    .top(px(s.y))
-                    .w(px(s.w))
-                    .h(px(s.h))
-                    .bg(separator(theme)),
-            );
         }
         root = root.child(rows_layer);
 
@@ -234,71 +197,6 @@ impl App {
                 .text_color(theme.muted_foreground)
                 .child(format!("{n} session{}", if n == 1 { "" } else { "s" })),
         )
-    }
-
-    /// The "Tools" caption row: wrench icon, label, tool count, and a
-    /// fold chevron — a click folds the tool rows away
-    /// ([`App::toggle_tools_collapsed`]).
-    fn pinned_header_row(&self, theme: &Theme, r: &LayoutRect, hovered: bool) -> gpui::Stateful<gpui::Div> {
-        let chevron = if self.tools_collapsed {
-            crate::ui::assets::ICON_CHEVRON_RIGHT
-        } else {
-            crate::ui::assets::ICON_CHEVRON_DOWN
-        };
-        row_shell(r, false, hovered, theme)
-            .id("folders-pinned")
-            .child(icon(
-                crate::ui::assets::ICON_WRENCH,
-                px(scaled(ROW_ICON)),
-                theme.muted_foreground,
-            ))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .text_size(px(scaled(12.5)))
-                    .text_color(theme.muted_foreground)
-                    .child("Tools"),
-            )
-            .child(count_badge(theme, self.tools.len(), false))
-            .child(icon(chevron, px(scaled(ROW_ICON)), theme.muted_foreground))
-    }
-
-    /// One pinned CLI-tool row: a green dot and the terminal's own pane title —
-    /// or the tool's command while that terminal has none of its own
-    /// ([`App::tool_row_label`]) — in monospace.
-    fn tool_row(
-        &self,
-        theme: &Theme,
-        r: &LayoutRect,
-        label: &str,
-        selected: bool,
-        hovered: bool,
-    ) -> gpui::Stateful<gpui::Div> {
-        let ink = if selected { theme.primary_foreground } else { theme.foreground };
-        row_shell(r, selected, hovered, theme)
-            .id(("folders-tool", r.y as usize))
-            .cursor_pointer()
-            .child(
-                div()
-                    .flex_none()
-                    .w(px(scaled(TOOL_DOT)))
-                    .h(px(scaled(TOOL_DOT)))
-                    .rounded_full()
-                    .bg(tool_green()),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .text_ellipsis()
-                    .font_family(crate::renderer::FONT_FAMILY)
-                    .text_size(px(scaled(11.5)))
-                    .text_color(ink)
-                    .child(label.to_string()),
-            )
     }
 
     /// One folder (section) row: folder icon or emoji, the name — or the
@@ -385,8 +283,8 @@ fn rel(r: &LayoutRect, parent: &LayoutRect) -> LayoutRect {
 
 /// The shared row box: absolute at `r`, the mock's selection fill
 /// (`Theme.primary` + white text) or a muted hover wash, horizontal flex
-/// with the row's icon gap.
-fn row_shell(r: &LayoutRect, selected: bool, hovered: bool, theme: &Theme) -> gpui::Div {
+/// with the row's icon gap. The sessions list's tools band uses it too.
+pub(crate) fn row_shell(r: &LayoutRect, selected: bool, hovered: bool, theme: &Theme) -> gpui::Div {
     div()
         .absolute()
         .left(px(r.x))
@@ -470,7 +368,7 @@ fn folder_row(
 }
 
 /// The trailing count: 11px, muted — 80% white on a selected row.
-fn count_badge(theme: &Theme, count: usize, selected: bool) -> gpui::Div {
+pub(crate) fn count_badge(theme: &Theme, count: usize, selected: bool) -> gpui::Div {
     div()
         .flex_none()
         .text_size(px(scaled(11.0)))

@@ -15,8 +15,10 @@
 //! One exception, deliberately narrow: sidebar row heights also follow the
 //! `appearance.font_size` setting, because the rows are an element tree
 //! ([`crate::sidebar_ui`]) whose type scales with it. The formula itself stays
-//! pure — see [`sidebar_row_h`] — and only [`sidebar_row_rect`] and
-//! [`tab_rect`] read the setting, so paint and hit-test still share one answer.
+//! pure — see [`sidebar_row_h`] — and only [`sidebar_row_rect`],
+//! [`tools_band`] (the fixed "Tools" caption and CLI-tool rows between the
+//! sessions header and the scrolling rows) and [`tab_rect`] read the setting,
+//! so paint and hit-test still share one answer.
 //!
 //! ## Collapse model
 //!
@@ -901,18 +903,23 @@ pub const FOLDERS_FOOTER_H: f32 = 34.0;
 /// Horizontal inset of the folder rows from the card edge (mock: body
 /// padding `0 8`).
 pub const FOLDER_BODY_PAD: f32 = 8.0;
-/// Height of a folder / "All sessions" / "Pinned tools" row (mock: 7px of
-/// padding around a 12.5px line).
+/// Height of a folder / "All sessions" row (mock: 7px of padding around a
+/// 12.5px line).
 pub const FOLDER_ROW_H: f32 = 30.0;
-/// Height of a pinned CLI-tool row (mock: 6px around an 11.5px mono line).
-pub const TOOL_ROW_H: f32 = 26.0;
 /// Vertical gap between the folders card's rows.
 pub const FOLDER_ROW_GAP: f32 = 1.0;
-/// Space the separator between the pinned tools and the folders takes: a
-/// 1px line with 6px margins above and below.
-pub const FOLDER_SEPARATOR_H: f32 = 13.0;
-/// Inset of that separator (and the footer text) from the card's edges.
-const FOLDER_SEPARATOR_INSET: f32 = 12.0;
+/// Height of the sessions list's "Tools" caption row (a folder-row-high
+/// line; see [`tools_band`]).
+pub const TOOLS_CAPTION_H: f32 = FOLDER_ROW_H;
+/// Height of a CLI-tool row (mock: 6px around an 11.5px mono line).
+pub const TOOL_ROW_H: f32 = 26.0;
+/// Vertical gap between the tools band's rows.
+pub const TOOL_ROW_GAP: f32 = 1.0;
+/// Space the separator closing the tools band takes: a 1px line with 6px
+/// margins above and below.
+pub const TOOLS_SEPARATOR_H: f32 = 13.0;
+/// Inset of that separator from the list's edges.
+const TOOLS_SEPARATOR_INSET: f32 = 12.0;
 
 /// Width of the whole left region in logical px: the sessions list plus
 /// the folders column when it is open, or the slim closed inset. A zero
@@ -992,8 +999,9 @@ pub fn folders_card_rect(height: u32, folders_w: f32, scale: f32) -> LayoutRect 
 
 /// Rect of the flat sessions list in physical px: right of the folders
 /// column, inset by the region padding top and bottom. Its first
-/// [`SESSIONS_HEADER_H`] is the list header; rows start below that (see
-/// [`sidebar_row_rect`]).
+/// [`SESSIONS_HEADER_H`] is the list header, the fixed [`tools_band`] hangs
+/// under that, and the session rows start below the band (see
+/// [`sessions_rows_rect`] / [`sidebar_row_rect`]).
 pub fn sessions_list_rect(
     sessions_w: f32,
     folders_w: f32,
@@ -1014,43 +1022,118 @@ pub fn sessions_list_rect(
     LayoutRect { x, y: pad, w: right - x, h: bottom - pad }
 }
 
-/// One row of the folders card, top to bottom: the "Pinned tools" caption
-/// and one row per registered CLI tool (only when there are tools), then
-/// "All sessions" and one row per section.
+/// The fixed "Tools" band at the top of the sessions list, directly under
+/// its header: the fold caption, one row per registered CLI tool (none
+/// while folded) and the hairline closing the band. It never scrolls — the
+/// session rows scroll beneath it, starting at [`sessions_rows_rect`].
+/// With no tools every rect is empty and `h` is 0.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToolsBand {
+    /// The "Tools" caption row (the fold toggle).
+    pub caption: LayoutRect,
+    /// One rect per visible tool row, in registry order.
+    pub rows: Vec<LayoutRect>,
+    /// The 1px line centred in the [`TOOLS_SEPARATOR_H`] gap under the rows.
+    pub separator: LayoutRect,
+    /// The band's full height, separator gap included.
+    pub h: f32,
+}
+
+/// The tools band for `n_tools` CLI tools inside `list` (the *unscrolled*
+/// [`sessions_list_rect`]), in device px. Row heights follow the chrome
+/// text size like the session rows do. Painting (`sidebar_ui.rs`) and
+/// hit-testing (`main.rs`) both read these rects.
+pub fn tools_band(list: &LayoutRect, n_tools: usize, tools_collapsed: bool, scale: f32) -> ToolsBand {
+    tools_band_at(list, n_tools, tools_collapsed, scale, chrome_ui_scale())
+}
+
+/// [`tools_band`] at an explicit text-size factor. Pure, so the tests can
+/// pin the band at a non-default size.
+fn tools_band_at(
+    list: &LayoutRect,
+    n_tools: usize,
+    tools_collapsed: bool,
+    scale: f32,
+    font_scale: f32,
+) -> ToolsBand {
+    let x = list.x;
+    let w = list.w.max(0.0);
+    let top = list.y + (SESSIONS_HEADER_H * scale).round();
+    if n_tools == 0 {
+        let empty = LayoutRect { x, y: top, w: 0.0, h: 0.0 };
+        return ToolsBand { caption: empty, rows: Vec::new(), separator: empty, h: 0.0 };
+    }
+    let gap = (TOOL_ROW_GAP * scale).round();
+    let caption = LayoutRect { x, y: top, w, h: (TOOLS_CAPTION_H * font_scale * scale).round() };
+    let row_h = (TOOL_ROW_H * font_scale * scale).round();
+    let mut y = caption.y + caption.h;
+    let mut rows = Vec::new();
+    if !tools_collapsed {
+        for _ in 0..n_tools {
+            y += gap;
+            rows.push(LayoutRect { x, y, w, h: row_h });
+            y += row_h;
+        }
+    }
+    let sep_h = (TOOLS_SEPARATOR_H * scale).round();
+    let inset = (TOOLS_SEPARATOR_INSET * scale).round();
+    let separator = LayoutRect {
+        x: x + inset,
+        y: y + ((TOOLS_SEPARATOR_H * scale) / 2.0).floor(),
+        w: (w - 2.0 * inset).max(0.0),
+        h: scale.round().max(1.0),
+    };
+    ToolsBand { caption, rows, separator, h: y + sep_h - top }
+}
+
+/// Height of the [`tools_band`] in device px: 0 with no tools, the caption
+/// and separator alone while folded.
+pub fn tools_band_h(n_tools: usize, tools_collapsed: bool, scale: f32) -> f32 {
+    tools_band(&LayoutRect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 }, n_tools, tools_collapsed, scale).h
+}
+
+/// The list rect the session-row helpers ([`sidebar_row_rect`],
+/// [`pinned_caption_rect`], the snoozed band, …) take: `list` (the
+/// [`sessions_list_rect`]) pushed down by the fixed tools band, then up by
+/// the wheel `scroll` (device px). Those helpers start their stack one
+/// [`SESSIONS_HEADER_H`] into the rect they are given, so the rows begin
+/// right under the band; the rect's height shrinks by the band so its
+/// bottom edge stays the list's.
+pub fn sessions_rows_rect(list: &LayoutRect, band_h: f32, scroll: f32) -> LayoutRect {
+    LayoutRect {
+        x: list.x,
+        y: list.y + band_h - scroll.round(),
+        w: list.w,
+        h: (list.h - band_h).max(0.0),
+    }
+}
+
+/// Top edge of the band the session rows are clipped to (device px, never
+/// scrolled): the bottom of the list header and the tools band.
+pub fn sessions_rows_top(list: &LayoutRect, band_h: f32, scale: f32) -> f32 {
+    list.y + (SESSIONS_HEADER_H * scale).round() + band_h
+}
+
+/// One row of the folders card, top to bottom: "All sessions" and one row
+/// per section. (The CLI tools left the card for the sessions list's
+/// [`tools_band`].)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FolderRow {
-    PinnedHeader,
-    Tool(usize),
     AllSessions,
     Section(usize),
 }
 
-/// The folders card's row list for `n_tools` CLI tools and `n_sections`
-/// sections, in paint order.
-pub fn folder_rows(n_tools: usize, tools_collapsed: bool, n_sections: usize) -> Vec<FolderRow> {
-    let mut rows = Vec::with_capacity(n_tools + n_sections + 2);
-    if n_tools > 0 {
-        rows.push(FolderRow::PinnedHeader);
-        if !tools_collapsed {
-            rows.extend((0..n_tools).map(FolderRow::Tool));
-        }
-    }
+/// The folders card's row list for `n_sections` sections, in paint order.
+pub fn folder_rows(n_sections: usize) -> Vec<FolderRow> {
+    let mut rows = Vec::with_capacity(n_sections + 1);
     rows.push(FolderRow::AllSessions);
     rows.extend((0..n_sections).map(FolderRow::Section));
     rows
 }
 
-fn folder_row_h(row: FolderRow) -> f32 {
-    match row {
-        FolderRow::Tool(_) => TOOL_ROW_H,
-        _ => FOLDER_ROW_H,
-    }
-}
-
 /// Rect of `rows[index]` inside `card` (physical px): rows stack below the
-/// card header, inset by [`FOLDER_BODY_PAD`], with the separator's space
-/// opening above "All sessions" whenever tool rows precede it. Painting,
-/// hovering and group-drop hit-testing all read this one rect.
+/// card header, inset by [`FOLDER_BODY_PAD`]. Painting, hovering and
+/// group-drop hit-testing all read this one rect.
 pub fn folder_row_rect(
     card: &LayoutRect,
     rows: &[FolderRow],
@@ -1062,41 +1145,10 @@ pub fn folder_row_rect(
     let gap = (FOLDER_ROW_GAP * scale).round();
     let x = card.x + pad;
     let w = (card.w - 2.0 * pad).max(0.0);
-    let mut y = card.y + (FOLDERS_HEADER_H * scale).round() - scroll.round();
-    for (i, row) in rows.iter().enumerate() {
-        if matches!(row, FolderRow::AllSessions) && i > 0 {
-            y += (FOLDER_SEPARATOR_H * scale).round();
-        }
-        let h = (folder_row_h(*row) * scale).round();
-        if i == index {
-            return LayoutRect { x, y, w, h };
-        }
-        y += h + gap;
-    }
-    LayoutRect { x, y, w, h: 0.0 }
-}
-
-/// The 1px separator between the tool rows and "All sessions", centred in
-/// the [`FOLDER_SEPARATOR_H`] gap; `None` when no tool rows precede it.
-pub fn folder_separator_rect(
-    card: &LayoutRect,
-    rows: &[FolderRow],
-    scroll: f32,
-    scale: f32,
-) -> Option<LayoutRect> {
-    let i = rows.iter().position(|r| matches!(r, FolderRow::AllSessions))?;
-    if i == 0 {
-        return None;
-    }
-    let all = folder_row_rect(card, rows, i, scroll, scale);
-    let inset = (FOLDER_SEPARATOR_INSET * scale).round();
-    let line = scale.round().max(1.0);
-    Some(LayoutRect {
-        x: card.x + inset,
-        y: all.y - ((FOLDER_SEPARATOR_H * scale) / 2.0).round(),
-        w: (card.w - 2.0 * inset).max(0.0),
-        h: line,
-    })
+    let h = (FOLDER_ROW_H * scale).round();
+    let top = card.y + (FOLDERS_HEADER_H * scale).round() - scroll.round();
+    let y = top + index as f32 * (h + gap);
+    LayoutRect { x, y, w, h: if index < rows.len() { h } else { 0.0 } }
 }
 
 /// Height of the folders card's row stack (unscrolled, device px): from the
@@ -1691,7 +1743,8 @@ pub fn sidebar_rows_extent(
     }
 }
 
-/// Pixel rect for `rows[index]` inside `list` (the [`sessions_list_rect`]):
+/// Pixel rect for `rows[index]` inside `list` (the [`sessions_rows_rect`] —
+/// the list rect pushed below the tools band and scrolled):
 /// rows stack below the list header and the "Pinned" caption, the pinned
 /// run then the section gap, span the
 /// list's full width and touch (the row paints its own hairline separator).
@@ -4007,8 +4060,7 @@ mod tests {
         assert_eq!(at, 1);
         assert_eq!(sections.iter().map(|s| s.id).collect::<Vec<_>>(), vec![2, 3, 1]);
         // Folders card rows fold the tools run away.
-        assert_eq!(folder_rows(2, true, 1), vec![FolderRow::PinnedHeader, FolderRow::AllSessions, FolderRow::Section(0)]);
-        assert_eq!(folder_rows(2, false, 1).len(), 5);
+        assert_eq!(folder_rows(1), vec![FolderRow::AllSessions, FolderRow::Section(0)]);
     }
 
     #[test]
@@ -4164,38 +4216,123 @@ mod tests {
         assert!(!chips.plus.contains(chips.plus.x, chips.plus.y));
     }
 
-    /// Folder rows: the pinned-tools caption and its tool rows come first
-    /// (only when there are tools), then "All sessions", then one row per
-    /// section in `sections` order.
+    /// The tools band hangs under the sessions header: caption, one row per
+    /// tool, then the separator gap; everything spans the list's width.
     #[test]
-    fn folder_rows_order_tools_then_all_sessions_then_folders() {
-        assert_eq!(
-            folder_rows(2, false, 1),
-            vec![
-                FolderRow::PinnedHeader,
-                FolderRow::Tool(0),
-                FolderRow::Tool(1),
-                FolderRow::AllSessions,
-                FolderRow::Section(0),
-            ]
-        );
-        assert_eq!(
-            folder_rows(0, false, 2),
-            vec![FolderRow::AllSessions, FolderRow::Section(0), FolderRow::Section(1)]
-        );
-        // No tools: nothing to separate "All sessions" from.
-        let card = folders_card_rect(1000, FOLDERS_CARD_W, 1.0);
-        assert!(folder_separator_rect(&card, &folder_rows(0, false, 2), 0.0, 1.0).is_none());
+    fn tools_band_stacks_under_the_sessions_header() {
+        let scale = 2.0;
+        let list = sessions_list_rect(260.0, FOLDERS_CARD_W, false, 1000, scale);
+        let band = tools_band_at(&list, 2, false, scale, 1.0);
+        let top = list.y + (SESSIONS_HEADER_H * scale).round();
+        assert_eq!(band.caption, LayoutRect {
+            x: list.x,
+            y: top,
+            w: list.w,
+            h: (TOOLS_CAPTION_H * scale).round(),
+        });
+        assert_eq!(band.rows.len(), 2);
+        let gap = (TOOL_ROW_GAP * scale).round();
+        assert_eq!(band.rows[0].y, band.caption.y + band.caption.h + gap);
+        assert_eq!(band.rows[1].y, band.rows[0].y + band.rows[0].h + gap);
+        for r in &band.rows {
+            assert_eq!((r.x, r.w, r.h), (list.x, list.w, (TOOL_ROW_H * scale).round()));
+        }
+        let rows_bottom = band.rows[1].y + band.rows[1].h;
+        assert_eq!(band.h, rows_bottom + (TOOLS_SEPARATOR_H * scale).round() - top);
+        assert!(band.separator.y > rows_bottom);
+        assert!(band.separator.y + band.separator.h <= top + band.h);
+        assert!(band.separator.x > list.x && band.separator.x + band.separator.w < list.x + list.w);
+        // The folders column moves the list, and the band with it.
+        let open = sessions_list_rect(260.0, FOLDERS_CARD_W, true, 1000, scale);
+        assert_eq!(tools_band_at(&open, 2, false, scale, 1.0).caption.x, open.x);
+        // The chrome text size scales the rows.
+        let big = tools_band_at(&list, 2, false, scale, 1.5);
+        assert_eq!(big.caption.h, (TOOLS_CAPTION_H * 1.5 * scale).round());
+        assert_eq!(big.rows[0].h, (TOOL_ROW_H * 1.5 * scale).round());
+        assert!(big.h > band.h);
     }
 
-    /// Folder row rects stack inside the card's body inset, start below the
-    /// header band, use the slimmer tool height, and leave the separator's
-    /// space between the tools and "All sessions".
+    /// Folded, the band is the caption and the separator gap; with no
+    /// tools it is absent and takes no height.
+    #[test]
+    fn tools_band_folds_to_its_caption_and_vanishes_without_tools() {
+        let scale = 1.0;
+        let list = sessions_list_rect(260.0, FOLDERS_CARD_W, false, 800, scale);
+        let folded = tools_band_at(&list, 3, true, scale, 1.0);
+        assert!(folded.rows.is_empty());
+        assert_eq!(folded.caption.h, TOOLS_CAPTION_H);
+        assert_eq!(folded.h, TOOLS_CAPTION_H + TOOLS_SEPARATOR_H);
+        assert!(folded.h < tools_band_at(&list, 3, false, scale, 1.0).h);
+
+        let none = tools_band_at(&list, 0, false, scale, 1.0);
+        assert_eq!(none.h, 0.0);
+        assert!(none.rows.is_empty());
+        assert_eq!((none.caption.w, none.caption.h, none.separator.h), (0.0, 0.0, 0.0));
+        assert_eq!(tools_band_h(0, false, scale), 0.0);
+        assert_eq!(tools_band_h(0, true, scale), 0.0);
+        assert_eq!(tools_band_h(3, false, scale), tools_band(&list, 3, false, scale).h);
+    }
+
+    /// Session rows, the "Pinned" caption and the clip band all start below
+    /// the tools band; the wheel scroll moves the rows but not the band.
+    #[test]
+    fn session_rows_start_below_the_tools_band() {
+        let scale = 2.0;
+        let list = sessions_list_rect(260.0, FOLDERS_CARD_W, false, 1000, scale);
+        let workspaces = vec![ws("a", None), ws("b", None)];
+        let rows = sidebar_rows_filtered(&workspaces, &[], None, false, false);
+        let band = tools_band(&list, 2, false, scale);
+        let band_bottom = band.caption.y + band.h;
+        assert_eq!(sessions_rows_top(&list, band.h, scale), band_bottom);
+
+        let rows_list = sessions_rows_rect(&list, band.h, 0.0);
+        assert_eq!(rows_list.y + rows_list.h, list.y + list.h);
+        let first = sidebar_row_rect(&rows, 0, &workspaces, false, scale, &rows_list);
+        assert_eq!(first.y, band_bottom);
+        assert_eq!(pinned_caption_rect(scale, &rows_list).y, band_bottom);
+        let zone = pinned_drop_zone(&rows, &workspaces, true, scale, &rows_list);
+        assert_eq!(zone.y, band_bottom);
+        // No band (no tools): exactly the old placement under the header.
+        let bare = sessions_rows_rect(&list, 0.0, 0.0);
+        assert_eq!(bare, list);
+        assert_eq!(
+            first.y - sidebar_row_rect(&rows, 0, &workspaces, false, scale, &bare).y,
+            band.h
+        );
+        // Scrolling lifts the rows under the band; the band stays put.
+        let scrolled = sessions_rows_rect(&list, band.h, 40.0);
+        assert_eq!(
+            sidebar_row_rect(&rows, 0, &workspaces, false, scale, &scrolled).y,
+            band_bottom - 40.0
+        );
+        assert_eq!(tools_band(&list, 2, false, scale), band);
+        // The scroll extent is measured from the rows' own top, so the band
+        // only shortens the viewport.
+        let s = SnoozedSection::default();
+        assert_eq!(
+            sidebar_rows_extent(&rows, &workspaces, false, s, scale, &rows_list),
+            sidebar_rows_extent(&rows, &workspaces, false, s, scale, &bare)
+        );
+    }
+
+    /// Folder rows: "All sessions", then one row per section in `sections`
+    /// order — the CLI tools are no longer in the card.
+    #[test]
+    fn folder_rows_order_all_sessions_then_folders() {
+        assert_eq!(
+            folder_rows(2),
+            vec![FolderRow::AllSessions, FolderRow::Section(0), FolderRow::Section(1)]
+        );
+        assert_eq!(folder_rows(0), vec![FolderRow::AllSessions]);
+    }
+
+    /// Folder row rects stack inside the card's body inset, starting right
+    /// below the header band, one uniform height and gap apart.
     #[test]
     fn folder_row_rects_stack_inside_the_card() {
         let scale = 2.0;
         let card = folders_card_rect(1000, FOLDERS_CARD_W, scale);
-        let rows = folder_rows(1, false, 2);
+        let rows = folder_rows(2);
         let rects: Vec<_> = (0..rows.len())
             .map(|i| folder_row_rect(&card, &rows, i, 0.0, scale))
             .collect();
@@ -4203,22 +4340,18 @@ mod tests {
         for r in &rects {
             assert_eq!(r.x, card.x + pad);
             assert_eq!(r.w, card.w - 2.0 * pad);
+            assert_eq!(r.h, (FOLDER_ROW_H * scale).round());
         }
         assert_eq!(rects[0].y, card.y + (FOLDERS_HEADER_H * scale).round());
-        assert_eq!(rects[0].h, (FOLDER_ROW_H * scale).round());
-        assert_eq!(rects[1].h, (TOOL_ROW_H * scale).round());
-        assert_eq!(rects[2].h, (FOLDER_ROW_H * scale).round());
         let gap = (FOLDER_ROW_GAP * scale).round();
         assert_eq!(rects[1].y, rects[0].y + rects[0].h + gap);
+        assert_eq!(rects[2].y, rects[1].y + rects[1].h + gap);
+        // The wheel scroll shifts the stack up.
+        assert_eq!(folder_row_rect(&card, &rows, 0, 10.0, scale).y, rects[0].y - 10.0);
         assert_eq!(
-            rects[2].y,
-            rects[1].y + rects[1].h + gap + (FOLDER_SEPARATOR_H * scale).round()
+            folder_rows_extent(&card, &rows, scale),
+            rects[2].y + rects[2].h - rects[0].y
         );
-        assert_eq!(rects[3].y, rects[2].y + rects[2].h + gap);
-        let sep = folder_separator_rect(&card, &rows, 0.0, scale).unwrap();
-        assert!(sep.y > rects[1].y + rects[1].h);
-        assert!(sep.y + sep.h <= rects[2].y);
-        assert!(sep.x > card.x && sep.x + sep.w < card.x + card.w);
 
         // Footer hugs the card's bottom; the header chips ride the header
         // band with "new" outermost, inset like the region.
@@ -4323,7 +4456,7 @@ mod tests {
         let mut workspaces = vec![ws("a", None)];
         let mut sections = vec![sec(3, false)];
         // Empty section still gets a folder row.
-        assert!(folder_rows(0, false, sections.len()).contains(&FolderRow::Section(0)));
+        assert!(folder_rows(sections.len()).contains(&FolderRow::Section(0)));
         // Nothing auto-removes it just for being empty.
         assert!(!workspaces.iter().any(|w| w.section == Some(3)));
         // Only the explicit delete removes it.

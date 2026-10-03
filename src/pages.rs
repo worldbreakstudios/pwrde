@@ -2,7 +2,7 @@
 //!
 //! pwrde has Arc-style *pages*: Sessions (the terminal workspace) and one page
 //! per user-registered CLI tool (see [`crate::cli_tools`]), opened from the
-//! folders card's pinned-tool rows (`crate::folders_ui`). Settings is not a
+//! sessions list's tools band (`crate::sidebar_ui`). Settings is not a
 //! page but its own window (`crate::settings_window`), opened by ⌘, or the
 //! sessions header's gear chip; its [`Section`]s live here. ⌘⇧←/→ cycle pages
 //! with wraparound; ⌘⇧↑/↓ cycle the sidebar's groups the same way.
