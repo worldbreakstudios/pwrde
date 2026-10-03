@@ -1326,20 +1326,6 @@ fn render_tools(app: &App, theme: &Theme, entity: gpui::WeakEntity<App>) -> AnyE
                 .px(px(12.))
                 .py(px(10.))
                 .child(
-                    // 26×26 icon chip
-                    div()
-                        .size(px(26.))
-                        .flex_shrink_0()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded(px(7.))
-                        .bg(inset(theme, 0.05))
-                        .text_size(px(12.))
-                        .font_family("monospace")
-                        .child(tool.icon.clone()),
-                )
-                .child(
                     div()
                         .flex_basis(px(0.))
                         .flex_grow(1.1)
@@ -1445,22 +1431,7 @@ fn render_tools(app: &App, theme: &Theme, entity: gpui::WeakEntity<App>) -> AnyE
                 .w_full()
                 .child(field("Name", &app.tool_form.name, 1.1))
                 .child(field("Command", &app.tool_form.command, 1.6))
-                .child(field("Directory", &app.tool_form.cwd, 1.0))
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap(px(3.))
-                        .w(px(64.))
-                        .flex_shrink_0()
-                        .child(
-                            div()
-                                .text_size(px(11.))
-                                .text_color(theme.muted_foreground)
-                                .child("Icon"),
-                        )
-                        .child(app.tool_form.icon.clone()),
-                ),
+                .child(field("Directory", &app.tool_form.cwd, 1.0)),
         )
         .child(
             div()
@@ -1474,10 +1445,7 @@ fn render_tools(app: &App, theme: &Theme, entity: gpui::WeakEntity<App>) -> AnyE
                         .min_w(px(0.))
                         .text_size(px(11.5))
                         .text_color(theme.muted_foreground)
-                        .child(
-                            "Directory accepts ~. Icon is any text — Nerd Font glyphs render \
-                             like the built-ins.",
-                        ),
+                        .child("Directory accepts ~."),
                 )
                 .child(add),
         );
