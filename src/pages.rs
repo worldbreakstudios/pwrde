@@ -5,7 +5,7 @@
 //! sessions list's tools band (`crate::sidebar_ui`). Settings is not a
 //! page but its own window (`crate::settings_window`), opened by ⌘, or the
 //! sessions header's gear chip; its [`Section`]s live here. ⌘⇧←/→ cycle pages
-//! with wraparound; ⌘⇧↑/↓ cycle the sidebar's groups the same way.
+//! with wraparound; ⌘⇧↑/↓ walk the sidebar's visible tool rows and groups the same way.
 //!
 //! Every ⌘ shortcut is an [`Action`] dispatched through a bindings table
 //! resolved from the settings store (`"keyboard.<action>"` keys, falling back

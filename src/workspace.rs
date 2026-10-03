@@ -1258,24 +1258,48 @@ fn sessions_header_chips_at(
     SessionsHeaderChips { show_folders, focus, plus, gear }
 }
 
-
-/// The group `⌘⇧↑/↓` (prev/next sidebar tab) should activate: the row
-/// `delta` steps away along `rows`, the sidebar's visible order — pins
+/// The stop `⌘⇧↑/↓` (prev/next sidebar tab) should activate: the one
+/// `delta` steps from `current` along what the sidebar shows top to
+/// bottom, wrapping at both ends — the `n_tools` *visible* tool rows (0
+/// while the band is folded), then `rows`, the visible group order: pins
 /// head the list, snoozed groups trail it, and a folder filter or a
 /// collapsed section contributes no rows at all. `None` when the sidebar
-/// shows no group. An `active` the filter hides is off-screen rather
-/// than missing, so stepping enters the list at the end nearest the
-/// direction pressed instead of landing on a hidden workspace index.
-pub fn cycle_sidebar_active(rows: &[SidebarRow], active: usize, delta: isize) -> Option<usize> {
-    if rows.is_empty() {
+/// shows neither. A `current` that is off-screen (a tool whose band is
+/// folded, a group the filter hides) is not missing, so stepping enters
+/// at the end nearest the direction pressed instead of landing on a
+/// hidden stop.
+pub fn cycle_sidebar_stop(
+    n_tools: usize,
+    rows: &[SidebarRow],
+    current: SidebarStop,
+    delta: isize,
+) -> Option<SidebarStop> {
+    let n = n_tools + rows.len();
+    if n == 0 {
         return None;
     }
-    let next = match active_row_index(rows, active) {
-        Some(i) => crate::pages::cycle(i, rows.len(), delta),
-        None if delta < 0 => rows.len() - 1,
+    let cur = match current {
+        SidebarStop::Tool(i) => (i < n_tools).then_some(i),
+        SidebarStop::Group(active) => active_row_index(rows, active).map(|i| n_tools + i),
+    };
+    let next = match cur {
+        Some(i) => crate::pages::cycle(i, n, delta),
+        None if delta < 0 => n - 1,
         None => 0,
     };
-    Some(rows[next].ws_idx)
+    Some(if next < n_tools {
+        SidebarStop::Tool(next)
+    } else {
+        SidebarStop::Group(rows[next - n_tools].ws_idx)
+    })
+}
+
+/// One stop of the ⌘⇧↑/↓ walk down the sessions sidebar: a row of the
+/// tools band or a group row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SidebarStop {
+    Tool(usize),
+    Group(usize),
 }
 
 /// Whether a throttled input may act now: the elapsed time since the last
@@ -3829,12 +3853,44 @@ mod tests {
         assert!(sidebar_rows_filtered(&workspaces, &sections, Some(99), false, false).is_empty());
     }
 
+    /// ⌘⇧↑/↓ walks the visible tool rows before the group rows and wraps
+    /// across both; a folded tools band contributes no stops.
+    #[test]
+    fn cycle_sidebar_stop_walks_tools_then_groups() {
+        use SidebarStop::{Group, Tool};
+        let workspaces = vec![ws("a", None), ws("b", None)];
+        let rows = sidebar_rows_filtered(&workspaces, &[], None, false, false);
+
+        assert_eq!(cycle_sidebar_stop(2, &rows, Tool(0), 1), Some(Tool(1)));
+        assert_eq!(cycle_sidebar_stop(2, &rows, Tool(1), 1), Some(Group(0)));
+        assert_eq!(cycle_sidebar_stop(2, &rows, Group(0), -1), Some(Tool(1)));
+        // Wrapping: up from the first tool is the last group, and back.
+        assert_eq!(cycle_sidebar_stop(2, &rows, Tool(0), -1), Some(Group(1)));
+        assert_eq!(cycle_sidebar_stop(2, &rows, Group(1), 1), Some(Tool(0)));
+
+        // Folded band: groups only, and a tool page steps into the list at
+        // the end nearest the direction pressed.
+        assert_eq!(cycle_sidebar_stop(0, &rows, Group(1), 1), Some(Group(0)));
+        assert_eq!(cycle_sidebar_stop(0, &rows, Tool(0), 1), Some(Group(0)));
+        assert_eq!(cycle_sidebar_stop(0, &rows, Tool(0), -1), Some(Group(1)));
+
+        // Tools alone still cycle; nothing at all is no stop.
+        assert_eq!(cycle_sidebar_stop(2, &[], Tool(1), 1), Some(Tool(0)));
+        assert_eq!(cycle_sidebar_stop(0, &[], Group(0), 1), None);
+    }
+
     /// ⌘⇧↑/↓ walks the visible rows: the pinned run first, then plain
     /// groups, then snoozed ones; a folder filter narrows the walk to
     /// that folder's members, and a collapsed Pinned/Snoozed section drops
     /// out of it entirely. Wrapping at both ends.
     #[test]
     fn cycle_sidebar_active_follows_visible_row_order() {
+        let cycle_sidebar_active = |rows: &[SidebarRow], active: usize, delta: isize| {
+            match cycle_sidebar_stop(0, rows, SidebarStop::Group(active), delta) {
+                Some(SidebarStop::Group(i)) => Some(i),
+                _ => None,
+            }
+        };
         let mut pinned = ws("pinned", None);
         pinned.pinned = true;
         let mut snoozed = ws("snoozed", None);

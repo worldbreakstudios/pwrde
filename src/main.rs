@@ -5727,9 +5727,13 @@ impl App {
     }
 
     /// ⌘⇧↑/↓: step through the sidebar's tabs, wrapping at both ends —
-    /// the workspace groups on the Sessions page.
+    /// the tools band's rows (unless folded), then the workspace groups.
     fn cycle_sidebar_tab(&mut self, delta: isize) {
-        if let Page::Sessions = self.page
+        let current = match self.page {
+            Page::Tool(i) => workspace::SidebarStop::Tool(i),
+            _ => workspace::SidebarStop::Group(self.active),
+        };
+        if matches!(self.page, Page::Sessions | Page::Tool(_))
             // Leading-edge throttle on the key-repeat burst only; the first
             // press always lands (the field is backdated at startup).
             && workspace::throttle_ready(self.sidebar_cycle_at.elapsed(), SIDEBAR_CYCLE_THROTTLE)
@@ -5740,8 +5744,14 @@ impl App {
             // away) not the raw workspace order, so
             // the selection lands on the row next to the one it left.
             let rows = self.sidebar_rows();
-            if let Some(next) = workspace::cycle_sidebar_active(&rows, self.active, delta) {
-                self.switch_workspace(next);
+            let n_tools = if self.tools_collapsed { 0 } else { self.n_tools() };
+            match workspace::cycle_sidebar_stop(n_tools, &rows, current, delta) {
+                Some(workspace::SidebarStop::Tool(i)) => self.set_page(Page::Tool(i)),
+                Some(workspace::SidebarStop::Group(next)) => {
+                    self.set_page(Page::Sessions);
+                    self.switch_workspace(next);
+                },
+                None => {},
             }
         }
     }
