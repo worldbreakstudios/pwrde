@@ -503,6 +503,7 @@ impl App {
             .map(|card| {
                 let ws = &self.workspaces[card.group];
                 let tab = crate::dashboard_ui::primary_tab(ws);
+                let (side_tabs, side_unread) = ws.side_tab_counts();
                 json!({
                     "group": card.group,
                     "title": ws.title(),
@@ -511,6 +512,8 @@ impl App {
                     "visible": card.visible,
                     "cols": tab.map(|t| t.cols),
                     "rows": tab.map(|t| t.rows),
+                    "side_tabs": side_tabs,
+                    "side_unread": side_unread,
                 })
             })
             .collect();
