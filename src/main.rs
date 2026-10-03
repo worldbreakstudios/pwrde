@@ -509,6 +509,9 @@ struct App {
     /// replaces the centered `message` overlay — see `toast_ui` for why a
     /// webview makes an in-window overlay the wrong tool.
     toasts: Vec<crate::toast_ui::ToastNote>,
+    /// While set, the info bar's cwd pill reads "Copied" — until this
+    /// deadline, which `infobar_ui` sets on a copy and `drain_events` clears.
+    pub(crate) cwd_copied_until: Option<std::time::Instant>,
     /// Monotonic id for the next toast, so a row keeps its identity while the
     /// stack shifts under the pointer.
     next_toast_id: u64,
@@ -5869,6 +5872,10 @@ impl App {
         if self.toast_due() {
             redraw = true;
         }
+        // The cwd pill's "Copied" flash ends the same way.
+        if crate::infobar_ui::flash_due(&mut self.cwd_copied_until, std::time::Instant::now()) {
+            redraw = true;
+        }
         while let Ok(event) = self.events_rx.try_recv() {
             match event {
                 TermEvent::Wakeup(id) => {
@@ -7749,6 +7756,7 @@ fn main() {
                         pending_group_section: None,
                         save_ws: None,
                         toasts: Vec::new(),
+                        cwd_copied_until: None,
                         next_toast_id: 0,
                         confirm: None,
                         pending_primary_cmd: std::collections::HashMap::new(),
