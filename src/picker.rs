@@ -167,6 +167,78 @@ pub struct ForkEntry {
     /// worktree). `None` for the forking scopes.
     pub path: Option<PathBuf>,
     pub scope: ForkScope,
+    /// The branch a [`ForkScope::Worktree`] has checked out — what its pull
+    /// request is matched by (PR head == branch). `None` for a detached
+    /// worktree and for every other scope.
+    pub branch: Option<String>,
+    /// The worktree branch's pull request, from the last repo-wide PR fetch.
+    /// `None` = no PR (or none known yet); only ever set on worktree rows.
+    pub pr: Option<ForkPr>,
+}
+
+/// Where a worktree's pull request stands — the three states the sidebar's
+/// PR-state icon tells apart, and the order worktree rows sort in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrState {
+    Draft,
+    Open,
+    /// Merged or closed: the worktree's work is done with.
+    Finished,
+}
+
+/// The pull request shown on a worktree row: its number and state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ForkPr {
+    pub number: u32,
+    pub state: PrState,
+}
+
+impl ForkPr {
+    /// Reduce a PR summary to what a row shows. A PR that is no longer open
+    /// is finished whether or not it was a draft, as on the sidebar cards.
+    pub fn from_summary(pr: &crate::gh::PrSummary) -> Self {
+        let state = if !pr.state.eq_ignore_ascii_case("open") {
+            PrState::Finished
+        } else if pr.is_draft {
+            PrState::Draft
+        } else {
+            PrState::Open
+        };
+        Self { number: pr.number, state }
+    }
+}
+
+/// Branch name → the pull request to show for it (see
+/// [`crate::gh::prs_by_head`]).
+pub type ForkPrMap = std::collections::HashMap<String, ForkPr>;
+
+/// Sort bucket of a worktree row: no PR first (possibly abandoned), then
+/// draft, open, and finished last.
+fn pr_bucket(pr: Option<ForkPr>) -> u8 {
+    match pr.map(|p| p.state) {
+        None => 0,
+        Some(PrState::Draft) => 1,
+        Some(PrState::Open) => 2,
+        Some(PrState::Finished) => 3,
+    }
+}
+
+/// Stamp every worktree row with its branch's PR from `prs` (clearing one the
+/// map no longer has). Detached worktrees and other scopes never carry a PR.
+pub fn annotate_worktree_prs(entries: &mut [ForkEntry], prs: &ForkPrMap) {
+    for entry in entries.iter_mut().filter(|e| e.scope == ForkScope::Worktree) {
+        entry.pr = entry.branch.as_deref().and_then(|b| prs.get(b)).copied();
+    }
+}
+
+/// Sort the contiguous run of worktree rows by PR status — none, draft, open,
+/// finished — stable within a status. Every other row stays where it is.
+pub fn sort_worktree_run(entries: &mut [ForkEntry]) {
+    let Some(start) = entries.iter().position(|e| e.scope == ForkScope::Worktree) else {
+        return;
+    };
+    let len = entries[start..].iter().take_while(|e| e.scope == ForkScope::Worktree).count();
+    entries[start..start + len].sort_by_key(|e| pr_bucket(e.pr));
 }
 
 /// The fork-source picker: a flat, filterable list of [`ForkEntry`]s over the
@@ -223,6 +295,30 @@ impl ForkPicker {
     /// The highlighted fork source, if the list is not empty.
     pub fn selected_entry(&self) -> Option<&ForkEntry> {
         self.rows.get(self.selected)
+    }
+
+    /// Fold a fresh branch → PR map into the open picker: re-annotate the
+    /// worktree rows and re-sort their run by PR status. The active filter
+    /// stays applied and the highlighted entry stays highlighted wherever the
+    /// sort moved it. Returns whether anything changed — when the map agrees
+    /// with what is already shown, nothing is touched.
+    pub fn apply_prs(&mut self, prs: &ForkPrMap) -> bool {
+        let mut entries = self.entries.clone();
+        annotate_worktree_prs(&mut entries, prs);
+        sort_worktree_run(&mut entries);
+        if entries == self.entries {
+            return false;
+        }
+        // Identity of the highlighted row: the PR field is what changes, so
+        // it is found again by everything else.
+        let same = |a: &ForkEntry, b: &ForkEntry| a.scope == b.scope && a.path == b.path && a.label == b.label;
+        let held = self.selected_entry().cloned();
+        self.entries = entries;
+        self.rebuild();
+        if let Some(i) = held.and_then(|h| self.rows.iter().position(|e| same(e, &h))) {
+            self.selected = i;
+        }
+        true
     }
 
     /// Recomputes [`ForkPicker::rows`] from the query (case-insensitive
@@ -741,7 +837,182 @@ mod tests {
     /// The visible-row window: capped by the list, the row cap and the
     /// window height, and scrolled so the selection is the last row shown.
     fn fork_entry(label: &str, from: Option<&str>, scope: ForkScope) -> ForkEntry {
-        ForkEntry { label: label.to_string(), from: from.map(str::to_string), path: None, scope }
+        ForkEntry { label: label.to_string(), from: from.map(str::to_string), path: None, scope, branch: None, pr: None }
+    }
+
+    /// A worktree row on `branch`, at `/repo/.worktrees/<branch>`.
+    fn worktree_entry(branch: &str, pr: Option<ForkPr>) -> ForkEntry {
+        ForkEntry {
+            label: format!("worktree  {branch}  (.worktrees/{branch})"),
+            from: None,
+            path: Some(PathBuf::from(format!("/repo/.worktrees/{branch}"))),
+            scope: ForkScope::Worktree,
+            branch: Some(branch.to_string()),
+            pr,
+        }
+    }
+
+    fn fork_pr(number: u32, state: PrState) -> Option<ForkPr> {
+        Some(ForkPr { number, state })
+    }
+
+    fn branches(entries: &[ForkEntry]) -> Vec<&str> {
+        entries.iter().filter_map(|e| e.branch.as_deref()).collect()
+    }
+
+    /// Worktree rows order as no PR, draft, open, finished — the abandoned
+    /// candidates first, the already-merged last.
+    #[test]
+    fn worktree_run_sorts_none_draft_open_finished() {
+        let mut entries = vec![
+            worktree_entry("merged", fork_pr(4, PrState::Finished)),
+            worktree_entry("open", fork_pr(3, PrState::Open)),
+            worktree_entry("draft", fork_pr(2, PrState::Draft)),
+            worktree_entry("bare", None),
+        ];
+        sort_worktree_run(&mut entries);
+        assert_eq!(branches(&entries), ["bare", "draft", "open", "merged"]);
+    }
+
+    /// Rows that share a status keep the order git listed them in.
+    #[test]
+    fn worktree_run_sort_is_stable_within_a_bucket() {
+        let mut entries = vec![
+            worktree_entry("open-b", fork_pr(9, PrState::Open)),
+            worktree_entry("bare-b", None),
+            worktree_entry("open-a", fork_pr(1, PrState::Open)),
+            worktree_entry("bare-a", None),
+        ];
+        sort_worktree_run(&mut entries);
+        assert_eq!(branches(&entries), ["bare-b", "bare-a", "open-b", "open-a"]);
+    }
+
+    /// Only the worktree run moves: the rows above and below it are exactly
+    /// where they were, and a list without worktrees is left alone.
+    #[test]
+    fn worktree_run_sort_leaves_other_rows_alone() {
+        let head = [
+            fork_entry("↪ new branch off default (origin/main)", None, ForkScope::Default),
+            fork_entry("⌂ repo root (no worktree)", None, ForkScope::RepoRoot),
+        ];
+        let tail = [
+            fork_entry("local   zeta", Some("zeta"), ForkScope::Local),
+            fork_entry("local   alpha", Some("alpha"), ForkScope::Local),
+            fork_entry("remote  origin/zeta", Some("origin/zeta"), ForkScope::Remote),
+        ];
+        let mut entries = head.to_vec();
+        entries.push(worktree_entry("merged", fork_pr(4, PrState::Finished)));
+        entries.push(worktree_entry("bare", None));
+        entries.extend(tail.iter().cloned());
+        sort_worktree_run(&mut entries);
+        assert_eq!(entries[..2], head);
+        assert_eq!(branches(&entries[2..4]), ["bare", "merged"]);
+        assert_eq!(entries[4..], tail);
+
+        let mut plain: Vec<ForkEntry> = head.iter().chain(tail.iter()).cloned().collect();
+        let before = plain.clone();
+        sort_worktree_run(&mut plain);
+        assert_eq!(plain, before);
+    }
+
+    /// Annotation matches PR head to the worktree's branch, clears a PR the
+    /// map dropped, and never touches a detached worktree or a branch row
+    /// that happens to share the name.
+    #[test]
+    fn annotate_matches_worktree_branches_only() {
+        let mut detached = worktree_entry("detached", None);
+        detached.branch = None;
+        let mut entries = vec![
+            worktree_entry("feature", None),
+            worktree_entry("stale", fork_pr(8, PrState::Open)),
+            detached,
+            fork_entry("local   feature", Some("feature"), ForkScope::Local),
+        ];
+        let prs = ForkPrMap::from([("feature".to_string(), ForkPr { number: 5, state: PrState::Draft })]);
+        annotate_worktree_prs(&mut entries, &prs);
+        assert_eq!(entries[0].pr, fork_pr(5, PrState::Draft));
+        assert_eq!(entries[1].pr, None);
+        assert_eq!(entries[2].pr, None);
+        assert_eq!(entries[3].pr, None);
+    }
+
+    /// A summary's state reduces to draft / open / finished; a merged or
+    /// closed PR is finished even if it was a draft.
+    #[test]
+    fn fork_pr_state_from_summary() {
+        let summary = |state: &str, is_draft: bool| crate::gh::PrSummary {
+            number: 7,
+            title: String::new(),
+            state: state.into(),
+            is_draft,
+            head: "b".into(),
+            author: String::new(),
+            review_decision: None,
+            mergeable: None,
+            checks: Vec::new(),
+            url: String::new(),
+        };
+        assert_eq!(ForkPr::from_summary(&summary("open", false)), ForkPr { number: 7, state: PrState::Open });
+        assert_eq!(ForkPr::from_summary(&summary("open", true)).state, PrState::Draft);
+        assert_eq!(ForkPr::from_summary(&summary("merged", false)).state, PrState::Finished);
+        assert_eq!(ForkPr::from_summary(&summary("closed", true)).state, PrState::Finished);
+    }
+
+    fn worktree_picker() -> ForkPicker {
+        ForkPicker::new(
+            PathBuf::from("/repo"),
+            vec![
+                fork_entry("↪ new branch off default (origin/main)", None, ForkScope::Default),
+                worktree_entry("alpha", None),
+                worktree_entry("beta", None),
+                worktree_entry("gamma", None),
+                fork_entry("local   main", Some("main"), ForkScope::Local),
+            ],
+        )
+    }
+
+    /// A fetched PR map re-sorts the open list and the highlight follows the
+    /// entry it was on, not the index.
+    #[test]
+    fn apply_prs_resorts_and_keeps_the_highlighted_entry() {
+        let mut picker = worktree_picker();
+        picker.select(1); // alpha
+        let prs = ForkPrMap::from([
+            ("alpha".to_string(), ForkPr { number: 11, state: PrState::Finished }),
+            ("beta".to_string(), ForkPr { number: 12, state: PrState::Open }),
+        ]);
+        assert!(picker.apply_prs(&prs));
+        assert_eq!(branches(&picker.rows), ["gamma", "beta", "alpha"]);
+        assert_eq!(picker.selected, 3);
+        let held = picker.selected_entry().expect("a selected entry");
+        assert_eq!(held.branch.as_deref(), Some("alpha"));
+        assert_eq!(held.pr, fork_pr(11, PrState::Finished));
+
+        // The same map again agrees with what is shown: nothing moves.
+        picker.select(2);
+        assert!(!picker.apply_prs(&prs));
+        assert_eq!(picker.selected, 2);
+        // An empty map on an unannotated list is a no-op too.
+        let mut fresh = worktree_picker();
+        assert!(!fresh.apply_prs(&ForkPrMap::new()));
+    }
+
+    /// The filter survives a re-sort: only matching rows show, in the new
+    /// order, with the highlight still on its entry.
+    #[test]
+    fn apply_prs_respects_the_active_filter() {
+        let mut picker = worktree_picker();
+        picker.set_query("worktree");
+        picker.select(0); // alpha
+        let prs = ForkPrMap::from([("alpha".to_string(), ForkPr { number: 11, state: PrState::Finished })]);
+        assert!(picker.apply_prs(&prs));
+        assert_eq!(picker.query, "worktree");
+        assert_eq!(branches(&picker.rows), ["beta", "gamma", "alpha"]);
+        assert_eq!(picker.rows.len(), 3);
+        assert_eq!(picker.selected, 2);
+        // Every row is still there once the filter clears.
+        picker.set_query("");
+        assert_eq!(picker.rows.len(), 5);
     }
 
     fn sample_fork_picker() -> ForkPicker {
@@ -753,6 +1024,8 @@ mod tests {
                 from: None,
                 path: Some(PathBuf::from("/repo/.worktrees/36647115")),
                 scope: ForkScope::Worktree,
+                branch: Some("bordeaux".into()),
+                pr: None,
             },
             fork_entry("local   main  (current, default)", Some("main"), ForkScope::Local),
             fork_entry("local   tw-term-features", Some("tw-term-features"), ForkScope::Local),
