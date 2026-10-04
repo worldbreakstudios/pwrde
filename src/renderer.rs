@@ -362,10 +362,19 @@ pub struct Frame {
     pub hot: Vec<LayoutRect>,
 }
 
+/// The hovered cell `(col, row)` when the link hover `(tile, col, row)` is
+/// on the pane of tile `id` — a workspace tile, or a dashboard card's primary
+/// tile — so only that pane thickens its link's underline.
+fn pane_link_hover(link_hover: Option<(u64, usize, usize)>, id: u64) -> Option<(usize, usize)> {
+    link_hover.filter(|(hovered, _, _)| *hovered == id).map(|(_, col, row)| (col, row))
+}
+
 /// One dashboard card as [`Renderer::dashboard`] takes it: the group's
 /// primary tab and the card's rects (physical px, already scrolled) from
 /// `workspace::dashboard_card_rect` / `dashboard_card_body`.
 pub struct DashCard<'a> {
+    /// The group's primary tile: what a link hover on this card is keyed by.
+    pub tile: u64,
     /// The primary pane's tab; `None` for a group whose primary has no tab.
     pub tab: Option<&'a workspace::Tab>,
     pub card: LayoutRect,
@@ -821,9 +830,7 @@ impl Renderer {
                     && let Some(session) = tile.tabs.get(tile.active).and_then(|t| t.session())
                 {
                     let draw_cursor = Some(*id) == focused_tile && !chrome.element_modal;
-                    let tile_hover = link_hover
-                        .filter(|(hid, _, _)| *hid == *id)
-                        .map(|(_, col, row)| (col, row));
+                    let tile_hover = pane_link_hover(link_hover, *id);
                     let (rows, images) = self.snapshot_pane(
                         session,
                         &term_palette,
@@ -1129,13 +1136,15 @@ impl Renderer {
     /// `cards` are the showing cards at their scrolled rects. One scrolled
     /// wholly out of `viewport` is skipped — no ground, no terminal lock —
     /// and the cursor is drawn only in the focused card (and never under a
-    /// modal: `draw_cursor`). A card whose primary tab has no terminal (a
+    /// modal: `draw_cursor`). `link_hover` underlines the hovered link in the
+    /// card it names, as `build_frame` does for a tile. A card whose primary tab has no terminal (a
     /// webview) gets only its ground; the element tree labels it.
     pub fn dashboard(
         &self,
         cards: &[DashCard<'_>],
         viewport: &LayoutRect,
         draw_cursor: bool,
+        link_hover: Option<(u64, usize, usize)>,
     ) -> DashboardFrame {
         let th = self.theme();
         let resolved = crate::term_theme::resolved(crate::theme::dark_active());
@@ -1170,7 +1179,7 @@ impl Renderer {
                 &resolved,
                 origin,
                 draw_cursor && card.focused,
-                None,
+                pane_link_hover(link_hover, card.tile),
                 &mut bg_quads,
                 &mut fg_quads,
             );

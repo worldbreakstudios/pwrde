@@ -439,6 +439,36 @@ impl Layout {
     }
 }
 
+/// The card menu's "Copy" row.
+pub(crate) const CARD_MENU_COPY: usize = 0;
+/// The card menu's "Go to session" row.
+pub(crate) const CARD_MENU_GO: usize = 1;
+
+/// A card's context menu, in order: "Copy" — live only while that card's
+/// terminal holds a pwrde selection (`has_selection`; what a mouse-tracking
+/// TUI selects itself is not ours to copy), with `copy_shortcut` as its hint
+/// — then, under a separator, "Go to session". `App::apply_context_menu`
+/// resolves the pick against [`CARD_MENU_COPY`] / [`CARD_MENU_GO`].
+pub(crate) fn card_menu_items(
+    has_selection: bool,
+    copy_shortcut: Option<crate::context_menu::Shortcut>,
+) -> Vec<crate::context_menu::MenuItem> {
+    vec![
+        crate::context_menu::MenuItem {
+            title: "Copy".into(),
+            enabled: has_selection,
+            separator_after: true,
+            shortcut: copy_shortcut,
+        },
+        crate::context_menu::MenuItem {
+            title: "Go to session".into(),
+            enabled: true,
+            separator_after: false,
+            shortcut: None,
+        },
+    ]
+}
+
 /// The pull request title a card footer shows after `#N` — the glyph beside
 /// it already says draft / open / merged — on one line, whitespace runs
 /// collapsed; `None` for a blank title, which leaves `#N` alone.
@@ -739,13 +769,30 @@ impl App {
             .then(|| crate::MouseLoc::Card(self.workspaces[group].primary_tile))
     }
 
+    /// The link under a point, as `App::link_hover` holds it — the card's
+    /// primary tile and the cell — when the point is on the in-view part of
+    /// a card body and that cell of its terminal is part of a link. Nothing
+    /// under the open flyover, which slides over the grid.
+    pub(crate) fn dashboard_link_hover(&self, px: f32, py: f32) -> Option<(u64, usize, usize)> {
+        if self.flyover_open
+            && !self.flyover_tabs.is_empty()
+            && self.flyover_rect_now().contains(px, py)
+        {
+            return None;
+        }
+        let crate::MouseLoc::Card(tile) = self.dashboard_pane_at(px, py)? else { return None };
+        let body = self.dashboard_body(tile)?;
+        let (col, row) = self.renderer.cell_at(&body, px, py)?;
+        self.dashboard_session(tile)?.link_at(col, row).map(|_| (tile, col, row))
+    }
+
     /// A left press on the dashboard's canvas (the bar's controls, a footer's
     /// PR label and "Open", and the scroll hint are element targets that stop
     /// the press first): read
     /// and focus the card under it — reading it even when it already was the
     /// focused one — and inside its body hand the click to the terminal: a
-    /// mouse report for a TUI that tracks the mouse, else the start of a
-    /// selection.
+    /// ⌘-click on a link opens it, else a mouse report for a TUI that tracks
+    /// the mouse, else the start of a selection.
     pub(crate) fn dashboard_mouse_down(&mut self, px: f32, py: f32) {
         // A press ends a pending dwell, wherever it lands: the card under it
         // is read by the press itself.
@@ -753,9 +800,26 @@ impl App {
         let layout = self.dashboard_layout();
         let Some((slot, group)) = layout.hit(px, py) else { return };
         let before = layout.card(slot);
+        // ⌘-click opens a link, as on the Sessions page. Resolved before the
+        // focus below can move the card — the hover promised this cell — and
+        // opened ahead of the mouse report and the selection, so neither a
+        // TUI nor a drag sees the press.
+        let link = if self.modifiers.platform && layout.body_in_view(slot).contains(px, py) {
+            let body = workspace::dashboard_card_body(&before, layout.scale);
+            let tile = self.workspaces[group].primary_tile;
+            self.renderer
+                .cell_at(&body, px, py)
+                .and_then(|(col, row)| self.dashboard_session(tile)?.link_at(col, row))
+        } else {
+            None
+        };
         self.dashboard_mark_read(group);
         self.switch_workspace(group);
         self.request_redraw();
+        if let Some(url) = link {
+            crate::open_in_browser(&url);
+            return;
+        }
         // Focusing can move the card — a reveal scroll, or a filtered grid
         // re-dealing its slots. The press then only focused it: the point no
         // longer names a cell of that terminal.
@@ -768,10 +832,10 @@ impl App {
         }
         let tile = self.workspaces[group].primary_tile;
         let loc = crate::MouseLoc::Card(tile);
+        let body = workspace::dashboard_card_body(&before, layout.scale);
         if self.try_forward_press(loc, MouseBtn::Left, px, py) {
             return;
         }
-        let body = workspace::dashboard_card_body(&before, layout.scale);
         if let Some((col, row)) = self.renderer.cell_at(&body, px, py)
             && let Some(session) = self.dashboard_session(tile)
         {
@@ -780,9 +844,10 @@ impl App {
         }
     }
 
-    /// A right press anywhere on a card opens its native context menu, whose
-    /// one item goes to that session. Like every other menu here, showing it
-    /// changes no focus.
+    /// A right press anywhere on a card opens its native context menu
+    /// ([`card_menu_items`]): Copy — that card's selection, with the live
+    /// binding as its hint — then "Go to session". Like every other menu
+    /// here, showing it changes no focus, and it leaves the selection be.
     pub(crate) fn dashboard_right_mouse_down(&mut self, window: &Window, cx: &mut Context<Self>) {
         let (px, py) = (self.cursor.0 as f32, self.cursor.1 as f32);
         // The flyover slides over the grid: a press on it is not on a card.
@@ -795,13 +860,16 @@ impl App {
         let Some(view) = crate::context_menu::ns_view(window) else { return };
         let layout = self.dashboard_layout();
         let Some((_, group)) = layout.hit(px, py) else { return };
-        let items = vec![crate::context_menu::MenuItem {
-            title: "Go to session".into(),
-            enabled: true,
-            separator_after: false,
-            shortcut: None,
-        }];
-        let target = crate::MenuTarget::Card { tile: self.workspaces[group].primary_tile };
+        let tile = self.workspaces[group].primary_tile;
+        let has_selection = self
+            .dashboard_session(tile)
+            .and_then(Session::selected_text)
+            .is_some_and(|text| !text.is_empty());
+        let items = card_menu_items(
+            has_selection,
+            crate::context_menu::shortcut_for(&crate::pages::Action::Copy.binding()),
+        );
+        let target = crate::MenuTarget::Card { tile };
         let at = (px / layout.scale, py / layout.scale);
         self.show_context_menu(view, at, target, items, window, cx);
     }
@@ -1414,6 +1482,36 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The card menu is Copy then "Go to session", a separator between
+    /// them; Copy is live only with a selection and carries the hint.
+    #[test]
+    fn card_menu_is_copy_then_go_to_session() {
+        let hint = crate::context_menu::Shortcut { key: "c".into(), mask: 1 << 20 };
+        for has_selection in [false, true] {
+            let items = card_menu_items(has_selection, Some(hint.clone()));
+            let titles: Vec<&str> = items.iter().map(|i| i.title.as_str()).collect();
+            assert_eq!(titles, ["Copy", "Go to session"]);
+            let copy = &items[CARD_MENU_COPY];
+            assert_eq!(copy.enabled, has_selection);
+            assert!(copy.separator_after);
+            assert_eq!(copy.shortcut.as_ref(), Some(&hint));
+            let go = &items[CARD_MENU_GO];
+            assert_eq!(go.title, "Go to session");
+            assert!(go.enabled);
+            assert!(!go.separator_after);
+            assert!(go.shortcut.is_none());
+        }
+    }
+
+    /// An unbound Copy leaves the row without a hint, not without the row.
+    #[test]
+    fn card_menu_copy_without_a_binding_has_no_hint() {
+        let items = card_menu_items(true, None);
+        assert_eq!(items.len(), 2);
+        assert!(items[CARD_MENU_COPY].shortcut.is_none());
+        assert!(items[CARD_MENU_COPY].enabled);
+    }
 
     /// The footer names the pull request by its title, on one line, never
     /// by its state word; a blank title leaves the number alone.
