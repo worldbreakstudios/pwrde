@@ -2452,6 +2452,8 @@ impl App {
         );
         self.workspaces[self.active].fix_focus();
         self.sync_layout();
+        // On the dashboard the folder set just lost a card: re-fit the grid.
+        self.dashboard_set_changed();
         self.request_redraw();
         self.persist_snapshot();
     }
@@ -5962,14 +5964,23 @@ impl App {
         // showing cards. A new session opens the picker, as the sidebar's ＋
         // does here, and ⇧⌘G opens the focused card's pull request — always in
         // the browser, since cards show no web tabs (a no-op with no card
-        // focused). Everything that acts on a group's split tree (tabs,
-        // splits, closes, collapse, the flyover) does not apply here.
+        // focused). ⌘W and ⇧⌘W both close the focused card's session, through
+        // the usual confirm dialog — a card is a whole group, so there is no
+        // tab-only close and a pinned primary tab does not stop it (a no-op
+        // with no card focused). Everything else that acts on a group's split
+        // tree (tabs, splits, collapse, the flyover) does not apply here.
         if self.page == Page::Dashboard {
             match action {
                 Action::OpenPrInGithub => {
                     return self
                         .dashboard_focused()
                         .is_some_and(|group| self.open_pr_for_group(group, true));
+                },
+                Action::CloseTab | Action::CloseGroup => {
+                    if self.dashboard_focused().is_none() {
+                        return false;
+                    }
+                    self.close_focused_group();
                 },
                 Action::NewGroup => self.open_picker(),
                 Action::Copy => self.copy(),
