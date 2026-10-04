@@ -79,8 +79,10 @@ tile actions (`split_right`, `new_tab`, `close_tab`, `close_group`,
 leaves the dashboard for the Sessions page. Each card's `status` in `state` is
 `read` or `unread` — the primary tab's unread flag: an attention signal (OSC 9)
 turns any card `unread`, the focused one included, and only a left click on
-the card or on its sessions-list row (neither drivable over the bus) or going
-to the session reads it. `send-text` is not keyboard input: on the dashboard it
+the card or on its sessions-list row (neither drivable over the bus), a
+keyboard focus move (`focus_*`, `next_tile` / `prev_tile`, the ⌘⇧+arrow
+actions, ⌘1–9) that then rests on the card for 1s, or going to the session
+reads it. `send-text` is not keyboard input: on the dashboard it
 still writes to the target group's focused pane, as on every page, which may
 be a pane no card shows.
 
