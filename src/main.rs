@@ -535,6 +535,11 @@ struct App {
     /// While set, the info bar's cwd pill reads "Copied" — until this
     /// deadline, which `infobar_ui` sets on a copy and `drain_events` clears.
     pub(crate) cwd_copied_until: Option<std::time::Instant>,
+    /// The dashboard's pending dwell: the card the last keyboard focus move
+    /// landed on, read by `drain_events` once it has kept the focus for
+    /// `dashboard_ui::DWELL` (`App::dashboard_arm_dwell` /
+    /// `dashboard_dwell_tick`).
+    pub(crate) dashboard_dwell: Option<crate::dashboard_ui::Dwell>,
     /// Monotonic id for the next toast, so a row keeps its identity while the
     /// stack shifts under the pointer.
     next_toast_id: u64,
@@ -5866,6 +5871,9 @@ impl App {
             && d >= 1
         {
             self.switch_workspace(d as usize - 1);
+            // On the Dashboard this is a keyboard focus move: resting on the
+            // card reads it (a no-op elsewhere, or with no such group).
+            self.dashboard_arm_dwell(d as usize - 1);
         }
         self.request_redraw();
     }
@@ -6175,6 +6183,8 @@ impl App {
         if self.page != page {
             self.page = page;
             self.recording = None;
+            // A dwell belongs to the dashboard it was armed on.
+            self.dashboard_dwell = None;
             // The sidebar cards are on screen again; top up whatever went
             // stale while another page was up.
             self.spawn_git_context_refresh();
@@ -6348,6 +6358,9 @@ impl App {
         if crate::infobar_ui::flash_due(&mut self.cwd_copied_until, std::time::Instant::now()) {
             redraw = true;
         }
+        // A dashboard card that kept the focus for a dwell after a keyboard
+        // move is read (which asks for its own redraw).
+        self.dashboard_dwell_tick(std::time::Instant::now());
         while let Ok(event) = self.events_rx.try_recv() {
             match event {
                 TermEvent::Wakeup(id) => {
@@ -8373,6 +8386,7 @@ fn main() {
                         save_ws: None,
                         toasts: Vec::new(),
                         cwd_copied_until: None,
+                        dashboard_dwell: None,
                         next_toast_id: 0,
                         confirm: None,
                         pending_primary_cmd: std::collections::HashMap::new(),
