@@ -505,7 +505,7 @@ impl App {
     }
 
     /// The folder set changed under the open dashboard — another folder was
-    /// picked, or the list's "Pinned" / "Snoozed" run folded: re-fit the new
+    /// picked, the list's "Pinned" / "Snoozed" run folded, or a group closed: re-fit the new
     /// set's primary PTYs to the re-shaped grid, clamp the scroll to the new
     /// content, and keep the focused card (if the set still has it) in view.
     /// A no-op off the Dashboard page.
