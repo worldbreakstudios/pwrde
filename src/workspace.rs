@@ -3067,7 +3067,7 @@ const DASH_TARGET_COL_W: f32 = 560.0;
 const DASH_TARGET_ROW_H: f32 = 430.0;
 /// Shortest a card may get: a short window scrolls instead of crushing them.
 const DASH_MIN_CARD_H: f32 = 200.0;
-/// A card's header (status dot, title, branch, status chip) and footer
+/// A card's header (status dot, title, branch) and footer
 /// (elapsed time, PR, diff, "Open").
 const DASH_CARD_HEADER_H: f32 = 34.0;
 const DASH_CARD_FOOTER_H: f32 = 30.0;
