@@ -777,6 +777,14 @@ pub fn snoozed_run(rows: &[SidebarRow], workspaces: &[Workspace]) -> usize {
         .count()
 }
 
+/// Whether row `i` of `n_rows` ends a run and so paints no hairline under
+/// it: the last row of the list, the last pinned row (the section gap
+/// closes that run) and the last row above a laid-out snoozed run (the
+/// "Snoozed" rail closes it — a hairline there would double that rail).
+pub fn sidebar_row_closes_run(i: usize, n_rows: usize, n_pinned: usize, n_snoozed: usize) -> bool {
+    i + 1 == n_rows || i + 1 == n_pinned || (n_snoozed > 0 && i + 1 + n_snoozed == n_rows)
+}
+
 // ─── Layout ─────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -3054,7 +3062,7 @@ const DASH_GAP: f32 = 10.0;
 const DASH_MIN_COL_W: f32 = 280.0;
 /// Shortest a card may get: a short window scrolls instead of crushing them.
 const DASH_MIN_CARD_H: f32 = 200.0;
-/// A card's header (status dot, title, branch, status chip) and footer
+/// A card's header (status dot, title, branch) and footer
 /// (elapsed time, PR, diff, "Open").
 const DASH_CARD_HEADER_H: f32 = 34.0;
 const DASH_CARD_FOOTER_H: f32 = 30.0;
@@ -5428,6 +5436,19 @@ mod tests {
     }
 
     // --- (c) geometry ---
+
+    #[test]
+    fn sidebar_row_closes_run_at_each_section_boundary() {
+        // 5 rows: 2 pinned, 1 ordinary, 2 snoozed (unfolded).
+        let closes: Vec<bool> = (0..5).map(|i| sidebar_row_closes_run(i, 5, 2, 2)).collect();
+        assert_eq!(closes, [false, true, true, false, true]);
+        // Folded or absent snoozed run: only the list's last row closes.
+        let closes: Vec<bool> = (0..3).map(|i| sidebar_row_closes_run(i, 3, 0, 0)).collect();
+        assert_eq!(closes, [false, false, true]);
+        // Every row snoozed: no row sits above the run.
+        let closes: Vec<bool> = (0..2).map(|i| sidebar_row_closes_run(i, 2, 0, 2)).collect();
+        assert_eq!(closes, [false, true]);
+    }
 
     /// The "Pinned" caption always heads the list (it is the drop zone that
     /// pins); the section gap — with the rail centred in it — sits after

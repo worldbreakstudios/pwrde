@@ -535,6 +535,11 @@ struct App {
     /// While set, the info bar's cwd pill reads "Copied" — until this
     /// deadline, which `infobar_ui` sets on a copy and `drain_events` clears.
     pub(crate) cwd_copied_until: Option<std::time::Instant>,
+    /// The dashboard's pending dwell: the card the last keyboard focus move
+    /// landed on, read by `drain_events` once it has kept the focus for
+    /// `dashboard_ui::DWELL` (`App::dashboard_arm_dwell` /
+    /// `dashboard_dwell_tick`).
+    pub(crate) dashboard_dwell: Option<crate::dashboard_ui::Dwell>,
     /// Monotonic id for the next toast, so a row keeps its identity while the
     /// stack shifts under the pointer.
     next_toast_id: u64,
@@ -2447,6 +2452,8 @@ impl App {
         );
         self.workspaces[self.active].fix_focus();
         self.sync_layout();
+        // On the dashboard the folder set just lost a card: re-fit the grid.
+        self.dashboard_set_changed();
         self.request_redraw();
         self.persist_snapshot();
     }
@@ -5876,6 +5883,9 @@ impl App {
             && d >= 1
         {
             self.switch_workspace(d as usize - 1);
+            // On the Dashboard this is a keyboard focus move: resting on the
+            // card reads it (a no-op elsewhere, or with no such group).
+            self.dashboard_arm_dwell(d as usize - 1);
         }
         self.request_redraw();
     }
@@ -5966,14 +5976,23 @@ impl App {
         // showing cards. A new session opens the picker, as the sidebar's ＋
         // does here, and ⇧⌘G opens the focused card's pull request — always in
         // the browser, since cards show no web tabs (a no-op with no card
-        // focused). Everything that acts on a group's split tree (tabs,
-        // splits, closes, collapse, the flyover) does not apply here.
+        // focused). ⌘W and ⇧⌘W both close the focused card's session, through
+        // the usual confirm dialog — a card is a whole group, so there is no
+        // tab-only close and a pinned primary tab does not stop it (a no-op
+        // with no card focused). Everything else that acts on a group's split
+        // tree (tabs, splits, collapse, the flyover) does not apply here.
         if self.page == Page::Dashboard {
             match action {
                 Action::OpenPrInGithub => {
                     return self
                         .dashboard_focused()
                         .is_some_and(|group| self.open_pr_for_group(group, true));
+                },
+                Action::CloseTab | Action::CloseGroup => {
+                    if self.dashboard_focused().is_none() {
+                        return false;
+                    }
+                    self.close_focused_group();
                 },
                 Action::NewGroup => self.open_picker(),
                 Action::Copy => self.copy(),
@@ -6178,6 +6197,8 @@ impl App {
             // A hover names a tile and a cell of the page left behind.
             self.link_hover = None;
             self.recording = None;
+            // A dwell belongs to the dashboard it was armed on.
+            self.dashboard_dwell = None;
             // The sidebar cards are on screen again; top up whatever went
             // stale while another page was up.
             self.spawn_git_context_refresh();
@@ -6351,6 +6372,9 @@ impl App {
         if crate::infobar_ui::flash_due(&mut self.cwd_copied_until, std::time::Instant::now()) {
             redraw = true;
         }
+        // A dashboard card that kept the focus for a dwell after a keyboard
+        // move is read (which asks for its own redraw).
+        self.dashboard_dwell_tick(std::time::Instant::now());
         while let Ok(event) = self.events_rx.try_recv() {
             match event {
                 TermEvent::Wakeup(id) => {
@@ -8377,6 +8401,7 @@ fn main() {
                         save_ws: None,
                         toasts: Vec::new(),
                         cwd_copied_until: None,
+                        dashboard_dwell: None,
                         next_toast_id: 0,
                         confirm: None,
                         pending_primary_cmd: std::collections::HashMap::new(),

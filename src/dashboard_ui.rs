@@ -17,8 +17,9 @@
 //! - one **card** per showing group: a 34px header (the unread dot — the
 //!   sidebar row's accent dot, with a halo ring, while unread, a dim dot with
 //!   none once read — the title the sidebar row shows, `repo/branch` on cards
-//!   300px or wider, the "unread" / "read" chip), the body, and a 30px footer
-//!   (elapsed time since the group last asked for attention, the PR, the
+//!   300px or wider, at the header's right edge), the body, and a 30px footer
+//!   (elapsed time since the group last asked for attention, the PR as
+//!   `#N` and its title, cut with an ellipsis when it does not fit, the
 //!   branch diff and, at the right, a hint of the tabs outside the primary
 //!   pane — "N tabs", or "N tabs · ● M unread" while some are unread; a hint
 //!   only, it never changes the card's own unread treatment — then
@@ -59,15 +60,19 @@
 //! browser, whatever `git.open_pr_in_webview` says: cards show no web tabs.
 //!
 //! **Status** ([`status`]) is the primary tab's `unread` flag and nothing
-//! else: *unread* or *read*. On this page a primary tab is read only by the
-//! user picking it with the mouse — a left press on its card, anywhere on it,
-//! the focused card included, or a click on its row in the sessions list
-//! (`Workspace::mark_primary_read`). Opening the dashboard, being on
-//! screen, being the focused card, keyboard focus moves and typing read
-//! nothing, and no pane counts as watched here ([`attention_watched`]): an
-//! attention signal (OSC 9) dots and stamps every primary, the focused
-//! card's too. Going to the session reads it the way arriving on the
-//! Sessions page always has.
+//! else: *unread* or *read*. On this page a primary tab is read by the user
+//! picking it with the mouse — a left press on its card, anywhere on it, the
+//! focused card included, or a click on its row in the sessions list
+//! (`Workspace::mark_primary_read`) — or by a keyboard focus move that then
+//! rests on its card: every such move (⇧⌘H/J/K/L, ⌘[ / ⌘], ⌘⇧+arrows, ⌘1–9)
+//! arms a [`Dwell`] for the card it lands on, replacing any pending one, and
+//! the 16ms pump reads that card once [`DWELL`] has passed with it still the
+//! focused card of this page ([`dwell_outcome`]); a mouse press or leaving
+//! the page cancels it. Opening the dashboard, being on screen, being the
+//! focused card, the keyboard move itself and typing read nothing, and no
+//! pane counts as watched here ([`attention_watched`]): an attention signal
+//! (OSC 9) dots and stamps every primary, the focused card's too. Going to
+//! the session reads it the way arriving on the Sessions page always has.
 //!
 //! **Which cards** ([`cards`]): the dashboard follows the folders card. Its
 //! cards are the **folder set** — the groups the sessions list shows for the
@@ -89,7 +94,7 @@
 //! a pull request whose group has no snapshot yet runs ⇧⌘G's one background
 //! `pr list`).
 
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use gpui::{
     AnyElement, BoxShadow, Context, FontWeight, Hsla, InteractiveElement, IntoElement,
@@ -98,7 +103,7 @@ use gpui::{
 
 use crate::App;
 use crate::git_context::derive_rollup;
-use crate::infobar_ui::{pr_state_word, repo_counts, repo_label};
+use crate::infobar_ui::{repo_counts, repo_label};
 use crate::pages::Page;
 use crate::renderer::color;
 use crate::sidebar_card::{CardAvatar, avatar_for, relative_time};
@@ -140,10 +145,6 @@ const TITLE_SIZE: f32 = 12.5;
 const BRANCH_SIZE: f32 = 11.0;
 const BRANCH_MAX_SHARE: f32 = 0.4;
 const BRANCH_MIN_CARD_W: f32 = 300.0;
-/// The status chip.
-const CHIP_H: f32 = 20.0;
-const CHIP_PAD_X: f32 = 8.0;
-const CHIP_TEXT_SIZE: f32 = 11.0;
 /// A card's footer: 10px side padding and gaps, 11px type and glyphs.
 const FOOTER_PAD_X: f32 = 10.0;
 const FOOTER_GAP: f32 = 10.0;
@@ -151,20 +152,18 @@ const FOOTER_TEXT_SIZE: f32 = 11.0;
 const FOOTER_GLYPH: f32 = 11.0;
 /// The mock's whites as alphas over the scheme ink (`StripStyle::pill_rgb`):
 /// a card's resting and hovered border, the hairlines under the header and
-/// over the footer, the filter's ground and its selected segment, the "read"
-/// chip, and how far the read dot's dim ink is faded.
+/// over the footer, the filter's ground and its selected segment, and how far
+/// the read dot's dim ink is faded.
 const BORDER: f32 = 0.08;
 const BORDER_HOVER: f32 = 0.22;
 const HAIRLINE: f32 = 0.06;
 const SEG_GROUND: f32 = 0.06;
 const SEG_SELECTED: f32 = 0.1;
-const READ_CHIP: f32 = 0.06;
 const READ_DOT: f32 = 0.6;
-/// The unread colour's alphas: the halo ring around the dot, the chip's
-/// ground, an unread card's border (its ground tint is the renderer's
+/// The unread colour's alphas: the halo ring around the dot, an unread
+/// card's border (its ground tint is the renderer's
 /// `DASH_UNREAD_TINT`).
 const UNREAD_HALO: f32 = 0.18;
-const UNREAD_CHIP: f32 = 0.12;
 const UNREAD_BORDER: f32 = 0.35;
 /// The "↓ N more" pill's type (its rect is `workspace::dashboard_more_pill`).
 const MORE_TEXT_SIZE: f32 = 11.5;
@@ -179,7 +178,7 @@ pub(crate) enum Status {
 }
 
 impl Status {
-    /// The `state` spelling, and the status chip's text.
+    /// The `state` spelling.
     pub(crate) fn name(self) -> &'static str {
         match self {
             Status::Unread => "unread",
@@ -249,6 +248,58 @@ pub(crate) fn shows(filter: Filter, status: Status, focused: bool) -> bool {
 /// always dots the tab, and only a click on the card reads it again.
 pub(crate) fn attention_watched(page: Page, on_screen: bool, in_flyover: bool) -> bool {
     in_flyover || (page == Page::Sessions && on_screen)
+}
+
+/// How long a card must keep the focus after a keyboard focus move before
+/// its primary is read.
+pub(crate) const DWELL: Duration = Duration::from_secs(1);
+
+/// A pending dwell (`App::dashboard_dwell`): the card a keyboard focus move
+/// landed on, and when resting on it reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Dwell {
+    /// Index into `App::workspaces`.
+    pub group: usize,
+    /// That group's primary tile — the card's identity, which a closed or
+    /// re-ordered group cannot shift the way it shifts the index.
+    pub tile: u64,
+    pub due: Instant,
+}
+
+impl Dwell {
+    /// The dwell a keyboard move onto `group`'s card at `now` arms.
+    pub(crate) fn arm(group: usize, tile: u64, now: Instant) -> Self {
+        Self { group, tile, due: now + DWELL }
+    }
+}
+
+/// What the pump does with a pending dwell this tick.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DwellOutcome {
+    /// Not due yet: keep it.
+    Pending,
+    /// Due, and its card still holds the focus: read this group's primary.
+    Read(usize),
+    /// Due, but the focus or the page moved on: forget it, reading nothing.
+    Dropped,
+}
+
+/// Decide a pending `dwell` at `now`. `focused` is the focused card as
+/// (group, primary tile) — `App::dashboard_focused` — and must match on
+/// both, so an index that came to name another group reads nothing.
+pub(crate) fn dwell_outcome(
+    dwell: Dwell,
+    now: Instant,
+    page: Page,
+    focused: Option<(usize, u64)>,
+) -> DwellOutcome {
+    if now < dwell.due {
+        DwellOutcome::Pending
+    } else if page == Page::Dashboard && focused == Some((dwell.group, dwell.tile)) {
+        DwellOutcome::Read(dwell.group)
+    } else {
+        DwellOutcome::Dropped
+    }
 }
 
 /// One group of the folder set as the dashboard sees it this instant.
@@ -418,6 +469,14 @@ pub(crate) fn card_menu_items(
     ]
 }
 
+/// The pull request title a card footer shows after `#N` — the glyph beside
+/// it already says draft / open / merged — on one line, whitespace runs
+/// collapsed; `None` for a blank title, which leaves `#N` alone.
+pub(crate) fn pr_footer_title(title: &str) -> Option<String> {
+    let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!title.is_empty()).then_some(title)
+}
+
 /// A group's primary pane tab — the one its card shows.
 pub(crate) fn primary_tab(ws: &Workspace) -> Option<&Tab> {
     ws.root.find_tile(ws.primary_tile).and_then(|t| t.active_tab())
@@ -476,7 +535,7 @@ impl App {
     }
 
     /// The folder set changed under the open dashboard — another folder was
-    /// picked, or the list's "Pinned" / "Snoozed" run folded: re-fit the new
+    /// picked, the list's "Pinned" / "Snoozed" run folded, or a group closed: re-fit the new
     /// set's primary PTYs to the re-shaped grid, clamp the scroll to the new
     /// content, and keep the focused card (if the set still has it) in view.
     /// A no-op off the Dashboard page.
@@ -520,7 +579,8 @@ impl App {
     /// The page just became the dashboard (`App::set_page`): start from the
     /// unfiltered grid, fit every primary PTY to its card, and bring the
     /// active group's card — the focused one — into view. Opening reads
-    /// nothing: an unread primary stays unread until its card is clicked.
+    /// and arms no dwell: an unread primary stays unread until its card is
+    /// clicked or a keyboard move rests on it.
     pub(crate) fn dashboard_opened(&mut self) {
         self.dashboard_filter = Filter::All;
         self.sync_dashboard_layout(false);
@@ -537,10 +597,13 @@ impl App {
         self.request_redraw();
     }
 
-    /// The user picked `group` with the mouse — a left press on its card, or
-    /// a click on its row in the sessions list: read its primary tab. The
-    /// only ways a primary is read on this page (see the module docs).
+    /// The user picked `group` — with the mouse (a left press on its card, or
+    /// a click on its row in the sessions list) or by resting on its card for
+    /// [`DWELL`] after a keyboard focus move (`App::dashboard_dwell_tick`):
+    /// read its primary tab. The only ways a primary is read on this page
+    /// (see the module docs). Either way a pending dwell is over.
     pub(crate) fn dashboard_mark_read(&mut self, group: usize) {
+        self.dashboard_dwell = None;
         if self.workspaces.get_mut(group).is_some_and(Workspace::mark_primary_read) {
             self.persist_snapshot();
             self.request_redraw();
@@ -595,6 +658,28 @@ impl App {
         }
     }
 
+    /// A keyboard focus move just landed on `group`'s card: start its dwell,
+    /// replacing any pending one, so passing through a card reads nothing.
+    /// Arms nothing off the Dashboard page or when the move focused no card
+    /// (a group outside the folder set).
+    pub(crate) fn dashboard_arm_dwell(&mut self, group: usize) {
+        self.dashboard_dwell = (self.page == Page::Dashboard
+            && self.dashboard_focused() == Some(group))
+        .then(|| Dwell::arm(group, self.workspaces[group].primary_tile, Instant::now()));
+    }
+
+    /// The pump's tick (`App::drain_events`): once the pending dwell is due,
+    /// read its card if it still holds the focus on this page, else drop it.
+    pub(crate) fn dashboard_dwell_tick(&mut self, now: Instant) {
+        let Some(dwell) = self.dashboard_dwell else { return };
+        let focused = self.dashboard_focused().map(|g| (g, self.workspaces[g].primary_tile));
+        match dwell_outcome(dwell, now, self.page, focused) {
+            DwellOutcome::Pending => {},
+            DwellOutcome::Read(group) => self.dashboard_mark_read(group),
+            DwellOutcome::Dropped => self.dashboard_dwell = None,
+        }
+    }
+
     /// ⇧⌘H/J/K/L on the dashboard: focus the neighbouring showing card.
     pub(crate) fn dashboard_step(&mut self, dir: NavDir) {
         let layout = self.dashboard_layout();
@@ -602,6 +687,7 @@ impl App {
             workspace::dashboard_focus_dir(&layout.shown, self.active, layout.grid.cols, dir)
         {
             self.switch_workspace(group);
+            self.dashboard_arm_dwell(group);
         }
     }
 
@@ -614,6 +700,7 @@ impl App {
             workspace::dashboard_focus_wrap(&layout.shown, self.active, layout.grid.cols, dir)
         {
             self.switch_workspace(group);
+            self.dashboard_arm_dwell(group);
         }
     }
 
@@ -622,6 +709,7 @@ impl App {
         let layout = self.dashboard_layout();
         if let Some(group) = workspace::dashboard_focus_cycle(&layout.shown, self.active, delta) {
             self.switch_workspace(group);
+            self.dashboard_arm_dwell(group);
         }
     }
 
@@ -706,6 +794,9 @@ impl App {
     /// ⌘-click on a link opens it, else a mouse report for a TUI that tracks
     /// the mouse, else the start of a selection.
     pub(crate) fn dashboard_mouse_down(&mut self, px: f32, py: f32) {
+        // A press ends a pending dwell, wherever it lands: the card under it
+        // is read by the press itself.
+        self.dashboard_dwell = None;
         let layout = self.dashboard_layout();
         let Some((slot, group)) = layout.hit(px, py) else { return };
         let before = layout.card(slot);
@@ -1143,17 +1234,10 @@ impl App {
 
         // ── Header ──────────────────────────────────────────────────────
         // The dot is the unread dot: lit with its halo while unread, dim and
-        // bare once read. The chip says the same in words.
-        let (dot, halo, chip_bg, chip_ink) = match card.status {
-            Status::Unread => (
-                inks.unread,
-                Some(inks.unread.opacity(UNREAD_HALO)),
-                inks.unread.opacity(UNREAD_CHIP),
-                inks.unread,
-            ),
-            Status::Read => {
-                (inks.ink_dim.opacity(READ_DOT), None, inks.wash(READ_CHIP), inks.ink_dim)
-            },
+        // bare once read.
+        let (dot, halo) = match card.status {
+            Status::Unread => (inks.unread, Some(inks.unread.opacity(UNREAD_HALO))),
+            Status::Read => (inks.ink_dim.opacity(READ_DOT), None),
         };
         let title = ws.title();
         let title = if title.is_empty() { "shell".to_string() } else { title };
@@ -1226,22 +1310,7 @@ impl App {
                     .text_color(inks.ink)
                     .child(title),
             )
-            .children(branch)
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .ml(px(HEADER_GAP * ui))
-                    .h(px(CHIP_H * ui))
-                    .px(px(CHIP_PAD_X * ui))
-                    .rounded(px(CHIP_H * ui / 2.0))
-                    .bg(chip_bg)
-                    .flex()
-                    .items_center()
-                    .whitespace_nowrap()
-                    .text_size(px(CHIP_TEXT_SIZE * ui))
-                    .text_color(chip_ink)
-                    .child(card.status.name()),
-            );
+            .children(branch);
 
         // ── Body placeholder ────────────────────────────────────────────
         // A primary tab without a terminal (a webview — its native view
@@ -1285,15 +1354,29 @@ impl App {
             };
             // An element target like "Open": the press stops here, so the
             // canvas path never sees it — `dashboard_open_pr` reads and
-            // focuses the card itself.
-            run()
+            // focuses the card itself. The one left run that shrinks: a long
+            // title ends in an ellipsis — the glyph and `#N` stay whole —
+            // rather than pushing the diff counts out of the footer.
+            div()
+                .min_w(px(0.0))
+                .flex()
+                .items_center()
+                .gap(px(5.0 * ui))
                 .cursor_pointer()
                 .on_mouse_down(
                     MouseButton::Left,
                     press(entity.clone(), move |this, _ev, _cx| this.dashboard_open_pr(group)),
                 )
-                .child(icon(crate::sidebar_ui::avatar_icon(kind), glyph, tint))
-                .child(format!("#{} {}", pr.number, pr_state_word(pr)))
+                .child(div().flex_shrink_0().child(icon(
+                    crate::sidebar_ui::avatar_icon(kind),
+                    glyph,
+                    tint,
+                )))
+                .child(div().flex_shrink_0().child(format!("#{}", pr.number)))
+                .children(
+                    pr_footer_title(&pr.title)
+                        .map(|title| div().min_w(px(0.0)).truncate().child(title)),
+                )
         });
         let diff = git.and_then(|c| repo_counts(c).0).map(|(added, removed)| {
             run()
@@ -1430,13 +1513,100 @@ mod tests {
         assert!(items[CARD_MENU_COPY].enabled);
     }
 
-    /// The status is the unread flag, spelled "unread" / "read" in `state`
-    /// and on the chip.
+    /// The footer names the pull request by its title, on one line, never
+    /// by its state word; a blank title leaves the number alone.
+    #[test]
+    fn pr_footer_title_is_the_one_line_title() {
+        assert_eq!(pr_footer_title("Dashboard: side-tab hint").as_deref(), Some("Dashboard: side-tab hint"));
+        assert_eq!(pr_footer_title(" Fix\n  the  footer ").as_deref(), Some("Fix the footer"));
+        assert_eq!(pr_footer_title("  "), None);
+        assert_eq!(pr_footer_title(""), None);
+    }
+
+    /// The status is the unread flag, spelled "unread" / "read" in `state`.
     #[test]
     fn status_is_the_unread_flag() {
         assert_eq!(status(true), Status::Unread);
         assert_eq!(status(false), Status::Read);
         assert_eq!([Status::Unread, Status::Read].map(Status::name), ["unread", "read"]);
+    }
+
+    /// A dwell reads nothing before its deadline, and at it reads its card
+    /// only while that card is still the focused one on the Dashboard.
+    #[test]
+    fn dwell_reads_only_a_card_that_kept_the_focus() {
+        let t0 = Instant::now();
+        let dwell = Dwell::arm(2, 20, t0);
+        assert_eq!(dwell.due, t0 + DWELL);
+        let here = Some((2, 20));
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        // Not yet due: stays pending, whatever the focus.
+        assert_eq!(dwell_outcome(dwell, t0, Page::Dashboard, here), DwellOutcome::Pending);
+        assert_eq!(dwell_outcome(dwell, at(999), Page::Dashboard, here), DwellOutcome::Pending);
+        assert_eq!(dwell_outcome(dwell, at(999), Page::Sessions, None), DwellOutcome::Pending);
+        // Due and still focused on the Dashboard: read.
+        assert_eq!(dwell_outcome(dwell, at(1000), Page::Dashboard, here), DwellOutcome::Read(2));
+        assert_eq!(dwell_outcome(dwell, at(5000), Page::Dashboard, here), DwellOutcome::Read(2));
+        // Due, but the focus moved to another card, or to none.
+        assert_eq!(
+            dwell_outcome(dwell, at(1000), Page::Dashboard, Some((3, 30))),
+            DwellOutcome::Dropped
+        );
+        assert_eq!(dwell_outcome(dwell, at(1000), Page::Dashboard, None), DwellOutcome::Dropped);
+        // Due, but the page is no longer the Dashboard.
+        assert_eq!(dwell_outcome(dwell, at(1000), Page::Sessions, here), DwellOutcome::Dropped);
+        assert_eq!(dwell_outcome(dwell, at(1000), Page::Tool(0), here), DwellOutcome::Dropped);
+    }
+
+    /// The index alone does not name the card: once a closed or re-ordered
+    /// group shifted it, the dwell reads neither group.
+    #[test]
+    fn dwell_does_not_follow_a_shifted_index() {
+        let t0 = Instant::now();
+        let dwell = Dwell::arm(2, 20, t0);
+        let due = t0 + DWELL;
+        // Index 2 now names another group; the armed one moved to index 1.
+        assert_eq!(
+            dwell_outcome(dwell, due, Page::Dashboard, Some((2, 30))),
+            DwellOutcome::Dropped
+        );
+        assert_eq!(
+            dwell_outcome(dwell, due, Page::Dashboard, Some((1, 20))),
+            DwellOutcome::Dropped
+        );
+    }
+
+    /// Each move re-arms, replacing the deadline: quick successive moves read
+    /// none of the cards passed through, only the one the focus rests on.
+    #[test]
+    fn dwell_rearm_reads_no_card_passed_through() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let groups = [(0, 10), (1, 11), (2, 12)];
+        let mut pending = None;
+        let mut read = Vec::new();
+        // A move every 400ms, the pump ticking every 100ms throughout; the
+        // focus stays on the last card.
+        for tick in 0..=30u64 {
+            let now = at(tick * 100);
+            let step = ((tick / 4) as usize).min(groups.len() - 1);
+            let focused = groups[step];
+            if tick % 4 == 0 && tick / 4 < groups.len() as u64 {
+                pending = Some(Dwell::arm(focused.0, focused.1, now));
+            }
+            if let Some(dwell) = pending {
+                match dwell_outcome(dwell, now, Page::Dashboard, Some(focused)) {
+                    DwellOutcome::Pending => {},
+                    DwellOutcome::Read(group) => {
+                        read.push((group, tick * 100));
+                        pending = None;
+                    },
+                    DwellOutcome::Dropped => pending = None,
+                }
+            }
+        }
+        // Only the last card, a full dwell after the last move (at 800ms).
+        assert_eq!(read, [(2, 1800)]);
     }
 
     /// All shows everything; Unread shows unread cards only — except the
