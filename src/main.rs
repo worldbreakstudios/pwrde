@@ -2681,9 +2681,7 @@ impl App {
     /// Copy the active selection's text to the system clipboard.
     fn copy(&mut self) {
         let Some(text) = self.keyboard_session().and_then(Session::selected_text) else { return };
-        if let Ok(mut clipboard) = arboard::Clipboard::new() {
-            let _ = clipboard.set_text(text);
-        }
+        copy_to_clipboard(text);
     }
 
     fn paste(&mut self) {
@@ -2947,7 +2945,7 @@ impl App {
     fn on_right_mouse_down(&mut self, window: &Window, cx: &mut Context<Self>) {
         // The dashboard: a right press anywhere on a card — its terminal
         // included, mouse-tracking TUI or not — opens the card's menu
-        // ("Go to session"). The sessions list beside the grid keeps its
+        // (Copy, "Go to session"). The sessions list beside the grid keeps its
         // rows' menu, which the sidebar branch below builds.
         if self.page == Page::Dashboard {
             if self.modal_overlay_open() {
@@ -3179,11 +3177,22 @@ impl App {
     fn apply_context_menu(&mut self, target: MenuTarget, choice: usize) {
         let now = SystemTime::now();
         match target {
-            // The dashboard card's one item, "Go to session": leave for the
-            // Sessions page showing that group. Looked up by its primary
-            // tile, so a group that closed meanwhile is simply not found.
+            // The dashboard card's menu (`dashboard_ui::card_menu_items`).
+            // Copy takes that card's selection — the card right-clicked,
+            // which need not be the focused one. "Go to session" leaves for
+            // the Sessions page showing that group. Both look the card up by
+            // its primary tile, so a group that closed meanwhile is simply
+            // not found.
             MenuTarget::Card { tile } => {
-                if choice == 0
+                if choice == dashboard_ui::CARD_MENU_COPY {
+                    if let Some(text) = self
+                        .dashboard_session(tile)
+                        .and_then(Session::selected_text)
+                        .filter(|text| !text.is_empty())
+                    {
+                        copy_to_clipboard(text);
+                    }
+                } else if choice == dashboard_ui::CARD_MENU_GO
                     && !self.is_empty_state()
                     && let Some(group) =
                         self.workspaces.iter().position(|ws| ws.primary_tile == tile)
@@ -5347,11 +5356,14 @@ impl App {
                     self.resize_hover = hover;
                     self.request_redraw();
                 }
-                // Link hover: suppress when any overlay is open or not in Sessions page.
-                let link_hover = if self.page != Page::Sessions
-                    || self.confirm.is_some()
-                    || self.webview_prompt.is_some()
-                {
+                // Link hover: suppress when any overlay is open, and off the
+                // pages that show terminals — Sessions' tiles, or the
+                // Dashboard's card bodies (keyed by the card's primary tile).
+                let link_hover = if self.confirm.is_some() || self.webview_prompt.is_some() {
+                    None
+                } else if self.page == Page::Dashboard {
+                    self.dashboard_link_hover(px, py)
+                } else if self.page != Page::Sessions {
                     None
                 } else {
                     let scale = self.renderer.scale;
@@ -6182,6 +6194,8 @@ impl App {
         }
         if self.page != page {
             self.page = page;
+            // A hover names a tile and a cell of the page left behind.
+            self.link_hover = None;
             self.recording = None;
             // A dwell belongs to the dashboard it was armed on.
             self.dashboard_dwell = None;
@@ -7511,6 +7525,7 @@ impl App {
                     let card = layout.card(slot);
                     let tab = dashboard_ui::primary_tab(&self.workspaces[group]);
                     renderer::DashCard {
+                        tile: self.workspaces[group].primary_tile,
                         tab,
                         card,
                         body: workspace::dashboard_card_body(&card, layout.scale),
@@ -7522,7 +7537,7 @@ impl App {
             // The cursor shows only where typing lands: the focused card,
             // and not while a modal or the focused flyover has the keyboard.
             let draw_cursor = !overlay_open && !(self.flyover_open && self.flyover_focused);
-            self.renderer.dashboard(&cards, &layout.viewport, draw_cursor)
+            self.renderer.dashboard(&cards, &layout.viewport, draw_cursor, link_hover_suppressed)
         });
         // The flyover panel lives outside the workspace tree, so its layer is
         // built here from App state and slotted into the frame's flyover
@@ -8962,6 +8977,14 @@ mod proc_title_tests {
             Some(false)
         );
         assert_eq!(proc_title_due(PROC_TITLE_POLL, PROC_TITLE_REFRESH), Some(true));
+    }
+}
+
+/// Put `text` on the system clipboard; a clipboard that cannot be opened is
+/// silently skipped. Shared by ⌘C and the dashboard card menu's Copy.
+fn copy_to_clipboard(text: String) {
+    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+        let _ = clipboard.set_text(text);
     }
 }
 
