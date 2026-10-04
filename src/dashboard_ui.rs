@@ -1,6 +1,6 @@
 //! The Dashboard page (`Page::Dashboard`, `Action::ToggleDashboard` ⌘G, the
 //! sessions header's grid chip): the **primary pane** of every group in the
-//! selected folder as a live card in one scrollable, count-adaptive grid, so
+//! selected folder as a live card in one scrollable grid sized from the viewport, so
 //! several agents can be watched — and typed into — at once. Secondary panes
 //! never appear here.
 //!

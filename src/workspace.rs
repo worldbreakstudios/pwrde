@@ -3060,6 +3060,11 @@ const DASH_GAP: f32 = 10.0;
 /// Narrowest column pitch — a card plus the gap after it, the mock's figure —
 /// before the grid drops one; the cards themselves get down to 270px.
 const DASH_MIN_COL_W: f32 = 280.0;
+/// The column pitch a wide viewport aims for — about an 80-column terminal a
+/// card — when it has room for more columns than the base shape.
+const DASH_TARGET_COL_W: f32 = 560.0;
+/// The row pitch a tall viewport aims for when it shows more than two rows.
+const DASH_TARGET_ROW_H: f32 = 430.0;
 /// Shortest a card may get: a short window scrolls instead of crushing them.
 const DASH_MIN_CARD_H: f32 = 200.0;
 /// A card's header (status dot, title, branch) and footer
@@ -3107,9 +3112,10 @@ pub struct DashGrid {
     pub card_h: f32,
 }
 
-/// Columns a dashboard of `n` cards wants before the width cap: one card
-/// fills the page, up to four pair up, more go three abreast.
-fn dashboard_wanted_cols(n: usize) -> usize {
+/// Columns a dashboard of `n` cards gets however narrow its cards' natural
+/// width would make the page: one card fills it, up to four pair up, more go
+/// three abreast.
+fn dashboard_base_cols(n: usize) -> usize {
     match n {
         0 | 1 => 1,
         2..=4 => 2,
@@ -3117,9 +3123,14 @@ fn dashboard_wanted_cols(n: usize) -> usize {
     }
 }
 
-/// The grid for `n` groups in `viewport`. The width caps the column count
-/// (no column pitch under [`DASH_MIN_COL_W`]); one row fills the viewport, two or
-/// more rows are half of it each, so two fill it and further rows scroll;
+/// The grid for `n` groups in `viewport`, sized from the room there is. A
+/// wide viewport holds as many columns as fit at [`DASH_TARGET_COL_W`] (to
+/// the nearest column, never fewer than [`dashboard_base_cols`], never more
+/// than `n`), the width caps that (no column pitch under
+/// [`DASH_MIN_COL_W`]), and the rows are then balanced — the fewest columns
+/// that keep the row count, so seven cards with room for six sit 4 + 3. One
+/// row fills the viewport; more rows share it as many at a time as fit at
+/// [`DASH_TARGET_ROW_H`] (at least two) and the rest scroll;
 /// [`DASH_MIN_CARD_H`] floors the height.
 pub fn dashboard_grid(viewport: &LayoutRect, n: usize, scale: f32) -> DashGrid {
     dashboard_grid_at(viewport, n, scale, chrome_ui_scale())
@@ -3131,18 +3142,20 @@ fn dashboard_grid_at(viewport: &LayoutRect, n: usize, scale: f32, ui: f32) -> Da
     let pad_x = (DASH_PAD_X * s).round();
     let pad_y = (DASH_PAD_Y * s).round();
     let gap = (DASH_GAP * s).round();
-    // The cap is measured in px at the default chrome text size, like the
+    // Pitches are measured in px at the default chrome text size, like the
     // info bar's shedding thresholds. (A negative quotient casts to 0.)
-    let fit = ((viewport.w / s - 2.0 * DASH_PAD_X + DASH_GAP) / DASH_MIN_COL_W).floor() as usize;
-    let cols = fit.clamp(1, dashboard_wanted_cols(n));
+    let usable_w = viewport.w / s - 2.0 * DASH_PAD_X + DASH_GAP;
+    let fit = (usable_w / DASH_MIN_COL_W).floor() as usize;
+    let natural = (usable_w / DASH_TARGET_COL_W).round() as usize;
+    let wanted = natural.max(dashboard_base_cols(n)).min(n.max(1));
+    let cols = fit.clamp(1, wanted);
     let rows = n.div_ceil(cols).max(1);
+    let cols = n.div_ceil(rows).max(1);
     let card_w =
         ((viewport.w - 2.0 * pad_x - (cols - 1) as f32 * gap) / cols as f32).floor().max(0.0);
-    let fill = if rows == 1 {
-        viewport.h - 2.0 * pad_y
-    } else {
-        (viewport.h - 2.0 * pad_y - gap) / 2.0
-    };
+    let usable_h = viewport.h / s - 2.0 * DASH_PAD_Y + DASH_GAP;
+    let in_view = ((usable_h / DASH_TARGET_ROW_H).floor() as usize).clamp(rows.min(2), rows);
+    let fill = (viewport.h - 2.0 * pad_y - (in_view - 1) as f32 * gap) / in_view as f32;
     let card_h = fill.floor().max((DASH_MIN_CARD_H * s).round());
     DashGrid { cols, rows, card_w, card_h }
 }
@@ -3665,7 +3678,7 @@ mod dashboard_tests {
         (grid.cols, grid.rows)
     }
 
-    /// The mock's count-adaptive grid: 1 → 1×1, 2 → side by side, 3–4 → two
+    /// The base shape, on a viewport with no room for more: 1 → 1×1, 2 → side by side, 3–4 → two
     /// columns, 5+ → three.
     #[test]
     fn grid_shape_follows_the_group_count() {
@@ -3699,14 +3712,57 @@ mod dashboard_tests {
             assert_eq!(cols(574.0, 6, scale, ui), 2);
             assert_eq!(cols(573.0, 6, scale, ui), 1);
             assert_eq!(cols(120.0, 6, scale, ui), 1, "never zero columns");
-            // The cap never raises the count past what `n` wants.
+            // The cap never raises the count past `n`.
             assert_eq!(cols(4000.0, 2, scale, ui), 2);
             assert_eq!(cols(4000.0, 1, scale, ui), 1);
         }
     }
 
-    /// One row fills the viewport minus the padding; two or more rows are
-    /// half of it each, so a third row scrolls.
+    /// A wide viewport takes as many columns as fit at the 560px target
+    /// pitch (to the nearest), never more than there are cards, and balances
+    /// the rows; a narrower one keeps the base shape.
+    #[test]
+    fn wide_viewports_add_columns() {
+        let grid = |w: f32, n: usize, scale: f32, ui: f32| {
+            let g = dashboard_grid_at(&LayoutRect { w: w * scale * ui, ..VIEW }, n, scale, ui);
+            (g.cols, g.rows)
+        };
+        for (scale, ui) in [(1.0, 1.0), (2.0, 1.0), (2.0, 1.5)] {
+            // A 1920 window beside the sidebar: three abreast, one row for three.
+            assert_eq!(grid(1670.0, 3, scale, ui), (3, 1));
+            assert_eq!(grid(1670.0, 4, scale, ui), (2, 2));
+            assert_eq!(grid(1670.0, 9, scale, ui), (3, 3));
+            // Room for six: seven cards balance to 4 + 3, twelve fill 6 × 2.
+            assert_eq!(grid(3450.0, 7, scale, ui), (4, 2));
+            assert_eq!(grid(3450.0, 12, scale, ui), (6, 2));
+            assert_eq!(grid(3450.0, 13, scale, ui), (5, 3));
+            assert_eq!(grid(3450.0, 4, scale, ui), (4, 1));
+            // Three fit from 2.5 target pitches up, four from 3.5.
+            assert_eq!(grid(1414.0, 3, scale, ui), (3, 1));
+            assert_eq!(grid(1413.0, 3, scale, ui), (2, 2));
+            assert_eq!(grid(1974.0, 8, scale, ui), (4, 2));
+            assert_eq!(grid(1973.0, 8, scale, ui), (3, 3));
+        }
+    }
+
+    /// A tall viewport shows as many rows as fit at the 430px target pitch
+    /// — never fewer than two of several, never more than there are.
+    #[test]
+    fn tall_viewports_show_more_rows() {
+        let card_h = |h: f32, n: usize| dashboard_grid_at(&LayoutRect { h, ..VIEW }, n, 1.0, 1.0).card_h;
+        // 1300 fits three row pitches; one px less fits two.
+        assert_eq!(card_h(1300.0, 9), (1300.0 - 20.0 - 20.0) / 3.0);
+        assert_eq!(card_h(1299.0, 9), ((1299.0 - 20.0 - 10.0) / 2.0_f32).floor());
+        // Only two rows to show: they still share the whole viewport.
+        assert_eq!(card_h(1300.0, 6), (1300.0 - 30.0) / 2.0);
+        assert_eq!(card_h(1300.0, 2), 1300.0 - 20.0);
+        // Scaled alike.
+        let big = dashboard_grid_at(&LayoutRect { h: 2600.0, ..VIEW }, 9, 2.0, 1.0);
+        assert_eq!(big.card_h, 2.0 * (1300.0 - 40.0) / 3.0);
+    }
+
+    /// One row fills the viewport minus the padding; on a viewport too short
+    /// for three, two or more rows are half of it each, so a third scrolls.
     #[test]
     fn rows_fill_the_viewport_two_at_a_time() {
         let one = dashboard_grid_at(&VIEW, 2, 1.0, 1.0);
